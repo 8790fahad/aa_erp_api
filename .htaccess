@@ -1,0 +1,25 @@
+# Proxy to Node (port must match your process, e.g. PM2 / node app).
+# Public URL path must match BASE_PATH in the API (default /flowbooks_api in app.js).
+
+RewriteEngine On
+
+# CORS: send browser OPTIONS preflight to Node so Express can answer with Access-Control-* headers.
+# (Adapted from a generic "elite-api" pattern — paths/ports below are Flowbooks-specific.)
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^(.*)$ http://127.0.0.1:42843/flowbooks_api/$1 [P,L,QSA]
+
+RewriteRule ^$ http://127.0.0.1:42843/flowbooks_api/ [P,L,QSA]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ http://127.0.0.1:42843/flowbooks_api/$1 [P,L,QSA]
+
+# Optional: block direct web access to sensitive filenames in this folder (tune as needed).
+<FilesMatch "\.(env|log|md|yml)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>

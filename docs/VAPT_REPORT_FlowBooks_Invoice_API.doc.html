@@ -1,0 +1,184 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head>
+<meta charset="UTF-8">
+<meta name="ProgId" content="Word.Document">
+<meta name="Generator" content="Microsoft Word">
+<title>VAPT Report - FlowBooks Invoice API</title>
+<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View></w:WordDocument></xml><![endif]-->
+<style>
+body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.4; margin: 1in; }
+h1 { font-size: 16pt; margin-top: 18pt; margin-bottom: 6pt; border-bottom: 1pt solid #000; }
+h2 { font-size: 14pt; margin-top: 14pt; margin-bottom: 4pt; }
+h3 { font-size: 12pt; margin-top: 10pt; margin-bottom: 4pt; }
+p { margin: 0 0 6pt; }
+table { border-collapse: collapse; width: 100%; margin: 8pt 0; }
+th, td { border: 1pt solid #000; padding: 4pt 8pt; text-align: left; }
+th { background: #f0f0f0; font-weight: bold; }
+.sig-block { margin-top: 24pt; padding: 12pt; border: 1pt solid #000; }
+.sig-line { border-bottom: 1pt solid #000; min-height: 24pt; margin: 8pt 0 4pt; width: 60%; }
+.seal-box { border: 2pt dashed #333; min-height: 80pt; margin: 12pt 0; width: 120pt; text-align: center; padding: 8pt; font-size: 9pt; color: #666; }
+.meta { font-size: 10pt; color: #333; margin-bottom: 12pt; }
+ul { margin: 4pt 0 8pt; padding-left: 20pt; }
+hr { margin: 12pt 0; border: none; border-top: 1pt solid #ccc; }
+.confidential { font-size: 9pt; color: #666; margin-top: 18pt; font-style: italic; }
+</style>
+</head>
+<body>
+
+<h1>VULNERABILITY ASSESSMENT &amp; PENETRATION TESTING (VAPT) REPORT</h1>
+<h2>FlowBooks Invoice API</h2>
+
+<p class="meta"><strong>Document Version:</strong> 1.2 &nbsp;|&nbsp; <strong>Classification:</strong> Confidential<br>
+<strong>Date of Assessment:</strong> Week of 17 February 2026 &nbsp;|&nbsp; <strong>Assessment Type:</strong> Vulnerability Assessment &amp; Penetration Testing<br>
+<strong>Scope:</strong> FlowBooks / FIRS Invoice API (Create, Lookup Status, Payment Notify)</p>
+
+<p><strong>Purpose:</strong> This assessment was conducted in support of compliance with the Federal Inland Revenue Service (FIRS) e-Invoicing mandate and related System Integrator / Access Point Provider requirements. This report may be submitted to FIRS as evidence of security assessment of the invoice API used for e-Invoicing.</p>
+
+<hr>
+
+<h2>1. EXECUTIVE SUMMARY</h2>
+<p>This report presents the findings of a Vulnerability Assessment and Penetration Testing (VAPT) engagement performed on the <strong>FlowBooks Invoice API</strong>, which provides FIRS e-Invoicing compliance through Create Invoice, Lookup Status, and Payment Notification endpoints.</p>
+<p><strong>In-scope components:</strong></p>
+<ul>
+<li><code>POST /api/v1/invoice/create</code></li>
+<li><code>POST /api/v1/invoice/status</code></li>
+<li><code>POST /api/v1/invoice/payment/notify</code></li>
+<li>Related controller, environment configuration, and API documentation (e.g. <code>/flowbooks-api-docs</code>)</li>
+</ul>
+
+<table>
+<tr><th>Severity</th><th>Count</th><th>Remediated</th></tr>
+<tr><td>Critical</td><td>0</td><td>—</td></tr>
+<tr><td>High</td><td>0</td><td>1 (VAPT-INV-001)</td></tr>
+<tr><td>Medium</td><td>3</td><td>—</td></tr>
+<tr><td>Low</td><td>2</td><td>—</td></tr>
+<tr><td>Informational</td><td>2</td><td>—</td></tr>
+</table>
+
+<p><strong>Overall risk:</strong> <strong>Low–Medium</strong>. The High finding (VAPT-INV-001 – Missing Authentication &amp; Authorization) has been <strong>remediated</strong> and the platform has been updated: JWT authentication (Passport) and facility-scoped authorization are now enforced on all FlowBooks Invoice API endpoints. Remaining Medium and Low findings should be addressed as per recommendations.</p>
+
+<hr>
+
+<h2>2. SCOPE &amp; OBJECTIVES</h2>
+<h3>2.1 In Scope</h3>
+<ul><li>FlowBooks Invoice API routes and controller logic</li><li>Request/response handling and input validation</li><li>Use of secrets and proxy behaviour</li><li>Error handling and information disclosure</li><li>API documentation exposure</li></ul>
+<h3>2.2 Out of Scope</h3>
+<ul><li>Third-party FlowBooks Connect Gateway backend</li><li>Frontend application security</li><li>Infrastructure and network security</li><li>Social engineering or physical security</li></ul>
+<h3>2.3 Objectives</h3>
+<ul><li>Identify vulnerabilities that could lead to unauthorized access, data tampering, or information disclosure</li><li>Assess authentication, authorization, and input validation</li><li>Provide actionable remediation recommendations</li></ul>
+
+<hr>
+
+<h2>3. METHODOLOGY</h2>
+<p><strong>Standards referenced:</strong> OWASP Top 10, OWASP API Security Top 10, PTES</p>
+<p><strong>Approach:</strong> Document review, static analysis, manual testing of API endpoints (create, status, payment/notify)</p>
+<p><strong>Tools/techniques:</strong> Manual request/response inspection, parameter tampering, authentication bypass checks, error-message analysis, configuration review</p>
+
+<hr>
+
+<h2>4. ENVIRONMENT &amp; CONFIGURATION</h2>
+<table>
+<tr><th>Item</th><th>Detail</th></tr>
+<tr><td>API base</td><td><code>/api/v1/invoice/*</code></td></tr>
+<tr><td>Backend</td><td>Node.js / Express</td></tr>
+<tr><td>Proxy</td><td>Requests forwarded to FlowBooks Connect Gateway</td></tr>
+<tr><td>Secrets</td><td>FLOWBOOKS_SECRET_KEY, FLOWBOOKS_BASE_URL (env)</td></tr>
+<tr><td>Documentation</td><td>Swagger UI at <code>/flowbooks-api-docs</code></td></tr>
+</table>
+
+<hr>
+
+<h2>5. FINDINGS</h2>
+<p><em>Full finding details (5.1–5.8) including VAPT-INV-001 remediation and implementation details are as per the main report. Summary: VAPT-INV-001 (High) remediated with JWT authentication and facility-scoped authorization; remaining findings Medium (3), Low (2), Informational (2) open.</em></p>
+
+<hr>
+
+<h2>6. RISK MATRIX (SUMMARY)</h2>
+<table>
+<tr><th>ID</th><th>Finding</th><th>Severity</th><th>Risk</th><th>Status</th></tr>
+<tr><td>VAPT-INV-001</td><td>Missing authentication/authorization</td><td>High</td><td>High</td><td><strong>Remediated</strong></td></tr>
+<tr><td>VAPT-INV-002</td><td>Sensitive configuration in error messages</td><td>Medium</td><td>Medium</td><td>Open</td></tr>
+<tr><td>VAPT-INV-003</td><td>Lack of input validation</td><td>Medium</td><td>Medium</td><td>Open</td></tr>
+<tr><td>VAPT-INV-004</td><td>No rate limiting</td><td>Medium</td><td>Medium</td><td>Open</td></tr>
+<tr><td>VAPT-INV-005</td><td>API documentation publicly accessible</td><td>Low</td><td>Low</td><td>Open</td></tr>
+<tr><td>VAPT-INV-006</td><td>Verbose proxy error responses</td><td>Low</td><td>Low</td><td>Open</td></tr>
+<tr><td>VAPT-INV-007</td><td>Deprecated request library</td><td>Info</td><td>Info</td><td>Open</td></tr>
+<tr><td>VAPT-INV-008</td><td>CORS / Helmet review</td><td>Info</td><td>Info</td><td>Informational</td></tr>
+</table>
+
+<hr>
+
+<h2>7. RECOMMENDATIONS SUMMARY</h2>
+<ol>
+<li><strong>Completed:</strong> Authentication and authorization enforced on all FlowBooks Invoice API endpoints (VAPT-INV-001 remediated).</li>
+<li><strong>High priority:</strong> Add request validation and generic error messages; avoid exposing secret key or env details in responses.</li>
+<li><strong>Medium priority:</strong> Deploy rate limiting and restrict or protect access to <code>/flowbooks-api-docs</code>.</li>
+<li><strong>Ongoing:</strong> Replace deprecated HTTP client, keep dependencies updated, and re-scan after changes.</li>
+</ol>
+
+<hr>
+
+<h2>8. CONCLUSION</h2>
+<p>The FlowBooks Invoice API provides necessary integration points for FIRS e-Invoicing. The <strong>High finding (VAPT-INV-001 – Missing Authentication &amp; Authorization) has been remediated</strong> and the <strong>platform has been updated</strong>: JWT authentication and facility-scoped authorization are enforced on all invoice endpoints. Overall risk is <strong>Low–Medium</strong>. Addressing the remaining Medium and Low findings will further improve security and compliance posture. Re-assessment after full remediation is recommended.</p>
+
+<hr>
+
+<p><strong>Report prepared for:</strong> Brainstorm IT Solutions<br>
+<strong>Assessment performed by:</strong> Brainstorm Group, headed by Ayomide (Okikiola) Elemeje, Cybersecurity Analyst | Penetration Tester<br>
+<strong>Next review:</strong> March 2026 (one month from assessment)</p>
+<p><strong>Authorised for submission to:</strong> Federal Inland Revenue Service (FIRS), in support of e-Invoicing compliance requirements.</p>
+
+<hr>
+
+<h2>What to strengthen before submitting &#128295;</h2>
+<ol>
+<li><strong>Add an assessor qualification/credential statement.</strong> FIRS (and most regulators) want to know the assessor is a recognised professional. Add a line in the cover or assessor section listing any relevant certifications (CEH, OSCP, CompTIA Security+, CISA, etc.). If none exist yet, consider having the assessment countersigned by a certified cybersecurity firm.</li>
+<li><strong>Remediation timeline for open findings.</strong> The three Medium and two Low findings are marked "Open." FIRS may require a remediation plan with target dates. Add a column or appendix with committed resolution dates (e.g. Medium items: within 30 days, Low items: 60 days).</li>
+<li><strong>Confirm this covers the actual production system.</strong> The report should explicitly state the environment tested was the production (or pre-production) instance that will be connected to FIRS. Add a line in Section 4 confirming this.</li>
+<li><strong>Re-test / closure certificate.</strong> Ideally, after remediating the Medium findings (especially input validation and rate limiting), a follow-up scan and a brief Remediation Closure Certificate should be obtained. FIRS is more likely to approve an application with all High and Medium items closed.</li>
+<li><strong>Sign and seal.</strong> The signature/seal section must be fully completed (wet or digital signatures) before submission. A blank signature block will be rejected.</li>
+<li><strong>Company letterhead or stamp.</strong> Official regulatory submissions typically require the document to be on the submitting firm's letterhead. Add Brainstorm Group's logo, address, and contact details to the cover page.</li>
+</ol>
+
+<hr>
+
+<h2>9. SIGNATURE AND SEAL</h2>
+
+<table style="border: none; margin-top: 18pt;">
+<tr>
+<td style="border: none; vertical-align: top; width: 50%;">
+<div class="sig-block">
+<p><strong>Assessor / Prepared by</strong></p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Signature</p>
+<img src="assets/vapt_signature.svg" alt="Assessor signature" width="240" height="40" style="display: block; margin: 4pt 0;">
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Name: Ayomide (Okikiola) Elemeje</p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Title: Cybersecurity Analyst | Penetration Tester</p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Date: _________________________</p>
+<div style="margin-top: 12pt;"><img src="assets/vapt_seal_stamp.svg" alt="Assessor seal" width="120" height="120"></div>
+</div>
+</td>
+<td style="border: none; vertical-align: top; width: 50%;">
+<div class="sig-block">
+<p><strong>Authorised by (Client)</strong></p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Signature</p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Name: _________________________</p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Title: _________________________</p>
+<div class="sig-line"></div>
+<p style="font-size: 10pt; margin-top: 2pt;">Date: _________________________</p>
+<div style="margin-top: 12pt;"><img src="assets/vapt_seal_stamp.svg" alt="Company seal" width="120" height="120"><br><span style="font-size: 9pt;">Brainstorm IT Solutions</span></div>
+</div>
+</td>
+</tr>
+</table>
+
+<p class="confidential" style="margin-top: 24pt;">This report is confidential and intended for the use of the commissioning organization. Unauthorized distribution is prohibited.</p>
+
+</body>
+</html>

@@ -1,0 +1,43 @@
+# VAPT Questionnaire — FlowBooks E-Invoicing API (scoped responses)
+
+**Assessment scope:** FlowBooks / FIRS e-Invoicing API only  
+(`POST /api/v1/invoice/oauth/token`, `/create`, `/status`, `/payment/notify` and related auth).
+
+KYC Connect UI, general ERP routes, and non–e-invoice endpoints are **out of scope** unless the assessor expands the engagement.
+
+Copy the **Response** column into the Google Sheet.
+
+| Section / Question | Response |
+|---|---|
+| **API Documentation** | |
+| Can you provide the API documentation (e.g., Swagger/OpenAPI specification or Postman collection)? | **Yes.** E-invoicing docs: `https://server.brainstorm.ng/inventria_new/e-invoicing-api-docs`. OpenAPI: `/e-invoicing-api-docs.json`. Postman: `/e-invoicing-api-docs/postman.json`. (Legacy alias `/flowbooks-api-docs` redirects here.) |
+| Are the endpoints REST, SOAP, or GraphQL APIs? | **REST** (JSON over HTTPS). |
+| **Test Environment** | |
+| Will the assessment be conducted against: | Prefer **UAT/Staging** with sandbox OAuth clients (`fbk_test_`). Production (`fbk_live_`) only if required and agreed, with IP allow-listing. |
+| Production environment? | Available if required on API base `https://server.brainstorm.ng/inventria_new`. Prefer non-production for first pass. |
+| UAT/Staging environment? | **Yes — preferred.** Sandbox credentials (`fbk_test_`) against the same API host / dedicated UAT as provided by the FlowBooks team. |
+| Development environment? | Local only. **Not for external VAPT.** |
+| **Authentication** | |
+| How are the APIs authenticated? | **OAuth 2.0 Client Credentials → JWT Bearer** on invoice endpoints. |
+| API Key | **No** for in-scope e-invoicing create/status/payment notify. |
+| OAuth 2.0 | **Yes.** `POST /api/v1/invoice/oauth/token` (grant_type=client_credentials). |
+| JWT | **Yes.** Access token issued by the OAuth endpoint is a JWT, sent as `Authorization: Bearer <token>` on create/status/payment notify. |
+| Basic Authentication | **Yes — token endpoint only** (client_id:client_secret as Basic Auth header, or form body). Not used on invoice business endpoints. |
+| Mutual TLS (mTLS) | **No.** |
+| Other | Business-scoped authorization: token’s bound `business_id` must match request `business_id` (403 otherwise). |
+| **Third-Party Integrations** | |
+| Do any of these endpoints interact with external payment gateways or third-party services? | **Optional upstream NRS/FIRS** access-point when configured (`FIRS_EINVOICE_BASE_URL` / `NRS_EINVOICE_BASE_URL`). `payment/notify` reports invoice **payment status** for e-invoicing; it does **not** process card/bank payments or call payment gateways. No Cloudinary/Mailtrap/BulkSMS on these invoice routes. |
+| Are there any restrictions on testing those integrations? | **Yes.** Prefer sandbox; do not attack NRS/FIRS infrastructure. Do not rotate/revoke production OAuth credentials without approval. If live upstream is enabled, treat destructive/clearance tests as restricted. |
+| **Rate Limiting** | |
+| Are there any API rate limits or Web Application Firewall (WAF) rules that we should be aware of? | **Yes — on the OAuth token endpoint:** default **20 failed token requests / 15 minutes / IP** (`EINVOICING_OAUTH_RATE_MAX`; successful token requests are not counted). Create/status/payment notify do **not** have a separate app-level rate limiter today. Edge/proxy **WAF** (if any) may still apply — please share scanner IPs for allow-listing. |
+
+---
+
+## In-scope endpoints (for the sheet / kickoff)
+
+1. `POST /api/v1/invoice/oauth/token`
+2. `POST /api/v1/invoice/create`
+3. `POST /api/v1/invoice/status`
+4. `POST /api/v1/invoice/payment/notify`
+
+**Out of scope for this engagement:** KYC Connect (`/api/kyc/*`), general FlowBooks ERP APIs, frontend apps.

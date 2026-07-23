@@ -1,0 +1,75 @@
+UBA BANK PLC (COA 100043) - Bank Reconciliation Test Data
+============================================================
+
+Period: 2026-01-01 to 2026-05-31
+Opening balance (statement): NGN 26,467,734.06
+Closing balance (statement): NGN 12,500,000.00
+
+GL entries for 100043: 257
+Bank statement lines (excl opening): 256
+  - Match GL (same ref/date/amount): 231 (90%)
+  - Bank-only (charges/interest): 25
+  - GL-only (not on statement): 26
+
+Upload steps:
+1. Import seed_general_ledger_reports.sql
+2. Ensure bank_account record exists with head=100043 (UBA BANK PLC)
+3. Upload UBA_100043_BankStatement_Jan-May2026.xlsx via Bank Reconciliation
+4. Date range: 2026-01-01 to 2026-05-31
+5. Match by reference + amount + date
+6. Post bank charges (type: charges) and interest (type: interest) from unmatched bank items
+
+Unmatched GL refs (books only):
+  2026-01-04 EXP-001617 Withdrawal 157,692.92 - Cash expense
+  2026-01-15 EXP-002664 Withdrawal 52,704.48 - Cash expense
+  2026-01-20 CYL-002870 Deposit 97,976.83 - Cylinder deposit - UNIK GASES
+  2026-01-28 SAL-002829 Withdrawal 836,882.77 - Salary payment
+  2026-02-28 CUS-002936 Deposit 199,842.58 - Customer receipt - AL-KHAIRAT GAS KANO
+  2026-02-28 EXP-002679 Withdrawal 253,319.52 - Cash expense
+  2026-03-12 CUS-001369 Deposit 109,179.31 - Customer receipt - B.N OKEKE GOMBE
+  2026-03-15 CAS-000048 Deposit 86,562.63 - Cash sale
+  2026-03-16 CYL-000714 Deposit 114,618.15 - Cylinder deposit - KOLA GASES
+  2026-03-21 BAN-000278 Deposit 643,746.47 - Inter-bank transfer
+  2026-03-22 EXP-001038 Withdrawal 282,228.63 - Cash expense
+  2026-03-25 LOC-001646 Withdrawal 74,396.90 - Payment to WELLCARE PHARMACY
+  2026-03-28 LOC-001405 Withdrawal 49,583.83 - Payment to BOARD OF INTERNAL REVENUE - PAYE
+  2026-03-29 BAN-001522 Withdrawal 68,042.71 - Inter-bank transfer
+  2026-04-02 CUS-000734 Deposit 352,605.46 - Customer receipt - AL-KHAIRAT GAS KANO
+  2026-04-06 CUS-002322 Deposit 352,107.37 - Customer receipt - A.D GAS KATSINA
+  2026-04-08 BAN-002933 Withdrawal 7,838.19 - Bank charges
+  2026-04-16 EXP-001028 Withdrawal 137,357.31 - Cash expense
+  2026-04-20 EXP-001037 Withdrawal 185,515.55 - Cash expense
+  2026-04-29 EXP-001359 Withdrawal 297,457.59 - Cash expense
+  2026-04-30 CUS-001412 Deposit 398,128.68 - Customer receipt - A.D GAS KATSINA
+  2026-05-03 PRE-001077 Withdrawal 41,378.64 - Prepayment - MEDICAL INSURANCE FOR MD
+  2026-05-09 BAN-002134 Deposit 92,486.15 - Inter-bank transfer
+  2026-05-13 BAN-000838 Withdrawal 9,146.00 - Bank charges
+  2026-05-23 ACC-001041 Withdrawal 59,614.83 - Accrual settlement - POWER HOLDING COMPANY LTD
+  2026-05-29 BAN-000446 Deposit 164,308.56 - Inter-bank transfer
+
+Bank-only items (post via reconciliation):
+  2026-01-31 CHG-001 Charge 12,560.57 - ACCOUNT MAINTENANCE FEE JAN-2026
+  2026-01-31 CHG-002 Charge 250.00 - SMS ALERT CHARGE JAN-2026
+  2026-01-31 CHG-003 Charge 18.75 - VAT ON SMS ALERT CHG
+  2026-02-28 CHG-004 Charge 12,560.57 - ACCOUNT MAINTENANCE FEE FEB-2026
+  2026-02-28 INT-001 Interest 1,842.50 - CREDIT INTEREST FOR FEB-2026
+  2026-02-28 CHG-005 Charge 52.50 - NIP TRANSFER CHARGE
+  2026-03-31 CHG-006 Charge 12,560.57 - ACCOUNT MAINTENANCE FEE MAR-2026
+  2026-03-31 CHG-007 Charge 150.00 - STAMP DUTY ON TRANSFERS MAR-2026
+  2026-03-31 INT-002 Interest 2,156.80 - CREDIT INTEREST FOR MAR-2026
+  2026-04-30 CHG-008 Charge 12,560.57 - ACCOUNT MAINTENANCE FEE APR-2026
+  2026-04-30 CHG-009 Charge 250.00 - SMS ALERT CHARGE APR-2026
+  2026-04-30 CHG-010 Charge 18.75 - VAT ON SMS ALERT CHG
+  2026-04-30 INT-003 Interest 1,987.25 - CREDIT INTEREST FOR APR-2026
+  2026-05-15 CHG-011 Charge 26.25 - NIP TRANSFER CHARGE
+  2026-05-31 CHG-012 Charge 12,560.57 - ACCOUNT MAINTENANCE FEE MAY-2026
+  2026-05-31 INT-004 Interest 2,234.10 - CREDIT INTEREST FOR MAY-2026
+  2026-02-14 CHG-013 Charge 1,050.00 - CARD MAINTENANCE FEE
+  2026-03-10 CHG-014 Charge 52.50 - NIP TRANSFER CHARGE
+  2026-04-08 CHG-015 Charge 3,500.00 - CHEQUE BOOK CHARGE
+  2026-05-20 CHG-016 Charge 50.00 - STAMP DUTY ELECTRONIC TRANSFER
+  2026-01-15 CHG-017 Charge 26.25 - NIP TRANSFER CHARGE
+  2026-02-05 INT-005 Interest 450.00 - MINIMUM BALANCE INTEREST ADJ
+  2026-03-22 CHG-018 Charge 0.01 - ACCOUNT DORMANCY FEE REVERSAL ADJ
+  2026-04-18 CHG-019 Charge 500.00 - UBA CONNECT SUBSCRIPTION
+  2026-05-08 CHG-020 Charge 52.50 - NIP TRANSFER CHARGE

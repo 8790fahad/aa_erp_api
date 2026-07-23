@@ -1,0 +1,3 @@
+exports.addPatient = (req, res) => {
+    
+}

@@ -1,0 +1,126 @@
+
+name: 🚀 Deploy inventria api to VPS via SSH
+
+on:
+  push:
+    branches:
+      - mf
+
+jobs:
+  deploy:
+    name: 🔐 SSH & Deploy
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v5
+
+      - name: 🔍 Verify deploy secrets & SSH reachability
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VPS_HOST:-}" ]; then
+            echo "::error::VPS_HOST secret is not set in GitHub repo settings."
+            exit 1
+          fi
+          if [ -z "${VPS_USER:-}" ]; then
+            echo "::error::VPS_USER secret is not set."
+            exit 1
+          fi
+          if [ -z "${{ secrets.VPS_PASSWORD }}" ]; then
+            echo "::error::VPS_PASSWORD secret is not set."
+            exit 1
+          fi
+
+          host="$(printf '%s' "$VPS_HOST" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | xargs)"
+          port="$(printf '%s' "${VPS_PORT:-22}" | xargs)"
+          port="${port:-22}"
+
+          if [ "$host" != "$VPS_HOST" ]; then
+            echo "::warning::VPS_HOST should be a bare IP or hostname (got: $VPS_HOST). Using: $host"
+          fi
+
+          if [ "$port" = "42843" ] || [ "$port" = "5173" ] || [ "$port" = "5175" ]; then
+            echo "::error::VPS_PORT looks like an app port ($port), not SSH. Use your SSH port (usually 22)."
+            exit 1
+          fi
+
+          echo "Testing TCP to ${host}:${port} (SSH) ..."
+          ok=""
+          for attempt in 1 2 3; do
+            if nc -zv -w 20 "$host" "$port"; then
+              ok="yes"
+              echo "SSH port reachable (attempt ${attempt})."
+              break
+            fi
+            echo "Attempt ${attempt} failed; retrying in 5s ..."
+            sleep 5
+          done
+
+          if [ -z "$ok" ]; then
+            echo "::error::Cannot reach ${host}:${port} from GitHub Actions."
+            echo "Check: (1) VPS is running, (2) VPS_PORT is SSH port (usually 22),"
+            echo "(3) cloud firewall / UFW allows inbound SSH from the internet,"
+            echo "(4) VPS_HOST is the public IP or DNS name."
+            exit 1
+          fi
+
+      - name: 📦 Install rsync/sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync sshpass netcat-openbsd
+
+      - name: 📤 Upload files to VPS
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          host="$(printf '%s' "$VPS_HOST" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | xargs)"
+          port="$(printf '%s' "${VPS_PORT:-22}" | xargs)"
+          port="${port:-22}"
+
+          rsync -az --delete \
+            --exclude ".git/" \
+            --exclude ".github/" \
+            --exclude "node_modules/" \
+            --exclude ".env" \
+            --exclude "logs/" \
+            --exclude "uploads/" \
+            --exclude "public/uploads/" \
+            -e "sshpass -e ssh -p ${port} \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=3" \
+            ./ "${VPS_USER}@${host}:/var/www/html/flowbooks_api/"
+
+      - name: 🔐 SSH to VPS and Deploy
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 20m
+          script: |
+            cd /var/www/html/flowbooks_api/
+            set -e
+
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+            nvm use 22
+
+            npm install --legacy-peer-deps
+            npm run migrate
+            npm run build
+            pm2 restart flowbooks_api || pm2 start build/app.js --name=flowbooks_api
+            pm2 save

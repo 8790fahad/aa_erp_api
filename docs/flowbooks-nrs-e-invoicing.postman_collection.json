@@ -1,0 +1,371 @@
+{
+  "info": {
+    "_postman_id": "flowbooks-nrs-einvoicing-v2",
+    "name": "FlowBooks NRS E-Invoicing",
+    "description": "FlowBooks NRS E-Invoicing API (System Integrator + Access Point Provider).\n\nRequests in this collection:\n1. Get Access Token (OAuth 2.0)\n2. Create Invoice\n3. Lookup Invoice Status\n4. Payment Notify (PENDING | PAID | REJECTED | PARTIAL)\n5. Transmit Invoice\n\nOAuth 2.0: set {{client_id}} and {{client_secret}} (keep the secret in an Environment). A pre-request script exchanges them for {{access_token}} and caches it until expiry.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// OAuth2 client-credentials: mint a short-lived token, cache until expiry.",
+          "const now = Math.floor(Date.now() / 1000);",
+          "const exp = Number(pm.collectionVariables.get('token_expiry') || 0);",
+          "const cached = pm.collectionVariables.get('access_token');",
+          "if (cached && exp - 60 > now) { return; } // still valid",
+          "",
+          "const clientId = pm.collectionVariables.get('client_id');",
+          "const clientSecret = pm.collectionVariables.get('client_secret');",
+          "if (!clientId || !clientSecret) {",
+          "  console.warn('Set client_id and client_secret to authenticate.');",
+          "  return;",
+          "}",
+          "const basic = 'Basic ' + CryptoJS.enc.Base64.stringify(",
+          "  CryptoJS.enc.Utf8.parse(clientId + ':' + clientSecret)",
+          ");",
+          "pm.sendRequest({",
+          "  url: pm.collectionVariables.get('authUrl') + '/api/v1/invoice/oauth/token',",
+          "  method: 'POST',",
+          "  header: {",
+          "    'Content-Type': 'application/x-www-form-urlencoded',",
+          "    'Authorization': basic",
+          "  },",
+          "  body: {",
+          "    mode: 'urlencoded',",
+          "    urlencoded: [{ key: 'grant_type', value: 'client_credentials' }]",
+          "  }",
+          "}, (err, res) => {",
+          "  if (err) { console.error('Token request failed', err); return; }",
+          "  const data = res.json();",
+          "  if (data && data.access_token) {",
+          "    pm.collectionVariables.set('access_token', data.access_token);",
+          "    const ttl = Number(data.expires_in || 3600);",
+          "    pm.collectionVariables.set('token_expiry', String(now + ttl));",
+          "  } else {",
+          "    console.error('No access_token in token response', data);",
+          "  }",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://server.brainstorm.ng/inventria_new",
+      "type": "string"
+    },
+    {
+      "key": "authUrl",
+      "value": "https://server.brainstorm.ng/inventria_new",
+      "type": "string"
+    },
+    {
+      "key": "client_id",
+      "value": "YOUR_CLIENT_ID",
+      "type": "string"
+    },
+    {
+      "key": "client_secret",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "token_expiry",
+      "value": "0",
+      "type": "string"
+    },
+    {
+      "key": "business_id",
+      "value": "a2381ffd-ea78-40e5-b1d2-2fb5d9412735",
+      "type": "string"
+    },
+    {
+      "key": "irn",
+      "value": "FB-2026-001-6AF0BD-20260709",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Get Access Token (OAuth 2.0)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Save the issued token so every other request can reuse it.",
+              "let data = {};",
+              "try { data = pm.response.json(); } catch (e) {}",
+              "if (pm.response.code === 200 && data.access_token) {",
+              "  const now = Math.floor(Date.now() / 1000);",
+              "  const ttl = Number(data.expires_in || 3600);",
+              "  pm.collectionVariables.set('access_token', data.access_token);",
+              "  pm.collectionVariables.set('token_expiry', String(now + ttl));",
+              "  pm.test('Access token issued', function () {",
+              "    pm.expect(data.access_token).to.be.a('string').and.not.empty;",
+              "  });",
+              "} else {",
+              "  pm.test('Access token issued', function () {",
+              "    pm.expect.fail('Token request failed: ' + JSON.stringify(data));",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "auth": {
+          "type": "basic",
+          "basic": [
+            {
+              "key": "username",
+              "value": "{{client_id}}",
+              "type": "string"
+            },
+            {
+              "key": "password",
+              "value": "{{client_secret}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            {
+              "key": "grant_type",
+              "value": "client_credentials",
+              "type": "text"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{authUrl}}/api/v1/invoice/oauth/token",
+          "host": [
+            "{{authUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "invoice",
+            "oauth",
+            "token"
+          ]
+        },
+        "description": "OAuth 2.0 client-credentials grant. Sends HTTP Basic auth with {{client_id}}:{{client_secret}} and grant_type=client_credentials, and returns a short-lived Bearer token. The test script stores {{access_token}} and {{token_expiry}} for the other requests. NOTE: the collection also auto-mints this token via a pre-request script, so running this request manually is optional — it's here so you can see/test the auth step directly."
+      }
+    },
+    {
+      "name": "Create Invoice",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{access_token}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"business_id\": \"a2381ffd-ea78-40e5-b1d2-2fb5d9412735\",\n  \"irn\": \"FB-2026-001-6AF0BD-20260709\",\n  \"invoice_kind\": \"B2B\",\n  \"issue_date\": \"2026-07-09\",\n  \"due_date\": \"2026-08-08\",\n  \"issue_time\": \"10:30:00\",\n  \"invoice_type_code\": \"381\",\n  \"payment_status\": \"PENDING\",\n  \"tax_point_date\": \"2026-07-09\",\n  \"document_currency_code\": \"NGN\",\n  \"tax_currency_code\": \"NGN\",\n  \"accounting_supplier_party\": {\n    \"party_name\": \"Sample Supplier Limited\",\n    \"tin\": \"12345678-0001\",\n    \"email\": \"hello@flowbooks.org\",\n    \"telephone\": \"+2348067643479\",\n    \"business_description\": \"Software Development\",\n    \"postal_address\": {\n      \"street_name\": \"1 Example Supplier Street\",\n      \"city_name\": \"Example City\",\n      \"postal_zone\": \"000001\",\n      \"country\": \"NG\"\n    }\n  },\n  \"accounting_customer_party\": {\n    \"party_name\": \"Sample Customer Limited\",\n    \"tin\": \"87654321-0001\",\n    \"email\": \"customer@example.com\",\n    \"telephone\": \"+2348000000001\",\n    \"business_description\": null,\n    \"postal_address\": {\n      \"street_name\": \"2 Example Customer Avenue\",\n      \"city_name\": \"Example City\",\n      \"postal_zone\": \"000002\",\n      \"country\": \"NG\"\n    }\n  },\n  \"invoice_line\": [\n    {\n      \"isic_code\": \"6201\",\n      \"service_category\": \"Software Development Services\",\n      \"discount_rate\": 0,\n      \"discount_amount\": 0,\n      \"fee_rate\": 0,\n      \"fee_amount\": 0,\n      \"invoiced_quantity\": 1,\n      \"line_extension_amount\": 1500000,\n      \"item\": {\n        \"name\": \"FlowBooks ERP Annual Subscription\",\n        \"description\": \"1.00 Each at 1500000.00 each\",\n        \"sellers_item_identification\": \"SVC-ERP-001\"\n      },\n      \"price\": {\n        \"price_amount\": 1500000,\n        \"base_quantity\": 1,\n        \"price_unit\": \"EA\"\n      }\n    },\n    {\n      \"hsn_code\": \"8471.30\",\n      \"product_category\": \"Computer Equipment\",\n      \"discount_rate\": 0,\n      \"discount_amount\": 0,\n      \"fee_rate\": 0,\n      \"fee_amount\": 0,\n      \"invoiced_quantity\": 2,\n      \"line_extension_amount\": 500000,\n      \"item\": {\n        \"name\": \"POS Terminal Device\",\n        \"description\": \"2.00 Each at 250000.00 each\",\n        \"sellers_item_identification\": \"8471.30\"\n      },\n      \"price\": {\n        \"price_amount\": 250000,\n        \"base_quantity\": 1,\n        \"price_unit\": \"EA\"\n      }\n    }\n  ],\n  \"tax_total\": [\n    {\n      \"tax_amount\": 150000,\n      \"tax_subtotal\": [\n        {\n          \"taxable_amount\": 1500000,\n          \"tax_amount\": 112500,\n          \"tax_category\": {\n            \"id\": \"STANDARD_VAT\",\n            \"percent\": 7.5\n          }\n        },\n        {\n          \"taxable_amount\": 500000,\n          \"tax_amount\": 37500,\n          \"tax_category\": {\n            \"id\": \"STANDARD_VAT\",\n            \"percent\": 7.5\n          }\n        }\n      ]\n    }\n  ],\n  \"legal_monetary_total\": {\n    \"line_extension_amount\": 2000000,\n    \"tax_exclusive_amount\": 2000000,\n    \"tax_inclusive_amount\": 2150000,\n    \"payable_amount\": 2150000\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/invoice/create",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "invoice",
+            "create"
+          ]
+        },
+        "description": "Submit a standardized invoice to NRS. Credit notes (380) and debit notes (384) require a billing_reference array."
+      }
+    },
+    {
+      "name": "Lookup Invoice Status",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{access_token}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"business_id\": \"a2381ffd-ea78-40e5-b1d2-2fb5d9412735\",\n  \"irn\": \"FB-2026-001-6AF0BD-20260709\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/invoice/status",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "invoice",
+            "status"
+          ]
+        },
+        "description": "Retrieve clearance and transmission status for an invoice by business_id and irn."
+      }
+    },
+    {
+      "name": "Payment Notify",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{access_token}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"business_id\": \"{{business_id}}\",\n  \"irn\": \"{{irn}}\",\n  \"payment_status\": \"PAID\",\n  \"reference\": \"payment_reference_or_note\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/invoice/payment/notify",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "invoice",
+            "payment",
+            "notify"
+          ]
+        },
+        "description": "Update payment status for a cleared invoice.\n\nSame endpoint for every status — only change payment_status:\n  PENDING | PAID | REJECTED | PARTIAL\n\nExamples (same request, different status):\n\nPAID:\n{ \"business_id\": \"{{business_id}}\", \"irn\": \"{{irn}}\", \"payment_status\": \"PAID\" }\n\nPARTIAL (amount required — this installment):\n{ \"business_id\": \"{{business_id}}\", \"irn\": \"{{irn}}\", \"payment_status\": \"PARTIAL\", \"amount\": 50000 }\n\nControls for PARTIAL: amount cannot exceed payable or remaining balance;\nwhen fully paid, status becomes PAID automatically."
+      }
+    },
+    {
+      "name": "Transmit Invoice",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{access_token}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"business_id\": \"{{business_id}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/invoice/transmit/{{irn}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "invoice",
+            "transmit",
+            "{{irn}}"
+          ],
+          "variable": [
+            {
+              "key": "irn",
+              "value": "{{irn}}",
+              "description": "Unique invoice tracking number (IRN)"
+            }
+          ]
+        },
+        "description": "Manually triggers transmission of a specific invoice to NRS by IRN.\n\nPath: POST /api/v1/invoice/transmit/{IRN}\nSet collection variables {{business_id}} and {{irn}} (same IRN used on Create).\n\nSuccess response:\n{ \"code\": 200, \"data\": { \"ok\": true } }"
+      }
+    }
+  ]
+}
