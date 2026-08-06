@@ -101,6 +101,9 @@ module.exports = (sequelize, DataTypes) => {
           fields: ["priority"],
         },
       ],
+      // Live table from fixed-assets migration (singular). Do not use pluralized name.
+      tableName: "asset_maintenance",
+      freezeTableName: true,
     }
   );
 

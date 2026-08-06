@@ -13,6 +13,13 @@ module.exports = (app) => {
     assets.calculateBulkDepreciation
   );
 
+  // Trigger scheduled auto-depreciation check (admin / testing)
+  app.post(
+    "/api/assets/depreciation/auto-run",
+    authenticate,
+    assets.triggerAutoDepreciation
+  );
+
   // Reports (static paths — must come before /:id)
   app.get(
     "/api/assets/reports/register",

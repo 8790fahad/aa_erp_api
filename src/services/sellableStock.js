@@ -2,7 +2,13 @@
 
 const db = require("../models");
 
-const SELLABLE_ZONES = ["for sales", "for sale"];
+/** Store zones that count toward sellable / Make Sale stock (per branchId). */
+const SELLABLE_ZONES = [
+  "for sales",
+  "for sale",
+  "resalable",
+  "finished good",
+];
 
 const skuEq = (a, b) =>
   `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;

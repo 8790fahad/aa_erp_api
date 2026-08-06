@@ -23,6 +23,53 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: "Straight Line",
         comment: "Default fixed-asset depreciation method for new assets",
       },
+      auto_depreciation_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment: "When true, cron runs bulk depreciation on schedule",
+      },
+      auto_depreciation_frequency: {
+        type: DataTypes.ENUM("monthly", "quarterly", "yearly"),
+        allowNull: false,
+        defaultValue: "monthly",
+        comment: "How often auto depreciation runs",
+      },
+      auto_depreciation_day: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 1,
+        comment: "Day of month (1-28) to run auto depreciation",
+      },
+      auto_depreciation_last_run: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+        comment: "Last successful auto depreciation run date",
+      },
+      invoice_closing_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment:
+          "When true, unpaid non-credit invoices auto-reverse after daily closing time",
+      },
+      invoice_closing_time: {
+        type: DataTypes.STRING(5),
+        allowNull: false,
+        defaultValue: "17:00",
+        comment: "Daily closing time HH:mm (local business timezone)",
+      },
+      invoice_closing_timezone: {
+        type: DataTypes.STRING(64),
+        allowNull: false,
+        defaultValue: "Africa/Lagos",
+        comment: "IANA timezone for invoice closing time",
+      },
+      invoice_closing_last_run: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+        comment: "Last date daily invoice auto-reverse ran",
+      },
       pro_bono_code: {
         type: DataTypes.STRING(50),
         allowNull: true,
@@ -209,7 +256,7 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: true,
         comment: "When true, PAYE is computed automatically from pay components and tax settings",
       },
-      /** Supplier bill (direct purchase): sync Finished Good / Resalable / By-Product lines to sales branch (for sales). */
+      /** Supplier bill (direct purchase): Finished Good / Resalable / By-Product stock-in uses sales zone (for sales). */
       price_setup_resalable_on_purchase: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
@@ -292,6 +339,18 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: "pdf",
         comment:
           "Default receipt format for sales — pdf (standard A4/A5) or terminal (80mm thermal printer)",
+      },
+      customer_notes: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        defaultValue: "Thanks for your business.",
+        comment: "Default customer notes shown on sales invoices",
+      },
+      terms_conditions: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        defaultValue: null,
+        comment: "Default terms & conditions shown on sales invoices",
       },
     },
     {

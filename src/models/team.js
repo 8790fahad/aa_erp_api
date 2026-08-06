@@ -1,22 +1,33 @@
 "use strict";
 module.exports = (sequelize, DataTypes) => {
-  const Team = sequelize.define("Team", {
-    teamName: {
-      type: DataTypes.STRING,
-      allowNull: false,
+  const Team = sequelize.define(
+    "Team",
+    {
+      teamName: {
+        type: DataTypes.STRING,
+        allowNull: false,
+      },
+      team_id: DataTypes.STRING,
+      facilityId: DataTypes.STRING,
+      description: DataTypes.TEXT,
+      status: {
+        type: DataTypes.ENUM("active", "inactive"),
+        defaultValue: "active",
+      },
+      headOfTeam: {
+        type: DataTypes.UUID,
+        allowNull: true,
+      },
+      user_id: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
     },
-    team_id: DataTypes.STRING,
-    facilityId: DataTypes.STRING,
-    description: DataTypes.TEXT,
-    status: {
-      type: DataTypes.ENUM("active", "inactive"),
-      defaultValue: "active",
+    {
+      tableName: "Teams",
+      freezeTableName: true,
     },
-    headOfTeam: {
-      type: DataTypes.UUID,
-      allowNull: true,
-    },
-  });
+  );
 
   // team.associate = (models) => {
   //   team.hasMany(models.users, {

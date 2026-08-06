@@ -3,60 +3,70 @@ const { Model } = require("sequelize");
 
 /** Sales Management flowchart stages (AA ERP). */
 const SALE_WORKFLOW_STAGES = [
-  { id: "sales_order", label: "Create Sales Order", phase: "order" },
-  { id: "invoice_generated", label: "Generate Invoice", phase: "order" },
-  { id: "submitted", label: "Submit for Processing", phase: "order" },
+  { id: "sales_order", label: "Create Sales Order", phase: "order", color: "slate" },
+  { id: "invoice_generated", label: "Generate Invoice", phase: "order", color: "slate" },
+  { id: "submitted", label: "Submit for Processing", phase: "order", color: "slate" },
   {
     id: "awaiting_payment",
     label: "Receive Payment (Cash / Transfer)",
     phase: "payment_cash",
+    color: "amber",
   },
   {
     id: "awaiting_cashier_confirm",
     label: "Cashier Confirms Payment",
     phase: "payment_cash",
+    color: "amber",
   },
   {
     id: "payment_confirmed",
     label: "Payment Confirmed",
     phase: "payment_cash",
+    color: "green",
   },
   {
     id: "awaiting_credit_approval",
     label: "Review & Approve Credit",
     phase: "payment_credit",
+    color: "rose",
   },
   {
     id: "credit_approved",
     label: "Credit Approved",
     phase: "payment_credit",
+    color: "green",
   },
   {
     id: "invoice_separation",
     label: "Invoice Separation",
     phase: "fulfillment",
+    color: "violet",
   },
   {
     id: "final_invoice",
     label: "Invoice Generation",
     phase: "fulfillment",
+    color: "blue",
   },
   {
     id: "warehouse_picking",
     label: "Warehouse Picks Items",
     phase: "fulfillment",
+    color: "orange",
   },
   {
     id: "dual_signature",
     label: "Dual Signature Verification",
     phase: "fulfillment",
+    color: "teal",
   },
   {
     id: "goods_released",
     label: "Release Goods to Customer",
     phase: "fulfillment",
+    color: "cyan",
   },
-  { id: "completed", label: "Completed", phase: "done" },
+  { id: "completed", label: "Completed", phase: "done", color: "emerald" },
 ];
 
 const STAGE_IDS = SALE_WORKFLOW_STAGES.map((s) => s.id);
@@ -77,7 +87,8 @@ function nextStageFor(current, paymentType) {
     payment_confirmed: "invoice_separation",
     awaiting_credit_approval: "credit_approved",
     credit_approved: "invoice_separation",
-    invoice_separation: "final_invoice",
+    // Separation produces one invoice copy per branch, then warehouse collect
+    invoice_separation: "warehouse_picking",
     final_invoice: "warehouse_picking",
     warehouse_picking: "dual_signature",
     dual_signature: "goods_released",
@@ -93,11 +104,36 @@ function stagesForPaymentType(paymentType) {
     paymentType === "transfer" ||
     paymentType === "split" ||
     paymentType === "bank";
-  return SALE_WORKFLOW_STAGES.filter((s) => {
-    if (s.phase === "payment_cash") return isPaid;
-    if (s.phase === "payment_credit") return !isPaid;
-    return true;
-  });
+
+  // Cash/transfer: Invoice → Cashier → Paid (separation) → Warehouse → Done
+  // Credit: Invoice → Paid (separation, skip cashier) → Warehouse → Done
+  const core = [
+    { id: "invoice_generated", label: "Invoice generated", phase: "order", color: "slate" },
+  ];
+  if (isPaid) {
+    core.push({
+      id: "awaiting_cashier_confirm",
+      label: "Cashier",
+      phase: "payment_cash",
+      color: "amber",
+    });
+  }
+  core.push(
+    {
+      id: "invoice_separation",
+      label: "Separation",
+      phase: "fulfillment",
+      color: "green",
+    },
+    {
+      id: "warehouse_picking",
+      label: "Warehouse",
+      phase: "fulfillment",
+      color: "orange",
+    },
+    { id: "completed", label: "Done", phase: "done", color: "emerald" },
+  );
+  return core;
 }
 
 module.exports = (sequelize, DataTypes) => {

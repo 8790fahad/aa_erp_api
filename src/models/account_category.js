@@ -81,6 +81,41 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: true,
         field: "display",
       },
+      normalBalance: {
+        type: DataTypes.STRING(10),
+        allowNull: true,
+        field: "normal_balance",
+        comment: "debit | credit",
+      },
+      fsSection: {
+        type: DataTypes.STRING(30),
+        allowNull: true,
+        field: "fs_section",
+        comment: "balance_sheet | profit_and_loss | off_statement",
+      },
+      reportingBehavior: {
+        type: DataTypes.STRING(30),
+        allowNull: false,
+        defaultValue: "fixed",
+        field: "reporting_behavior",
+        comment: "fixed | balance_switch",
+      },
+      alternateNature: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        field: "alternate_nature",
+      },
+      accountRole: {
+        type: DataTypes.STRING(40),
+        allowNull: true,
+        defaultValue: "general",
+        field: "account_role",
+      },
+      plLine: {
+        type: DataTypes.STRING(40),
+        allowNull: true,
+        field: "pl_line",
+      },
     },
     {
       tableName: "account_category",

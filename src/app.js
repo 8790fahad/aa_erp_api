@@ -445,9 +445,11 @@ require("./routes/pharmacy")(app);
 require("./routes/engineering")(app);
 require("./routes/inventory")(app);
 require("./routes/audit")(app);
+require("./routes/activityAudit")(app);
 require("./routes/stoctmangement")(app);
 require("./routes/sales")(app);
 require("./routes/saleWorkflow")(app);
+require("./routes/rebateLedger")(app);
 require("./routes/customer")(app);
 require("./routes/generalledger")(app);
 require("./routes/journalEntries")(app);
@@ -569,6 +571,34 @@ const startServer = () => {
     console.log(
       `[Worker ${process.pid}] App listening at http://${host}:${portNumber}`,
     );
+
+    // Only one worker should own the depreciation cron (avoid duplicate runs).
+    const isCronLeader =
+      !cluster.isWorker || (cluster.worker && cluster.worker.id === 1);
+    if (isCronLeader) {
+      try {
+        const {
+          startDepreciationCron,
+        } = require("./jobs/depreciationCron");
+        startDepreciationCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start depreciation cron:`,
+          err.message,
+        );
+      }
+      try {
+        const {
+          startInvoiceClosingCron,
+        } = require("./jobs/invoiceClosingCron");
+        startInvoiceClosingCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start invoice closing cron:`,
+          err.message,
+        );
+      }
+    }
   });
   return server;
 };

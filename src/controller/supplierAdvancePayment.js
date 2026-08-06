@@ -11,6 +11,68 @@ const {
   Account,
   SupplierEntry,
 } = require("../models");
+const {
+  recordActivity,
+  pickActor,
+} = require("../services/activityAuditService");
+const { parseAmount } = require("../utils/parseAmount");
+const { validatePostingDate } = require("../utils/validatePostingDate");
+
+/** Available supplier deposit/advance on prepaid (accrued) GL only. */
+async function getAvailableSupplierAdvance(facilityId, supplierNo, transaction) {
+  const balRows = await db.sequelize.query(
+    `SELECT COALESCE(SUM(dr) - SUM(cr), 0) AS available_advance
+     FROM general_ledger
+     WHERE facility_id = :facilityId
+       AND transaction_ref = :supplierNo
+       AND LOWER(type) IN ('accrued', 'advance')`,
+    {
+      replacements: { facilityId, supplierNo },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+  return Math.max(0, parseFloat(balRows[0]?.available_advance || 0));
+}
+
+async function getBillAmountDue(facilityId, invoiceRef, transaction) {
+  const rows = await db.sequelize.query(
+    `SELECT
+       i.amount,
+       COALESCE(payments.total_paid, 0) AS total_paid,
+       GREATEST(i.amount - COALESCE(payments.total_paid, 0), 0) AS amount_due
+     FROM invoices i
+     LEFT JOIN (
+       SELECT
+         reference_number AS transaction_ref,
+         facility_id,
+         SUM(
+           CASE
+             WHEN type = 'bank' THEN cr
+             WHEN type = 'payment' THEN dr
+             ELSE 0
+           END
+         ) AS total_paid
+       FROM general_ledger
+       WHERE type IN ('bank', 'payment')
+         AND facility_id = :facilityId
+         AND reference_number = :invoiceRef
+       GROUP BY reference_number, facility_id
+     ) payments
+       ON payments.transaction_ref = i.invoice_ref
+      AND payments.facility_id = i.facility_id
+     WHERE i.invoice_ref = :invoiceRef
+       AND i.facility_id = :facilityId
+       AND i.type = 'purchase'
+     LIMIT 1`,
+    {
+      replacements: { facilityId, invoiceRef },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+  return rows[0] || null;
+}
 
 /**
  * Bank/payable lines historically used `account.head`. Chart of accounts lives in
@@ -589,6 +651,21 @@ exports.createSupplierAdvancePayment = async (req, res) => {
       };
     });
 
+    await recordActivity({
+      facilityId: facility,
+      userId: pickActor(req) || userId,
+      action: "create",
+      entityType: "supplier_payment",
+      entityId: result.reference_number,
+      entityLabel: supplierName,
+      after: result,
+      remark: narration || "Supplier advance payment recorded",
+      meta: {
+        supplier_number: supplierNoResolved,
+        bills: invoices.map((i) => i.invoice_ref),
+      },
+    });
+
     const payload = {
       success: true,
       data: result,
@@ -644,14 +721,10 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
 
     let availableAdvance = 0;
     if (filterBySupplier) {
-      const balRows = await db.sequelize.query(
-        `SELECT COALESCE(SUM(cr) - SUM(dr), 0) AS available_advance
-         FROM general_ledger
-         WHERE facility_id = :facilityId AND transaction_ref = :supplierNo
-           AND LOWER(type) IN ('payable', 'advance')`,
-        { replacements: { facilityId, supplierNo: filterBySupplier }, type: db.sequelize.QueryTypes.SELECT },
+      availableAdvance = await getAvailableSupplierAdvance(
+        facilityId,
+        filterBySupplier,
       );
-      availableAdvance = Math.max(0, parseFloat(balRows[0]?.available_advance || 0));
     }
 
     return res.json({
@@ -669,9 +742,292 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       })),
       count:             rows.length,
       available_advance: availableAdvance,
+      available_deposit: availableAdvance,
     });
   } catch (error) {
     console.error("getSupplierAdvanceHistory:", error);
     return res.status(500).json({ success: false, message: "Error fetching supplier advance history" });
+  }
+};
+
+/**
+ * POST /api/v1/apply-supplier-advance
+ * Apply existing supplier deposit/advance to one or more unpaid purchase bills.
+ * body: {
+ *   facilityId, userId, supplier_no,
+ *   applications: [{ invoice_ref, amount }],
+ *   transaction_date?, narration?
+ * }
+ */
+exports.applySupplierAdvanceToBills = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    supplier_no,
+    supplierNo,
+    applications = [],
+    narration = "",
+  } = req.body;
+
+  const supplierNumber = String(supplier_no || supplierNo || "").trim();
+  const actor = userId || pickActor(req);
+
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!actor) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!supplierNumber) {
+    return res.status(400).json({ success: false, error: "supplier_no is required" });
+  }
+  if (!Array.isArray(applications) || applications.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "applications must be a non-empty array of { invoice_ref, amount }",
+    });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(
+      req.body.transaction_date || new Date(),
+      { field: "transaction_date" },
+    );
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+  const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+
+  try {
+    const supplier = await SuppliersInfo.findOne({
+      where: { supplier_number: supplierNumber, facilityId },
+    });
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: "Supplier not found" });
+    }
+
+    const payableCode = supplier.payable_code;
+    const accrualCode =
+      supplier.payable_accural_code || supplier.payable_accrual_code;
+    if (!payableCode || !accrualCode) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Supplier missing payable_code or payable_accural_code (advance account)",
+      });
+    }
+
+    const [payableAccount, advanceAccount] = await Promise.all([
+      db.AccountCategory.findOne({
+        where: { code: payableCode, facility_id: facilityId },
+      }),
+      db.AccountCategory.findOne({
+        where: { code: accrualCode, facility_id: facilityId },
+      }),
+    ]);
+    if (!payableAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Payable account not found: ${payableCode}`,
+      });
+    }
+    if (!advanceAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Advance account not found: ${accrualCode}`,
+      });
+    }
+
+    const availableDeposit = await getAvailableSupplierAdvance(
+      facilityId,
+      supplierNumber,
+    );
+
+    const cleaned = [];
+    let totalApply = 0;
+    for (const row of applications) {
+      const invoice_ref = String(row.invoice_ref || row.invoiceRef || "").trim();
+      const amount = parseAmount(row.amount) ?? 0;
+      if (!invoice_ref || amount <= 0) continue;
+      cleaned.push({ invoice_ref, amount });
+      totalApply += amount;
+    }
+    if (cleaned.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "No valid application amounts provided",
+      });
+    }
+    if (availableDeposit <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: `No available deposit/advance for supplier ${supplierNumber}`,
+        available_deposit: 0,
+      });
+    }
+    if (totalApply > availableDeposit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Apply total (${totalApply}) exceeds available deposit (${availableDeposit})`,
+        available_deposit: availableDeposit,
+      });
+    }
+
+    const referenceNumber = `SAD-${await getAndUpdateNumber("SAD", facilityId)}`;
+    const supplierName = supplier.supplier_name || supplierNumber;
+    const descBase =
+      String(narration || "").trim() ||
+      `Deposit applied to bills — ${supplierName}`;
+
+    const applied = await db.sequelize.transaction(async (t) => {
+      let remainingPool = availableDeposit;
+      const settled = [];
+
+      for (const { invoice_ref, amount } of cleaned) {
+        const invoice = await db.Invoice.findOne({
+          where: {
+            invoice_ref,
+            facility_id: facilityId,
+            type: "purchase",
+          },
+          transaction: t,
+        });
+        if (!invoice) {
+          throw Object.assign(new Error(`Bill ${invoice_ref} not found`), {
+            status: 404,
+          });
+        }
+        if (invoice.ref_number !== supplierNumber) {
+          throw Object.assign(
+            new Error(
+              `Bill ${invoice_ref} does not belong to supplier ${supplierNumber}`,
+            ),
+            { status: 400 },
+          );
+        }
+
+        const bill = await getBillAmountDue(facilityId, invoice_ref, t);
+        const amountDue = parseFloat(bill?.amount_due || 0);
+        if (amountDue <= 0.009) {
+          throw Object.assign(
+            new Error(`Bill ${invoice_ref} is already fully paid`),
+            { status: 400 },
+          );
+        }
+
+        const applyAmt = Math.min(amount, remainingPool, amountDue);
+        if (applyAmt <= 0) break;
+
+        // Dr Payable (settle bill with deposit)
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: payableAccount.code,
+            account_subhead: payableAccount.parent_code || 0,
+            dr: applyAmt,
+            cr: 0,
+            account_description: payableAccount.description,
+            transaction_description: `${descBase} — ${invoice_ref}`,
+            reference_number: invoice_ref,
+            purpose_of_payment: `Apply supplier deposit — ${invoice_ref}`,
+            payee: supplierName,
+            created_by: actor,
+            facility_id: facilityId,
+            status: "paid",
+            type: "payment",
+            transaction_ref: supplierNumber,
+          },
+          { transaction: t },
+        );
+
+        // Cr Advance / prepaid (consume deposit)
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: advanceAccount.code,
+            account_subhead: advanceAccount.parent_code || 0,
+            dr: 0,
+            cr: applyAmt,
+            account_description: advanceAccount.description,
+            transaction_description: `${descBase} — ${invoice_ref}`,
+            reference_number: invoice_ref,
+            purpose_of_payment: `Apply supplier deposit — ${invoice_ref}`,
+            payee: supplierName,
+            created_by: actor,
+            facility_id: facilityId,
+            status: "paid",
+            type: "accrued",
+            transaction_ref: supplierNumber,
+          },
+          { transaction: t },
+        );
+
+        await SupplierEntry.create(
+          {
+            supplier_number: supplierNumber,
+            description: `Deposit applied — ${invoice_ref}`,
+            qty_in: 0,
+            qty_out: 1,
+            cost: applyAmt,
+            facilityId,
+            mode_of_payment: "ADVANCE",
+            receiptNo: referenceNumber,
+            cheque_no: invoice_ref,
+            type: "payment",
+            link_id: invoice_ref,
+            created_by: actor,
+            created_at: new Date(),
+          },
+          { transaction: t },
+        );
+
+        remainingPool -= applyAmt;
+        settled.push({ invoice_ref, amount: applyAmt });
+      }
+
+      return settled;
+    });
+
+    const appliedTotal = applied.reduce((s, x) => s + x.amount, 0);
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "apply",
+      entityType: "supplier_advance",
+      entityId: referenceNumber,
+      entityLabel: supplierName,
+      after: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        applied_total: appliedTotal,
+        applications: applied,
+      },
+      remark: descBase,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Applied deposit of ${appliedTotal.toLocaleString()} to ${applied.length} bill(s)`,
+      data: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        applied_total: appliedTotal,
+        available_before: availableDeposit,
+        available_after: Math.max(0, availableDeposit - appliedTotal),
+        applications: applied,
+      },
+    });
+  } catch (error) {
+    console.error("applySupplierAdvanceToBills:", error);
+    const status = error.status || 500;
+    return res.status(status).json({
+      success: false,
+      error:
+        status === 500 ? "Failed to apply supplier deposit" : error.message,
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 };

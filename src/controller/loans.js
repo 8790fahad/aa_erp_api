@@ -219,7 +219,7 @@ exports.createLoan = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Loan receivable account is missing. Configure it on the loan type in Loan Setup.",
+          "Loan receivable account is missing. Select a receivable account when creating the loan.",
       });
     }
 

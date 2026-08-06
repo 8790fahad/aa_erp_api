@@ -30,6 +30,176 @@ const generateEmployeeId = async (facilityId) => {
   return `EMP-${String(nextNumber).padStart(4, "0")}`;
 };
 
+function normalizeLookupKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function resolveDepartmentForBulk({
+  departmentId,
+  departmentName,
+  facilityId,
+  deptById,
+  deptByName,
+  transaction,
+}) {
+  const id = String(departmentId || "").trim();
+  const name = String(departmentName || "").trim();
+
+  if (id && deptById.has(id)) {
+    return deptById.get(id);
+  }
+
+  const nameKey = normalizeLookupKey(name);
+  if (nameKey && deptByName.has(nameKey)) {
+    return deptByName.get(nameKey);
+  }
+
+  if (nameKey) {
+    const created = await db.Department.create(
+      {
+        departmentName: name,
+        facilityId,
+        type: "others",
+        status: "active",
+      },
+      { transaction },
+    );
+    deptById.set(String(created.id), created);
+    deptByName.set(nameKey, created);
+    return created;
+  }
+
+  if (id) {
+    throw new Error(`Department ID '${id}' not found for this facility`);
+  }
+  throw new Error("Department is required");
+}
+
+async function resolveRoleForBulk({
+  roleId,
+  roleName,
+  facilityId,
+  roleById,
+  roleByName,
+  transaction,
+}) {
+  const id = String(roleId || "").trim();
+  const name = String(roleName || "").trim();
+
+  if (id) {
+    const role = roleById.get(id) || roleById.get(String(Number(id)));
+    if (role) return role;
+  }
+
+  const nameKey = normalizeLookupKey(name);
+  if (nameKey && roleByName.has(nameKey)) {
+    return roleByName.get(nameKey);
+  }
+
+  if (nameKey) {
+    const created = await db.Role.create(
+      {
+        name,
+        facilityId,
+        status: "active",
+        description: null,
+      },
+      { transaction },
+    );
+    roleById.set(String(created.id), created);
+    roleByName.set(nameKey, created);
+    return created;
+  }
+
+  if (id) {
+    throw new Error(`Role ID '${id}' not found for this facility`);
+  }
+  throw new Error("Role is required");
+}
+
+/** Convert UI rows [{name, amount}] or object map into a JSON map for salary_structures */
+const toComponentMap = (value) => {
+  if (!value) return {};
+  if (Array.isArray(value)) {
+    const map = {};
+    value.forEach((row) => {
+      const name = String(row?.name || "").trim();
+      if (!name) return;
+      map[name] = parseFloat(row.amount) || 0;
+    });
+    return map;
+  }
+  if (typeof value === "object") return value;
+  return {};
+};
+
+/**
+ * Create/update a personal salary package for an employee (hidden from UI).
+ * Keeps payroll working without a separate Salary Structure screen.
+ */
+const upsertEmployeeSalaryPackage = async ({
+  facilityId,
+  employee,
+  basicSalary,
+  allowances,
+  deductions,
+  userId,
+  transaction,
+}) => {
+  const basic = parseFloat(basicSalary);
+  if (!basic || Number.isNaN(basic) || basic <= 0) {
+    return employee?.salaryStructureId || null;
+  }
+
+  const allowancesMap = toComponentMap(allowances);
+  const deductionsMap = toComponentMap(deductions);
+  const displayName =
+    `${employee?.firstName || ""} ${employee?.lastName || ""}`.trim() ||
+    "Employee";
+  const structureName = `${displayName} Package`;
+
+  let structure = null;
+  if (employee?.salaryStructureId) {
+    structure = await db.salary_structures.findByPk(employee.salaryStructureId, {
+      transaction,
+    });
+  }
+
+  if (structure) {
+    await structure.update(
+      {
+        structureName,
+        basicSalary: basic,
+        allowances: allowancesMap,
+        deductions: deductionsMap,
+        updatedBy: userId,
+        status: "Active",
+      },
+      { transaction },
+    );
+    return structure.id;
+  }
+
+  structure = await db.salary_structures.create(
+    {
+      id: uuidv4(),
+      facilityId,
+      structureName,
+      structureCode: `PKG-${uuidv4().replace(/-/g, "").slice(0, 10).toUpperCase()}`,
+      basicSalary: basic,
+      allowances: allowancesMap,
+      deductions: deductionsMap,
+      paymentType: "Monthly",
+      status: "Active",
+      accountCode: "",
+      createdBy: userId,
+    },
+    { transaction },
+  );
+
+  return structure.id;
+};
+
 // Get all employees
 exports.getAllEmployees = async (req, res) => {
   try {
@@ -115,6 +285,9 @@ exports.createEmployee = async (req, res) => {
       hireDate,
       contractType,
       salaryStructureId,
+      basicSalary,
+      allowances,
+      deductions,
       emergencyContact,
       emergencyPhone,
       nextOfKin,
@@ -154,6 +327,19 @@ exports.createEmployee = async (req, res) => {
       employeeId = await generateEmployeeId(facilityId);
     }
 
+    // Prefer simple per-employee package (basic + allowances/deductions)
+    let resolvedStructureId = salaryStructureId || null;
+    if (basicSalary) {
+      resolvedStructureId = await upsertEmployeeSalaryPackage({
+        facilityId,
+        employee: { firstName, lastName },
+        basicSalary,
+        allowances,
+        deductions,
+        userId: createdBy,
+      });
+    }
+
     const employee = await db.employees.create({
       id: uuidv4(),
       employeeId,
@@ -176,7 +362,7 @@ exports.createEmployee = async (req, res) => {
       designation,
       hireDate,
       contractType,
-      salaryStructureId,
+      salaryStructureId: resolvedStructureId,
       emergencyContact,
       emergencyPhone,
       nextOfKin,
@@ -217,8 +403,8 @@ exports.createEmployee = async (req, res) => {
       });
     }
 
-    // Link salary structure → PAYE profile so tax setup picks up basic pay + relief flags
-    if (salaryStructureId) {
+    // Link salary package → PAYE profile so tax setup picks up basic pay + relief flags
+    if (resolvedStructureId) {
       try {
         await syncEmployeePayeProfileFromStructure(employee, {
           payeFlags: { appliesRent, appliesNHF, appliesNHIS, appliesPension },
@@ -437,6 +623,9 @@ exports.updateEmployee = async (req, res) => {
       appliesNHF,
       appliesNHIS,
       appliesPension,
+      basicSalary,
+      allowances,
+      deductions,
       ...rest
     } = req.body;
     
@@ -459,7 +648,15 @@ exports.updateEmployee = async (req, res) => {
       });
     }
 
-    const updatePayload = { ...rest, updatedBy };
+    // Strip non-column payload fields that belong on the salary package
+    const {
+      basicSalary: _bs,
+      allowances: _al,
+      deductions: _de,
+      ...safeRest
+    } = rest;
+
+    const updatePayload = { ...safeRest, updatedBy };
 
     const customEmployeeId = String(requestedEmployeeId || "").trim();
     if (customEmployeeId && customEmployeeId !== employee.employeeId) {
@@ -479,12 +676,36 @@ exports.updateEmployee = async (req, res) => {
       updatePayload.employeeId = customEmployeeId;
     }
 
+    // Keep employee first/last name in sync for package naming
+    const nameForPackage = {
+      firstName: updatePayload.firstName || employee.firstName,
+      lastName: updatePayload.lastName || employee.lastName,
+      salaryStructureId: employee.salaryStructureId,
+    };
+
+    if (basicSalary !== undefined && basicSalary !== null && basicSalary !== "") {
+      const structureId = await upsertEmployeeSalaryPackage({
+        facilityId,
+        employee: nameForPackage,
+        basicSalary,
+        allowances,
+        deductions,
+        userId: updatedBy,
+      });
+      if (structureId) {
+        updatePayload.salaryStructureId = structureId;
+      }
+    }
+
     const updatedEmployee = await employee.update(updatePayload);
 
     if (updatePayload.salaryStructureId || updatedEmployee.salaryStructureId) {
       try {
         await syncEmployeePayeProfileFromStructure(updatedEmployee, {
-          force: Boolean(updatePayload.salaryStructureId),
+          force: Boolean(
+            updatePayload.salaryStructureId ||
+              (basicSalary !== undefined && basicSalary !== null && basicSalary !== ""),
+          ),
           payeFlags: { appliesRent, appliesNHF, appliesNHIS, appliesPension },
         });
       } catch (payeErr) {
@@ -1006,6 +1227,12 @@ exports.bulkCreateEmployees = async (req, res) => {
       roles.map((r) => [String(r.name || "").trim().toLowerCase(), r]),
     );
     const deptById = new Map(departments.map((d) => [String(d.id), d]));
+    const deptByName = new Map(
+      departments.map((d) => [
+        String(d.departmentName || "").trim().toLowerCase(),
+        d,
+      ]),
+    );
     const structureById = new Map(structures.map((s) => [String(s.id), s]));
     const bankByCode = new Map(
       banks.map((b) => [String(b.bank_code).trim(), b]),
@@ -1022,9 +1249,15 @@ exports.bulkCreateEmployees = async (req, res) => {
       const dateOfBirth = String(row.dateOfBirth || "").trim();
       const hireDate = String(row.hireDate || "").trim();
       const departmentId = String(row.departmentId || "").trim();
+      const departmentName = String(
+        row.departmentName || row.department || "",
+      ).trim();
       const roleIdRaw = String(row.roleId || "").trim();
-      const designationRaw = String(row.designation || "").trim();
+      const roleNameRaw = String(
+        row.roleName || row.role || row.designation || "",
+      ).trim();
       const salaryStructureId = String(row.salaryStructureId || "").trim();
+      const basicSalaryRaw = String(row.basicSalary || "").trim();
       const bankCode = String(row.bankCode || "").trim();
       const bankAccount = String(row.bankAccount || "").trim();
       const accountName = String(row.accountName || "").trim();
@@ -1063,45 +1296,64 @@ exports.bulkCreateEmployees = async (req, res) => {
         continue;
       }
 
-      const department = deptById.get(departmentId);
-      if (!department) {
+      if (!departmentId && !departmentName) {
         errors.push({
           row: rowNum,
-          message: `Invalid Department ID '${departmentId || ""}' — department not found for this facility`,
+          message: "Department is required (use Department name or Department ID)",
+        });
+        continue;
+      }
+      if (departmentId && !departmentName && !deptById.get(departmentId)) {
+        errors.push({
+          row: rowNum,
+          message: `Invalid Department ID '${departmentId}' — department not found for this facility`,
         });
         continue;
       }
 
-      let role =
-        (roleIdRaw && roleById.get(roleIdRaw)) ||
-        (roleIdRaw && roleById.get(String(Number(roleIdRaw)))) ||
-        (designationRaw && roleByName.get(designationRaw.toLowerCase())) ||
-        null;
-      if (!role) {
+      if (!roleIdRaw && !roleNameRaw) {
         errors.push({
           row: rowNum,
-          message: `Invalid Role ID '${roleIdRaw || designationRaw || ""}' — role not found for this facility`,
+          message: "Role is required (use Role name or Role ID)",
+        });
+        continue;
+      }
+      if (
+        roleIdRaw &&
+        !roleNameRaw &&
+        !roleById.get(roleIdRaw) &&
+        !roleById.get(String(Number(roleIdRaw)))
+      ) {
+        errors.push({
+          row: rowNum,
+          message: `Invalid Role ID '${roleIdRaw}' — role not found for this facility`,
         });
         continue;
       }
 
-      if (!salaryStructureId) {
-        errors.push({ row: rowNum, message: "Salary Structure ID is required" });
-        continue;
-      }
-      const structure = structureById.get(salaryStructureId);
-      if (!structure) {
-        errors.push({
-          row: rowNum,
-          message: `Invalid Salary Structure ID '${salaryStructureId}' — not found for this facility`,
-        });
-        continue;
-      }
-      if (structure.status && structure.status !== "Active") {
-        errors.push({
-          row: rowNum,
-          message: `Salary Structure '${salaryStructureId}' is not Active`,
-        });
+      const basicSalary = parseFloat(String(basicSalaryRaw).replace(/,/g, ""));
+      let resolvedStructureId = null;
+      if (basicSalary && !Number.isNaN(basicSalary) && basicSalary > 0) {
+        resolvedStructureId = null; // package created on insert
+      } else if (salaryStructureId) {
+        const structure = structureById.get(salaryStructureId);
+        if (!structure) {
+          errors.push({
+            row: rowNum,
+            message: `Invalid Salary Structure ID '${salaryStructureId}' — not found for this facility`,
+          });
+          continue;
+        }
+        if (structure.status && structure.status !== "Active") {
+          errors.push({
+            row: rowNum,
+            message: `Salary Structure '${salaryStructureId}' is not Active`,
+          });
+          continue;
+        }
+        resolvedStructureId = structure.id;
+      } else {
+        errors.push({ row: rowNum, message: "Basic Salary is required" });
         continue;
       }
 
@@ -1149,11 +1401,17 @@ exports.bulkCreateEmployees = async (req, res) => {
         bankCode,
         accountName,
         accountType: String(row.accountType || "").trim() || null,
-        departmentId: Number(department.id),
-        designation: role.name,
+        departmentId: departmentId || null,
+        departmentName: departmentName || null,
+        roleId: roleIdRaw || null,
+        roleName: roleNameRaw || null,
         hireDate,
         contractType,
-        salaryStructureId: structure.id,
+        salaryStructureId: resolvedStructureId,
+        basicSalary:
+          basicSalary && !Number.isNaN(basicSalary) && basicSalary > 0
+            ? basicSalary
+            : null,
         emergencyContact: String(row.emergencyContact || "").trim() || null,
         emergencyPhone: String(row.emergencyPhone || "").trim() || null,
         nextOfKin: String(row.nextOfKin || "").trim() || null,
@@ -1188,6 +1446,29 @@ exports.bulkCreateEmployees = async (req, res) => {
         const row = normalizedRows[i];
         const rowNum = i + 2;
 
+        let department;
+        let role;
+        try {
+          department = await resolveDepartmentForBulk({
+            departmentId: row.departmentId,
+            departmentName: row.departmentName,
+            facilityId,
+            deptById,
+            deptByName,
+            transaction,
+          });
+          role = await resolveRoleForBulk({
+            roleId: row.roleId,
+            roleName: row.roleName,
+            facilityId,
+            roleById,
+            roleByName,
+            transaction,
+          });
+        } catch (resolveErr) {
+          throw Object.assign(new Error(resolveErr.message), { row: rowNum });
+        }
+
         let employeeId = row.employeeId;
         if (employeeId) {
           if (usedEmployeeIds.has(employeeId)) {
@@ -1215,6 +1496,19 @@ exports.bulkCreateEmployees = async (req, res) => {
         }
         usedEmployeeIds.add(employeeId);
 
+        let salaryStructureId = row.salaryStructureId;
+        if (row.basicSalary) {
+          salaryStructureId = await upsertEmployeeSalaryPackage({
+            facilityId,
+            employee: { firstName: row.firstName, lastName: row.lastName },
+            basicSalary: row.basicSalary,
+            allowances: [],
+            deductions: [],
+            userId: createdBy,
+            transaction,
+          });
+        }
+
         const employee = await db.employees.create(
           {
             id: uuidv4(),
@@ -1233,11 +1527,11 @@ exports.bulkCreateEmployees = async (req, res) => {
             bankCode: row.bankCode,
             accountName: row.accountName,
             accountType: row.accountType,
-            departmentId: row.departmentId,
-            designation: row.designation,
+            departmentId: Number(department.id),
+            designation: role.name,
             hireDate: row.hireDate,
             contractType: row.contractType,
-            salaryStructureId: row.salaryStructureId,
+            salaryStructureId,
             emergencyContact: row.emergencyContact,
             emergencyPhone: row.emergencyPhone,
             nextOfKin: row.nextOfKin,

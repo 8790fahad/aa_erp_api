@@ -7,6 +7,151 @@ const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const {
   verifyProductAccountsAndBranch,
 } = require("../services/productAccountValidation");
+const { getAndUpdateNumber } = require("../services/numberGen");
+
+function mapValuationMethodKey(invEvM) {
+  const raw = String(invEvM || "Weighted Average Cost").trim();
+  if (raw === "Weighted Average Cost" || raw.toUpperCase() === "WAC") {
+    return "WAC";
+  }
+  if (raw.toUpperCase() === "FIFO") return "FIFO";
+  if (raw.toUpperCase() === "LIFO") return "LIFO";
+  return "WAC";
+}
+
+function valuationMethodLabel(key, invEvM) {
+  const k = String(key || "").toUpperCase();
+  if (k === "WAC") return "Weighted Average Cost (WAC)";
+  if (k === "FIFO") return "First In, First Out (FIFO)";
+  if (k === "LIFO") return "Last In, First Out (LIFO)";
+  return String(invEvM || key || "Weighted Average Cost");
+}
+
+/**
+ * Batch unit costs from store_entries (same perpetual rules as getCurrentUnitCost).
+ * Returns Map<sku, number>.
+ */
+async function batchUnitCostsFromStoreEntries(
+  facilityId,
+  skus,
+  valuationMethod = "WAC",
+) {
+  const costs = new Map();
+  const uniqueSkus = [...new Set((skus || []).filter(Boolean).map(String))];
+  if (!facilityId || uniqueSkus.length === 0) return costs;
+
+  const rows = await db.sequelize.query(
+    `
+      SELECT product_id, qty_in, qty_out, cost_price
+      FROM store_entries
+      WHERE facilityId = :facilityId
+        AND product_id IN (:skus)
+      ORDER BY product_id ASC, receive_date ASC, id ASC
+    `,
+    {
+      replacements: { facilityId, skus: uniqueSkus },
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+
+  const bySku = new Map();
+  for (const row of rows) {
+    const sku = String(row.product_id || "");
+    if (!sku) continue;
+    if (!bySku.has(sku)) bySku.set(sku, []);
+    bySku.get(sku).push(row);
+  }
+
+  for (const sku of uniqueSkus) {
+    const skuRows = bySku.get(sku) || [];
+    if (skuRows.length === 0) {
+      costs.set(sku, 0);
+      continue;
+    }
+
+    let stockBalance = 0;
+    let totalCost = 0;
+    const fifoLayers = [];
+    let lastPositiveCost = 0;
+    let positiveInSum = 0;
+    let positiveInQty = 0;
+
+    for (const row of skuRows) {
+      const qtyIn = parseFloat(row.qty_in) || 0;
+      const qtyOut = parseFloat(row.qty_out) || 0;
+      let costPrice = row.cost_price == null ? 0 : parseFloat(row.cost_price);
+
+      if (qtyIn > 0) {
+        const costToUse =
+          costPrice > 0
+            ? costPrice
+            : stockBalance > 0
+              ? totalCost / stockBalance
+              : lastPositiveCost;
+        if (costToUse > 0) {
+          lastPositiveCost = costToUse;
+          positiveInSum += qtyIn * costToUse;
+          positiveInQty += qtyIn;
+        }
+        if (valuationMethod === "FIFO" || valuationMethod === "LIFO") {
+          fifoLayers.push({ qty: qtyIn, cost: costToUse });
+        } else {
+          totalCost += qtyIn * costToUse;
+        }
+        stockBalance += qtyIn;
+      }
+
+      if (qtyOut > 0) {
+        if (valuationMethod === "FIFO") {
+          let remaining = qtyOut;
+          while (remaining > 0 && fifoLayers.length > 0) {
+            const layer = fifoLayers[0];
+            const take = Math.min(layer.qty, remaining);
+            layer.qty -= take;
+            remaining -= take;
+            if (layer.qty <= 0) fifoLayers.shift();
+          }
+        } else if (valuationMethod === "LIFO") {
+          let remaining = qtyOut;
+          while (remaining > 0 && fifoLayers.length > 0) {
+            const layer = fifoLayers[fifoLayers.length - 1];
+            const take = Math.min(layer.qty, remaining);
+            layer.qty -= take;
+            remaining -= take;
+            if (layer.qty <= 0) fifoLayers.pop();
+          }
+        } else {
+          const avg = stockBalance > 0 ? totalCost / stockBalance : 0;
+          totalCost -= qtyOut * avg;
+        }
+        stockBalance -= qtyOut;
+        stockBalance = Math.max(0, stockBalance);
+        totalCost = Math.max(0, totalCost);
+      }
+    }
+
+    let unitCost = 0;
+    if (stockBalance > 0) {
+      if (valuationMethod === "WAC") {
+        unitCost = totalCost / stockBalance;
+      } else if (valuationMethod === "FIFO") {
+        unitCost = fifoLayers.length > 0 ? fifoLayers[0].cost : 0;
+      } else if (valuationMethod === "LIFO") {
+        unitCost =
+          fifoLayers.length > 0 ? fifoLayers[fifoLayers.length - 1].cost : 0;
+      }
+    }
+    if (unitCost <= 0 && positiveInQty > 0) {
+      unitCost = positiveInSum / positiveInQty;
+    }
+    if (unitCost <= 0) {
+      unitCost = lastPositiveCost;
+    }
+    costs.set(sku, Number((unitCost || 0).toFixed(2)));
+  }
+
+  return costs;
+}
 
 // Get products list with pagination and search
 exports.getProductsList = async (req, res) => {
@@ -99,62 +244,93 @@ exports.getProductsList = async (req, res) => {
       offset: parseInt(offset),
     });
 
+    const business = await db.business.findOne({
+      where: { id: facilityId },
+      attributes: ["inv_ev_m", "default_valuation_source"],
+      raw: true,
+    });
+    const valuationMethod = mapValuationMethodKey(business?.inv_ev_m);
+
+    const skus = products.map((p) => p.sku).filter(Boolean);
+    const unitCostBySku = await batchUnitCostsFromStoreEntries(
+      facilityId,
+      skus,
+      valuationMethod,
+    );
+
     // For services business type, we don't need inventory batches
     // For other business types, we can include batch information
     const enrichedProducts = await Promise.all(
       products.map(async (product) => {
+        const plain = product.toJSON();
         if (businessType === "services") {
-          // Services don't need inventory tracking
           return {
-            ...product.toJSON(),
+            ...plain,
             quantity_on_hand: 0,
             avg_unit_cost: 0,
+            valuation_cost: 0,
             total_value: 0,
             active_batches: 0,
           };
-        } else {
-          // Get inventory information for non-service businesses
-          try {
-            // Get current valuation
-            const valuation = await db.InventoryValuation.findOne({
-              where: {
-                product_id: product.id,
-                facility_id: facilityId,
-              },
-            });
-
-            // Get batch count
-            const batchCount = await db.InventoryBatch.count({
-              where: {
-                product_id: product.id,
-                facility_id: facilityId,
-                status: "ACTIVE",
-                quantity_on_hand: {
-                  [db.Sequelize.Op.gt]: 0,
-                },
-              },
-            });
-
-            return {
-              ...product.toJSON(),
-              quantity_on_hand: valuation?.quantity_on_hand || 0,
-              avg_unit_cost: valuation?.avg_unit_cost || 0,
-              total_value: valuation?.total_value || 0,
-              valuation_method: valuation?.valuation_method || "WAC",
-              active_batches: batchCount,
-            };
-          } catch (error) {
-            // Return product as is if there's an error getting inventory info
-            return {
-              ...product.toJSON(),
-              quantity_on_hand: 0,
-              avg_unit_cost: 0,
-              total_value: 0,
-              active_batches: 0,
-            };
-          }
         }
-      })
+
+        try {
+          // inventory_valuation.product_id is SKU (see purchase / store flows)
+          const valuation = await db.InventoryValuation.findOne({
+            where: {
+              product_id: product.sku,
+              facility_id: facilityId,
+            },
+            order: [["updated_at", "DESC"]],
+          });
+
+          const batchCount = await db.InventoryBatch.count({
+            where: {
+              product_id: product.id,
+              facility_id: facilityId,
+              status: "ACTIVE",
+              quantity_on_hand: {
+                [db.Sequelize.Op.gt]: 0,
+              },
+            },
+          });
+
+          const storeUnitCost = unitCostBySku.get(String(product.sku)) || 0;
+          const tableUnitCost = parseFloat(valuation?.avg_unit_cost || 0) || 0;
+          const masterCost = parseFloat(plain.cost_price || 0) || 0;
+          const valuationCost =
+            storeUnitCost > 0
+              ? storeUnitCost
+              : tableUnitCost > 0
+                ? tableUnitCost
+                : masterCost;
+
+          return {
+            ...plain,
+            quantity_on_hand: valuation?.quantity_on_hand || 0,
+            avg_unit_cost: valuationCost,
+            valuation_cost: valuationCost,
+            total_value:
+              valuation?.total_value ||
+              valuationCost * (parseFloat(valuation?.quantity_on_hand || 0) || 0),
+            valuation_method:
+              valuation?.valuation_method || valuationMethod || "WAC",
+            active_batches: batchCount,
+          };
+        } catch (error) {
+          const storeUnitCost = unitCostBySku.get(String(product.sku)) || 0;
+          const masterCost = parseFloat(plain.cost_price || 0) || 0;
+          const valuationCost = storeUnitCost > 0 ? storeUnitCost : masterCost;
+          return {
+            ...plain,
+            quantity_on_hand: 0,
+            avg_unit_cost: valuationCost,
+            valuation_cost: valuationCost,
+            total_value: 0,
+            active_batches: 0,
+          };
+        }
+      }),
     );
 
     // Calculate additional metrics
@@ -201,6 +377,14 @@ exports.getProductsList = async (req, res) => {
         outOfStockProducts,
         totalInventoryValue,
         totalSalesValue,
+        valuation_method: valuationMethod,
+        valuation_method_label: valuationMethodLabel(
+          valuationMethod,
+          business?.inv_ev_m,
+        ),
+        inv_ev_m: business?.inv_ev_m || null,
+        default_valuation_source:
+          business?.default_valuation_source || "default_cost",
       },
     });
   } catch (error) {
@@ -683,6 +867,8 @@ exports.createProductWithStoreEntry = async (req, res) => {
           qty_in,
         });
 
+        const obRef = `OB-${await getAndUpdateNumber("OB", facility_id)}`;
+
         // Create store entry for this receipt
         storeEntry = await db.StoreEntry.create(
           {
@@ -703,7 +889,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
 
             type: STORE_ENTRY_TYPE.OPENING_BALANCE,
             receive_date: new Date().toISOString().split("T")[0],
-            reference_number: `${Date.now()}`,
+            reference_number: obRef,
             truckNo: "",
             waybillNo: "",
             otherInfo: "Initial stock entry",
@@ -717,7 +903,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
         if (quantity > 0 && cost_price > 0) {
           const amount = cost_price * quantity;
           const narration = `Opening Balance - ${name} - Qty: ${quantity} @ ${cost_price}`;
-          const ref = `OB-${Date.now()}`;
+          const ref = obRef;
           const openingBalanceDate =
             moment(as_of_date).format("YYYY-MM-DD") ||
             moment().format("YYYY-MM-DD"); // or use store opening date
@@ -758,7 +944,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
               cr: 0,
               account_description: inventoryAccount.description,
               transaction_description: name || inventoryAccount.description,
-              reference_number: `${sku}`,
+              reference_number: ref,
               purpose_of_payment: narration,
               created_by: user_id,
               facility_id: facility_id,
@@ -781,7 +967,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
               account_description: openingBalanceEquityAccount.description,
               transaction_description:
                 name || openingBalanceEquityAccount.description,
-              reference_number: `${sku}`,
+              reference_number: ref,
               purpose_of_payment: narration,
               created_by: user_id,
               facility_id: facility_id,
@@ -1033,7 +1219,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
           ? "Returnable Assets"
           : "Finished Good";
 
-        const refNum = `BK-${batchTs}-${index}`;
+        const refNum = `OB-${await getAndUpdateNumber("OB", facility_id)}`;
 
         storeEntry = await db.StoreEntry.create(
           {
@@ -1095,7 +1281,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
               cr: 0,
               account_description: inventoryAcct.description,
               transaction_description: name,
-              reference_number: product.sku,
+              reference_number: refNum,
               purpose_of_payment: narration,
               created_by: user_id,
               facility_id,
@@ -1114,7 +1300,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
               cr: amount,
               account_description: equityAcct.description,
               transaction_description: name,
-              reference_number: product.sku,
+              reference_number: refNum,
               purpose_of_payment: narration,
               created_by: user_id,
               facility_id,
@@ -1309,6 +1495,8 @@ exports.updateProduct = async (req, res) => {
             ? "Finished Good"
             : "Sales";
 
+      const obRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
+
       storeEntry = await db.StoreEntry.create(
         {
           product_id: product.sku,
@@ -1327,7 +1515,7 @@ exports.updateProduct = async (req, res) => {
           inserted_by: user_id,
           type: STORE_ENTRY_TYPE.OPENING_BALANCE,
           receive_date: moment(as_of_date).format("YYYY-MM-DD"),
-          reference_number: `${Date.now()}`,
+          reference_number: obRef,
           truckNo: "",
           waybillNo: "",
           otherInfo: "Stock added on product update",
@@ -1370,7 +1558,7 @@ exports.updateProduct = async (req, res) => {
             cr: 0,
             account_description: inventoryAccount.description,
             transaction_description: product.name || inventoryAccount.description,
-            reference_number: `${product.sku}`,
+            reference_number: obRef,
             purpose_of_payment: narration,
             created_by: user_id,
             facility_id: facilityId,
@@ -1390,7 +1578,7 @@ exports.updateProduct = async (req, res) => {
             account_description: openingBalanceEquityAccount.description,
             transaction_description:
               product.name || openingBalanceEquityAccount.description,
-            reference_number: `${product.sku}`,
+            reference_number: obRef,
             purpose_of_payment: narration,
             created_by: user_id,
             facility_id: facilityId,

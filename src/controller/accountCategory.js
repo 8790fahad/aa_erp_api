@@ -1,5 +1,6 @@
 const db = require("../models");
 const { Op, QueryTypes } = require("sequelize");
+const { getAndUpdateNumber } = require("../services/numberGen");
 
 /**
  * Chart rollup: walk parent_code chain to root (validation / hierarchy context).
@@ -435,7 +436,14 @@ exports.getAccountCategories = async (req, res) => {
         account_nature,
         category,
         subcategory,
-        display
+        display,
+        normal_balance,
+        fs_section,
+        COALESCE(reporting_behavior, 'fixed') AS reporting_behavior,
+        alternate_nature,
+        COALESCE(account_role, 'general') AS account_role,
+        pl_line,
+        is_active
       FROM account_category
       WHERE facility_id = :facilityId
         AND (is_active = 1 OR is_active IS NULL)
@@ -802,6 +810,60 @@ const ACCOUNT_NATURE_TO_CATEGORY = {
   EXPENSE: "expenses",
 };
 
+function normalizeFsSection(value, accountNature) {
+  const s = String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+  if (s === "pl" || s === "profit_and_loss" || s === "p&l" || s === "pnl") {
+    return "profit_and_loss";
+  }
+  if (s === "off_statement" || s === "off") return "off_statement";
+  if (s === "bs" || s === "balance_sheet") return "balance_sheet";
+  if (["REVENUE", "EXPENSE"].includes(accountNature)) return "profit_and_loss";
+  return "balance_sheet";
+}
+
+function normalizeNormalBalance(value, accountNature) {
+  const s = String(value || "")
+    .toLowerCase()
+    .trim();
+  if (s === "debit" || s === "credit") return s;
+  return ["ASSET", "EXPENSE"].includes(accountNature) ? "debit" : "credit";
+}
+
+function normalizeReportingBehavior(value) {
+  const s = String(value || "")
+    .toLowerCase()
+    .trim();
+  return s === "balance_switch" ? "balance_switch" : "fixed";
+}
+
+function normalizeAlternateNature(value) {
+  const s = String(value || "")
+    .toUpperCase()
+    .trim();
+  if (["ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"].includes(s)) {
+    return s;
+  }
+  return null;
+}
+
+function normalizeAccountRole(value) {
+  const s = String(value || "")
+    .toLowerCase()
+    .trim();
+  return s || "general";
+}
+
+function normalizePlLine(value) {
+  if (value === null || value === undefined || value === "") return null;
+  return String(value)
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+}
+
 exports.createAccountCategory = async (req, res) => {
   const transaction = await db.sequelize.transaction();
 
@@ -817,6 +879,10 @@ exports.createAccountCategory = async (req, res) => {
       accountNature,
       normalBalance,
       fsSection = "BS",
+      reportingBehavior,
+      alternateNature,
+      accountRole,
+      plLine,
       facilityId,
       openingBalance = 0,
       openingBalanceDate,
@@ -931,9 +997,21 @@ exports.createAccountCategory = async (req, res) => {
     }
 
     // Determine normal balance if not provided
-    const finalNormalBalance =
-      normalBalance ||
-      (["ASSET", "EXPENSE"].includes(accountNature) ? "DEBIT" : "CREDIT");
+    const finalNormalBalance = normalizeNormalBalance(
+      normalBalance,
+      accountNature,
+    );
+    const finalFsSection = normalizeFsSection(fsSection, accountNature);
+    const finalReportingBehavior = normalizeReportingBehavior(reportingBehavior);
+    const finalAlternateNature =
+      finalReportingBehavior === "balance_switch"
+        ? normalizeAlternateNature(alternateNature) ||
+          (accountNature === "LIABILITY" ? "ASSET" : accountNature === "ASSET" ? "LIABILITY" : null)
+        : normalizeAlternateNature(alternateNature);
+    const finalAccountRole = normalizeAccountRole(accountRole);
+    const finalPlLine =
+      finalFsSection === "profit_and_loss" ? normalizePlLine(plLine) : normalizePlLine(plLine);
+
     const normalizedCategory = ACCOUNT_NATURE_TO_CATEGORY[accountNature] || null;
     if (!normalizedCategory) {
       await transaction.rollback();
@@ -957,7 +1035,11 @@ exports.createAccountCategory = async (req, res) => {
         detail: detail || null,
         accountNature,
         normalBalance: finalNormalBalance,
-        fsSection,
+        fsSection: finalFsSection,
+        reportingBehavior: finalReportingBehavior,
+        alternateNature: finalAlternateNature,
+        accountRole: finalAccountRole,
+        plLine: finalPlLine,
         facilityId,
         isActive: isActiveParsed,
       },
@@ -996,7 +1078,7 @@ exports.createAccountCategory = async (req, res) => {
       equityCr = 0;
     const absAmount = Math.abs(openingBalanceAmount);
 
-    if (finalNormalBalance === "DEBIT") {
+    if (finalNormalBalance === "debit" || finalNormalBalance === "DEBIT") {
       openingBalanceAmount >= 0
         ? ((dr = absAmount), (equityCr = absAmount))
         : ((cr = absAmount), (equityDr = absAmount));
@@ -1006,7 +1088,7 @@ exports.createAccountCategory = async (req, res) => {
         : ((dr = absAmount), (equityCr = absAmount));
     }
 
-    const ref = `OB-${code}`;
+    const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
     // Ledger: New Account
     await db.GeneralLedger.create(
@@ -1078,7 +1160,7 @@ exports.updateAccountCategory = async (req, res) => {
   const transaction = await db.sequelize.transaction();
   try {
     const { code, facilityId } = req.query || req.body;
-    const updateData = req.body;
+    const body = req.body || {};
 
     if (!code || !facilityId) {
       await transaction.rollback();
@@ -1088,11 +1170,108 @@ exports.updateAccountCategory = async (req, res) => {
       });
     }
 
-    // Don't allow updating code or parentCode directly
-    delete updateData.code;
-    delete updateData.parentCode;
-    delete updateData.sortOrder;
-    delete updateData.sort_order;
+    const existing = await db.AccountCategory.findOne({
+      where: { code, facilityId },
+      transaction,
+    });
+    if (!existing) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Account category not found",
+      });
+    }
+
+    const accountNature =
+      body.accountNature ||
+      body.account_nature ||
+      existing.accountNature;
+
+    const updateData = {};
+
+    if (body.description !== undefined) {
+      updateData.description = String(body.description).trim();
+    }
+    if (body.type !== undefined) updateData.type = body.type;
+    if (body.category !== undefined) updateData.category = body.category;
+    if (body.subcategory !== undefined) updateData.subcategory = body.subcategory;
+    if (body.detail !== undefined) updateData.detail = body.detail;
+    if (body.accountNature !== undefined || body.account_nature !== undefined) {
+      updateData.accountNature =
+        body.accountNature || body.account_nature;
+    }
+    if (body.display !== undefined) {
+      updateData.display =
+        body.display === true ||
+        body.display === 1 ||
+        body.display === "1" ||
+        body.display === "true";
+    }
+    if (body.isActive !== undefined || body.is_active !== undefined) {
+      const v = body.isActive !== undefined ? body.isActive : body.is_active;
+      updateData.isActive =
+        v === true || v === 1 || v === "1" || v === "true";
+    }
+
+    const normalBalanceIn =
+      body.normalBalance !== undefined
+        ? body.normalBalance
+        : body.normal_balance;
+    if (normalBalanceIn !== undefined) {
+      updateData.normalBalance = normalizeNormalBalance(
+        normalBalanceIn,
+        accountNature,
+      );
+    }
+
+    const fsSectionIn =
+      body.fsSection !== undefined ? body.fsSection : body.fs_section;
+    if (fsSectionIn !== undefined) {
+      updateData.fsSection = normalizeFsSection(fsSectionIn, accountNature);
+    }
+
+    const reportingIn =
+      body.reportingBehavior !== undefined
+        ? body.reportingBehavior
+        : body.reporting_behavior;
+    if (reportingIn !== undefined) {
+      updateData.reportingBehavior = normalizeReportingBehavior(reportingIn);
+    }
+
+    const altNatureIn =
+      body.alternateNature !== undefined
+        ? body.alternateNature
+        : body.alternate_nature;
+    if (altNatureIn !== undefined) {
+      updateData.alternateNature = normalizeAlternateNature(altNatureIn);
+    } else if (updateData.reportingBehavior === "balance_switch") {
+      const primary = updateData.accountNature || existing.accountNature;
+      updateData.alternateNature =
+        primary === "LIABILITY"
+          ? "ASSET"
+          : primary === "ASSET"
+            ? "LIABILITY"
+            : existing.alternateNature;
+    }
+
+    const roleIn =
+      body.accountRole !== undefined ? body.accountRole : body.account_role;
+    if (roleIn !== undefined) {
+      updateData.accountRole = normalizeAccountRole(roleIn);
+    }
+
+    const plLineIn = body.plLine !== undefined ? body.plLine : body.pl_line;
+    if (plLineIn !== undefined) {
+      updateData.plLine = normalizePlLine(plLineIn);
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "No updatable fields provided",
+      });
+    }
 
     const [updated] = await db.AccountCategory.update(updateData, {
       where: {
@@ -1421,7 +1600,7 @@ async function postOpeningBalanceForUpload({
     dr = absAmount;
     equityCr = absAmount;
   }
-  const ref = `OB-${code}`;
+  const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
   const txDate =
     openingBalanceDate || new Date().toISOString().split("T")[0];
   await db.GeneralLedger.create(

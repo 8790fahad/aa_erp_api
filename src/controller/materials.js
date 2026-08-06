@@ -1941,41 +1941,79 @@ exports.InsertDiscountSetup = async (req, res) => {
     value = 0,
     status = "active",
     discountAccountHead = "",
+    minOrderAmount = 0,
+    customerType = "",
   } = req.body;
 
   console.log("Incoming Discount Setup Data:", req.body);
 
   try {
-    // Generate simple UUID for discount ID
+    if (!facilityId || !discountName || !discountType || !discountAccountHead) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "facilityId, discountName, discountType and discountAccountHead are required",
+      });
+    }
+
+    const numericValue = parseFloat(value);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "value must be a number greater than 0",
+      });
+    }
+    if (discountType === "Percentage" && numericValue > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage discount cannot exceed 100",
+      });
+    }
+
+    const minOrder = parseFloat(minOrderAmount) || 0;
+    if (minOrder < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "minOrderAmount cannot be negative",
+      });
+    }
 
     await db.sequelize.query(
       `INSERT INTO discount_table (
-
         discount_name,
         discount_type,
         value,
         status,
         discount_account_head,
-        facilityId
+        facilityId,
+        min_order_amount,
+        customer_type,
+        created_at,
+        updated_at
       ) VALUES (
-
         :discount_name,
         :discount_type,
         :value,
         :status,
         :discount_account_head,
-        :facilityId
+        :facilityId,
+        :min_order_amount,
+        :customer_type,
+        NOW(),
+        NOW()
       )`,
       {
         replacements: {
-          discount_name: discountName,
+          discount_name: String(discountName).trim(),
           discount_type: discountType,
-          value,
-          status,
+          value: numericValue,
+          status: status === "disabled" ? "disabled" : "active",
           discount_account_head: discountAccountHead,
           facilityId,
+          min_order_amount: minOrder,
+          customer_type: customerType ? String(customerType).trim() : null,
         },
-      }
+      },
     );
 
     res.json({
@@ -1984,6 +2022,19 @@ exports.InsertDiscountSetup = async (req, res) => {
     });
   } catch (error) {
     console.error("InsertDiscountSetup error:", error);
+    const msg = String(error.message || error);
+    if (msg.includes("uq_discount_name_per_facility")) {
+      return res.status(409).json({
+        success: false,
+        message: "A discount with this name already exists for this business",
+      });
+    }
+    if (msg.includes("fk_discount_account_head")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid discount account head for this business",
+      });
+    }
     res.status(500).json({ success: false, error: error.message || error });
   }
 };
@@ -1997,6 +2048,8 @@ exports.EditDiscountSetup = async (req, res) => {
     value = 0,
     status = "",
     discountAccountHead = "",
+    minOrderAmount = 0,
+    customerType = "",
   } = req.body;
 
   console.log("Incoming Edit Discount Data:", req.body);
@@ -2009,6 +2062,28 @@ exports.EditDiscountSetup = async (req, res) => {
       });
     }
 
+    const numericValue = parseFloat(value);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "value must be a number greater than 0",
+      });
+    }
+    if (discountType === "Percentage" && numericValue > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage discount cannot exceed 100",
+      });
+    }
+
+    const minOrder = parseFloat(minOrderAmount) || 0;
+    if (minOrder < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "minOrderAmount cannot be negative",
+      });
+    }
+
     const [result] = await db.sequelize.query(
       `UPDATE discount_table
        SET
@@ -2016,27 +2091,46 @@ exports.EditDiscountSetup = async (req, res) => {
          discount_type = :discount_type,
          value = :value,
          status = :status,
-         discount_account_head = :discount_account_head
+         discount_account_head = :discount_account_head,
+         min_order_amount = :min_order_amount,
+         customer_type = :customer_type,
+         updated_at = NOW()
        WHERE discount_id = :discount_id AND facilityId = :facilityId`,
       {
         replacements: {
-          discount_name: discountName,
+          discount_name: String(discountName).trim(),
           discount_type: discountType,
-          value,
-          status,
+          value: numericValue,
+          status: status === "disabled" ? "disabled" : "active",
           discount_account_head: discountAccountHead,
+          min_order_amount: minOrder,
+          customer_type: customerType ? String(customerType).trim() : null,
           discount_id: discountId,
           facilityId,
         },
-      }
+      },
     );
 
     res.json({
       success: true,
       message: "Discount setup successfully updated.",
+      results: result,
     });
   } catch (error) {
     console.error("EditDiscountSetup error:", error);
+    const msg = String(error.message || error);
+    if (msg.includes("uq_discount_name_per_facility")) {
+      return res.status(409).json({
+        success: false,
+        message: "A discount with this name already exists for this business",
+      });
+    }
+    if (msg.includes("fk_discount_account_head")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid discount account head for this business",
+      });
+    }
     res.status(500).json({ success: false, error: error.message || error });
   }
 };
@@ -2045,12 +2139,26 @@ exports.getDiscountSetup = async (req, res) => {
   const { facilityId } = req.body;
   try {
     const [results] = await db.sequelize.query(
-      `SELECT * FROM discount_table WHERE facilityId = :facilityId `,
+      `SELECT
+         discount_id,
+         discount_name,
+         discount_type,
+         value,
+         status,
+         facilityId,
+         discount_account_head,
+         min_order_amount,
+         customer_type,
+         created_at,
+         updated_at
+       FROM discount_table
+       WHERE facilityId = :facilityId
+       ORDER BY discount_name ASC`,
       {
         replacements: {
           facilityId,
         },
-      }
+      },
     );
 
     res.json({ success: true, results });

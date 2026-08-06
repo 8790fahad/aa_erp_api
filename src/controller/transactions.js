@@ -6,6 +6,7 @@ import {
 const db = require("../models");
 const moment = require("moment");
 const UUIDV4 = require("uuid").v4;
+const { Op } = require("sequelize");
 const { sellingApi } = require("./api/transactionsApi");
 const { getAndUpdateNumber } = require("../services/numberGen");
 const { getSellableQtyAtBranch } = require("../services/sellableStock");
@@ -1213,6 +1214,8 @@ exports.getSaleByCode = async (req, res) => {
         mode_of_payment: item.mode_of_payment,
         line_of_business: item.line_of_business,
         created_at: item.created_at,
+        branch_id: item.branch_id != null ? Number(item.branch_id) : null,
+        branchId: item.branch_id != null ? Number(item.branch_id) : null,
       };
     };
 
@@ -1356,10 +1359,44 @@ exports.getSaleByCode = async (req, res) => {
       ? customerCopyData
       : [];
 
+    // Enrich line branch from store_entries when customer_entries lack branch_id
+    let enrichedItems = items;
+    try {
+      if (db.StoreEntry) {
+        const storeRows = await db.StoreEntry.findAll({
+          where: {
+            facilityId,
+            reference_number: saleCode,
+            qty_out: { [Op.gt]: 0 },
+          },
+          attributes: ["id", "product_id", "branchId", "qty_out"],
+          raw: true,
+        });
+        if (storeRows.length) {
+          const bySku = new Map();
+          for (const se of storeRows) {
+            const key = String(se.product_id || "");
+            if (!bySku.has(key)) bySku.set(key, []);
+            bySku.get(key).push(se);
+          }
+          enrichedItems = items.map((it) => {
+            if (it.branch_id != null || it.branchId != null) return it;
+            const list = bySku.get(String(it.link_id || "")) || [];
+            const match = list.shift();
+            if (!match) return it;
+            const bid = match.branchId != null ? Number(match.branchId) : null;
+            return { ...it, branch_id: bid, branchId: bid };
+          });
+        }
+      }
+    } catch (enrichErr) {
+      console.warn("getSaleByCode branch enrich:", enrichErr.message);
+    }
+
     return res.json({
       success: true,
       data: {
-        items,
+        items: enrichedItems,
         deliveryItems,
         user: {
           name: user?.firstname + " " + user?.lastname,
@@ -2282,6 +2319,7 @@ exports.createSale = async (req, res) => {
       discount_info = {},
       pro_bono_code,
       tax_amount = 0,
+      total_amount = null,
       txn_type = "Credit Sale",
       modeOfPayment,
       accountHead,
@@ -2296,17 +2334,77 @@ exports.createSale = async (req, res) => {
       sale_revenue_code,
       finished_goods_code,
       inventory_account,
-      taxes = [],
+      taxes: taxesRaw = [],
       transaction_date,
       sale_branch_id = 0,
       apply_prepayment = false,
       amountPaid: amountPaidFromClient = 0,
+      defer_payment = false,
     } = req.body;
 
     console.log(req.body, "=============> req.body");
 
+    /** Drop duplicate tax ids; if inclusive+exclusive Output VAT clones share a rate, keep exclusive. */
+    const normalizeSaleTaxes = (taxList) => {
+      if (!Array.isArray(taxList) || !taxList.length) return [];
+      const byId = new Map();
+      taxList.forEach((tax, idx) => {
+        const id = tax?.id ?? tax?.tax_id;
+        const key = id != null ? String(id) : `anon-${idx}`;
+        if (!byId.has(key)) byId.set(key, tax);
+      });
+      let list = Array.from(byId.values());
+
+      const isOutputVat = (t) => {
+        const d = String(t?.description || t?.name || "").toLowerCase();
+        return d.includes("vat");
+      };
+      const isExclusiveTax = (t) => {
+        const inc = String(t?.inclusive_type || "").toLowerCase();
+        const typ = String(t?.tax_type || "").toLowerCase();
+        if (inc === "exclusive") return true;
+        if (inc === "inclusive") return false;
+        return typ === "exclusive";
+      };
+
+      const outputVat = list.filter(isOutputVat);
+      if (outputVat.length > 1) {
+        const byRate = new Map();
+        for (const t of outputVat) {
+          const rate = String(Number(t.rate) || 0);
+          if (!byRate.has(rate)) byRate.set(rate, []);
+          byRate.get(rate).push(t);
+        }
+        const dropIds = new Set();
+        for (const group of byRate.values()) {
+          if (group.length < 2) continue;
+          const keep =
+            group.find((t) => isExclusiveTax(t)) || group[0];
+          const keepId = String(keep.id ?? keep.tax_id);
+          for (const t of group) {
+            const tid = String(t.id ?? t.tax_id);
+            if (tid !== keepId) dropIds.add(tid);
+          }
+        }
+        if (dropIds.size) {
+          console.warn(
+            "createSale: dropping duplicate Output VAT variants",
+            [...dropIds],
+          );
+          list = list.filter(
+            (t) => !dropIds.has(String(t.id ?? t.tax_id)),
+          );
+        }
+      }
+      return list;
+    };
+
+    const taxes = normalizeSaleTaxes(taxesRaw);
+
     const isCashSale = txn_type === "Cash Sale";
     const isCreditSale = txn_type === "Credit Sale";
+    /** Paid invoices go to cashier — do not settle cash/bank on create. */
+    const deferPaymentToCashier = Boolean(defer_payment) || isCashSale;
 
     // ===================================================================
     // VALIDATION
@@ -2337,6 +2435,27 @@ exports.createSale = async (req, res) => {
         ? payment_splits.filter((s) => s && Number(s.amount) > 0)
         : [];
 
+      // Capture intended payment mode for Sales Management → Cashier.
+      // Settlement happens when the cashier confirms, not on invoice create.
+      if (deferPaymentToCashier) {
+        const rawMode = String(modeOfPayment || "")
+          .toLowerCase()
+          .trim();
+        if (rawMode === "split" || rawMode === "both") {
+          cashModeOfPayment = "split";
+        } else if (
+          rawMode === "bank" ||
+          rawMode === "bank transfer" ||
+          rawMode === "transfer"
+        ) {
+          cashModeOfPayment = "bank";
+        } else {
+          cashModeOfPayment = "cash";
+        }
+        resolvedPaymentSplits = [];
+        cashBankAccount = null;
+        resolvedBankAccountId = "";
+      } else {
       const resolvePaymentAccount = async (mode, splitAccountHead, splitBank) => {
         let codeData = null;
         let bankId = "";
@@ -2474,6 +2593,7 @@ exports.createSale = async (req, res) => {
           message: err.message || "Invalid payment accounts",
         });
       }
+      } // end !deferPaymentToCashier
     }
 
     saleDate = transaction_date
@@ -3111,13 +3231,17 @@ exports.createSale = async (req, res) => {
         markUpValue = calculatedMarkUp > 0 ? calculatedMarkUp : 1;
       }
 
+      const lineBranchId =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+
       await db.StoreEntry.create(
         {
           receive_date: saleDate,
           reference_number: saleRef,
           qty_in: 0,
           qty_out: qty,
-          sale_no: saleRef,
           multiplier_id: multiplierValue
             ? multiplierValue.id
             : itm.multiplier_id,
@@ -3126,7 +3250,7 @@ exports.createSale = async (req, res) => {
           selling_price: sellingPrice,
           // Store zone is always "for sales"; branchId tracks the physical branch.
           branch_name: "for sales",
-          branchId: saleBranchId,
+          branchId: lineBranchId,
           inserted_by: created_by,
           facilityId,
           trn_number: saleRef,
@@ -3161,6 +3285,11 @@ exports.createSale = async (req, res) => {
         totalProBonoValue += fairMarketValue;
       }
 
+      const lineBranchId =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+
       await db.StoreEntry.create(
         {
           receive_date: saleDate,
@@ -3171,7 +3300,7 @@ exports.createSale = async (req, res) => {
           mark_up: 1,
           selling_price: sellingPrice,
           branch_name: "for sales",
-          branchId: saleBranchId,
+          branchId: lineBranchId,
           inserted_by: created_by,
           facilityId,
           type: saleStoreEntryType({ isProBono, isService: true }),
@@ -3187,6 +3316,16 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     // FIRST PASS: CALCULATE SUBTOTAL AND VALIDATE ITEMS
     // ===================================================================
+    // Aggregate qty by SKU so multi-line same-SKU carts cannot bypass limits
+    const qtyBySku = new Map();
+    for (const itm of items) {
+      const sku = itm.product_id;
+      const qty = Number(itm.quantity);
+      if (!sku || !(qty > 0)) continue;
+      qtyBySku.set(sku, (qtyBySku.get(sku) || 0) + qty);
+    }
+    const productBySku = new Map();
+
     for (const itm of items) {
       const qty = Number(itm.quantity);
       const price = Number(itm.selling_price);
@@ -3202,34 +3341,38 @@ exports.createSale = async (req, res) => {
         throw new Error(`Invalid item: ${sku} - price must be greater than 0`);
       }
 
-      const product = await db.Product.findOne({
-        where: { sku, facility_id: facilityId },
-        attributes: [
-          "id",
-          "sku",
-          "name",
-          "item_type",
-          "category",
-          "inventory_account",
-          "cogs_head",
-          "revenue_account",
-          "taxable",
-          "daily_sales_limit",
-          "weekly_sales_limit",
-          "monthly_sales_limit",
-        ],
-      });
-      if (!product) throw new Error(`Product not found: ${sku}`);
+      let product = productBySku.get(sku);
+      if (!product) {
+        product = await db.Product.findOne({
+          where: { sku, facility_id: facilityId },
+          attributes: [
+            "id",
+            "sku",
+            "name",
+            "item_type",
+            "category",
+            "inventory_account",
+            "cogs_head",
+            "revenue_account",
+            "taxable",
+            "daily_sales_limit",
+            "weekly_sales_limit",
+            "monthly_sales_limit",
+          ],
+        });
+        if (!product) throw new Error(`Product not found: ${sku}`);
+        productBySku.set(sku, product);
 
-      // Sales target / limit — block even when stock remains
-      await assertProductSalesLimits({
-        product,
-        sku,
-        facilityId,
-        qty,
-        saleDate,
-        transaction: t,
-      });
+        // Sales target / limit — block even when stock remains (aggregated qty)
+        await assertProductSalesLimits({
+          product,
+          sku,
+          facilityId,
+          qty: qtyBySku.get(sku) || qty,
+          saleDate,
+          transaction: t,
+        });
+      }
 
       // Check inventory for goods — branch total from store_entries (same as Goods List)
       if (["Finished Good", "Resalable", ""].includes(product.item_type)) {
@@ -3464,6 +3607,11 @@ exports.createSale = async (req, res) => {
         );
       }
 
+      const lineBranchId =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        null;
+
       // Create CustomerEntry
       await db.CustomerEntry.create(
         {
@@ -3492,6 +3640,7 @@ exports.createSale = async (req, res) => {
             ? "service"
             : "sales",
           created_by,
+          branch_id: lineBranchId,
         },
         { transaction: t }
       );
@@ -3610,6 +3759,14 @@ exports.createSale = async (req, res) => {
     // Net amount can be zero if all items are Pro-bono
     if (netAmount < 0) {
       throw new Error("Net amount cannot be negative");
+    }
+
+    // Prefer Invoice Total from the UI (Total NGN) so Cashier Point /
+    // A/R due matches what was shown on New Invoice.
+    const clientTotal = Number(total_amount);
+    if (Number.isFinite(clientTotal) && clientTotal > 0) {
+      netAmount = clientTotal;
+      arDebitAmount = clientTotal;
     }
 
     console.log("\n=== NET AMOUNT CALCULATION ===");
@@ -4248,7 +4405,7 @@ exports.createSale = async (req, res) => {
     await t.rollback();
     console.error("createSale error:", err.message, err.stack);
     const isClientError =
-      /Insufficient quantity|Invalid item|not found|required/i.test(
+      /Insufficient quantity|Invalid item|not found|required|limit reached|sales .+ limit/i.test(
         String(err.message || ""),
       );
     return res.status(isClientError ? 400 : 500).json({
@@ -4758,6 +4915,17 @@ exports.getAllTransactionsData = async (req, res) => {
       }
     }
 
+    // Sales Invoices page: only real sale invoices (INV-123), not credit notes (CN-*)
+    // or opening-balance docs (OP-*, INV-OB-*, OB-*).
+    const salesOnlyList =
+      typeFilter &&
+      typeFilter.length === 1 &&
+      String(typeFilter[0]).toLowerCase() === "sales" &&
+      !customerNo;
+    if (salesOnlyList) {
+      whereClause.invoice_ref = { [Op.regexp]: "^INV-[0-9]+$" };
+    }
+
     // Optional text search across invoice_ref, description, ref_number (customer no)
     const finalWhere = search && String(search).trim()
       ? {
@@ -4933,31 +5101,85 @@ exports.getAllTransactionsData = async (req, res) => {
       }
     }
 
+    // Join sale workflow stage (pay → separate → warehouse → …) for sales invoices
+    let workflowBySaleCode = {};
+    const isSalesList =
+      Array.isArray(typeFilter) &&
+      typeFilter.some((t) => String(t).toLowerCase() === "sales");
+    if (isSalesList && invoices.length > 0 && db.SaleWorkflow) {
+      try {
+        const saleCodes = [
+          ...new Set(
+            invoices.map((inv) => inv.invoice_ref).filter(Boolean),
+          ),
+        ];
+        if (saleCodes.length) {
+          const workflows = await db.SaleWorkflow.findAll({
+            where: {
+              facility_id: facilityId,
+              sale_code: { [Op.in]: saleCodes },
+            },
+            attributes: [
+              "sale_code",
+              "status",
+              "payment_type",
+              "hold_overnight",
+            ],
+            raw: true,
+          });
+          const {
+            SALE_WORKFLOW_STAGES,
+          } = require("../models/sale_workflows");
+          workflows.forEach((w) => {
+            const meta =
+              SALE_WORKFLOW_STAGES.find((s) => s.id === w.status) || null;
+            workflowBySaleCode[w.sale_code] = {
+              workflow_status: w.status,
+              workflow_status_label: meta?.label || w.status,
+              workflow_status_color: meta?.color || "slate",
+              payment_type: w.payment_type,
+              hold_overnight: Boolean(w.hold_overnight),
+            };
+          });
+        }
+      } catch (err) {
+        console.error("Error fetching sale workflows for invoices:", err);
+      }
+    }
+
     // Transform data to match frontend expectations
-    const formattedInvoices = invoices.map((invoice) => ({
-      id: invoice.invoice_id,
-      invoice_id: invoice.invoice_id,
-      first_document: invoice.ref_number || invoice.invoice_ref,
-      invoice_ref: invoice.invoice_ref,
-      ref_number: invoice.ref_number,
-      transactionTypeName: invoice.type?.toUpperCase() || "N/A",
-      type: invoice.type,
-      customerName: customerNameMap[invoice.ref_number] || null,
-      vendorName: null,
-      employeeName: null,
-      invoice_date: invoice.transaction_date || invoice.created_at,
-      transaction_date: invoice.transaction_date,
-      due_date: invoice.due_date,
-      description: invoice.description,
-      amount: parseFloat(invoice.amount || 0),
-      total: parseFloat(invoice.amount || 0),
-      status: invoice.payment_method === "posted" ? "posted" : "pending",
-      payment_method: invoice.payment_method,
-      branchId: invoice.branchId || null,
-      branch_name: branchNameMap[invoice.branchId] || null,
-      created_by: invoice.created_by,
-      created_at: invoice.created_at,
-    }));
+    const formattedInvoices = invoices.map((invoice) => {
+      const wf = workflowBySaleCode[invoice.invoice_ref] || null;
+      return {
+        id: invoice.invoice_id,
+        invoice_id: invoice.invoice_id,
+        first_document: invoice.ref_number || invoice.invoice_ref,
+        invoice_ref: invoice.invoice_ref,
+        ref_number: invoice.ref_number,
+        transactionTypeName: invoice.type?.toUpperCase() || "N/A",
+        type: invoice.type,
+        customerName: customerNameMap[invoice.ref_number] || null,
+        vendorName: null,
+        employeeName: null,
+        invoice_date: invoice.transaction_date || invoice.created_at,
+        transaction_date: invoice.transaction_date,
+        due_date: invoice.due_date,
+        description: invoice.description,
+        amount: parseFloat(invoice.amount || 0),
+        total: parseFloat(invoice.amount || 0),
+        status: invoice.payment_method === "posted" ? "posted" : "pending",
+        payment_method: invoice.payment_method,
+        branchId: invoice.branchId || null,
+        branch_name: branchNameMap[invoice.branchId] || null,
+        created_by: invoice.created_by,
+        created_at: invoice.created_at,
+        workflow_status: wf?.workflow_status || null,
+        workflow_status_label: wf?.workflow_status_label || null,
+        workflow_status_color: wf?.workflow_status_color || null,
+        workflow_payment_type: wf?.payment_type || null,
+        hold_overnight: wf?.hold_overnight || false,
+      };
+    });
 
     return res.json({
       success: true,
@@ -5162,6 +5384,7 @@ exports.getSalesLineReport = async (req, res) => {
            ''
          ) AS customer_no,
          COALESCE(p.name, se.product_id, '—') AS product_name,
+         COALESCE(p.sku, se.product_id, '') AS product_sku,
          CASE
            WHEN LOWER(TRIM(COALESCE(se.type, ''))) IN ('pro-bono', 'pro_bono')
              THEN 'pro-bono'
@@ -5195,6 +5418,7 @@ exports.getSalesLineReport = async (req, res) => {
       customer_name: row.customer_name || "",
       customer_no: row.customer_no || "",
       product_name: row.product_name || "—",
+      product_sku: row.product_sku || "",
       line_type: row.line_type || "sales",
       qty: parseFloat(row.qty || 0) || 0,
       unit_price: parseFloat(row.unit_price || 0) || 0,

@@ -393,6 +393,7 @@ exports.createNewUser = async (req, res) => {
     branchId = null,
     branchIds = [],
     departmentId = null,
+    cashier_type = null,
   } = req.body;
 
   // Accept either branchIds[] (multi) or a single branchId for backward
@@ -419,6 +420,26 @@ exports.createNewUser = async (req, res) => {
             .status(400)
             .json({ success: false, message: "Id is require to update" });
         }
+        const roleLower = String(role || "").toLowerCase();
+        const isCashierRole =
+          roleLower.includes("cashier") || roleLower.includes("casheir");
+        const resolvedCashierType =
+          isCashierRole &&
+          (cashier_type === "cash" || cashier_type === "transfer")
+            ? cashier_type
+            : null;
+
+        if (
+          isCashierRole &&
+          cashier_type !== "cash" &&
+          cashier_type !== "transfer"
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Cashier role requires payment type: cash or transfer",
+          });
+        }
+
         const updateUser = {
           email,
           phone,
@@ -426,6 +447,7 @@ exports.createNewUser = async (req, res) => {
           lastname,
           role,
           status,
+          cashier_type: resolvedCashierType,
           // Single departmentId is still supported for legacy HR forms.
           departmentId:
             departmentId != null && departmentId !== ""
@@ -598,6 +620,17 @@ exports.createNewUser = async (req, res) => {
         return Number.isFinite(n) ? n : null;
       })();
 
+      const roleLowerCreate = String(role || "").toLowerCase();
+      const isCashierCreate =
+        roleLowerCreate.includes("cashier") ||
+        roleLowerCreate.includes("casheir");
+      if (isCashierCreate && cashier_type !== "cash" && cashier_type !== "transfer") {
+        return res.status(400).json({
+          success: false,
+          message: "Cashier role requires payment type: cash or transfer",
+        });
+      }
+
       const user = await User.create(
         {
           id: entry_id_in,
@@ -609,6 +642,11 @@ exports.createNewUser = async (req, res) => {
           status,
           facilityId,
           branchId: parsedPrimaryBranchId,
+          cashier_type:
+            isCashierCreate &&
+            (cashier_type === "cash" || cashier_type === "transfer")
+              ? cashier_type
+              : null,
         },
         { transaction },
       );
@@ -1513,6 +1551,8 @@ exports.create = async (req, res) => {
           "seal",
           "inv_ev_m",
           "default_valuation_source",
+          "customer_notes",
+          "terms_conditions",
         ],
       });
 
@@ -2403,7 +2443,7 @@ exports.login = (req, res) => {
             const payload = { id, username, email, facilityId }; //jwt payload
             jwt.sign(
               payload,
-              "secret",
+              process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret",
               {
                 expiresIn: 3600,
               },
@@ -2450,6 +2490,7 @@ exports.login = (req, res) => {
                       branch_names: branches.map((b) => b.branch_name),
                       departmentId: user[0].dataValues.departmentId || null,
                       role: userRole,
+                      cashier_type: user[0].dataValues.cashier_type || null,
                       description:
                         currentBusiness?.description ??
                         business?.dataValues?.description,
@@ -2545,7 +2586,7 @@ exports.loginWithUsername = (req, res) => {
 
             jwt.sign(
               payload,
-              "secret",
+              process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret",
               {
                 expiresIn: 3600,
               },
@@ -2566,6 +2607,7 @@ exports.loginWithUsername = (req, res) => {
                     phone: user[0].dataValues.phone,
                     image: user[0].dataValues.image,
                     role: userRole,
+                    cashier_type: user[0].dataValues.cashier_type || null,
                     designation: designation,
                     accessTo: user[0]?.dataValues?.accessTo?.split(","),
                     facilityId: user[0].dataValues.facilityId,
@@ -2679,6 +2721,7 @@ exports.verifyUserToken = (req, res) => {
                 businessType: user[0].dataValues.businessType,
                 address: user[0].dataValues.address,
                 role: userRole,
+                cashier_type: user[0].dataValues.cashier_type || null,
                 designation: designation,
                 facilityId: user[0].dataValues.facilityId,
                 branchId:
@@ -2837,6 +2880,7 @@ exports.getUserByFacility = async (req, res) => {
         users.departmentId,
         users.code,
         users.role,
+        users.cashier_type,
         users.store,
         users.createdAt,
         users.updatedAt,

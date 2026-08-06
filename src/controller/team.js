@@ -1,6 +1,10 @@
 const db = require("../models");
 const Team = db.Team;
 const User = db.User;
+const {
+  recordActivity,
+  pickActor,
+} = require("../services/activityAuditService");
 
 // Create new Team
 const createTeam = async (req, res) => {
@@ -23,6 +27,7 @@ const createTeam = async (req, res) => {
       description,
       headOfTeam,
       facilityId,
+      user_id: pickActor(req),
     });
 
     const id = team.dataValues.id;
@@ -38,6 +43,17 @@ const createTeam = async (req, res) => {
         }
       );
     }
+
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req),
+      action: "create",
+      entityType: "team",
+      entityId: id,
+      entityLabel: teamName,
+      after: { teamName, team_id, description, headOfTeam, facilityId },
+      remark: "Team created",
+    });
 
     return res.status(201).json({
       message: "Team created successfully",
@@ -83,10 +99,29 @@ const updateTeam = async (req, res) => {
       });
     }
 
+    const before = {
+      teamName: team.teamName,
+      team_id: team.team_id,
+      description: team.description,
+      headOfTeam: team.headOfTeam,
+    };
+
     await Team.update(
       { teamName, team_id, description, headOfTeam },
       { where: { id } }
     );
+
+    await recordActivity({
+      facilityId: team.facilityId,
+      userId: pickActor(req),
+      action: "update",
+      entityType: "team",
+      entityId: id,
+      entityLabel: teamName || team.teamName,
+      before,
+      after: { teamName, team_id, description, headOfTeam },
+      remark: "Team updated",
+    });
 
     return res.status(200).json({
       message: "Team updated successfully",
@@ -110,7 +145,22 @@ const updateTeamStatus = async (req, res) => {
   }
 
   try {
+    const existing = await Team.findByPk(teamId);
     await Team.update({ status }, { where: { id: teamId } });
+
+    if (existing) {
+      await recordActivity({
+        facilityId: existing.facilityId,
+        userId: pickActor(req),
+        action: "status_change",
+        entityType: "team",
+        entityId: teamId,
+        entityLabel: existing.teamName,
+        before: { status: existing.status },
+        after: { status },
+        remark: "Team status updated",
+      });
+    }
 
     return res.status(200).json({
       message: "Team status updated successfully",
@@ -140,6 +190,17 @@ const addTeamMember = async (req, res) => {
         replacements: { teamId, userId, facilityId },
       }
     );
+
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req),
+      action: "update",
+      entityType: "team",
+      entityId: teamId,
+      entityLabel: `member:${userId}`,
+      after: { memberUserId: userId, teamId },
+      remark: "Team member added",
+    });
 
     return res.status(200).json({
       message: "User added to team successfully",
@@ -262,7 +323,19 @@ const deleteTeam = async (req, res) => {
       return res.status(404).json({ message: "Team not found" });
     }
 
+    const before = team.get ? team.get({ plain: true }) : team;
     await team.destroy();
+
+    await recordActivity({
+      facilityId: before.facilityId,
+      userId: pickActor(req),
+      action: "delete",
+      entityType: "team",
+      entityId: id,
+      entityLabel: before.teamName,
+      before,
+      remark: "Team deleted",
+    });
 
     return res.status(200).json({ message: "Team deleted successfully" });
   } catch (error) {

@@ -53,35 +53,35 @@ module.exports = (app) => {
   );
 
   // Payroll Management Routes
+  // Static payroll paths must be registered before /:month/:year.
   app.post("/api/hr/payroll/run", payrollController.runPayroll);
   app.get(
     "/api/hr/payroll/batches",
     payrollController.getAllPayrollBatches
   );
   app.get(
-    "/api/hr/payroll/:month/:year",
-
-    payrollController.getPayrollByMonth
+    "/api/hr/payroll/payslip/:id",
+    payrollController.getPayslip
   );
   app.get(
-    "/api/hr/payroll/payslip/:id",
-
-    payrollController.getPayslip
+    "/api/hr/payroll/history",
+    payrollController.getPayrollHistory
   );
   app.put(
     "/api/hr/payroll/mark-paid",
-
     payrollController.markPayrollAsPaid
   );
   app.put(
     "/api/hr/payroll/status/:id",
-
     payrollController.updatePayrollStatus
   );
   app.put(
     "/api/hr/payroll/batch-status",
-
     payrollController.batchUpdateStatus
+  );
+  app.get(
+    "/api/hr/payroll/:month/:year",
+    payrollController.getPayrollByMonth
   );
 
   // PAYE 2026 Settings
@@ -191,11 +191,6 @@ module.exports = (app) => {
       });
     }
   });
-
-  app.get(
-    "/api/hr/payroll/history",
-    payrollController.getPayrollHistory
-  );
 
   // Salary Structures routes
   app.post(

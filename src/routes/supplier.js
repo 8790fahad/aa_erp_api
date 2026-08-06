@@ -101,4 +101,8 @@ module.exports = (app) => {
     "/api/v1/get-supplier-advance-history",
     supplierAdvancePayment.getSupplierAdvanceHistory,
   );
+  app.post(
+    "/api/v1/apply-supplier-advance",
+    supplierAdvancePayment.applySupplierAdvanceToBills,
+  );
 };

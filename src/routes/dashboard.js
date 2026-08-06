@@ -21,4 +21,8 @@ module.exports = (app) => {
     account.getExpensesByCategory,
   );
   app.get("/api/cash-flow/dashboard/:facilityId", account.getCashFlowDashboard);
+  app.get(
+    "/api/dashboard/financial-overview",
+    account.getFinancialDashboardOverview,
+  );
 };

@@ -97,7 +97,13 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
   try {
     const { month, year, payrolls = [] } = payrollData;
     const batchRef = `PAY-${month}-${year}`;
-    const txDate   = transactionDate ? new Date(transactionDate) : new Date();
+    // Posting date cannot be in the future (general_ledger rule). Clamp to today.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    let txDate = transactionDate ? new Date(transactionDate) : new Date();
+    if (Number.isNaN(txDate.getTime()) || txDate > today) {
+      txDate = today;
+    }
     const lines = [];
 
     let payePayableCode = DEFAULT_CODES.PAYE_PAYABLE;
@@ -112,6 +118,22 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
       console.warn("[PayrollGL] Could not load PAYE ledger account, using default:", err.message);
     }
 
+    // Resolve facility salary expense code when structure accountCode is empty / invalid default.
+    let facilitySalaryCode = DEFAULT_CODES.SALARY_EXPENSE;
+    try {
+      const salaryCat = await db.AccountCategory.findOne({
+        where: {
+          facilityId,
+          isActive: true,
+          description: { [db.Sequelize.Op.like]: "%Salaries and Wages%" },
+        },
+        order: [["level", "DESC"]],
+      });
+      if (salaryCat?.code) facilitySalaryCode = String(salaryCat.code);
+    } catch (err) {
+      /* keep default */
+    }
+
     for (const p of payrolls) {
       const empId   = p.employeeId;
       const empName = [p.employee?.firstName, p.employee?.lastName].filter(Boolean).join(" ") || empId;
@@ -119,7 +141,11 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
       const tRef    = `${batchRef}-${empId}`.slice(0, 100);
 
       // 1. DR Basic Salary Expense
-      const salaryCode = p.salaryStructure?.accountCode || DEFAULT_CODES.SALARY_EXPENSE;
+      const rawSalaryCode = p.salaryStructure?.accountCode;
+      const salaryCode =
+        rawSalaryCode && String(rawSalaryCode).trim()
+          ? String(rawSalaryCode).trim()
+          : facilitySalaryCode;
       if (parseFloat(p.basicSalary) > 0) {
         lines.push(buildGLLine({
           accountCode: salaryCode,
@@ -141,6 +167,7 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
           debit: parseFloat(p.overtime),
           credit: 0,
           facilityId, reference: empRef, transactionRef: tRef, createdBy, employeeId: empId,
+          transactionDate: txDate,
         }));
       }
 
@@ -158,6 +185,7 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
           debit: parseFloat(amount),
           credit: 0,
           facilityId, reference: empRef, transactionRef: tRef, createdBy, employeeId: empId,
+          transactionDate: txDate,
         }));
       }
 
@@ -174,6 +202,7 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
           debit: parseFloat(amount),
           credit: 0,
           facilityId, reference: empRef, transactionRef: tRef, createdBy, employeeId: empId,
+          transactionDate: txDate,
         }));
       }
 
@@ -256,6 +285,7 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
           debit: 0,
           credit: parseFloat(amount),
           facilityId, reference: empRef, transactionRef: tRef, createdBy, employeeId: empId,
+          transactionDate: txDate,
         }));
       }
 

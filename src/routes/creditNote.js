@@ -8,6 +8,7 @@ module.exports = (app) => {
   );
   app.post("/api/credit-notes", creditNoteController.createCreditNote);
   app.post("/api/credit-notes/list", creditNoteController.getCreditNotes);
+  app.post("/api/credit-notes/apply", creditNoteController.applyCreditNote);
   app.get("/api/credit-notes/search-invoices", creditNoteController.searchInvoices);
   app.get("/api/credit-notes/invoices/:entityId", creditNoteController.getInvoicesForEntity);
   app.get("/api/credit-notes/:creditNoteNumber", creditNoteController.getCreditNoteDetails);

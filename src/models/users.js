@@ -42,6 +42,11 @@ module.exports = (sequelize, DataTypes) => {
       },
       code: DataTypes.STRING,
       role: DataTypes.STRING,
+      /** Cashier role only: "cash" | "transfer" — which payments they collect. */
+      cashier_type: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+      },
       store: DataTypes.STRING,
       branchId: {
         type: DataTypes.INTEGER,

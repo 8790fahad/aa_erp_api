@@ -1,6 +1,7 @@
 const db = require("../models");
 const moment = require("moment");
 const { Op } = require("sequelize");
+const { getAndUpdateNumber } = require("../services/numberGen");
 
 /**
  * Create a new customer with proper ledger setup
@@ -74,6 +75,7 @@ exports.createCustomer = async (req, res) => {
 
     // Create customer entry for opening balance (if any)
     if (credit_limit > 0) {
+      const obRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
       await db.CustomerEntry.create(
         {
           customerNo,
@@ -82,7 +84,7 @@ exports.createCustomer = async (req, res) => {
           cr: parseFloat(credit_limit),
           facilityId,
           mode_of_payment: "opening_balance",
-          receiptNo: `OB-${customerNo}`,
+          receiptNo: obRef,
           created_by: userId,
         },
         { transaction }

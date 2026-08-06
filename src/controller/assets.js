@@ -14,6 +14,10 @@ const {
   getAccumulatedDepreciationAccountCode,
   getDepreciationExpenseAccountCode,
 } = require('./assetAccounting');
+const {
+  recordActivity,
+  pickActor,
+} = require('../services/activityAuditService');
 
 // Helper function to generate asset code
 const generateAssetCode = async (facilityId, category) => {
@@ -91,6 +95,7 @@ exports.createAsset = async (req, res) => {
       paymentAccountName,
       chequeNumber,
       postToLedger,
+      recordedInPurchase,
     } = req.body;
 
     // `description` is treated as the display name; keep asset_name in sync.
@@ -142,6 +147,11 @@ exports.createAsset = async (req, res) => {
       supplier_number: supplierNumber || null,
       supplier_name: supplierName || null,
       invoice_ref: invoiceRef || null,
+      recorded_in_purchase:
+        recordedInPurchase === true ||
+        recordedInPurchase === "true" ||
+        recordedInPurchase === 1 ||
+        recordedInPurchase === "1",
       attachment_urls: attachmentsJson,
       acquisition_date: acquisitionDate,
       acquisition_cost: resolvedCost,
@@ -178,13 +188,20 @@ exports.createAsset = async (req, res) => {
     let journalRef = null;
     let ledgerWarning = null;
 
-    // Bills already post to the ledger — skip capitalization JE when linked.
+    // Already booked in purchase (or explicit postToLedger=false) — skip capitalization JE.
+    const alreadyInPurchase =
+      recordedInPurchase === true ||
+      recordedInPurchase === 'true' ||
+      recordedInPurchase === 1 ||
+      recordedInPurchase === '1' ||
+      asset.recorded_in_purchase === true;
     const shouldPostLedger =
-      postToLedger === true ||
-      postToLedger === 'true' ||
-      (postToLedger !== false &&
-        postToLedger !== 'false' &&
-        !invoiceRef);
+      !alreadyInPurchase &&
+      (postToLedger === true ||
+        postToLedger === 'true' ||
+        (postToLedger !== false &&
+          postToLedger !== 'false' &&
+          !invoiceRef));
 
     if (shouldPostLedger) {
       try {
@@ -446,6 +463,13 @@ exports.updateAsset = async (req, res) => {
     if (req.body.supplierNumber !== undefined) updateData.supplier_number = req.body.supplierNumber || null;
     if (req.body.supplierName !== undefined) updateData.supplier_name = req.body.supplierName || null;
     if (req.body.invoiceRef !== undefined) updateData.invoice_ref = req.body.invoiceRef || null;
+    if (req.body.recordedInPurchase !== undefined) {
+      updateData.recorded_in_purchase =
+        req.body.recordedInPurchase === true ||
+        req.body.recordedInPurchase === 'true' ||
+        req.body.recordedInPurchase === 1 ||
+        req.body.recordedInPurchase === '1';
+    }
     if (req.body.custodian !== undefined) updateData.custodian = req.body.custodian;
     if (req.body.custodianId !== undefined) updateData.custodianId = req.body.custodianId || null;
     if (req.body.status) updateData.status = req.body.status;
@@ -470,7 +494,28 @@ exports.updateAsset = async (req, res) => {
     // Always update the updatedBy field
     updateData.updatedBy = updatedBy;
 
+    const before = {
+      asset_code: asset.asset_code,
+      asset_name: asset.asset_name,
+      description: asset.description,
+      status: asset.status,
+      location: asset.location,
+      custodian: asset.custodian,
+    };
+
     await asset.update(updateData);
+
+    await recordActivity({
+      facilityId: asset.facility_id,
+      userId: pickActor(req) || updatedBy,
+      action: 'update',
+      entityType: 'asset',
+      entityId: asset.id,
+      entityLabel: asset.asset_code || asset.asset_name,
+      before,
+      after: updateData,
+      remark: 'Asset updated',
+    });
 
     res.json({
       success: true,
@@ -564,6 +609,24 @@ const performDisposal = async (asset, opts) => {
     accumulated_depreciation: accumulatedDepreciation,
     net_book_value: netBookValue,
     updatedBy: createdBy,
+  });
+
+  await recordActivity({
+    facilityId: facility,
+    userId: createdBy,
+    action: 'delete',
+    entityType: 'asset',
+    entityId: asset.id,
+    entityLabel: asset.asset_code || asset.description,
+    before: { status: asset.status },
+    after: {
+      status: finalStatus,
+      disposal_date: disposalDate,
+      disposal_proceeds: disposalProceeds,
+      net_book_value: netBookValue,
+    },
+    remark: finalStatus === 'Written Off' ? 'Asset written off' : 'Asset disposed',
+    meta: { journalRef, gainLoss },
   });
 
   return { journalRef, ledgerWarning, netBookValue, gainLoss, accumulatedDepreciation };
@@ -1076,6 +1139,163 @@ const computePeriodBookDepreciation = (asset, periodMonths = 1) => {
 // Bulk depreciation calculation and recording.
 // Posts ONE summarized journal grouped by category (book depreciation) and
 // updates FIRS capital-allowance figures in parallel WITHOUT any GL impact.
+exports.runBulkDepreciation = async ({
+  facilityId,
+  periodEndDate,
+  depreciationDate,
+  assetIds,
+  periodMonths = 1,
+  createdBy = "SYSTEM",
+}) => {
+  const runDate = periodEndDate || depreciationDate;
+
+  if (!facilityId || !runDate) {
+    const err = new Error("facilityId and periodEndDate are required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const months = Math.max(1, parseInt(periodMonths, 10) || 1);
+
+  const whereClause = {
+    facility_id: facilityId,
+    status: "Active",
+  };
+
+  if (assetIds && assetIds.length > 0) {
+    whereClause.id = { [Op.in]: assetIds };
+  }
+
+  const assets = await Asset.findAll({ where: whereClause });
+
+  const depreciationResults = [];
+  const categoryTotals = {};
+  let totalBookDepreciation = 0;
+  let totalFirsAllowance = 0;
+
+  for (const asset of assets) {
+    try {
+      // Cost already booked via purchase — skip depreciation GL / register updates.
+      if (asset.recorded_in_purchase) {
+        depreciationResults.push({
+          assetId: asset.id,
+          assetCode: asset.asset_code,
+          description: asset.description,
+          category: asset.category,
+          depreciationAmount: 0,
+          skipped: true,
+          skipReason: "recorded_in_purchase",
+        });
+        continue;
+      }
+
+      const depreciationAmount = computePeriodBookDepreciation(asset, months);
+
+      // FIRS capital allowance (parallel, tax-only, never posted to GL).
+      const firs = computeFirsPeriodAllowance(asset, { periodMonths: months });
+
+      if (depreciationAmount <= 0 && firs.allowance <= 0) {
+        continue;
+      }
+
+      if (depreciationAmount > 0 && AssetTransaction) {
+        await AssetTransaction.create({
+          id: uuidv4(),
+          assetId: asset.id,
+          transactionType: "Depreciation",
+          transactionDate: runDate,
+          amount: depreciationAmount,
+          description: `Bulk depreciation for ${asset.description}`,
+          facilityId,
+          createdBy,
+          status: "Approved",
+        });
+
+        const cat = asset.category || "Other Assets";
+        if (!categoryTotals[cat]) categoryTotals[cat] = { amount: 0, count: 0 };
+        categoryTotals[cat].amount += depreciationAmount;
+        categoryTotals[cat].count += 1;
+      }
+
+      const currentAccum = parseFloat(asset.accumulated_depreciation || 0);
+      const newAccum = parseFloat((currentAccum + depreciationAmount).toFixed(2));
+      const newNbv = parseFloat(
+        (parseFloat(asset.acquisition_cost) - newAccum).toFixed(2),
+      );
+
+      await asset.update({
+        accumulated_depreciation: newAccum,
+        net_book_value: newNbv,
+        last_depreciation_date:
+          depreciationAmount > 0 ? runDate : asset.last_depreciation_date,
+        firs_written_down_value: firs.newWrittenDownValue,
+        firs_allowance_to_date: firs.newAllowanceToDate,
+        updatedBy: createdBy,
+      });
+
+      totalBookDepreciation += depreciationAmount;
+      totalFirsAllowance += firs.allowance;
+
+      depreciationResults.push({
+        assetId: asset.id,
+        assetCode: asset.asset_code,
+        description: asset.description,
+        category: asset.category,
+        depreciationAmount,
+        newAccumulatedDepreciation: newAccum,
+        newNetBookValue: newNbv,
+        firsAllowance: firs.allowance,
+        firsWrittenDownValue: firs.newWrittenDownValue,
+      });
+    } catch (error) {
+      console.error(`Error processing depreciation for asset ${asset.id}:`, error);
+    }
+  }
+
+  // Post ONE summarized journal grouped by category (book depreciation only).
+  let journalRef = null;
+  let ledgerWarning = null;
+  if (Object.keys(categoryTotals).length > 0) {
+    try {
+      journalRef = await createBulkDepreciationJournal(
+        categoryTotals,
+        runDate,
+        facilityId,
+        { createdBy },
+      );
+      if (journalRef && AssetTransaction) {
+        await AssetTransaction.update(
+          { journalEntryId: journalRef },
+          {
+            where: {
+              facilityId,
+              transactionType: "Depreciation",
+              transactionDate: runDate,
+              journalEntryId: null,
+            },
+          },
+        );
+      }
+    } catch (ledgerError) {
+      console.error("Bulk depreciation GL posting failed:", ledgerError);
+      ledgerWarning = ledgerError.message;
+    }
+  }
+
+  return {
+    processedAssets: depreciationResults.length,
+    totalAssets: assets.length,
+    totalBookDepreciation: parseFloat(totalBookDepreciation.toFixed(2)),
+    totalFirsAllowance: parseFloat(totalFirsAllowance.toFixed(2)),
+    journalRef,
+    categoryTotals,
+    results: depreciationResults,
+    ledgerWarning,
+    periodEndDate: runDate,
+    periodMonths: months,
+  };
+};
+
 exports.calculateBulkDepreciation = async (req, res) => {
   try {
     const {
@@ -1085,147 +1305,95 @@ exports.calculateBulkDepreciation = async (req, res) => {
       assetIds,
       periodMonths = 1,
     } = req.body;
-    const createdBy = req.user?.id || req.body.createdBy || 'SYSTEM';
-    const runDate = periodEndDate || depreciationDate;
+    const createdBy = req.user?.id || req.body.createdBy || "SYSTEM";
 
-    if (!facilityId || !runDate) {
-      return res.status(400).json({
-        success: false,
-        message: 'facilityId and periodEndDate are required'
-      });
-    }
-
-    const whereClause = {
-      facility_id: facilityId,
-      status: 'Active'
-    };
-
-    if (assetIds && assetIds.length > 0) {
-      whereClause.id = { [Op.in]: assetIds };
-    }
-
-    const assets = await Asset.findAll({ where: whereClause });
-
-    const depreciationResults = [];
-    const categoryTotals = {};
-    let totalBookDepreciation = 0;
-    let totalFirsAllowance = 0;
-
-    for (const asset of assets) {
-      try {
-        const depreciationAmount = computePeriodBookDepreciation(asset, periodMonths);
-
-        // FIRS capital allowance (parallel, tax-only, never posted to GL).
-        const firs = computeFirsPeriodAllowance(asset, { periodMonths });
-
-        if (depreciationAmount <= 0 && firs.allowance <= 0) {
-          continue;
-        }
-
-        if (depreciationAmount > 0 && AssetTransaction) {
-          await AssetTransaction.create({
-            id: uuidv4(),
-            assetId: asset.id,
-            transactionType: 'Depreciation',
-            transactionDate: runDate,
-            amount: depreciationAmount,
-            description: `Bulk depreciation for ${asset.description}`,
-            facilityId,
-            createdBy,
-            status: 'Approved',
-          });
-
-          const cat = asset.category || 'Other Assets';
-          if (!categoryTotals[cat]) categoryTotals[cat] = { amount: 0, count: 0 };
-          categoryTotals[cat].amount += depreciationAmount;
-          categoryTotals[cat].count += 1;
-        }
-
-        const currentAccum = parseFloat(asset.accumulated_depreciation || 0);
-        const newAccum = parseFloat((currentAccum + depreciationAmount).toFixed(2));
-        const newNbv = parseFloat(
-          (parseFloat(asset.acquisition_cost) - newAccum).toFixed(2)
-        );
-
-        await asset.update({
-          accumulated_depreciation: newAccum,
-          net_book_value: newNbv,
-          last_depreciation_date: depreciationAmount > 0 ? runDate : asset.last_depreciation_date,
-          firs_written_down_value: firs.newWrittenDownValue,
-          firs_allowance_to_date: firs.newAllowanceToDate,
-          updatedBy: createdBy,
-        });
-
-        totalBookDepreciation += depreciationAmount;
-        totalFirsAllowance += firs.allowance;
-
-        depreciationResults.push({
-          assetId: asset.id,
-          assetCode: asset.asset_code,
-          description: asset.description,
-          category: asset.category,
-          depreciationAmount,
-          newAccumulatedDepreciation: newAccum,
-          newNetBookValue: newNbv,
-          firsAllowance: firs.allowance,
-          firsWrittenDownValue: firs.newWrittenDownValue,
-        });
-      } catch (error) {
-        console.error(`Error processing depreciation for asset ${asset.id}:`, error);
-      }
-    }
-
-    // Post ONE summarized journal grouped by category (book depreciation only).
-    let journalRef = null;
-    let ledgerWarning = null;
-    try {
-      journalRef = await createBulkDepreciationJournal(
-        categoryTotals,
-        runDate,
-        facilityId,
-        { createdBy }
-      );
-      if (journalRef && AssetTransaction) {
-        // Tag the depreciation transactions created in this run.
-        await AssetTransaction.update(
-          { journalEntryId: journalRef },
-          {
-            where: {
-              facilityId,
-              transactionType: 'Depreciation',
-              transactionDate: runDate,
-              journalEntryId: null,
-            },
-          }
-        );
-      }
-    } catch (ledgerError) {
-      console.error('Bulk depreciation GL posting failed:', ledgerError);
-      ledgerWarning = ledgerError.message;
-    }
+    const data = await exports.runBulkDepreciation({
+      facilityId,
+      periodEndDate,
+      depreciationDate,
+      assetIds,
+      periodMonths,
+      createdBy,
+    });
 
     res.json({
       success: true,
-      message: `Bulk depreciation processed for ${depreciationResults.length} assets`,
-      data: {
-        processedAssets: depreciationResults.length,
-        totalAssets: assets.length,
-        totalBookDepreciation: parseFloat(totalBookDepreciation.toFixed(2)),
-        totalFirsAllowance: parseFloat(totalFirsAllowance.toFixed(2)),
-        journalRef,
-        categoryTotals,
-        results: depreciationResults,
-      },
-      journalRef,
-      ledgerWarning,
+      message: `Bulk depreciation processed for ${data.processedAssets} assets`,
+      data,
+      journalRef: data.journalRef,
+      ledgerWarning: data.ledgerWarning,
     });
-
   } catch (error) {
-    console.error('Error calculating bulk depreciation:', error);
+    console.error("Error calculating bulk depreciation:", error);
+    const status = error.statusCode || 500;
+    res.status(status).json({
+      success: false,
+      message:
+        status === 400
+          ? error.message
+          : "Error calculating bulk depreciation",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Manually trigger the auto-depreciation cron logic.
+ * body: { facilityId?, force?: boolean }
+ * - If facilityId + force: run that facility now (ignores day/frequency gate)
+ * - Else: run the scheduled check for all due businesses
+ */
+exports.triggerAutoDepreciation = async (req, res) => {
+  try {
+    const { facilityId, force } = req.body || {};
+    const {
+      runScheduledDepreciation,
+      processFacility,
+      FREQUENCY_MONTHS,
+    } = require("../jobs/depreciationCron");
+
+    if (facilityId && force) {
+      const business = await db.business.findByPk(facilityId, {
+        attributes: [
+          "id",
+          "business_name",
+          "auto_depreciation_enabled",
+          "auto_depreciation_frequency",
+          "auto_depreciation_day",
+          "auto_depreciation_last_run",
+        ],
+      });
+      if (!business) {
+        return res.status(404).json({
+          success: false,
+          message: "Business not found",
+        });
+      }
+      const result = await processFacility(business);
+      return res.json({
+        success: true,
+        message: `Auto depreciation forced for ${business.business_name || facilityId}`,
+        data: {
+          frequency: business.auto_depreciation_frequency,
+          periodMonths:
+            FREQUENCY_MONTHS[business.auto_depreciation_frequency] || 1,
+          ...result,
+        },
+      });
+    }
+
+    const results = await runScheduledDepreciation();
+    res.json({
+      success: true,
+      message: `Scheduled check complete — ${results.length} facility(ies) processed`,
+      data: { results },
+    });
+  } catch (error) {
+    console.error("Error triggering auto depreciation:", error);
     res.status(500).json({
       success: false,
-      message: 'Error calculating bulk depreciation',
-      error: error.message
+      message: "Error triggering auto depreciation",
+      error: error.message,
     });
   }
 };

@@ -132,6 +132,10 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
     ? `HAVING ${sofpZeroBalanceShapeCrNormal}`
     : `HAVING ABS(COALESCE(SUM(gl.cr - gl.dr), 0)) > 0.005`;
 
+  // Exclude balance_switch accounts from digit-based buckets; they are
+  // classified by closing net sign (debit → asset, credit → liability).
+  const excludeBalanceSwitch = `AND COALESCE(ac.reporting_behavior, 'fixed') != 'balance_switch'`;
+
   const assetsQuery = `
     SELECT
       ac.code            AS account_code,
@@ -149,6 +153,7 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
     WHERE ac.facility_id = :facilityId
       AND SUBSTRING(TRIM(ac.code), 1, 1) = '1'
       AND ac.is_active = 1
+      ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
     ${assetHaving}
     ORDER BY ac.category, ac.code
@@ -171,6 +176,7 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
     WHERE ac.facility_id = :facilityId
       AND SUBSTRING(TRIM(ac.code), 1, 1) = '2'
       AND ac.is_active = 1
+      ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
     ${liabilityHaving}
     ORDER BY ac.category, ac.code
@@ -193,12 +199,39 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
     WHERE ac.facility_id = :facilityId
       AND SUBSTRING(TRIM(ac.code), 1, 1) = '3'
       AND ac.is_active = 1
+      ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
     ${equityHaving}
     ORDER BY ac.category, ac.code
   `;
 
-  const [assets, liabilities, equity] = await Promise.all([
+  const balanceSwitchQuery = `
+    SELECT
+      ac.code            AS account_code,
+      ac.description     AS account_name,
+      ac.category,
+      COALESCE(ac.type, ac.category) AS type,
+      ac.level           AS level,
+      ac.parent_code     AS parent_code,
+      ac.account_nature  AS account_nature,
+      ac.alternate_nature AS alternate_nature,
+      COALESCE(SUM(gl.dr - gl.cr), 0) AS net_debit
+    FROM account_category ac
+    LEFT JOIN general_ledger gl
+      ON ac.code = gl.account_code
+      AND gl.facility_id = :facilityId
+      AND gl.transaction_date <= :asOfDate
+    WHERE ac.facility_id = :facilityId
+      AND ac.is_active = 1
+      AND COALESCE(ac.reporting_behavior, 'fixed') = 'balance_switch'
+    GROUP BY
+      ac.code, ac.description, ac.category, ac.type, ac.level,
+      ac.parent_code, ac.account_nature, ac.alternate_nature
+    HAVING ABS(COALESCE(SUM(gl.dr - gl.cr), 0)) > 0.005
+    ORDER BY ac.category, ac.code
+  `;
+
+  const [assets, liabilities, equity, switchRows] = await Promise.all([
     db.sequelize.query(assetsQuery, {
       replacements: { facilityId, asOfDate },
       type: QueryTypes.SELECT,
@@ -211,7 +244,34 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
       replacements: { facilityId, asOfDate },
       type: QueryTypes.SELECT,
     }),
+    db.sequelize.query(balanceSwitchQuery, {
+      replacements: { facilityId, asOfDate },
+      type: QueryTypes.SELECT,
+    }),
   ]);
+
+  // Dual-nature (VAT/clearing): net debit → asset side; net credit → liability.
+  for (const row of switchRows || []) {
+    const netDebit = parseFloat(row.net_debit) || 0;
+    const base = {
+      account_code: row.account_code,
+      account_name: row.account_name,
+      category: row.category,
+      type: row.type,
+      level: row.level,
+      parent_code: row.parent_code,
+      reporting_behavior: "balance_switch",
+    };
+    if (netDebit > 0.005) {
+      assets.push({ ...base, amount: netDebit, effective_nature: "ASSET" });
+    } else if (netDebit < -0.005) {
+      liabilities.push({
+        ...base,
+        amount: Math.abs(netDebit),
+        effective_nature: "LIABILITY",
+      });
+    }
+  }
 
   applyAssetClassification(assets);
   applyLiabilityClassification(liabilities);
@@ -683,6 +743,8 @@ exports.getTrialBalance = async (req, res) => {
         ac.type            AS type,
         ac.category        AS category,
         ac.account_nature  AS account_nature,
+        ac.alternate_nature AS alternate_nature,
+        COALESCE(ac.reporting_behavior, 'fixed') AS reporting_behavior,
         ac.level           AS level,
         COALESCE(SUM(gl.dr), 0) AS total_debit,
         COALESCE(SUM(gl.cr), 0) AS total_credit
@@ -695,7 +757,8 @@ exports.getTrialBalance = async (req, res) => {
         AND ac.is_active   = 1
       GROUP BY
         ac.code, ac.parent_code, ac.description,
-        ac.type, ac.category, ac.account_nature, ac.level
+        ac.type, ac.category, ac.account_nature, ac.alternate_nature,
+        ac.reporting_behavior, ac.level
     `;
 
     const allAccounts = await db.sequelize.query(allAccountsQuery, {
@@ -926,6 +989,28 @@ exports.getTrialBalance = async (req, res) => {
         account_code:   row.account_code,
         account_name:   row.account_name,
         account_nature: row.account_nature,
+        effective_nature: (() => {
+          if (row.reporting_behavior !== "balance_switch") {
+            return row.account_nature;
+          }
+          const net = (parseFloat(rolledDr) || 0) - (parseFloat(rolledCr) || 0);
+          if (net > 0.005) {
+            return (
+              (row.account_nature === "ASSET"
+                ? row.account_nature
+                : row.alternate_nature) || "ASSET"
+            );
+          }
+          if (net < -0.005) {
+            return (
+              (row.account_nature === "LIABILITY"
+                ? row.account_nature
+                : row.alternate_nature) || "LIABILITY"
+            );
+          }
+          return row.account_nature;
+        })(),
+        reporting_behavior: row.reporting_behavior || "fixed",
         category:       row.category,
         type:           row.type,
         hierarchy:      hierarchyMemo.get(code) ?? 0,
@@ -1516,8 +1601,28 @@ const ABOVE_OP_PROFIT_SUBCATS = new Set(["impairment_loss"]);
  * Returns one of:
  *   "turnover" | "other_income" | "cost_of_sales" | "admin_costs" |
  *   "impairment" | "interest" | "taxes"
+ * Prefer explicit pl_line when set on the account.
  */
-function classifySection(accountNature, rawType, subcategory) {
+function classifySection(accountNature, rawType, subcategory, plLine) {
+  const explicit = String(plLine || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+  const PL_LINE_MAP = {
+    turnover: "turnover",
+    other_income: "other_income",
+    cost_of_sales: "cost_of_sales",
+    admin_costs: "admin_costs",
+    finance: "interest",
+    interest: "interest",
+    tax: "taxes",
+    taxes: "taxes",
+    impairment: "impairment",
+  };
+  if (explicit && PL_LINE_MAP[explicit]) {
+    return PL_LINE_MAP[explicit];
+  }
+
   const key = toTaxonomyKey(rawType);
 
   if (accountNature === "REVENUE") {
@@ -1577,7 +1682,8 @@ exports.getIncomeStatement = async (req, res) => {
          description,
          type          AS account_type,
          subcategory,
-         account_nature
+         account_nature,
+         pl_line
        FROM account_category
        WHERE facility_id    = :facilityId
          AND account_nature IN ('REVENUE', 'EXPENSE')
@@ -1596,6 +1702,7 @@ exports.getIncomeStatement = async (req, res) => {
          ac.description                       AS account_name,
          ac.subcategory,
          ac.account_nature,
+         ac.pl_line,
          COALESCE(SUM(gl.cr - gl.dr), 0)     AS cr_net,
          COALESCE(SUM(gl.dr - gl.cr), 0)     AS dr_net
        FROM account_category ac
@@ -1611,7 +1718,7 @@ exports.getIncomeStatement = async (req, res) => {
          AND ac.is_active      = 1
        GROUP BY
          ac.code, ac.parent_code, ac.description,
-         ac.subcategory, ac.account_nature
+         ac.subcategory, ac.account_nature, ac.pl_line
        ORDER BY ac.code ASC`,
       { replacements: { facilityId, startDate, endDate }, type: QueryTypes.SELECT }
     );
@@ -1627,7 +1734,7 @@ exports.getIncomeStatement = async (req, res) => {
         taxonomyKey   : toTaxonomyKey(grp.account_type),
         subcategory,
         accountNature : grp.account_nature,
-        isSection     : classifySection(grp.account_nature, grp.account_type, subcategory),
+        isSection     : classifySection(grp.account_nature, grp.account_type, subcategory, grp.pl_line),
         items         : [],
         total         : 0,
         noteRef       : null,
@@ -1635,9 +1742,34 @@ exports.getIncomeStatement = async (req, res) => {
     }
 
     // ── 5. Assign line items to their note groups ────────────────────────────
+    // Flat CoAs (leaf under root only) have no display=0 intermediate groups.
+    // In that case treat each leaf as its own face line / note group.
     for (const item of lineItems) {
-      const grp = noteGroupMap[item.note_group_code];
-      if (!grp) continue;
+      let grp = noteGroupMap[item.note_group_code];
+      if (!grp) {
+        const subcategory = item.subcategory || "";
+        const key = item.account_code;
+        if (!noteGroupMap[key]) {
+          noteGroupMap[key] = {
+            noteGroupCode: key,
+            description: item.account_name,
+            accountType: item.account_type || item.subcategory || "",
+            taxonomyKey: toTaxonomyKey(item.account_type || item.subcategory || ""),
+            subcategory,
+            accountNature: item.account_nature,
+            isSection: classifySection(
+              item.account_nature,
+              item.account_type || item.subcategory || "",
+              subcategory,
+              item.pl_line,
+            ),
+            items: [],
+            total: 0,
+            noteRef: null,
+          };
+        }
+        grp = noteGroupMap[key];
+      }
 
       // Sign convention (IS perspective):
       //   REVENUE: positive = income  → use cr_net

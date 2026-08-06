@@ -88,6 +88,10 @@ module.exports = (app) => {
     customer.getReceivedPaymentHistory
   );
   app.get("/api/v1/get-outstanding-invoices", customer.getOutstandingInvoices);
+  app.post(
+    "/api/v1/apply-customer-advance",
+    customer.applyCustomerAdvanceToInvoices,
+  );
   app.get(
     "/api/v1/get-customer-nos-by-branch",
     customer.getCustomerNosByBranch

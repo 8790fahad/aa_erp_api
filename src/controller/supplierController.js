@@ -7,6 +7,10 @@ const {
   syncSupplierContacts,
   syncSupplierAddresses,
 } = require("./supplierNormalize");
+const {
+  recordActivity,
+  pickActor,
+} = require("../services/activityAuditService");
 // const { getAndUpdateNumber } = require("../services/numberGen");
 
 exports.createSupplier = async (req, res) => {
@@ -154,7 +158,7 @@ exports.createSupplier = async (req, res) => {
         });
       }
 
-      const billRef = `OB-${supplierNo}`;
+      const billRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
       // -------------------------------------------------
       // CASE 1: POSITIVE OB → YOU OWE SUPPLIER (A/P)
@@ -311,6 +315,21 @@ exports.createSupplier = async (req, res) => {
     }
 
     await transaction.commit();
+
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req) || userId,
+      action: "create",
+      entityType: "supplier",
+      entityId: supplierNo,
+      entityLabel: supplier.supplier_name || name,
+      after: {
+        supplier_number: supplierNo,
+        supplier_name: supplier.supplier_name,
+        status: supplier.status,
+      },
+      remark: "Supplier created",
+    });
 
     return res.status(201).json({
       success: true,
@@ -514,6 +533,18 @@ exports.updateSupplier = async (req, res) => {
       });
     }
 
+    const beforeSnapshot = {
+      supplier_name: supplier.supplier_name,
+      email: supplier.email,
+      phone: supplier.phone,
+      address: supplier.address,
+      tin: supplier.tin,
+      payable_code: supplier.payable_code,
+      payable_accural_code: supplier.payable_accural_code,
+      branch_id: supplier.branch_id,
+      status: supplier.status,
+    };
+
     const billing = billing_address || null;
     const shipping = shipping_address || null;
     const addressLine =
@@ -590,6 +621,18 @@ exports.updateSupplier = async (req, res) => {
 
     await transaction.commit();
 
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req),
+      action: "update",
+      entityType: "supplier",
+      entityId: supplier_number,
+      entityLabel: supplier.supplier_name || name,
+      before: beforeSnapshot,
+      after: updateData,
+      remark: "Supplier updated",
+    });
+
     res.json({
       success: true,
       message: "Supplier updated successfully",
@@ -632,9 +675,22 @@ exports.deleteSupplier = async (req, res) => {
       });
     }
 
+    const before = supplier.get({ plain: true });
+
     if (permanent === "true") {
       // Permanent delete
       await supplier.destroy();
+      await recordActivity({
+        facilityId,
+        userId: pickActor(req),
+        action: "delete",
+        entityType: "supplier",
+        entityId: supplier_number,
+        entityLabel: before.supplier_name,
+        before,
+        remark: "Supplier permanently deleted",
+        meta: { permanent: true },
+      });
       res.json({
         success: true,
         message: "Supplier deleted permanently",
@@ -642,6 +698,18 @@ exports.deleteSupplier = async (req, res) => {
     } else {
       // Soft delete - just change status
       await supplier.update({ status: "inactive" });
+      await recordActivity({
+        facilityId,
+        userId: pickActor(req),
+        action: "delete",
+        entityType: "supplier",
+        entityId: supplier_number,
+        entityLabel: before.supplier_name,
+        before: { status: before.status },
+        after: { status: "inactive" },
+        remark: "Supplier deactivated",
+        meta: { permanent: false },
+      });
       res.json({
         success: true,
         message: "Supplier deactivated successfully",

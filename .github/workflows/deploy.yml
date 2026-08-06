@@ -1,5 +1,4 @@
-
-name: 🚀 Deploy inventria api to VPS via SSH
+name: 🚀 Deploy  to VPS via SSH
 
 on:
   push:
@@ -100,7 +99,7 @@ jobs:
               -o ConnectTimeout=30 \
               -o ServerAliveInterval=15 \
               -o ServerAliveCountMax=3" \
-            ./ "${VPS_USER}@${host}:/var/www/html/flowbooks_api/"
+            ./ "${VPS_USER}@${host}:/var/www/html/flowbooks/"
 
       - name: 🔐 SSH to VPS and Deploy
         uses: appleboy/ssh-action@v1.0.0
@@ -111,7 +110,7 @@ jobs:
           port: ${{ secrets.VPS_PORT || 22 }}
           command_timeout: 20m
           script: |
-            cd /var/www/html/flowbooks_api/
+            cd /var/www/html/flowbooks/
             set -e
 
             export NVM_DIR="$HOME/.nvm"
@@ -122,5 +121,5 @@ jobs:
             npm install --legacy-peer-deps
             npm run migrate
             npm run build
-            pm2 restart flowbooks_api || pm2 start build/app.js --name=flowbooks_api
+            pm2 restart flowbooks || pm2 start build/app.js --name=flowbooks
             pm2 save

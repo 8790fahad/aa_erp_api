@@ -24,6 +24,21 @@ const getAccountEntriesVersionId =
 const { QueryTypes, Op, Sequelize } = require("sequelize");
 const { findAccountCategoryForFacility } = require("./accountCategory");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const {
+  fetchEnrichedSalesInvoices,
+  aggregateReceivableMetrics,
+  sumPaymentsReceivedInPeriod,
+  getDateRangeLast30Days,
+  getLocalDateStr,
+  startOfLocalDay,
+} = require("../services/salesInvoiceSettlement");
+const {
+  buildFinancialDashboardOverview,
+} = require("../services/financialDashboard");
+const {
+  recordActivity,
+  pickActor,
+} = require("../services/activityAuditService");
 
 exports.getAccountByCategory = (req, res) => {
   const { category } = req.params;
@@ -2817,6 +2832,22 @@ exports.applyAdvanceToBill = async (req, res) => {
 
     await t.commit();
 
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req) || invoice.created_by || invoice.user_id,
+      action: "apply",
+      entityType: "supplier_advance",
+      entityId: invoice_ref,
+      entityLabel: supplier.supplier_name || supplierNo,
+      after: {
+        invoice_ref,
+        settled_amount: settleAmount,
+        remaining_payable: Math.max(0, remaining - settleAmount),
+        supplier_number: supplierNo,
+      },
+      remark: `Advance applied to ${invoice_ref}`,
+    });
+
     return res.json({
       success: true,
       message: `Advance of ₦${settleAmount.toLocaleString()} successfully applied to ${invoice_ref}`,
@@ -2858,6 +2889,9 @@ exports.updatePRStatus = async (req, res) => {
           message: `Invalid status. Allowed: ${allowed.join(", ")}`,
         });
     }
+    const existing = await db.PurchaseRequisition.findOne({
+      where: { pr_no, facilityId },
+    });
     const [updated] = await db.PurchaseRequisition.update(
       { status },
       { where: { pr_no, facilityId } },
@@ -2867,6 +2901,17 @@ exports.updatePRStatus = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Purchase requisition not found" });
     }
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req),
+      action: "status_change",
+      entityType: "purchase_requisition",
+      entityId: pr_no,
+      entityLabel: pr_no,
+      before: { status: existing?.status },
+      after: { status },
+      remark: `PR status updated to ${status}`,
+    });
     return res.json({
       success: true,
       message: `PR ${pr_no} status updated to ${status}`,
@@ -5452,13 +5497,31 @@ exports.nurmberGenerator = (req, res) => {
     .catch((err) => res.json({ success: false, err }));
 };
 
-exports.deleteExpenses = (req, res) => {
+exports.deleteExpenses = async (req, res) => {
   const { id } = req.params;
-  const stmt = `DELETE FROM expense WHERE  id="${id}"`;
-  db.sequelize
-    .query(stmt)
-    .then((results) => res.json({ success: true }))
-    .catch((err) => res.status(500).json({ err }));
+  try {
+    const rows = await db.sequelize.query(
+      `SELECT id, request_no, amount, facilityId, status FROM expense WHERE id = :id LIMIT 1`,
+      { replacements: { id }, type: db.sequelize.QueryTypes.SELECT },
+    );
+    const before = rows[0] || { id };
+    await db.sequelize.query(`DELETE FROM expense WHERE id = :id`, {
+      replacements: { id },
+    });
+    await recordActivity({
+      facilityId: before.facilityId || req.body?.facilityId || "unknown",
+      userId: pickActor(req),
+      action: "delete",
+      entityType: "expense",
+      entityId: id,
+      entityLabel: before.request_no || String(id),
+      before,
+      remark: "Expense deleted",
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ err });
+  }
 };
 
 exports.sendTo = (req, res) => {
@@ -6189,62 +6252,71 @@ exports.insertMemo = async (req, res) => {
       try {
         console.log("Generating memo with code:", newCode);
 
-        // Insert memo using the updated stored procedure
+        const memoStatus =
+          String(query_type || "").toLowerCase() === "update_insert"
+            ? "reviewed"
+            : "pending";
+
+        // Direct SQL — no stored procedure
         await db.sequelize.query(
-          `CALL insertMemo(
-            :query_type,
-            :from_name,
-            :date,
-            :purpose,
-            :memo_id,
-            :amount,
-            :remark,
-            :facilityId,
-            :raise_by,
-            :user_id,
-            :subject,
-            :details,
-            :recipient,
-            :description,
-            :total,
-            :pr_no,
-            :reference_number,
-            :status,
-            :priority,
-            :supplier_name,
-            :supplier_code,
-            :account_code,
-            :supplier_number
+          `INSERT INTO memo (
+            from_name, date, purpose, memo_id, amount, remark, status,
+            facilityId, raise_by, user_id, subject, details, recipient,
+            description, supplier_name, supplier_number, supplier_code,
+            account_code, total, reference_number, pr_no, priority
+          ) VALUES (
+            :from_name, :date, :purpose, :memo_id, :amount, :remark, :status,
+            :facilityId, :raise_by, :user_id, :subject, :details, :recipient,
+            :description, :supplier_name, :supplier_number, :supplier_code,
+            :account_code, :total, :reference_number, :pr_no, :priority
           )`,
           {
             replacements: {
-              query_type,
               from_name,
-              date,
+              date: date || moment().format("YYYY-MM-DD"),
               purpose,
               memo_id: newCode,
-              amount,
-              remark,
+              amount: parseFloat(amount) || 0,
+              remark: remark || "",
+              status: memoStatus,
               facilityId,
               raise_by,
-              priority: priority ? priority : "Medium",
               user_id,
               subject,
-              details,
-              recipient,
-              description,
-              total,
-              pr_no,
-              reference_number: reference_number || "",
-              status,
+              details: details || purpose || "",
+              recipient: recipient || "Managing Director",
+              description: description || "",
               supplier_name: supplier_name || "",
+              supplier_number: supplier_number || "",
               supplier_code: supplier_code || "",
               account_code: account_code || "",
-              supplier_number: supplier_number || "",
+              total: parseFloat(total) || 0,
+              reference_number: reference_number || "",
+              pr_no: pr_no || null,
+              priority: priority || "Medium",
             },
             transaction,
           },
         );
+
+        if (pr_no) {
+          await db.sequelize.query(
+            `UPDATE purchase_requisition
+             SET memo_id = :memo_id,
+                 amount = IFNULL(amount, 0) + IFNULL(:amount, 0)
+             WHERE pr_no COLLATE utf8mb4_unicode_ci = :pr_no
+               AND facilityId COLLATE utf8mb4_unicode_ci = :facilityId`,
+            {
+              replacements: {
+                memo_id: newCode,
+                amount: parseFloat(amount) || 0,
+                pr_no,
+                facilityId,
+              },
+              transaction,
+            },
+          );
+        }
 
         // Insert expenses
         if (expenses && expenses.length > 0) {
@@ -7290,80 +7362,225 @@ exports.getAllProductionsByStore = async (req, res) => {
   }
 };
 
-exports.getMemos = (req, res) => {
-  console.log(req.body);
-  const { facilityId, status, userId, query_type, memo_id } = req.params;
-  db.sequelize
-    .query(
-      `call getMemoList(:facilityId,:status,:query_type,:userId,:memo_id)`,
-      {
-        replacements: {
-          facilityId: facilityId,
-          status,
-          userId,
-          query_type,
-          memo_id: 0,
-        },
-      },
-    )
-    .then((results) => {
-      res.json({ success: true, results: results });
-    })
-    .catch((err) => {
-      console.log(err);
-      res.status(404).json({ success: false, err });
-      // res.status(500).json({ success: false, err });
+/**
+ * Memo list without stored procedures (avoids collation errors from getMemoList).
+ * Mirrors former getMemoList query_type branches.
+ */
+async function fetchMemoList({
+  facilityId,
+  status = "all",
+  query_type = "list",
+  userId = "",
+  memo_id = "0",
+} = {}) {
+  const qt = String(query_type || "list").trim();
+  const replacements = {
+    facilityId,
+    status: status || "all",
+    userId: userId || "",
+    memo_id: memo_id && String(memo_id) !== "0" ? String(memo_id) : null,
+  };
+
+  let sql;
+  switch (qt) {
+    case "voucher":
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND status IN ('approved', 'Pv Generated')
+        ORDER BY date DESC`;
+      break;
+    case "re_list":
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND status = 'reviewed'
+        ORDER BY date DESC`;
+      break;
+    case "closed":
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND status = 'closed'
+        ORDER BY date DESC`;
+      break;
+    case "list_by_id":
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND (:status = 'all' OR status = :status)
+          AND memo_id COLLATE utf8mb4_unicode_ci = :memo_id
+        ORDER BY date DESC`;
+      break;
+    case "others":
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND status IN ('pending', 'Rejected')
+          AND user_id COLLATE utf8mb4_unicode_ci = :userId
+        ORDER BY date DESC`;
+      break;
+    case "initial":
+      sql = `
+        SELECT m.*,
+               (
+                 SELECT l.remark
+                 FROM logs l
+                 WHERE l.status = 'returned'
+                   AND l.id_link COLLATE utf8mb4_unicode_ci = m.memo_id COLLATE utf8mb4_unicode_ci
+                 LIMIT 1
+               ) AS last_return_remark
+        FROM memo m
+        WHERE m.facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND m.status IN ('pending', 'returned')
+          AND m.user_id COLLATE utf8mb4_unicode_ci = :userId
+        ORDER BY m.date DESC`;
+      break;
+    case "review":
+      sql = `
+        SELECT m.*,
+               (
+                 SELECT l.remark
+                 FROM logs l
+                 WHERE l.status = 'rejected'
+                   AND l.id_link COLLATE utf8mb4_unicode_ci = m.memo_id COLLATE utf8mb4_unicode_ci
+                 LIMIT 1
+               ) AS last_return_remark
+        FROM memo m
+        WHERE m.facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND (IFNULL(m.total, 0) - IFNULL(m.amount, 0)) > 0
+          AND m.status IN ('pending', 'rejected', 'Part Payment')
+        ORDER BY m.date DESC`;
+      break;
+    case "list":
+    default:
+      sql = `
+        SELECT *
+        FROM memo
+        WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+          AND (:status = 'all' OR status = :status)
+        ORDER BY date DESC`;
+      break;
+  }
+
+  return db.sequelize.query(sql, {
+    replacements,
+    type: QueryTypes.SELECT,
+  });
+}
+
+exports.getMemos = async (req, res) => {
+  try {
+    const { facilityId, status, userId, query_type } = req.params;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    const results = await fetchMemoList({
+      facilityId,
+      status,
+      userId,
+      query_type,
+      memo_id: "0",
     });
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("getMemos:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch memos",
+      err: err.message,
+    });
+  }
 };
 
-exports.getVoucherMemos = (req, res) => {
-  const { facilityId, status } = req.params;
-  const { dateFrom, dateTo } = req.query;
+exports.getVoucherMemos = async (req, res) => {
+  try {
+    const { facilityId, status } = req.params;
+    const { dateFrom, dateTo } = req.query;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
 
-  db.sequelize
-    .query(
-      `CALL getMemoVoucherList(:facilityId, :status, :dateFrom, :dateTo)`,
-      {
-        replacements: {
-          facilityId,
-          status,
-          dateFrom: dateFrom || null,
-          dateTo: dateTo || null,
-        },
-      },
-    )
-    .then((results) => {
-      res.json({ success: true, results });
-    })
-    .catch((err) => {
-      console.error(err);
-      res.status(500).json({ success: false, err });
+    const replacements = {
+      facilityId,
+      status: status || "approved",
+      dateFrom: dateFrom || null,
+      dateTo: dateTo || null,
+    };
+
+    let sql = `
+      SELECT *
+      FROM memo
+      WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+        AND status IN ('approved', 'Pv Generated')`;
+    if (dateFrom && dateTo) {
+      sql += ` AND date BETWEEN :dateFrom AND :dateTo`;
+    } else if (dateFrom) {
+      sql += ` AND date >= :dateFrom`;
+    } else if (dateTo) {
+      sql += ` AND date <= :dateTo`;
+    }
+    sql += ` ORDER BY date DESC`;
+
+    const results = await db.sequelize.query(sql, {
+      replacements,
+      type: QueryTypes.SELECT,
     });
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("getVoucherMemos:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch voucher memos",
+      err: err.message,
+    });
+  }
 };
 
-exports.getMemosByID = (req, res) => {
-  console.log(req.body, "req.body --------------------------------");
+exports.getMemosByID = async (req, res) => {
+  try {
+    const {
+      facilityId = "",
+      status = "",
+      userId = "",
+      query_type = "",
+      memo_id = "",
+    } = req.body;
 
-  const {
-    facilityId = "",
-    status = "",
-    userId = "",
-    query_type = "",
-    memo_id = "",
-  } = req.body;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
 
-  db.sequelize
-    .query(
-      `CALL getMemoList(:facilityId, :status, :query_type, :userId, :memo_id)`,
-      {
-        replacements: { facilityId, status, userId, query_type, memo_id },
-      },
-    )
-    .then((results) => res.json({ success: true, results }))
-    .catch((err) => {
-      console.error(err);
-      res.status(500).json({ success: false, err });
+    const results = await fetchMemoList({
+      facilityId,
+      status,
+      userId,
+      query_type: query_type || "list_by_id",
+      memo_id,
     });
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("getMemosByID:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch memo",
+      err: err.message,
+    });
+  }
 };
 export const getMemoDataById = async (req, res) => {
   try {
@@ -8255,6 +8472,7 @@ WHERE se.branch_name in ("Finished Good","Resalable") and p.item_type in ("Finis
 exports.getReadyForSalesItems = async (req, res) => {
   try {
     const { facilityId } = req.params;
+    const { attachSalesLimitInfo } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8266,35 +8484,61 @@ exports.getReadyForSalesItems = async (req, res) => {
 
     const balanceCondition = allowSalesWithoutStock
       ? ""
-      : "WHERE `balance` > 0";
+      : "WHERE sd.`balance` > 0";
 
+    // All sales-floor stock for the facility — no branch filter.
+    // Same SKU appears once per branchId with its own balance.
     const query = `
       SELECT
-        \`sku\`,
-        \`item_name\`,
-        \`uom_category\`,
-        \`uom\`,
-        \`product_id\`,
-        \`facilityId\`,
-        \`selling_price\`,
-        \`expiry_date\`,
-        \`multiplier_type\`,
-        \`multiplier_id\`,
-        \`balance\`,
-        \`unit_of_measure\`,
-        \`branch_name\`,
-        \`taxable\`,
-        CONCAT(\`product_id\`, '-', COALESCE(\`expiry_date\`, 'NULL'), '-', COALESCE(\`multiplier_id\`, 'NULL'), '-', \`selling_price\`) AS \`id\`
-      FROM \`sales_dep\`
-      ${balanceCondition ? balanceCondition + " AND" : "WHERE"} \`facilityId\` = :facilityId
-        AND (\`expiry_date\` IS NULL OR \`expiry_date\` >= CURDATE())
-      ORDER BY \`item_name\`, \`expiry_date\`
+        sd.\`sku\`,
+        sd.\`item_name\`,
+        sd.\`uom_category\`,
+        sd.\`uom\`,
+        sd.\`product_id\`,
+        sd.\`facilityId\`,
+        sd.\`branchId\`,
+        sd.\`selling_price\`,
+        sd.\`expiry_date\`,
+        sd.\`multiplier_type\`,
+        sd.\`multiplier_id\`,
+        sd.\`balance\`,
+        sd.\`unit_of_measure\`,
+        sd.\`branch_name\`,
+        sd.\`taxable\`,
+        p.\`daily_sales_limit\`,
+        p.\`weekly_sales_limit\`,
+        p.\`monthly_sales_limit\`,
+        b.\`branch_name\` AS \`location_name\`,
+        CONCAT(
+          sd.\`product_id\`, '-',
+          COALESCE(sd.\`expiry_date\`, 'NULL'), '-',
+          COALESCE(sd.\`multiplier_id\`, 'NULL'), '-',
+          sd.\`selling_price\`, '-',
+          COALESCE(sd.\`branchId\`, '0')
+        ) AS \`id\`
+      FROM \`sales_dep\` sd
+      LEFT JOIN \`products\` p
+        ON p.\`sku\` = sd.\`product_id\`
+        AND p.\`facility_id\` = sd.\`facilityId\`
+      LEFT JOIN \`branches\` b
+        ON b.\`id\` = sd.\`branchId\`
+        AND (b.\`facilityId\` = sd.\`facilityId\` OR b.\`facilityId\` IS NULL)
+      ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
+        AND sd.\`branchId\` IS NOT NULL
+        AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
+      ORDER BY
+        COALESCE(b.\`branch_name\`, ''),
+        sd.\`item_name\`,
+        sd.\`branchId\`,
+        sd.\`expiry_date\`
     `;
 
     const results = await db.sequelize.query(query, {
       replacements: { facilityId },
       type: db.Sequelize.QueryTypes.SELECT,
     });
+
+    await attachSalesLimitInfo(results, facilityId);
 
     res.json({ success: true, results });
   } catch (err) {
@@ -8307,6 +8551,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
   try {
     const { facilityId } = req.params;
     const { branchId } = req.query;
+    const { attachSalesLimitInfo } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8316,46 +8561,67 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 
     const allowSalesWithoutStock = business?.allow_sales_without_stock || false;
 
-    const balanceCondition = allowSalesWithoutStock
+    const balanceClause = allowSalesWithoutStock
       ? ""
-      : "WHERE `balance` > 0";
+      : "WHERE sd.`balance` > 0";
 
+    // Default: all branches, one row per (product, branch). Optional
+    // branchId query param still supported for callers that need it.
     let query = `
       SELECT
-        \`sku\`,
-        \`item_name\`,
-        \`uom_category\`,
-        \`uom\`,
-        \`product_id\`,
-        \`facilityId\`,
-        \`branchId\`,
-        \`selling_price\`,
-        \`expiry_date\`,
-        \`multiplier_type\`,
-        \`multiplier_id\`,
-        \`balance\`,
-        \`unit_of_measure\`,
-        \`branch_name\`,
-        \`taxable\`,
-        CONCAT(\`product_id\`, '-', COALESCE(\`expiry_date\`, 'NULL'), '-', COALESCE(\`multiplier_id\`, 'NULL'), '-', \`selling_price\`) AS \`id\`
-      FROM \`sales_dep\`
-      ${balanceCondition ? balanceCondition + " AND" : "WHERE"} \`facilityId\` = :facilityId
-        AND (\`expiry_date\` IS NULL OR \`expiry_date\` >= CURDATE())
+        sd.\`sku\`,
+        sd.\`item_name\`,
+        sd.\`uom_category\`,
+        sd.\`uom\`,
+        sd.\`product_id\`,
+        sd.\`facilityId\`,
+        sd.\`branchId\`,
+        sd.\`selling_price\`,
+        sd.\`expiry_date\`,
+        sd.\`multiplier_type\`,
+        sd.\`multiplier_id\`,
+        sd.\`balance\`,
+        sd.\`unit_of_measure\`,
+        sd.\`branch_name\`,
+        sd.\`taxable\`,
+        p.\`daily_sales_limit\`,
+        p.\`weekly_sales_limit\`,
+        p.\`monthly_sales_limit\`,
+        b.\`branch_name\` AS \`location_name\`,
+        CONCAT(
+          sd.\`product_id\`, '-',
+          COALESCE(sd.\`expiry_date\`, 'NULL'), '-',
+          COALESCE(sd.\`multiplier_id\`, 'NULL'), '-',
+          sd.\`selling_price\`, '-',
+          COALESCE(sd.\`branchId\`, '0')
+        ) AS \`id\`
+      FROM \`sales_dep\` sd
+      LEFT JOIN \`products\` p
+        ON p.\`sku\` = sd.\`product_id\`
+        AND p.\`facility_id\` = sd.\`facilityId\`
+      LEFT JOIN \`branches\` b
+        ON b.\`id\` = sd.\`branchId\`
+        AND (b.\`facilityId\` = sd.\`facilityId\` OR b.\`facilityId\` IS NULL)
+      ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
+        AND sd.\`branchId\` IS NOT NULL
+        AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
     `;
 
     const replacements = { facilityId };
 
     if (branchId && branchId !== "all") {
-      query += ` AND \`branchId\` = :branchId`;
+      query += ` AND sd.\`branchId\` = :branchId`;
       replacements.branchId = branchId;
     }
 
-    query += ` ORDER BY \`item_name\`, \`expiry_date\``;
+    query += ` ORDER BY COALESCE(b.\`branch_name\`, ''), sd.\`item_name\`, sd.\`branchId\`, sd.\`expiry_date\``;
 
     const results = await db.sequelize.query(query, {
       replacements,
       type: db.Sequelize.QueryTypes.SELECT,
     });
+
+    await attachSalesLimitInfo(results, facilityId);
 
     res.json({ success: true, results });
   } catch (err) {
@@ -8365,10 +8631,11 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 };
 
 // Get service products for sales
-exports.getServiceProducts = (req, res) => {
-  const { facilityId } = req.params;
-  db.sequelize
-    .query(
+exports.getServiceProducts = async (req, res) => {
+  try {
+    const { facilityId } = req.params;
+    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const results = await db.sequelize.query(
       `SELECT
     p.id,
     p.name AS item_name,
@@ -8382,6 +8649,9 @@ exports.getServiceProducts = (req, res) => {
     p.item_type,
     p.status,
     p.taxable,
+    p.daily_sales_limit,
+    p.weekly_sales_limit,
+    p.monthly_sales_limit,
     p.created_at,
     p.updated_at,
     'available' AS balance,
@@ -8393,18 +8663,16 @@ WHERE p.facility_id = :facilityId
     AND p.status = 'Active'
 ORDER BY p.name ASC;`,
       {
-        replacements: {
-          facilityId,
-        },
+        replacements: { facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
       },
-    )
-    .then((results) => {
-      res.json({ success: true, results: results[0] });
-    })
-    .catch((err) => {
-      console.log(err);
-      res.status(500).json({ err });
-    });
+    );
+    await attachSalesLimitInfo(results, facilityId);
+    res.json({ success: true, results });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ err: err.message || err });
+  }
 };
 
 // Update service product pricing
@@ -9499,13 +9767,43 @@ exports.updateDepreciationMethod = async (req, res) => {
       });
     }
 
-    const [updatedRowsCount] = await db.business.update(
-      { depreciation_method: decodedMethod },
-      {
-        where: { id: facilityId },
-        returning: true,
-      },
-    );
+    const updatePayload = { depreciation_method: decodedMethod };
+
+    // Optional auto-run settings (from body)
+    if (req.body && typeof req.body === "object") {
+      if (req.body.auto_depreciation_enabled !== undefined) {
+        updatePayload.auto_depreciation_enabled =
+          req.body.auto_depreciation_enabled === true ||
+          req.body.auto_depreciation_enabled === "true" ||
+          req.body.auto_depreciation_enabled === 1 ||
+          req.body.auto_depreciation_enabled === "1";
+      }
+      if (req.body.auto_depreciation_frequency) {
+        const freq = String(req.body.auto_depreciation_frequency).toLowerCase();
+        if (!["monthly", "quarterly", "yearly"].includes(freq)) {
+          return res.status(400).json({
+            success: false,
+            message: "auto_depreciation_frequency must be monthly, quarterly, or yearly",
+          });
+        }
+        updatePayload.auto_depreciation_frequency = freq;
+      }
+      if (req.body.auto_depreciation_day !== undefined) {
+        const day = parseInt(req.body.auto_depreciation_day, 10);
+        if (Number.isNaN(day) || day < 1 || day > 28) {
+          return res.status(400).json({
+            success: false,
+            message: "auto_depreciation_day must be between 1 and 28",
+          });
+        }
+        updatePayload.auto_depreciation_day = day;
+      }
+    }
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+      returning: true,
+    });
 
     if (updatedRowsCount === 0) {
       return res.status(404).json({
@@ -9533,6 +9831,10 @@ exports.updateDepreciationMethod = async (req, res) => {
         b.inv_ev_m,
         b.costing_method,
         b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
         m.access_to,
         m.functionalities
       FROM membership m
@@ -9547,7 +9849,7 @@ exports.updateDepreciationMethod = async (req, res) => {
     res.json({
       success: true,
       results: updatedBusiness[0] || updatedBusiness,
-      message: "Depreciation method updated successfully",
+      message: "Depreciation settings updated successfully",
     });
   } catch (err) {
     console.error("Error updating depreciation method:", err);
@@ -9558,6 +9860,187 @@ exports.updateDepreciationMethod = async (req, res) => {
         process.env.NODE_ENV === "development"
           ? err.message
           : "Something went wrong",
+    });
+  }
+};
+
+/**
+ * POST /account/update-invoice-closing/:facilityId/:user_id
+ * body: { invoice_closing_enabled, invoice_closing_time, invoice_closing_timezone? }
+ */
+exports.updateInvoiceClosingSettings = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const body = req.body || {};
+
+    const updatePayload = {};
+
+    if (body.invoice_closing_enabled !== undefined) {
+      updatePayload.invoice_closing_enabled =
+        body.invoice_closing_enabled === true ||
+        body.invoice_closing_enabled === "true" ||
+        body.invoice_closing_enabled === 1 ||
+        body.invoice_closing_enabled === "1";
+    }
+
+    if (body.invoice_closing_time !== undefined) {
+      const time = String(body.invoice_closing_time || "").trim();
+      if (!/^\d{1,2}:\d{2}$/.test(time)) {
+        return res.status(400).json({
+          success: false,
+          message: "invoice_closing_time must be HH:mm (e.g. 17:00)",
+        });
+      }
+      const [hRaw, mRaw] = time.split(":");
+      const h = Math.min(23, Math.max(0, parseInt(hRaw, 10)));
+      const m = Math.min(59, Math.max(0, parseInt(mRaw, 10)));
+      updatePayload.invoice_closing_time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    }
+
+    if (body.invoice_closing_timezone !== undefined) {
+      const tz = String(body.invoice_closing_timezone || "").trim();
+      if (tz.length < 3 || tz.length > 64) {
+        return res.status(400).json({
+          success: false,
+          message: "invoice_closing_timezone is invalid",
+        });
+      }
+      updatePayload.invoice_closing_timezone = tz;
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No invoice closing settings provided",
+      });
+    }
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+    });
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.id,
+        b.business_name,
+        b.business_type,
+        b.business_logo,
+        b.primary_color,
+        b.secondary_color,
+        b.business_phone,
+        b.prefix,
+        b.payable_code,
+        b.receivable_code,
+        b.cost_of_sale,
+        b.payable_accural_code,
+        b.receivable_accural_code,
+        b.sale_revenue_code,
+        b.inv_ev_m,
+        b.costing_method,
+        b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
+        b.invoice_closing_enabled,
+        b.invoice_closing_time,
+        b.invoice_closing_timezone,
+        b.invoice_closing_last_run,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Invoice closing time",
+      after: updatePayload,
+      remark: "Invoice payment validity / daily closing settings updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: "Invoice closing settings updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating invoice closing settings:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
+/**
+ * POST /account/run-invoice-closing/:facilityId
+ * Manual trigger for today's unpaid non-credit reverse (owner/admin).
+ */
+exports.runInvoiceClosingNow = async (req, res) => {
+  try {
+    const { facilityId } = req.params;
+    const userId = req.body?.userId || pickActor(req) || "manual";
+    if (!facilityId) {
+      return res.status(400).json({ success: false, message: "facilityId is required" });
+    }
+
+    const {
+      reverseUnpaidNonCreditInvoicesForFacility,
+      getNowPartsInTimezone,
+    } = require("../services/invoiceClosingService");
+
+    const business = await db.business.findByPk(facilityId);
+    if (!business) {
+      return res.status(404).json({ success: false, message: "Business not found" });
+    }
+
+    const summary = await reverseUnpaidNonCreditInvoicesForFacility({
+      facilityId,
+      userId,
+      reason:
+        req.body?.reason ||
+        `Manually reversed unpaid non-credit invoices after closing time ${business.invoice_closing_time || "17:00"}`,
+    });
+
+    const parts = getNowPartsInTimezone(
+      business.invoice_closing_timezone || "Africa/Lagos",
+    );
+    await db.business.update(
+      { invoice_closing_last_run: parts.date },
+      { where: { id: facilityId } },
+    );
+
+    return res.json({
+      success: true,
+      message: `Reversed ${summary.reversed} of ${summary.candidates} unpaid non-credit invoice(s)`,
+      data: summary,
+    });
+  } catch (err) {
+    console.error("runInvoiceClosingNow:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to run invoice closing",
     });
   }
 };
@@ -9633,7 +10116,7 @@ exports.updateDefaultValuationSource = async (req, res) => {
   }
 };
 
-/** Toggle: record Finished Good / Resalable / By-Product supplier-bill lines on sales branch (for sales) when purchasing stock. */
+/** Toggle: set selling_price on Finished Good / Resalable / By-Product supplier-bill stock-in (for sales zone). */
 exports.updatePriceSetupResalableOnPurchase = async (req, res) => {
   try {
     const { enabled, facilityId } = req.params;
@@ -10810,6 +11293,69 @@ exports.updateDocumentHeaderStyle = (req, res) => {
     });
 };
 
+exports.updateInvoiceNotes = (req, res) => {
+  const { businessId } = req.params;
+  const customer_notes =
+    req.body?.customer_notes !== undefined
+      ? String(req.body.customer_notes)
+      : undefined;
+  const terms_conditions =
+    req.body?.terms_conditions !== undefined
+      ? String(req.body.terms_conditions)
+      : undefined;
+
+  if (customer_notes === undefined && terms_conditions === undefined) {
+    return res.status(400).json({
+      success: false,
+      message: "customer_notes or terms_conditions is required",
+    });
+  }
+
+  const sets = [];
+  const replacements = { businessId };
+  if (customer_notes !== undefined) {
+    sets.push("customer_notes = :customer_notes");
+    replacements.customer_notes = customer_notes;
+  }
+  if (terms_conditions !== undefined) {
+    sets.push("terms_conditions = :terms_conditions");
+    replacements.terms_conditions = terms_conditions;
+  }
+
+  db.sequelize
+    .query(
+      `UPDATE business SET ${sets.join(", ")} WHERE id = :businessId`,
+      {
+        replacements,
+        type: db.Sequelize.QueryTypes.UPDATE,
+      },
+    )
+    .then(([rowsUpdated]) => {
+      if (rowsUpdated === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "No business found with that ID",
+        });
+      }
+      res.json({
+        success: true,
+        message: "Invoice notes updated successfully",
+        results: {
+          ...(customer_notes !== undefined ? { customer_notes } : {}),
+          ...(terms_conditions !== undefined ? { terms_conditions } : {}),
+        },
+      });
+    })
+    .catch((err) => {
+      console.error("Error updating invoice notes:", err);
+      res.status(500).json({
+        success: false,
+        message: "Server error. Could not update invoice notes.",
+        err: err.message,
+      });
+    });
+};
+
 exports.updateDashboardWidgets = (req, res) => {
   const { businessId } = req.params;
   const { dashboard_widgets } = req.body;
@@ -11073,144 +11619,267 @@ exports.getRequisitionSummary = (req, res) => {
     });
 };
 
-// call add_purchase_order(10,'2021-09-01','','','',4800,
-//           'finished purchase','2df2af55-9f1c-468d-9b27-29da38e3473b','-','0',0,45,
-//           '1-7179027288943b6309f3443696a84f86')
-// Executing (default): call add_purchase_order_list(0, 'Bua spaghetti','',
-//               0,'3000','4800',14400000,'',
-//               10,'','update','2df2af55-9f1c-468d-9b27-29da38e3473b','2021-09-01','new order','','0',
-//               '','false','','f02fd9e7-8e8a-4cca-86b6-fe5c9a6db16f','',
-//                 '','','')
+/**
+ * Purchase requisition queries — direct SQL/ORM (no stored procedure).
+ */
+async function runPurchaseRequisitionQuery({
+  query_type = "",
+  branch = "",
+  branch_id = "",
+  date = null,
+  reason = "",
+  facilityId,
+  requisitor = "",
+  user_id = "",
+  supplier_name = "",
+  supplier_code = "",
+  total = null,
+  pr_no = "",
+  po_no = "",
+  account_code = "",
+  transaction = null,
+}) {
+  const qt = String(query_type || "").trim();
+  const opts = transaction ? { transaction } : {};
 
-exports.getRequisition = (req, res) => {
+  if (qt === "insert") {
+    await db.PurchaseRequisition.create(
+      {
+        pr_no,
+        po_no: po_no || null,
+        branch: branch || "",
+        branch_id: branch_id || null,
+        date: date || moment().format("YYYY-MM-DD"),
+        reason: reason || null,
+        facilityId,
+        requisitor: requisitor || "",
+        user_id: user_id || "",
+        supplier_name: supplier_name || null,
+        supplier_code: supplier_code || null,
+        total: total != null ? total : 0,
+        amount: 0,
+        status: "Pending",
+        account_code: account_code || "",
+        created_at: new Date(),
+      },
+      opts,
+    );
+    return [{ pr_no, status: "Pending" }];
+  }
+
+  if (qt === "select" || qt === "select-pending") {
+    const rows = await db.PurchaseRequisition.findAll({
+      where: { facilityId, status: "Pending" },
+      order: [
+        ["date", "DESC"],
+        ["created_at", "DESC"],
+      ],
+      ...opts,
+      raw: true,
+    });
+    return rows;
+  }
+
+  if (qt === "select-history" || qt === "select-all") {
+    const rows = await db.PurchaseRequisition.findAll({
+      where: { facilityId },
+      order: [
+        ["date", "DESC"],
+        ["created_at", "DESC"],
+      ],
+      ...opts,
+      raw: true,
+    });
+    return rows;
+  }
+
+  if (qt === "select-approved") {
+    const rows = await db.PurchaseRequisition.findAll({
+      where: {
+        facilityId,
+        status: { [Op.in]: ["Approved", "Pending Payment"] },
+      },
+      order: [
+        ["date", "DESC"],
+        ["created_at", "DESC"],
+      ],
+      ...opts,
+      raw: true,
+    });
+    return rows;
+  }
+
+  if (qt === "select-grn") {
+    const rows = await db.PurchaseRequisition.findAll({
+      where: { facilityId, status: "Approved" },
+      order: [
+        ["date", "DESC"],
+        ["created_at", "DESC"],
+      ],
+      ...opts,
+      raw: true,
+    });
+    return rows;
+  }
+
+  if (qt === "select-pending-payment") {
+    const rows = await db.sequelize.query(
+      `SELECT *
+       FROM purchase_requisition
+       WHERE facilityId = :facilityId
+         AND status = 'Pending Payment'
+         AND IFNULL(total, 0) - IFNULL(amount, 0) > 0
+       ORDER BY date DESC, created_at DESC`,
+      {
+        replacements: { facilityId },
+        type: QueryTypes.SELECT,
+        ...opts,
+      },
+    );
+    return rows;
+  }
+
+  if (qt === "select-individual" || qt === "select-pr") {
+    const where =
+      qt === "select-individual"
+        ? { facilityId, pr_no }
+        : { pr_no };
+    const rows = await db.PurchaseRequisition.findAll({
+      where,
+      ...opts,
+      raw: true,
+    });
+    return rows;
+  }
+
+  if (qt === "select-exp") {
+    // Explicit COLLATE avoids utf8mb4_general_ci vs unicode_ci join errors
+    const rows = await db.sequelize.query(
+      `SELECT
+         a.item_code,
+         COALESCE(b.name, a.item_name) AS item_name,
+         b.inventory_account,
+         a.unit_measure,
+         a.quantity,
+         a.approved_qty,
+         a.id,
+         a.est_cost,
+         a.unit_category,
+         a.chart_code,
+         b.unit_of_measure AS uom,
+         b.cogs_head,
+         b.revenue_account
+       FROM requisition_details a
+       LEFT JOIN products b
+         ON a.item_code COLLATE utf8mb4_unicode_ci = b.sku COLLATE utf8mb4_unicode_ci
+        AND (
+          b.facility_id IS NULL
+          OR a.facilityId COLLATE utf8mb4_unicode_ci = b.facility_id COLLATE utf8mb4_unicode_ci
+        )
+       WHERE a.pr_no COLLATE utf8mb4_unicode_ci = :pr_no COLLATE utf8mb4_unicode_ci
+         AND (
+           :facilityId = ''
+           OR a.facilityId COLLATE utf8mb4_unicode_ci = :facilityId COLLATE utf8mb4_unicode_ci
+         )
+       ORDER BY a.id ASC`,
+      {
+        replacements: { pr_no, facilityId: facilityId || "" },
+        type: QueryTypes.SELECT,
+        ...opts,
+      },
+    );
+    return rows;
+  }
+
+  if (qt === "update") {
+    await db.PurchaseRequisition.update(
+      { status: "Approved", po_no: po_no || null },
+      { where: { pr_no }, ...opts },
+    );
+    return [{ pr_no, status: "Approved", po_no }];
+  }
+
+  if (qt === "update-pending") {
+    await db.PurchaseRequisition.update(
+      { status: "Pending Payment", po_no: po_no || null },
+      { where: { pr_no }, ...opts },
+    );
+    return [{ pr_no, status: "Pending Payment", po_no }];
+  }
+
+  throw new Error(`Unsupported purchase requisition query_type: ${qt || "(empty)"}`);
+}
+
+exports.getRequisition = async (req, res) => {
   const {
-    prefix,
     branch = "",
     branch_id = "",
     date = null,
-    busName = "",
-    totalExpenses = 0,
     reason = "",
     requisitor = "",
     user_id = "",
     facilityId,
     supplier_name = "",
     supplier_code = "",
-    description = "",
     query_type = "",
     total = null,
     pr_no = "",
-    expenses = [],
     po_no = "",
     account_code = "",
   } = req.body;
-  console.log(req.body, "=====================>req.body");
-  // console.log("Request body: ", req.body);
 
-  db.sequelize
-    .query(
-      `call purchaseRequisition(:query_type,:branch,:branch_id,:date,:reason,:facilityId,:requisitor,:user_id,:supplier_name,:supplier_code,:total,:pr_no,:po_no,:account_code)`,
-      {
-        replacements: {
-          query_type,
-          branch,
-          branch_id,
-          date,
-          reason,
-          facilityId,
-          requisitor,
-          user_id,
-          supplier_name,
-          supplier_code,
-          total,
-          pr_no: pr_no,
-          po_no: po_no,
-          account_code,
-        },
-      },
-    )
-    .then((results) => {
-      // Insert expenses into the expenses table
-      // if (expenses && expenses.length > 0) {
-      //   const expensePromises = expenses.map((expense) => {
-      //     return db.sequelize.query(
-      //       `INSERT INTO requisition_details (pr_no, item_code, chart_code, item_name, est_cost, unit_category, unit_measure, quantity) VALUES (:pr_no, :item_code, :chart_code, :item_name, :estCost, :unit_category, :unit_measure, :quantity)`,
-      //       {
-      //         replacements: {
-      //           pr_no: newCode,
-      //           item_code: expense.item_code,
-      //           chart_code: expense.chart_code,
-      //           item_name: expense.item,
-      //           estCost: expense.estCost || 0,
-      //           unit_category: expense.category,
-      //           unit_measure: expense.unit,
-      //           quantity: expense.quantity,
-      //         },
-      //       }
-      //     );
-      //   });
-
-      //   Promise.all(expensePromises)
-      //     .then(() => {
-      //       numberGeneratorUpdate(
-      //         { query_type: "pr", in_number: _code },
-      //         (rev) => {
-      //           res.json({
-      //             success: true,
-      //             results: results,
-      //             rev,
-      //             message: "Requisition and expenses added successfully",
-      //           });
-      //         }
-      //       );
-      //     })
-      //     .catch((err) => {
-      //       console.log(err);
-      //       res.status(500).json({
-      //         success: false,
-      //         err,
-      //         message: "Error while trying to add expenses",
-      //       });
-      //     });
-      // } else {
-      //   numberGeneratorUpdate(
-      //     { query_type: "pr", in_number: _code, facilityId },
-      //     (rev) => {
-      res.json({
-        success: true,
-        results: results,
-        // rev,
-        message: "Requisition fetched successfully",
-      });
-      //     }
-      //   );
-      // }
-    })
-    .catch((err) => {
-      console.log(err);
-      res.status(500).json({
+  try {
+    if (!facilityId && !["select-exp", "select-pr"].includes(String(query_type))) {
+      return res.status(400).json({
         success: false,
-        err,
-        message: "Error while trying to add requisition",
+        message: "facilityId is required",
       });
+    }
+
+    const results = await runPurchaseRequisitionQuery({
+      query_type,
+      branch,
+      branch_id,
+      date,
+      reason,
+      facilityId,
+      requisitor,
+      user_id,
+      supplier_name,
+      supplier_code,
+      total,
+      pr_no,
+      po_no,
+      account_code,
     });
+
+    return res.json({
+      success: true,
+      results,
+      message: "Requisition fetched successfully",
+    });
+  } catch (err) {
+    console.error("getRequisition:", err);
+    return res.status(500).json({
+      success: false,
+      err: err.message,
+      message: err.message || "Error while trying to fetch requisition",
+    });
+  }
 };
+
 exports.insertRequisition = async (req, res) => {
   const {
-    prefix,
     branch = "",
     branch_id = "",
     date = null,
-    busName = "",
-    totalExpenses = 0,
     reason = "",
     requisitor = "",
     user_id = "",
     facilityId,
     supplier_name = "",
     supplier_code = "",
-    description = "",
-    query_type = "",
+    query_type = "insert",
     total = null,
     pr_no = "",
     expenses = [],
@@ -11218,78 +11887,87 @@ exports.insertRequisition = async (req, res) => {
     account_code = "",
   } = req.body;
 
-  // Start a transaction
   const transaction = await db.sequelize.transaction();
 
   try {
-    // Get the next PR number
-    let code = await getAndUpdateNumber("pr", facilityId);
-    let newCode = `PR/${moment().format("YY")}/${code}`;
+    if (!facilityId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
 
-    // Insert the main requisition record
-    const requisitionResult = await db.sequelize.query(
-      `call purchaseRequisition(:query_type,:branch,:branch_id,:date,:reason,:facilityId,:requisitor,:user_id,:supplier_name,:supplier_code,:total,:pr_no,:po_no,:account_code)`,
-      {
-        replacements: {
-          query_type,
-          branch,
-          branch_id,
-          date,
-          reason,
-          facilityId,
-          requisitor,
-          user_id,
-          supplier_name,
-          supplier_code,
-          total,
-          pr_no: pr_no || newCode,
-          po_no: po_no,
-          account_code,
-        },
-        transaction,
-        type: QueryTypes.RAW,
-      },
-    );
+    const code = await getAndUpdateNumber("pr", facilityId);
+    const newCode = pr_no || `PR/${moment().format("YY")}/${code}`;
 
-    // Insert expenses into the requisition_details table
+    const requisitionResult = await runPurchaseRequisitionQuery({
+      query_type: query_type || "insert",
+      branch,
+      branch_id,
+      date: date || moment().format("YYYY-MM-DD"),
+      reason,
+      facilityId,
+      requisitor,
+      user_id,
+      supplier_name,
+      supplier_code,
+      total,
+      pr_no: newCode,
+      po_no,
+      account_code: account_code || "",
+      transaction,
+    });
+
     if (expenses && expenses.length > 0) {
       for (const expense of expenses) {
-        await db.sequelize.query(
-          `INSERT INTO requisition_details (facilityId, pr_no, item_code, chart_code, item_name, est_cost, unit_category, unit_measure, quantity) VALUES (:facilityId, :pr_no, :item_code, :chart_code, :item_name, :estCost, :unit_category, :unit_measure, :quantity)`,
+        await db.RequisitionDetail.create(
           {
-            replacements: {
-              facilityId,
-              pr_no: newCode,
-              item_code: expense.item_code,
-              chart_code: expense.chart_code,
-              item_name: expense.item,
-              estCost: expense.estCost || 0,
-              unit_category: expense.category,
-              unit_measure: expense.unit,
-              quantity: expense.quantity,
-            },
-            transaction,
-            type: QueryTypes.INSERT,
+            facilityId,
+            pr_no: newCode,
+            item_code: expense.item_code || expense.code || "",
+            chart_code: expense.chart_code || "",
+            item_name: expense.item || expense.item_name || "",
+            est_cost: expense.estCost || expense.est_cost || 0,
+            unit_category: expense.category || expense.unit_category || "",
+            unit_measure: expense.unit || expense.unit_measure || expense.uom || "",
+            quantity: expense.quantity || 0,
+            created_at: new Date(),
           },
+          { transaction },
         );
       }
     }
 
-    // Commit the transaction
     await transaction.commit();
 
-    res.json({
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req) || user_id || requisitor,
+      action: "create",
+      entityType: "purchase_requisition",
+      entityId: newCode,
+      entityLabel: newCode,
+      after: {
+        pr_no: newCode,
+        supplier_code,
+        total,
+        reason,
+        line_count: expenses?.length || 0,
+      },
+      remark: reason || "Purchase requisition created",
+    });
+
+    return res.json({
       success: true,
       results: requisitionResult,
       pr_no: newCode,
       message: "Requisition created successfully",
     });
   } catch (error) {
-    // Rollback the transaction in case of error
     await transaction.rollback();
-
     console.error("Error creating requisition:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error.message,
       message: "Error while trying to create requisition",
@@ -11297,109 +11975,109 @@ exports.insertRequisition = async (req, res) => {
   }
 };
 
-exports.updateRequisition = (req, res) => {
+exports.updateRequisition = async (req, res) => {
   const {
-    prefix,
     branch = "",
     branch_id = "",
     date = null,
-    busName = "",
-    totalExpenses = 0,
     reason = "",
     requisitor = "",
     user_id = "",
     facilityId,
     supplier_name = "",
     supplier_code = "",
-    description = "",
     query_type = "",
     total = null,
     pr_no = "",
-    expenses = [],
     account_code = "",
     items = [],
   } = req.body;
 
-  // console.log("Request body: ", req.body);
-  numberGenerator({ query_type: "po" }, (rev) => {
-    let code = rev[0].po_id;
-    let _code = code;
-    console.log(code);
-    let newCode = `PO/${moment().format("YY")}/${code}`;
-    const qt = query_type;
-    db.sequelize
-      .query(
-        `call purchaseRequisition(:query_type,:branch,:branch_id,:date,:reason,:facilityId,:requisitor,:user_id,:supplier_name,:supplier_code,:total,:pr_no,:po_no,:account_code)`,
-        {
-          replacements: {
-            query_type,
-            branch,
-            branch_id,
-            date,
-            reason,
-            facilityId,
-            requisitor,
-            user_id,
-            supplier_name,
-            supplier_code,
-            total,
-            pr_no: pr_no,
-            po_no: newCode,
-            account_code: "",
-          },
-        },
-      )
-      .then(async (results) => {
-        if (Array.isArray(items) && items.length > 0 && pr_no && facilityId) {
-          for (const item of items) {
-            const approvedQty = parseFloat(item.approved_qty);
-            if (!Number.isFinite(approvedQty)) continue;
-
-            const replacements = {
-              approved_qty: approvedQty,
-              pr_no,
-              facilityId,
-            };
-            let whereClause = "pr_no = :pr_no AND facilityId = :facilityId";
-
-            if (item.id) {
-              whereClause += " AND id = :id";
-              replacements.id = item.id;
-            } else if (item.item_code) {
-              whereClause += " AND item_code = :item_code";
-              replacements.item_code = item.item_code;
-            } else {
-              continue;
-            }
-
-            await db.sequelize.query(
-              `UPDATE requisition_details SET approved_qty = :approved_qty WHERE ${whereClause}`,
-              { replacements },
-            );
-          }
-        }
-
-        numberGeneratorUpdate({ query_type: "pr", in_number: _code }, (rev) => {
-          res.json({
-            success: true,
-            results: results,
-            rev,
-            message:
-              qt === "select"
-                ? "Requisition fetched successfully"
-                : "Requisition added successfully",
-          });
-        });
-      })
-      .catch((err) => {
-        console.log(err);
-        res.status(500).json({
-          success: false,
-          err,
-          message: "Error while trying to add requisition",
-        });
+  try {
+    if (!pr_no) {
+      return res.status(400).json({
+        success: false,
+        message: "pr_no is required",
       });
-  });
+    }
+
+    let newCode = "";
+    if (query_type === "update" || query_type === "update-pending") {
+      const code = await getAndUpdateNumber("po", facilityId);
+      newCode = `PO/${moment().format("YY")}/${code}`;
+    }
+
+    const results = await runPurchaseRequisitionQuery({
+      query_type,
+      branch,
+      branch_id,
+      date,
+      reason,
+      facilityId,
+      requisitor,
+      user_id,
+      supplier_name,
+      supplier_code,
+      total,
+      pr_no,
+      po_no: newCode,
+      account_code: account_code || "",
+    });
+
+    if (Array.isArray(items) && items.length > 0 && pr_no && facilityId) {
+      for (const item of items) {
+        const approvedQty = parseFloat(item.approved_qty);
+        if (!Number.isFinite(approvedQty)) continue;
+
+        const where = { pr_no, facilityId };
+        if (item.id) where.id = item.id;
+        else if (item.item_code) where.item_code = item.item_code;
+        else continue;
+
+        await db.RequisitionDetail.update(
+          { approved_qty: approvedQty },
+          { where },
+        );
+      }
+    }
+
+    if (query_type !== "select") {
+      await recordActivity({
+        facilityId,
+        userId: pickActor(req) || user_id || requisitor,
+        action: "update",
+        entityType: "purchase_requisition",
+        entityId: pr_no,
+        entityLabel: pr_no,
+        after: {
+          pr_no,
+          po_no: newCode || undefined,
+          query_type,
+          supplier_code,
+          total,
+          status: query_type,
+        },
+        remark: "Purchase requisition updated",
+      });
+    }
+
+    return res.json({
+      success: true,
+      results,
+      po_no: newCode || undefined,
+      message:
+        query_type === "select"
+          ? "Requisition fetched successfully"
+          : "Requisition updated successfully",
+    });
+  } catch (err) {
+    console.error("updateRequisition:", err);
+    return res.status(500).json({
+      success: false,
+      err: err.message,
+      message: "Error while trying to update requisition",
+    });
+  }
 };
 
 exports.generateGoodReceive1 = async (req, res) => {
@@ -12095,8 +12773,8 @@ exports.directPurchaseConsumables = async (req, res) => {
     const vatPolicy = business?.vat_policy || "vat_exclusive";
     const priceSetupResalableOnPurchase =
       !!business?.price_setup_resalable_on_purchase;
-    /** Supplier bill → `for sales` store row when setting is on (matches product master item_type). */
-    const salesBranchPriceSetupItemTypes = new Set([
+    /** Sellable product types land in the sales floor zone (`for sales`). */
+    const salesFloorItemTypes = new Set([
       "Resalable",
       "Finished Good",
       "By-Product",
@@ -12112,7 +12790,7 @@ exports.directPurchaseConsumables = async (req, res) => {
     const ledgerEntries = [];
     const storeEntryPromises = [];
 
-    // branchId comes directly from the frontend (integer)
+    // branchId = physical warehouse/location from the frontend; branch_name = store zone
     const targetBranchId = parseInt(target_branch_id, 10) || 0;
 
     // === PARSE TAX AMOUNT ===
@@ -12201,6 +12879,23 @@ exports.directPurchaseConsumables = async (req, res) => {
       });
 
       // === 1. Store Entry (Stock In) ===
+      // Physical location = selected warehouse (branchId). Sellable goods use
+      // zone `for sales` so they appear in Make Sale / sales_dep immediately.
+      const isSalesFloorItem = salesFloorItemTypes.has(product.item_type);
+      const storeZone = isSalesFloorItem
+        ? SALES_STORE_BRANCH_NAME
+        : target_department || product.item_type || "Main Warehouse";
+      const storeDestination = isSalesFloorItem
+        ? "Sales"
+        : target_department || "Main Warehouse";
+
+      let salesSellingPrice = null;
+      if (priceSetupResalableOnPurchase && isSalesFloorItem) {
+        const fromMaster = parseFloat(product.selling_price);
+        salesSellingPrice =
+          Number.isFinite(fromMaster) && fromMaster > 0 ? fromMaster : cost;
+      }
+
       storeEntryPromises.push(
         db.StoreEntry.create(
           {
@@ -12212,15 +12907,18 @@ exports.directPurchaseConsumables = async (req, res) => {
             qty_in: qty,
             qty_out: 0,
             cost_price: cost,
+            ...(salesSellingPrice != null
+              ? { selling_price: salesSellingPrice }
+              : {}),
             expiry_date: item.expiry_date || null,
             inserted_by: userId,
             facilityId,
             transaction_ref: pvCode,
             supplier_code: supplier_no,
             supplier_name,
-            branch_name: target_department || product.item_type,
+            branch_name: storeZone,
             branchId: targetBranchId,
-            destination: target_department || "Main Warehouse",
+            destination: storeDestination,
             source: `Direct Purchase`,
             status: "approved",
             activation: "active",
@@ -12230,45 +12928,6 @@ exports.directPurchaseConsumables = async (req, res) => {
           { transaction },
         ),
       );
-
-      if (
-        priceSetupResalableOnPurchase &&
-        salesBranchPriceSetupItemTypes.has(product.item_type)
-      ) {
-        const fromMaster = parseFloat(product.selling_price);
-        const salesSellingPrice =
-          Number.isFinite(fromMaster) && fromMaster > 0 ? fromMaster : cost;
-        storeEntryPromises.push(
-          db.StoreEntry.create(
-            {
-              receive_date: moment(
-                item.transaction_date || transaction_date || new Date(),
-              ).format("YYYY-MM-DD"),
-              po_no: "DIRECT",
-              reference_number: pvCode,
-              qty_in: 0,
-              qty_out: 0,
-              cost_price: cost,
-              selling_price: salesSellingPrice,
-              expiry_date: item.expiry_date || null,
-              inserted_by: userId,
-              facilityId,
-              transaction_ref: pvCode,
-              supplier_code: supplier_no,
-              supplier_name,
-              branch_name: "for sales",
-              branchId: targetBranchId,
-              destination: "Sales",
-              source: "Direct Purchase (price setup)",
-              status: "approved",
-              activation: "active",
-              type: STORE_ENTRY_TYPE.PURCHASE,
-              product_id: sku,
-            },
-            { transaction },
-          ),
-        );
-      }
 
       // === 2. Supplier Purchase Entry ===
       await db.SupplierEntry.create(
@@ -15137,12 +15796,11 @@ exports.supplierPayment = async (req, res) => {
   }
 };
 
-exports.getRequisitionByPr = (req, res) => {
+exports.getRequisitionByPr = async (req, res) => {
   const {
     branch = "",
     branch_id = "",
     date = null,
-    totalExpenses = 0,
     reason = "",
     requisitor = "",
     user_id = "",
@@ -15155,53 +15813,28 @@ exports.getRequisitionByPr = (req, res) => {
     account_code = "",
   } = req.body;
 
-  db.sequelize
-    .query(
-      `call purchaseRequisition(
-        :query_type,
-        :branch,
-        :branch_id,
-        :date,
-        :reason,
-        :facilityId,
-        :requisitor,
-        :user_id,
-        :supplier_name,
-        :supplier_code,
-        :total,
-        :pr_no,
-        :po_no,
-        :account_code
-      )`,
-      {
-        replacements: {
-          query_type,
-          branch,
-          branch_id,
-          date,
-          reason,
-          facilityId,
-          requisitor,
-          user_id,
-          supplier_name,
-          supplier_code,
-          total,
-          pr_no,
-          po_no: null,
-          account_code,
-        },
-      },
-    )
-    .then((results) => {
-      res.json({
-        success: true,
-        results: results,
-      });
-    })
-    .catch((err) => {
-      console.log(err);
-      res.status(500).json({ success: false, err });
+  try {
+    const results = await runPurchaseRequisitionQuery({
+      query_type,
+      branch,
+      branch_id,
+      date,
+      reason,
+      facilityId,
+      requisitor,
+      user_id,
+      supplier_name,
+      supplier_code,
+      total,
+      pr_no,
+      po_no: null,
+      account_code,
     });
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("getRequisitionByPr:", err);
+    return res.status(500).json({ success: false, err: err.message });
+  }
 };
 
 exports.getChartCodeAndCategory = (req, res) => {
@@ -17877,5 +18510,150 @@ exports.getAccountLedgerReport = async (req, res) => {
   } catch (error) {
     console.error("Error generating account ledger report:", error);
     return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.getFinancialDashboardOverview = async (req, res) => {
+  try {
+    const { facilityId, from, to, asOf } = req.query;
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const convertDate = (dateStr) => {
+      if (!dateStr) return null;
+      const parts = dateStr.split("-");
+      if (parts.length === 3) {
+        if (parts[0].length === 4) return dateStr;
+        return `${parts[2]}-${parts[1]}-${parts[0]}`;
+      }
+      return dateStr;
+    };
+
+    const today = asOf
+      ? moment(convertDate(asOf), "YYYY-MM-DD").toDate()
+      : new Date();
+    const { fromDate: last30From, toDate: last30To } =
+      getDateRangeLast30Days(today);
+
+    const overview = await buildFinancialDashboardOverview(db.sequelize, {
+      facilityId,
+      from,
+      to,
+    });
+
+    const salesInvoices = await fetchEnrichedSalesInvoices(
+      db.sequelize,
+      facilityId,
+    );
+    const receivableMetrics = aggregateReceivableMetrics(salesInvoices, today);
+    const paidLast30Days = await sumPaymentsReceivedInPeriod(
+      db.sequelize,
+      facilityId,
+      last30From,
+      last30To,
+    );
+
+    const purchaseInvoices = await db.sequelize.query(
+      `
+        SELECT
+          i.amount,
+          COALESCE(payments.total_paid, 0) AS total_paid,
+          (i.amount - COALESCE(payments.total_paid, 0)) AS amount_due,
+          i.due_date
+        FROM invoices i
+        LEFT JOIN (
+          SELECT
+            reference_number AS transaction_ref,
+            facility_id,
+            SUM(
+              CASE
+                WHEN type = 'bank' THEN cr
+                WHEN type = 'payment' THEN dr
+                ELSE 0
+              END
+            ) AS total_paid
+          FROM general_ledger
+          WHERE type IN ('bank', 'payment')
+            AND facility_id = :facilityId
+            AND reference_number IS NOT NULL
+            AND reference_number != ''
+          GROUP BY reference_number, facility_id
+        ) payments
+          ON payments.transaction_ref = i.invoice_ref
+          AND payments.facility_id = i.facility_id
+        WHERE i.type = 'purchase'
+          AND i.facility_id = :facilityId
+      `,
+      {
+        replacements: { facilityId },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    let billsUnpaid = 0;
+    let billsOverdue = 0;
+    purchaseInvoices.forEach((invoice) => {
+      const amountDue = parseFloat(invoice.amount_due || 0);
+      if (amountDue <= 0) return;
+      billsUnpaid += amountDue;
+      const dueDate = invoice.due_date
+        ? startOfLocalDay(invoice.due_date)
+        : null;
+      if (dueDate && startOfLocalDay(today) > dueDate) {
+        billsOverdue += amountDue;
+      }
+    });
+
+    const billsPaidLast30 = await db.sequelize.query(
+      `
+        SELECT COALESCE(SUM(gl.cr), 0) AS total_paid
+        FROM general_ledger gl
+        INNER JOIN invoices i
+          ON i.invoice_ref = gl.reference_number
+          AND i.facility_id = gl.facility_id
+          AND i.type = 'purchase'
+        WHERE gl.facility_id = :facilityId
+          AND LOWER(gl.type) IN ('bank', 'payment')
+          AND gl.cr > 0
+          AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
+      `,
+      {
+        replacements: { facilityId, fromDate: last30From, toDate: last30To },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    overview.invoicesSummary = {
+      notDueYet: receivableMetrics.notDueYet,
+      overdue: receivableMetrics.overdue,
+      totalOutstanding: receivableMetrics.totalReceivable,
+      paidLast30Days,
+      asOfDate: getLocalDateStr(today),
+    };
+
+    overview.billsToPay = {
+      unpaid: billsUnpaid,
+      overdue: billsOverdue,
+      notDueYet: Math.max(0, billsUnpaid - billsOverdue),
+      paidLast30Days: parseFloat(billsPaidLast30[0]?.total_paid || 0),
+      asOfDate: getLocalDateStr(today),
+    };
+
+    return res.status(200).json({
+      success: true,
+      results: overview,
+    });
+  } catch (error) {
+    console.error("Error fetching financial dashboard overview:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching financial dashboard overview",
+      error: error.message,
+    });
   }
 };

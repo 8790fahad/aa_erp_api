@@ -17,6 +17,8 @@ public
 # misc
 .DS_Store
 .env
+/backups
+backups/
 
 # VAPT / sandbox credential packages (never commit)
 docs/*Credentials*.zip

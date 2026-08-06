@@ -104,9 +104,10 @@ exports.getCustomerAdvanceHistory = async (req, res) => {
         const amount = parseFloat(e.cost) || 0;
         const linkId = String(e.link_id || "").trim();
         const desc = String(e.description || "");
+        // Pure advances store receipt (AD-*) on link_id; applications point at INV-* or say "Advance applied".
         const isApplied =
-          Boolean(linkId) ||
-          /advance applied|payment for invoice/i.test(desc);
+          /advance applied|payment for invoice/i.test(desc) ||
+          /^INV[-_]/i.test(linkId);
         return {
           entry_id: e.entry_id,
           date: e.created_at,
@@ -119,10 +120,11 @@ exports.getCustomerAdvanceHistory = async (req, res) => {
         };
       });
 
+    // Advance liability only — do not net against A/R (receivable) invoice balances.
     const balRows = await db.sequelize.query(
       `SELECT COALESCE(SUM(cr) - SUM(dr), 0) AS available_deposit
        FROM general_ledger
-       WHERE LOWER(type) IN ('receivable', 'recevable', 'deposit')
+       WHERE LOWER(type) = 'deposit'
          AND facility_id = :facilityId
          AND transaction_ref = :customerNo`,
       {
@@ -162,7 +164,6 @@ exports.getReceivedPaymentHistory = async (req, res) => {
       pageSize = 10,
       fromDate,
       toDate,
-      receivedOnly = "true",
     } = req.query;
 
     if (!facilityId) {
@@ -177,27 +178,19 @@ exports.getReceivedPaymentHistory = async (req, res) => {
     const offset = (pageNum - 1) * limitNum;
 
     const replacements = { facilityId, limit: limitNum, offset };
+    // Group customer deposit receipts (AD-*) into one list row per payment.
     const whereParts = [
       "ce.facilityId = :facilityId",
       "ce.type = 'deposit'",
       "ce.cost > 0",
-      // Invoice payments only — exclude customer advance receipts (AD-*).
-      `COALESCE(NULLIF(TRIM(ce.link_id), ''), ce.receiptNo) LIKE 'INV-%'`,
+      "ce.receiptNo LIKE 'AD-%'",
     ];
 
     if (branchId && String(branchId).trim() && String(branchId) !== "all") {
       const parsedBranchId = parseInt(branchId, 10);
       if (Number.isFinite(parsedBranchId) && parsedBranchId > 0) {
         replacements.branchId = parsedBranchId;
-        whereParts.push(`(
-          ce.branch_id = :branchId
-          OR EXISTS (
-            SELECT 1 FROM invoices i
-            WHERE i.facility_id = :facilityId
-              AND i.branchId = :branchId
-              AND i.invoice_ref = COALESCE(NULLIF(TRIM(ce.link_id), ''), ce.receiptNo)
-          )
-        )`);
+        whereParts.push("ce.branch_id = :branchId");
       }
     }
 
@@ -222,26 +215,17 @@ exports.getReceivedPaymentHistory = async (req, res) => {
       replacements.search = `%${searchTerm}%`;
     }
 
-    if (String(receivedOnly).toLowerCase() !== "false") {
-      // Show cash received from customers; exclude invoice-application offsets.
-      whereParts.push(`(
-        ce.description NOT LIKE '%advance applied%'
-        AND ce.description NOT LIKE '%payment for invoice%'
-        AND NOT (
-          TRIM(COALESCE(ce.link_id, '')) != ''
-          AND TRIM(ce.link_id) LIKE 'OP-%'
-        )
-      )`);
-    }
-
     const whereSql = whereParts.join(" AND ");
 
     const countRows = await db.sequelize.query(
-      `SELECT COUNT(*) AS total
-       FROM customer_entries ce
-       LEFT JOIN customers c
-         ON ce.customerNo = c.customerNo AND ce.facilityId = c.facilityId
-       WHERE ${whereSql}`,
+      `SELECT COUNT(*) AS total FROM (
+         SELECT ce.receiptNo
+         FROM customer_entries ce
+         LEFT JOIN customers c
+           ON ce.customerNo = c.customerNo AND ce.facilityId = c.facilityId
+         WHERE ${whereSql}
+         GROUP BY ce.receiptNo, ce.customerNo
+       ) grouped`,
       {
         replacements,
         type: db.sequelize.QueryTypes.SELECT,
@@ -251,29 +235,30 @@ exports.getReceivedPaymentHistory = async (req, res) => {
 
     const rows = await db.sequelize.query(
       `SELECT
-         ce.entry_id,
-         ce.customerNo,
-         ce.description,
-         ce.cost,
-         ce.mode_of_payment,
-         ce.receiptNo,
-         ce.link_id,
-         ce.branch_id,
-         ce.created_at,
-         c.fullname AS customer_name,
-         c.phone AS customer_phone,
-         c.email AS customer_email,
-         COALESCE(b.branch_name, inv_b.branch_name, '') AS branch_name
+         ce.receiptNo AS receipt_no,
+         ce.customerNo AS customer_no,
+         MAX(ce.created_at) AS date,
+         MAX(ce.mode_of_payment) AS mode_of_payment,
+         MAX(ce.branch_id) AS branch_id,
+         MAX(c.fullname) AS customer_name,
+         MAX(c.phone) AS customer_phone,
+         MAX(c.email) AS customer_email,
+         MAX(COALESCE(b.branch_name, '')) AS branch_name,
+         MAX(ce.description) AS description,
+         SUM(ce.cost) AS amount,
+         SUM(
+           CASE
+             WHEN TRIM(COALESCE(ce.link_id, '')) LIKE 'INV-%' THEN ce.cost
+             ELSE 0
+           END
+         ) AS applied
        FROM customer_entries ce
        LEFT JOIN customers c
          ON ce.customerNo = c.customerNo AND ce.facilityId = c.facilityId
        LEFT JOIN branches b ON ce.branch_id = b.id
-       LEFT JOIN invoices inv
-         ON inv.facility_id = ce.facilityId
-        AND inv.invoice_ref = COALESCE(NULLIF(TRIM(ce.link_id), ''), ce.receiptNo)
-       LEFT JOIN branches inv_b ON inv.branchId = inv_b.id
        WHERE ${whereSql}
-       ORDER BY ce.created_at DESC
+       GROUP BY ce.receiptNo, ce.customerNo
+       ORDER BY MAX(ce.created_at) DESC
        LIMIT :limit OFFSET :offset`,
       {
         replacements,
@@ -282,34 +267,23 @@ exports.getReceivedPaymentHistory = async (req, res) => {
     );
 
     const results = rows.map((e) => {
-      const amount = parseFloat(e.cost) || 0;
-      const linkId = String(e.link_id || "").trim();
-      const receiptNo = String(e.receiptNo || "").trim();
-      const invoiceRef = /^INV-/i.test(linkId)
-        ? linkId
-        : /^INV-/i.test(receiptNo)
-          ? receiptNo
-          : linkId || receiptNo;
-      const desc = String(e.description || "");
-      const isApplied =
-        /advance applied|payment for invoice/i.test(desc) ||
-        (Boolean(linkId) && /^OP-/i.test(linkId));
+      const amount = parseFloat(e.amount) || 0;
+      const applied = parseFloat(e.applied) || 0;
       return {
-        entry_id: e.entry_id,
-        date: e.created_at,
-        customer_no: e.customerNo,
+        receipt_no: String(e.receipt_no || "").trim(),
+        date: e.date,
+        customer_no: e.customer_no,
         customer_name: e.customer_name || "",
         customer_phone: e.customer_phone || "",
         customer_email: e.customer_email || "",
-        receipt_no: receiptNo,
-        link_id: linkId,
-        reference: invoiceRef,
-        description: desc,
+        description: e.description || "",
         amount,
+        applied,
+        remaining: Math.max(0, amount - applied),
         mode_of_payment: e.mode_of_payment || "",
         branch_id: e.branch_id,
         branch_name: e.branch_name || "",
-        direction: isApplied ? "applied" : "received",
+        direction: "received",
       };
     });
 
@@ -911,7 +885,7 @@ exports.CreateCustomer = async (req, res) => {
         });
       }
 
-      const invoiceRef = `OP-${newCustomerNo}`;
+      const invoiceRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
       const transactionDate = obdate
         ? moment(obdate).format("YYYY-MM-DD")
         : moment().format("YYYY-MM-DD");
@@ -1206,7 +1180,7 @@ exports.CreateCustomerUpload = async (req, res) => {
           ? moment(obdate).format("YYYY-MM-DD")
           : moment().format("YYYY-MM-DD");
 
-        const reference = `OP-${newCustomerNo}`;
+        const reference = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
         const commonFields = {
           transaction_date: transactionDate,
           transaction_description: "Opening Balance",
@@ -1522,7 +1496,7 @@ exports.CreateSupplierUpload = async (req, res) => {
           const transactionDate = obdate
             ? moment(obdate).format("YYYY-MM-DD")
             : moment().format("YYYY-MM-DD");
-          const billRef = `OB-${supplierNo}`;
+          const billRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
           if (OB > 0) {
             // Credit A/P
@@ -2148,9 +2122,15 @@ export const createDeposit = async (req, res) => {
     bankAccount,
     receivable_deposit_code, // liability/prepayment
     receivable_code, // A/R
-    invoices = [], // array of invoices to settle specifically
     branchId = null, // branch the payment is received at (optional)
   } = req.body;
+  // Explicit invoices array (even []) = only settle those lines; remainder → advance.
+  // Omitted invoices = legacy: auto-apply against open A/R balance, then advance.
+  const invoicesProvided = Object.prototype.hasOwnProperty.call(
+    req.body,
+    "invoices",
+  );
+  const invoices = Array.isArray(req.body.invoices) ? req.body.invoices : [];
   console.log(
     "[create-customer-deposit] req.body",
     JSON.stringify(req.body, null, 2),
@@ -2281,14 +2261,16 @@ export const createDeposit = async (req, res) => {
 
     // 7. Database transaction
     const result = await db.sequelize.transaction(async (t) => {
-      // Case 1: Specific invoices provided → process each invoice individually
+      // Case 1: Specific invoice lines → settle only those; leftover → advance
       if (invoices.length > 0) {
-        if (!receivableAccount)
-          return res.status(400).json({
-            error: "Receivable account required to settle specific invoices",
-          });
+        if (!receivableAccount) {
+          const err = new Error(
+            "Receivable account required to settle specific invoices",
+          );
+          err.statusCode = 400;
+          throw err;
+        }
 
-        // Loop through each invoice and apply payment
         for (const invoice of invoices) {
           const { invoice_ref, amount_paid: amount_to_apply } = invoice;
           const lineAmount = parseAmount(amount_to_apply) ?? 0;
@@ -2303,7 +2285,6 @@ export const createDeposit = async (req, res) => {
               remaining_before: remainingAmount,
             });
 
-            // DR: Cash / Bank for this invoice payment
             ledgerEntries.push({
               account_code: cashBankAccount.code,
               account_subhead: cashBankAccount.parent_code || 0,
@@ -2317,7 +2298,6 @@ export const createDeposit = async (req, res) => {
               transaction_ref: "",
             });
 
-            // CR: Receivable for this specific invoice
             ledgerEntries.push({
               account_code: receivableAccount.code,
               account_subhead:
@@ -2334,7 +2314,6 @@ export const createDeposit = async (req, res) => {
               transaction_ref: customer_no,
             });
 
-            // Create CustomerEntry for this specific invoice payment
             await CustomerEntry.create(
               {
                 customerNo: customer_no,
@@ -2359,13 +2338,11 @@ export const createDeposit = async (req, res) => {
             amountAppliedToReceivable += applicationAmount;
             remainingAmount -= applicationAmount;
 
-            // Stop if we've used all the payment
             if (remainingAmount <= 0) break;
           }
         }
-      } else {
-        // Case 2: No specific invoices → general payment against outstanding A/R balance
-        // Only apply when customer owes (positive balance). Negative = credit/deposit already.
+      } else if (!invoicesProvided) {
+        // Case 2 (legacy): invoices omitted → auto-apply against open A/R, then advance
         const receivableBalanceDue = Math.max(0, previousBalance);
         amountAppliedToReceivable = Math.min(
           remainingAmount,
@@ -2373,15 +2350,15 @@ export const createDeposit = async (req, res) => {
         );
         remainingAmount -= amountAppliedToReceivable;
 
-        // Process general A/R payment if applicable
         if (amountAppliedToReceivable > 0) {
-          if (!receivableAccount)
-            return res.status(400).json({
-              error:
-                "Receivable account required to reduce outstanding balance",
-            });
+          if (!receivableAccount) {
+            const err = new Error(
+              "Receivable account required to reduce outstanding balance",
+            );
+            err.statusCode = 400;
+            throw err;
+          }
 
-          // DR: Cash / Bank for A/R payment
           ledgerEntries.push({
             account_code: cashBankAccount.code,
             account_subhead: cashBankAccount.parent_code || 0,
@@ -2390,13 +2367,12 @@ export const createDeposit = async (req, res) => {
             reference_number: referenceNumber,
             bank_account_id: bankAccount?.id || null,
             account_description:
-              accountHead.description || cashBankAccount.description,
+              accountHead?.description || cashBankAccount.description,
             transaction_description: `${narration} from ${customerName}`,
             type: "bank",
             transaction_ref: "",
           });
 
-          // CR: Accounts Receivable
           ledgerEntries.push({
             account_code: receivableAccount.code,
             account_subhead:
@@ -2413,7 +2389,6 @@ export const createDeposit = async (req, res) => {
             transaction_ref: customer_no,
           });
 
-          // Create CustomerEntry for general A/R payment
           await CustomerEntry.create(
             {
               customerNo: customer_no,
@@ -2435,13 +2410,17 @@ export const createDeposit = async (req, res) => {
           );
         }
       }
+      // Case 3: invoices: [] explicitly → skip A/R auto-apply; full amount → advance below
 
-      // Handle remaining balance as advance deposit (for both cases)
+      // Remaining balance as customer advance / credit
       if (remainingAmount > 0) {
-        if (!depositAccount)
-          return res.status(400).json({
-            error: "Deposit account code required for advance payments",
-          });
+        if (!depositAccount) {
+          const err = new Error(
+            "Deposit account code required for advance payments",
+          );
+          err.statusCode = 400;
+          throw err;
+        }
 
         // DR: Cash / Bank for remaining amount (use chart row from lookup — same as invoice / A/R lines)
         ledgerEntries.push({
@@ -2537,15 +2516,31 @@ export const createDeposit = async (req, res) => {
       };
     });
 
+    const advanceAmt = parseFloat(result?.advanceAmount) || 0;
+    const appliedAmt = parseFloat(result?.appliedToReceivable) || 0;
+    let message = "Customer payment/deposit recorded successfully";
+    if (advanceAmt > 0 && appliedAmt > 0) {
+      message = `Payment recorded: applied ${appliedAmt.toLocaleString()} to invoices; advance ${advanceAmt.toLocaleString()}`;
+    } else if (advanceAmt > 0) {
+      message = `Customer advance of ${advanceAmt.toLocaleString()} recorded`;
+    } else if (appliedAmt > 0) {
+      message = `Payment of ${appliedAmt.toLocaleString()} applied to invoices`;
+    }
+
     return res.status(201).json({
       success: true,
       data: result,
-      message: "Customer payment/deposit recorded successfully",
+      message,
     });
   } catch (error) {
     console.error("Error creating deposit:", error);
-    return res.status(500).json({
-      error: "Failed to create deposit",
+    const status = error?.statusCode || 500;
+    return res.status(status).json({
+      success: false,
+      error:
+        status === 400
+          ? error.message
+          : "Failed to create deposit",
       details:
         process.env.NODE_ENV === "development" ? error.message : undefined,
     });
@@ -4109,6 +4104,8 @@ exports.CreateProductUploadRawMaterial = async (req, res) => {
       let storeEntry = null;
 
       if (shouldCreateStoreEntry) {
+        const obRef = `OB-${await getAndUpdateNumber("OB", itemFacilityId)}`;
+
         storeEntry = await db.StoreEntry.create(
           {
             product_id: product.sku,
@@ -4127,7 +4124,7 @@ exports.CreateProductUploadRawMaterial = async (req, res) => {
             inserted_by: itemUserId,
             type: STORE_ENTRY_TYPE.OPENING_BALANCE,
             receive_date: new Date().toISOString().split("T")[0],
-            reference_number: product.sku,
+            reference_number: obRef,
             truckNo: "",
             waybillNo: "",
             otherInfo: "Bulk initial stock entry",
@@ -4169,7 +4166,7 @@ exports.CreateProductUploadRawMaterial = async (req, res) => {
               cr: 0,
               account_description: inventoryAccount.description,
               transaction_description: name,
-              reference_number: product.sku,
+              reference_number: obRef,
               purpose_of_payment: narration,
               created_by: itemUserId,
               facility_id: itemFacilityId,
@@ -4189,7 +4186,7 @@ exports.CreateProductUploadRawMaterial = async (req, res) => {
                 cr: amount,
                 account_description: openingBalanceEquityAccount.description,
                 transaction_description: name,
-                reference_number: product.sku,
+                reference_number: obRef,
                 purpose_of_payment: narration,
                 created_by: itemUserId,
                 facility_id: itemFacilityId,
@@ -4358,6 +4355,8 @@ exports.CreateProductUploadWip = async (req, res) => {
         }
       }
 
+      const obRef = `OB-${await getAndUpdateNumber("OB", itemFacilityId)}`;
+
       const storeEntry = await db.StoreEntry.create(
         {
           product_id: product.sku,
@@ -4376,7 +4375,7 @@ exports.CreateProductUploadWip = async (req, res) => {
           inserted_by: itemUserId,
           type: STORE_ENTRY_TYPE.OPENING_BALANCE,
           receive_date: openingBalanceDate,
-          reference_number: product.sku,
+          reference_number: obRef,
           truckNo: "",
           waybillNo: "",
           otherInfo: "Bulk WIP opening stock entry",
@@ -4388,7 +4387,7 @@ exports.CreateProductUploadWip = async (req, res) => {
       if (quantity > 0 && cost_price > 0) {
         const amount = cost_price * quantity;
         const narration = `Opening Balance WIP - ${product.name} - Qty: ${quantity} @ ${cost_price}`;
-        const ref = product.sku;
+        const ref = obRef;
 
         await db.GeneralLedger.create(
           {
@@ -4404,7 +4403,7 @@ exports.CreateProductUploadWip = async (req, res) => {
             created_by: itemUserId,
             facility_id: itemFacilityId,
             type: "OPENING_BALANCE",
-            transaction_ref: ref,
+            transaction_ref: product.sku,
           },
           { transaction },
         );
@@ -4424,7 +4423,7 @@ exports.CreateProductUploadWip = async (req, res) => {
               created_by: itemUserId,
               facility_id: itemFacilityId,
               type: "OPENING_BALANCE",
-              transaction_ref: ref,
+              transaction_ref: product.sku,
             },
             { transaction },
           );
@@ -4694,6 +4693,250 @@ exports.getCombinedSuppliersAndCustomers = async (req, res) => {
       success: false,
       message: "Error fetching combined suppliers and customers",
       error: error.message,
+    });
+  }
+};
+
+/**
+ * Apply existing customer advance / deposit to open sales invoices.
+ * No new cash is received — consumes deposit liability against A/R.
+ *
+ * POST /api/v1/apply-customer-advance
+ * body: {
+ *   facilityId, userId, customer_no,
+ *   applications: [{ invoice_ref, amount }],
+ *   transaction_date?, narration?
+ * }
+ */
+exports.applyCustomerAdvanceToInvoices = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    customer_no,
+    applications = [],
+    narration = "",
+  } = req.body;
+
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!customer_no) {
+    return res.status(400).json({ success: false, error: "customer_no is required" });
+  }
+  if (!Array.isArray(applications) || applications.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "applications must be a non-empty array of { invoice_ref, amount }",
+    });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(
+      req.body.transaction_date || new Date(),
+      { field: "transaction_date" },
+    );
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+  const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+
+  try {
+    const customer = await Customer.findOne({
+      where: { customerNo: customer_no, facilityId },
+    });
+    if (!customer) {
+      return res.status(404).json({ success: false, error: "Customer not found" });
+    }
+
+    const business = await db.business.findOne({ where: { id: facilityId } });
+    const depositCode =
+      customer.receivable_accural_code ||
+      business?.receivable_accural_code ||
+      "";
+    const receivableCode =
+      customer.receivable_code || business?.receivable_code || "";
+
+    if (!depositCode || !receivableCode) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Customer advance/receivable accounts are not configured (receivable_accural_code / receivable_code)",
+      });
+    }
+
+    const [depositAccount, receivableAccount] = await Promise.all([
+      db.AccountCategory.findOne({
+        where: { code: depositCode, facility_id: facilityId },
+      }),
+      db.AccountCategory.findOne({
+        where: { code: receivableCode, facility_id: facilityId },
+      }),
+    ]);
+    if (!depositAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Deposit/advance account not found: ${depositCode}`,
+      });
+    }
+    if (!receivableAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Receivable account not found: ${receivableCode}`,
+      });
+    }
+
+    // Available advance: deposit liability only (not netted against A/R invoices)
+    const balRows = await db.sequelize.query(
+      `SELECT COALESCE(SUM(cr) - SUM(dr), 0) AS available_deposit
+       FROM general_ledger
+       WHERE LOWER(type) = 'deposit'
+         AND facility_id = :facilityId
+         AND transaction_ref = :customerNo`,
+      {
+        replacements: { facilityId, customerNo: customer_no },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const availableDeposit = Math.max(
+      0,
+      parseFloat(balRows[0]?.available_deposit || 0),
+    );
+
+    const cleaned = [];
+    let totalApply = 0;
+    for (const row of applications) {
+      const invoice_ref = String(row.invoice_ref || row.invoiceRef || "").trim();
+      const amount = parseAmount(row.amount) ?? 0;
+      if (!invoice_ref || amount <= 0) continue;
+      cleaned.push({ invoice_ref, amount });
+      totalApply += amount;
+    }
+    if (cleaned.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "No valid application amounts provided",
+      });
+    }
+    if (totalApply > availableDeposit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Apply total (${totalApply}) exceeds available advance (${availableDeposit})`,
+        available_deposit: availableDeposit,
+      });
+    }
+
+    const referenceNumber = `AA-${await getAndUpdateNumber("AA", facilityId)}`;
+    const customerName = customer.fullname || customer_no;
+    const descBase =
+      String(narration || "").trim() ||
+      `Advance applied to invoices — ${customerName}`;
+
+    const applied = await db.sequelize.transaction(async (t) => {
+      let remainingPool = availableDeposit;
+      const settled = [];
+
+      for (const { invoice_ref, amount } of cleaned) {
+        const applyAmt = Math.min(amount, remainingPool);
+        if (applyAmt <= 0) break;
+
+        // DR deposit liability (consume advance)
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: depositAccount.code,
+            account_subhead: depositAccount.parent_code || 0,
+            dr: applyAmt,
+            cr: 0,
+            account_description: depositAccount.description,
+            transaction_description: `${descBase} — ${invoice_ref}`,
+            reference_number: invoice_ref,
+            purpose_of_payment: `Apply customer advance — ${invoice_ref}`,
+            payee: customerName,
+            created_by: userId,
+            facility_id: facilityId,
+            status: "posted",
+            type: "deposit",
+            transaction_ref: customer_no,
+          },
+          { transaction: t },
+        );
+
+        // CR A/R (reduce outstanding)
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: receivableAccount.code,
+            account_subhead:
+              receivableAccount.subhead ||
+              receivableAccount.parent_code ||
+              0,
+            dr: 0,
+            cr: applyAmt,
+            account_description: receivableAccount.description,
+            transaction_description: `${descBase} — ${invoice_ref}`,
+            reference_number: invoice_ref,
+            purpose_of_payment: `Apply customer advance — ${invoice_ref}`,
+            payee: customerName,
+            created_by: userId,
+            facility_id: facilityId,
+            status: "posted",
+            type: "receivable",
+            transaction_ref: customer_no,
+          },
+          { transaction: t },
+        );
+
+        await CustomerEntry.create(
+          {
+            customerNo: customer_no,
+            description: `Advance applied — ${invoice_ref}`,
+            qty_in: 0,
+            qty_out: 0,
+            cost: applyAmt,
+            amount_paid: applyAmt,
+            facilityId,
+            mode_of_payment: "ADVANCE",
+            link_id: invoice_ref,
+            type: "deposit",
+            receiptNo: referenceNumber,
+            bank_account_id: "",
+            created_by: userId,
+            created_at: new Date(),
+          },
+          { transaction: t },
+        );
+
+        remainingPool -= applyAmt;
+        settled.push({ invoice_ref, amount: applyAmt });
+      }
+
+      return settled;
+    });
+
+    const appliedTotal = applied.reduce((s, x) => s + x.amount, 0);
+    return res.status(201).json({
+      success: true,
+      message: `Applied advance of ${appliedTotal.toLocaleString()} to ${applied.length} invoice(s)`,
+      data: {
+        reference_number: referenceNumber,
+        customer_no,
+        applied_total: appliedTotal,
+        available_before: availableDeposit,
+        available_after: Math.max(0, availableDeposit - appliedTotal),
+        applications: applied,
+      },
+    });
+  } catch (error) {
+    console.error("applyCustomerAdvanceToInvoices:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to apply customer advance",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 };

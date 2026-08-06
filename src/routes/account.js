@@ -340,6 +340,14 @@ module.exports = (app) => {
     account.updateDepreciationMethod,
   );
   app.post(
+    "/account/update-invoice-closing/:facilityId/:user_id",
+    account.updateInvoiceClosingSettings,
+  );
+  app.post(
+    "/account/run-invoice-closing/:facilityId",
+    account.runInvoiceClosingNow,
+  );
+  app.post(
     "/account/update-default-valuation-source/:source/:facilityId/:user_id",
     account.updateDefaultValuationSource,
   );
@@ -410,6 +418,10 @@ module.exports = (app) => {
   app.post(
     "/account/update-document-header-style/:businessId",
     account.updateDocumentHeaderStyle,
+  );
+  app.post(
+    "/account/update-invoice-notes/:businessId",
+    account.updateInvoiceNotes,
   );
   app.post(
     "/account/update-dashboard-widgets/:businessId",

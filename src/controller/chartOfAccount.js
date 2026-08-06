@@ -3,6 +3,7 @@ const account = require("../routes/account");
 
 // controllers/accountController.js
 const moment = require("moment");
+const { getAndUpdateNumber } = require("../services/numberGen");
 // const db = require("../models");
 
 const NORMAL_BALANCE = {
@@ -129,7 +130,7 @@ module.exports.create_chart_of_acct = async (req, res) => {
     }
 
     const today = opening_balance_date;
-    const ref = `OB-${head}-${Date.now()}`.substring(0, 15); // Limit to 15 chars for reference_number
+    const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
     // 6️⃣ Ledger Entry 1 → Account Itself
     await db.GeneralLedger.create(

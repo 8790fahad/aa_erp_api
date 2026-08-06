@@ -55,6 +55,14 @@ module.exports = (sequelize, DataTypes) => {
         field: "invoice_ref",
         comment: "Linked purchase bill / invoice reference",
       },
+      recorded_in_purchase: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: "recorded_in_purchase",
+        comment:
+          "Already booked in purchase — skip capitalization and depreciation GL",
+      },
       attachment_urls: {
         type: DataTypes.TEXT,
         allowNull: true,

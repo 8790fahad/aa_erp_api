@@ -1,6 +1,7 @@
 const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
+const { getAndUpdateNumber } = require("../services/numberGen");
 
 const statementTxnNet = (txn) => {
   const credit = parseFloat(txn.credit || 0);
@@ -570,9 +571,7 @@ exports.createBankAccount = async (req, res) => {
         });
       }
 
-      const ref = `OB-${bankAccount.id}-${Date.now()
-        .toString(36)
-        .toUpperCase()}`;
+      const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
       // Determine debit/credit based on normal balance (Bank = Debit balance)
       const isPositive = openingBalance >= 0;
@@ -761,9 +760,7 @@ exports.bulkCreateBankAccounts = async (req, res) => {
             continue;
           }
 
-          const ref = `OB-${bankAccount.id}-${Date.now()
-            .toString(36)
-            .toUpperCase()}`;
+          const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
           const isPositive = openingBalance >= 0;
           const amount = Math.abs(openingBalance);
 

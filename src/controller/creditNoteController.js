@@ -6,6 +6,10 @@ const {
   reasonRequiresInventoryProductLines,
   getInventoryExplanationPrompt,
 } = require("./creditNoteReasonController");
+const {
+  recordActivity,
+  pickActor,
+} = require("../services/activityAuditService");
 
 const PAYMENT_ADJUSTMENT_LABELS = {
   offset_outstanding: "Offset against outstanding invoice",
@@ -92,7 +96,8 @@ function formatRefundModeNote(mode, chequeNo, extras = {}) {
 }
 
 /**
- * Generate Credit Note Number
+ * Generate Credit Note Number via number_generator
+ * prefixes: credit_note_customer → CN-C-YY-#### | credit_note_supplier → CN-S-YY-####
  */
 const generateCreditNoteNumber = async (facilityId, type) => {
   const prefix = type === "customer" ? "CN-C" : "CN-S";
@@ -102,6 +107,11 @@ const generateCreditNoteNumber = async (facilityId, type) => {
     facilityId
   );
   return `${prefix}-${year}-${String(sequence).padStart(4, "0")}`;
+};
+
+const isValidReservedCreditNoteNumber = (value, type) => {
+  const expected = type === "customer" ? "CN-C" : "CN-S";
+  return new RegExp(`^${expected}-\\d{2}-\\d{4}$`).test(String(value || "").trim());
 };
 
 /**
@@ -173,6 +183,7 @@ exports.createCreditNote = async (req, res) => {
       adjustmentAmount,
       discount,
       invoiceSnapshot,
+      creditNoteNumber: requestedCreditNoteNumber,
     } = req.body;
 
     let methodSuffix = formatPaymentAdjustmentNote(paymentAdjustmentMethod);
@@ -290,15 +301,21 @@ exports.createCreditNote = async (req, res) => {
     }
 
     // Get business VAT policy
-    const business = await db.Business.findOne({
-      where: { id: facilityId },
-      attributes: ["vat_policy"],
-    });
+    const BusinessModel = db.Business || db.business;
+    const business = BusinessModel
+      ? await BusinessModel.findOne({
+          where: { id: facilityId },
+          attributes: ["vat_policy"],
+        })
+      : null;
 
     const vatPolicy = business?.vat_policy || "vat_exclusive";
 
-    // Generate Credit Note Number
-    const creditNoteNumber = await generateCreditNoteNumber(facilityId, type);
+    // Prefer number reserved by UI via /get-and-update; otherwise allocate now
+    let creditNoteNumber = String(requestedCreditNoteNumber || "").trim();
+    if (!isValidReservedCreditNoteNumber(creditNoteNumber, type)) {
+      creditNoteNumber = await generateCreditNoteNumber(facilityId, type);
+    }
 
     // Get customer or supplier account
     let receivablePayableAccount = null;
@@ -319,14 +336,32 @@ exports.createCreditNote = async (req, res) => {
       entityId = customerId;
       entityName = customer.fullname || customer.customerNo;
 
-      // Get Accounts Receivable account
-      const arAccount = await db.AccountCategory.findOne({
+      // Get Accounts Receivable account (A/R naming varies)
+      let arAccount = await db.AccountCategory.findOne({
         where: {
           facility_id: facilityId,
           description: { [Op.like]: "%Accounts Receivable%" },
           level: 2,
         },
       });
+      if (!arAccount) {
+        arAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Accounts receivable%" },
+            level: 2,
+          },
+        });
+      }
+      if (!arAccount) {
+        arAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%A/R%" },
+            level: 2,
+          },
+        });
+      }
 
       if (!arAccount) {
         await transaction.rollback();
@@ -351,14 +386,41 @@ exports.createCreditNote = async (req, res) => {
       entityId = supplierId;
       entityName = supplier.supplier_name || supplier.supplier_number;
 
-      // Get Accounts Payable account
-      const apAccount = await db.AccountCategory.findOne({
+      // Get Accounts Payable account (A/P naming / levels vary by CoA)
+      let apAccount = await db.AccountCategory.findOne({
         where: {
           facility_id: facilityId,
           description: { [Op.like]: "%Accounts Payable%" },
-          level: 2,
         },
+        order: [["level", "ASC"]],
       });
+      if (!apAccount) {
+        apAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Accounts payable%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+      if (!apAccount) {
+        apAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%A/P%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+      if (!apAccount) {
+        apAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Trade Payable%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
 
       if (!apAccount) {
         await transaction.rollback();
@@ -371,36 +433,106 @@ exports.createCreditNote = async (req, res) => {
       receivablePayableAccount = apAccount;
     }
 
-    // Get Sales Returns / Purchase Returns account
+    // Resolve offset accounts from line items (Zoho-style) or CoA fallbacks
+    const lineAccountCodes = [
+      ...new Set(
+        (lineItems || [])
+          .map((li) => String(li?.account?.code || li?.account?.head || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    const lineAccountsByCode = {};
+    if (lineAccountCodes.length) {
+      const found = await db.AccountCategory.findAll({
+        where: {
+          facility_id: facilityId,
+          code: { [Op.in]: lineAccountCodes },
+        },
+      });
+      for (const acc of found) {
+        lineAccountsByCode[String(acc.code)] = acc;
+      }
+    }
+
+    const usableLines = (lineItems || [])
+      .map((li, idx) => {
+        const code = String(li?.account?.code || li?.account?.head || "").trim();
+        const amt = Number(li?.amount) || 0;
+        return {
+          idx,
+          code,
+          amount: amt,
+          account: code ? lineAccountsByCode[code] : null,
+          description: String(li?.description || "").trim(),
+        };
+      })
+      .filter((l) => l.account && l.amount > 0);
+
+    // Fallback single returns/adjustment account when lines lack chart codes
     const returnsAccountName =
       type === "customer" ? "Sales Returns" : "Purchase Returns";
-    let returnsAccount = await db.AccountCategory.findOne({
-      where: {
-        facility_id: facilityId,
-        description: { [Op.like]: `%${returnsAccountName}%` },
-        level: 2,
-      },
-    });
-
-    // If not found, try Income Adjustment / Expense Adjustment
-    if (!returnsAccount) {
-      const adjustmentAccountName =
-        type === "customer" ? "Income Adjustment" : "Expense Adjustment";
+    let returnsAccount = null;
+    if (!usableLines.length) {
       returnsAccount = await db.AccountCategory.findOne({
         where: {
           facility_id: facilityId,
-          description: { [Op.like]: `%${adjustmentAccountName}%` },
-          level: 2,
+          description: { [Op.like]: `%${returnsAccountName}%` },
         },
+        order: [["level", "ASC"]],
       });
-    }
 
-    if (!returnsAccount) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message: `${returnsAccountName} or Adjustment account not found. Please set it up in Chart of Accounts.`,
-      });
+      if (!returnsAccount) {
+        const adjustmentAccountName =
+          type === "customer" ? "Income Adjustment" : "Expense Adjustment";
+        returnsAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: `%${adjustmentAccountName}%` },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+
+      if (!returnsAccount && type === "customer") {
+        returnsAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Discount Allowed%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+
+      if (!returnsAccount && type === "supplier") {
+        returnsAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Inventory%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+
+      if (!returnsAccount && type === "supplier") {
+        returnsAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            description: { [Op.like]: "%Cost of Sales%" },
+          },
+          order: [["level", "ASC"]],
+        });
+      }
+
+      if (!returnsAccount) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            type === "customer"
+              ? "Sales Returns, Income Adjustment, or Discount Allowed account not found. Please set it up in Chart of Accounts."
+              : "Select a line account, or set up Purchase Returns / Inventory in Chart of Accounts.",
+        });
+      }
     }
 
     // Get VAT Control account
@@ -410,8 +542,8 @@ exports.createCreditNote = async (req, res) => {
         where: {
           facility_id: facilityId,
           description: { [Op.like]: "%VAT%" },
-          level: 2,
         },
+        order: [["level", "ASC"]],
       });
 
       if (!vatAccount) {
@@ -440,146 +572,117 @@ exports.createCreditNote = async (req, res) => {
       calculatedVat = subtotal - netAmount;
     }
 
-    // Create ledger entries
+    const purpose = `Credit Note ${creditNoteNumber}`;
+    const glType = type === "customer" ? "discount" : "payable";
+    const refNum = String(creditNoteNumber).slice(0, 15);
+
+    const pushGl = (account, dr, cr, desc, lineKey) => {
+      const parent =
+        account.parentCode ?? account.parent_code ?? account.code ?? "0";
+      ledgerEntries.push({
+        facility_id: facilityId,
+        transaction_date: transactionDate,
+        transaction_ref: `${creditNoteNumber}-${lineKey}`,
+        reference_number: refNum,
+        account_code: account.code,
+        account_description: account.description,
+        account_subhead: String(parent),
+        dr: Number(Number(dr).toFixed(2)),
+        cr: Number(Number(cr).toFixed(2)),
+        transaction_description: String(desc).slice(0, 500),
+        purpose_of_payment: purpose.slice(0, 150),
+        payee: String(entityName || entityId || "").slice(0, 50),
+        mode_of_payment: "credit_note",
+        bank_account_id: "",
+        type: glType,
+        status: "saved",
+        created_by: userId,
+      });
+    };
+
+    const offsetDesc = (lineDesc) =>
+      `Credit Note ${creditNoteNumber} - ${entityName}${
+        lineDesc ? ` - ${lineDesc}` : reason ? ` - ${reason}` : ""
+      }${methodSuffix}`;
+
+    // Create ledger entries — prefer Zoho line accounts when present
     if (type === "customer") {
-      // Customer Credit Note:
-      // Dr Sales Returns / Income Adjustment
-      // Cr Accounts Receivable (Customer)
-      // Cr VAT Control (if applicable)
-
-      // Debit: Sales Returns / Income Adjustment
-      ledgerEntries.push({
-        facility_id: facilityId,
-        transaction_date: transactionDate,
-        transaction_ref: entityId, // Use customer ID for ledger filtering
-        account_code: returnsAccount.code,
-        account_name: returnsAccount.description,
-        account_category: returnsAccount.category || "",
-        account_subhead: returnsAccount.subhead || 0,
-        account_parent_code: returnsAccount.parent_code || 0,
-        debit: netAmount,
-        credit: 0,
-        balance: 0,
-        description: `Credit Note ${creditNoteNumber} - ${entityName}${reason ? ` - ${reason}` : ""}${methodSuffix}`,
-        transaction_type: "credit_note",
-        transaction_category: "customer_credit_note",
-        created_by: userId,
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
-
-      // Credit: Accounts Receivable
-      ledgerEntries.push({
-        facility_id: facilityId,
-        transaction_date: transactionDate,
-        transaction_ref: entityId, // Use customer ID for ledger filtering
-        account_code: receivablePayableAccount.code,
-        account_name: receivablePayableAccount.description,
-        account_category: receivablePayableAccount.category || "",
-        account_subhead: receivablePayableAccount.subhead || 0,
-        account_parent_code: receivablePayableAccount.parent_code || 0,
-        debit: 0,
-        credit: totalAmount,
-        balance: 0,
-        description: `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
-        transaction_type: "credit_note",
-        transaction_category: "customer_credit_note",
-        created_by: userId,
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
-
-      // Credit: VAT Control (if applicable)
-      if (vatAmount > 0 && vatAccount) {
-        ledgerEntries.push({
-          facility_id: facilityId,
-          transaction_date: transactionDate,
-          transaction_ref: entityId, // Use customer ID for ledger filtering
-          account_code: vatAccount.code,
-          account_name: vatAccount.description,
-          account_category: vatAccount.category || "",
-          account_subhead: vatAccount.subhead || 0,
-          account_parent_code: vatAccount.parent_code || 0,
-          debit: 0,
-          credit: calculatedVat,
-          balance: 0,
-          description: `Credit Note ${creditNoteNumber} - VAT Reversal${methodSuffix}`,
-          transaction_type: "credit_note",
-          transaction_category: "customer_credit_note",
-          created_by: userId,
-          created_at: new Date(),
-          updated_at: new Date(),
+      // Dr line accounts (or Sales Returns) / Cr Accounts Receivable
+      if (usableLines.length) {
+        usableLines.forEach((line, i) => {
+          pushGl(
+            line.account,
+            line.amount,
+            0,
+            offsetDesc(line.description),
+            `L${i + 1}`,
+          );
         });
+      } else {
+        pushGl(
+          returnsAccount,
+          netAmount,
+          0,
+          offsetDesc(""),
+          "DR",
+        );
+      }
+
+      pushGl(
+        receivablePayableAccount,
+        0,
+        totalAmount,
+        `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
+        "AR",
+      );
+
+      if (vatAmount > 0 && vatAccount) {
+        pushGl(
+          vatAccount,
+          0,
+          calculatedVat,
+          `Credit Note ${creditNoteNumber} - VAT Reversal${methodSuffix}`,
+          "VAT",
+        );
       }
     } else {
-      // Supplier Credit Note:
-      // Dr Accounts Payable (Supplier)
-      // Cr Purchase Returns / Expense Adjustment
-      // Dr VAT Control (if applicable) - VAT is reversed
+      // Dr Accounts Payable / Cr line accounts (or Purchase Returns / Inventory)
+      pushGl(
+        receivablePayableAccount,
+        totalAmount,
+        0,
+        `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
+        "AP",
+      );
 
-      // Debit: Accounts Payable
-      ledgerEntries.push({
-        facility_id: facilityId,
-        transaction_date: transactionDate,
-        transaction_ref: entityId, // Use supplier ID for ledger filtering
-        account_code: receivablePayableAccount.code,
-        account_name: receivablePayableAccount.description,
-        account_category: receivablePayableAccount.category || "",
-        account_subhead: receivablePayableAccount.subhead || 0,
-        account_parent_code: receivablePayableAccount.parent_code || 0,
-        debit: totalAmount,
-        credit: 0,
-        balance: 0,
-        description: `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
-        transaction_type: "credit_note",
-        transaction_category: "supplier_credit_note",
-        created_by: userId,
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
-
-      // Credit: Purchase Returns / Expense Adjustment
-      ledgerEntries.push({
-        facility_id: facilityId,
-        transaction_date: transactionDate,
-        transaction_ref: entityId, // Use supplier ID for ledger filtering
-        account_code: returnsAccount.code,
-        account_name: returnsAccount.description,
-        account_category: returnsAccount.category || "",
-        account_subhead: returnsAccount.subhead || 0,
-        account_parent_code: returnsAccount.parent_code || 0,
-        debit: 0,
-        credit: netAmount,
-        balance: 0,
-        description: `Credit Note ${creditNoteNumber} - ${entityName}${reason ? ` - ${reason}` : ""}${methodSuffix}`,
-        transaction_type: "credit_note",
-        transaction_category: "supplier_credit_note",
-        created_by: userId,
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
-
-      // Debit: VAT Control (if applicable) - VAT reversal
-      if (vatAmount > 0 && vatAccount) {
-        ledgerEntries.push({
-          facility_id: facilityId,
-          transaction_date: transactionDate,
-          transaction_ref: entityId, // Use supplier ID for ledger filtering
-          account_code: vatAccount.code,
-          account_name: vatAccount.description,
-          account_category: vatAccount.category || "",
-          account_subhead: vatAccount.subhead || 0,
-          account_parent_code: vatAccount.parent_code || 0,
-          debit: calculatedVat,
-          credit: 0,
-          balance: 0,
-          description: `Credit Note ${creditNoteNumber} - VAT Reversal${methodSuffix}`,
-          transaction_type: "credit_note",
-          transaction_category: "supplier_credit_note",
-          created_by: userId,
-          created_at: new Date(),
-          updated_at: new Date(),
+      if (usableLines.length) {
+        usableLines.forEach((line, i) => {
+          pushGl(
+            line.account,
+            0,
+            line.amount,
+            offsetDesc(line.description),
+            `L${i + 1}`,
+          );
         });
+      } else {
+        pushGl(
+          returnsAccount,
+          0,
+          netAmount,
+          offsetDesc(""),
+          "CR",
+        );
+      }
+
+      if (vatAmount > 0 && vatAccount) {
+        pushGl(
+          vatAccount,
+          calculatedVat,
+          0,
+          `Credit Note ${creditNoteNumber} - VAT Reversal${methodSuffix}`,
+          "VAT",
+        );
       }
     }
 
@@ -625,6 +728,7 @@ exports.createCreditNote = async (req, res) => {
           receiptNo: creditNoteNumber,
           link_id: reference || null, // Link to original invoice
           type: "discount", // Using 'discount' type for credit adjustments
+          bank_account_id: "",
           created_by: userId,
         },
         { transaction }
@@ -640,20 +744,261 @@ exports.createCreditNote = async (req, res) => {
           cost: totalAmount,
           facilityId: facilityId,
           mode_of_payment: "credit_note",
+          receiptNo: creditNoteNumber,
           cheque_no: creditNoteNumber,
           link_id: reference || null, // Link to original invoice/bill
           type: "discount", // Using 'discount' type for credit adjustments
+          bank_account_id: "",
           created_by: userId,
         },
         { transaction }
       );
     }
 
+    // Zoho Refund path: settle immediately via cash/bank and close the note
+    let creditsAppliedOnCreate = 0;
+    let creditsRemainingOnCreate = totalAmount;
+    let docStatusOnCreate = "open";
+
+    if (paymentAdjustmentMethod === "refund_bank") {
+      const mode = ["cash", "bank", "cheque"].includes(refundModeOfPayment)
+        ? refundModeOfPayment
+        : "bank";
+      const bankId =
+        refundBankAccountId != null
+          ? refundBankAccountId
+          : req.body.refundBankAccount?.id;
+
+      let moneyAccount = null;
+      let bankAccountIdForGl = "";
+
+      if (mode === "cash") {
+        const head = String(refundAccountHead?.head || "").trim();
+        moneyAccount = await db.AccountCategory.findOne({
+          where: { facility_id: facilityId, code: head },
+        });
+        if (!moneyAccount) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Cash account ${head} not found in Chart of Accounts`,
+          });
+        }
+      } else {
+        const [banks] = await db.sequelize.query(
+          `SELECT id, head, account_name, account_number
+           FROM bank_accounts
+           WHERE facility_id = :facilityId AND id = :id
+           LIMIT 1`,
+          {
+            replacements: { facilityId, id: bankId },
+            transaction,
+          },
+        );
+        const bank = banks?.[0];
+        if (!bank?.head) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              "Bank account must be linked to a chart account (head) for refund posting",
+          });
+        }
+        moneyAccount = await db.AccountCategory.findOne({
+          where: { facility_id: facilityId, code: String(bank.head) },
+        });
+        if (!moneyAccount) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Bank GL account ${bank.head} not found in Chart of Accounts`,
+          });
+        }
+        bankAccountIdForGl = String(bank.id);
+      }
+
+      const refundDesc = `Refund ${creditNoteNumber} - ${entityName} via ${mode}`;
+      const moneyParent = String(
+        moneyAccount.parentCode ?? moneyAccount.parent_code ?? moneyAccount.code ?? "0",
+      );
+      const controlParent = String(
+        receivablePayableAccount.parentCode ??
+          receivablePayableAccount.parent_code ??
+          receivablePayableAccount.code ??
+          "0",
+      );
+
+      // Customer: Dr AR, Cr Bank/Cash — reverse open credit and pay out
+      // Vendor:   Cr AP, Dr Bank/Cash — reverse open credit and pay out
+      if (type === "customer") {
+        await db.GeneralLedger.bulkCreate(
+          [
+            {
+              facility_id: facilityId,
+              transaction_date: transactionDate,
+              transaction_ref: `${creditNoteNumber}-REFUND-AR`,
+              reference_number: refNum,
+              account_code: receivablePayableAccount.code,
+              account_description: receivablePayableAccount.description,
+              account_subhead: controlParent,
+              dr: Number(Number(totalAmount).toFixed(2)),
+              cr: 0,
+              transaction_description: refundDesc.slice(0, 500),
+              purpose_of_payment: `Refund ${creditNoteNumber}`.slice(0, 150),
+              payee: String(entityName || entityId || "").slice(0, 50),
+              mode_of_payment: mode,
+              bank_account_id: bankAccountIdForGl,
+              type: "discount",
+              status: "saved",
+              created_by: userId,
+            },
+            {
+              facility_id: facilityId,
+              transaction_date: transactionDate,
+              transaction_ref: `${creditNoteNumber}-REFUND-CASH`,
+              reference_number: refNum,
+              account_code: moneyAccount.code,
+              account_description: moneyAccount.description,
+              account_subhead: moneyParent,
+              dr: 0,
+              cr: Number(Number(totalAmount).toFixed(2)),
+              transaction_description: refundDesc.slice(0, 500),
+              purpose_of_payment: `Refund ${creditNoteNumber}`.slice(0, 150),
+              payee: String(entityName || entityId || "").slice(0, 50),
+              mode_of_payment: mode,
+              bank_account_id: bankAccountIdForGl,
+              type: "discount",
+              status: "saved",
+              created_by: userId,
+            },
+          ],
+          { transaction },
+        );
+
+        await db.CustomerEntry.create(
+          {
+            customerNo: entityId,
+            description: refundDesc.slice(0, 255),
+            qty_in: totalAmount,
+            qty_out: 0,
+            cost: totalAmount,
+            facilityId,
+            mode_of_payment: mode,
+            receiptNo: creditNoteNumber,
+            link_id: "REFUND",
+            type: "discount",
+            bank_account_id: bankAccountIdForGl,
+            created_by: userId,
+          },
+          { transaction },
+        );
+      } else {
+        await db.GeneralLedger.bulkCreate(
+          [
+            {
+              facility_id: facilityId,
+              transaction_date: transactionDate,
+              transaction_ref: `${creditNoteNumber}-REFUND-CASH`,
+              reference_number: refNum,
+              account_code: moneyAccount.code,
+              account_description: moneyAccount.description,
+              account_subhead: moneyParent,
+              dr: Number(Number(totalAmount).toFixed(2)),
+              cr: 0,
+              transaction_description: refundDesc.slice(0, 500),
+              purpose_of_payment: `Refund ${creditNoteNumber}`.slice(0, 150),
+              payee: String(entityName || entityId || "").slice(0, 50),
+              mode_of_payment: mode,
+              bank_account_id: bankAccountIdForGl,
+              type: "payable",
+              status: "saved",
+              created_by: userId,
+            },
+            {
+              facility_id: facilityId,
+              transaction_date: transactionDate,
+              transaction_ref: `${creditNoteNumber}-REFUND-AP`,
+              reference_number: refNum,
+              account_code: receivablePayableAccount.code,
+              account_description: receivablePayableAccount.description,
+              account_subhead: controlParent,
+              dr: 0,
+              cr: Number(Number(totalAmount).toFixed(2)),
+              transaction_description: refundDesc.slice(0, 500),
+              purpose_of_payment: `Refund ${creditNoteNumber}`.slice(0, 150),
+              payee: String(entityName || entityId || "").slice(0, 50),
+              mode_of_payment: mode,
+              bank_account_id: bankAccountIdForGl,
+              type: "payable",
+              status: "saved",
+              created_by: userId,
+            },
+          ],
+          { transaction },
+        );
+
+        await db.SupplierEntry.create(
+          {
+            supplier_number: entityId,
+            description: refundDesc.slice(0, 255),
+            qty_in: 0,
+            qty_out: totalAmount,
+            cost: totalAmount,
+            facilityId,
+            mode_of_payment: mode,
+            receiptNo: creditNoteNumber,
+            cheque_no: creditNoteNumber,
+            link_id: "REFUND",
+            type: "payment",
+            bank_account_id: bankAccountIdForGl,
+            created_by: userId,
+          },
+          { transaction },
+        );
+      }
+
+      await db.CreditNoteApplication.create(
+        {
+          facility_id: facilityId,
+          credit_note_number: creditNoteNumber,
+          invoice_ref: "REFUND",
+          amount: totalAmount,
+          created_by: userId,
+        },
+        { transaction },
+      );
+
+      creditsAppliedOnCreate = totalAmount;
+      creditsRemainingOnCreate = 0;
+      docStatusOnCreate = "closed";
+    }
+
     await transaction.commit();
+
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req) || userId,
+      action: "create",
+      entityType: type === "supplier" ? "vendor_credit" : "credit_note",
+      entityId: creditNoteNumber,
+      entityLabel: entityName || entityId,
+      after: {
+        creditNoteNumber,
+        type,
+        entityId,
+        totalAmount,
+        status: docStatusOnCreate,
+        paymentAdjustmentMethod,
+      },
+      remark: reason || "Credit note created",
+    });
 
     res.status(201).json({
       success: true,
-      message: "Credit note created successfully",
+      message:
+        paymentAdjustmentMethod === "refund_bank"
+          ? "Credit note created and refunded successfully"
+          : "Credit note created successfully",
       data: {
         creditNoteNumber,
         type,
@@ -666,6 +1011,9 @@ exports.createCreditNote = async (req, res) => {
         vatAmount: calculatedVat,
         totalAmount,
         lineItems,
+        creditsApplied: creditsAppliedOnCreate,
+        creditsRemaining: creditsRemainingOnCreate,
+        status: docStatusOnCreate,
         paymentAdjustmentMethod: paymentAdjustmentMethod || "offset_outstanding",
         refundModeOfPayment:
           paymentAdjustmentMethod === "refund_bank"
@@ -699,13 +1047,24 @@ exports.createCreditNote = async (req, res) => {
   }
 };
 
+
 /**
- * Get Credit Notes List
+ * Zoho-style list: Credit Notes (CN-C*) and Vendor Credits (CN-S*) from invoices + applications.
  * POST /api/credit-notes/list
+ * body: { facilityId, type?: customer|supplier, status?: open|closed|all, search?, page?, limit? }
  */
 exports.getCreditNotes = async (req, res) => {
   try {
-    const { facilityId, type, startDate, endDate, page = 1, limit = 50 } = req.body;
+    const {
+      facilityId,
+      type,
+      status = "all",
+      search = "",
+      startDate,
+      endDate,
+      page = 1,
+      limit = 50,
+    } = req.body || {};
 
     if (!facilityId) {
       return res.status(400).json({
@@ -714,82 +1073,150 @@ exports.getCreditNotes = async (req, res) => {
       });
     }
 
+    const prefix =
+      type === "supplier" || type === "vendor"
+        ? "CN-S%"
+        : type === "customer"
+          ? "CN-C%"
+          : "CN-%";
+    const invType =
+      type === "supplier" || type === "vendor"
+        ? "purchase"
+        : type === "customer"
+          ? "sales"
+          : null;
+
     const where = {
       facility_id: facilityId,
-      transaction_type: "credit_note",
+      invoice_ref: { [Op.like]: prefix },
+      amount: { [Op.lt]: 0 },
     };
-
-    if (type) {
-      where.transaction_category =
-        type === "customer" ? "customer_credit_note" : "supplier_credit_note";
-    }
-
+    if (invType) where.type = invType;
     if (startDate && endDate) {
       where.transaction_date = {
-        [Op.between]: [new Date(startDate), new Date(endDate)],
+        [Op.between]: [startDate, endDate],
       };
     }
+    if (search && String(search).trim()) {
+      const q = `%${String(search).trim()}%`;
+      where[Op.and] = [
+        {
+          [Op.or]: [
+            { invoice_ref: { [Op.like]: q } },
+            { ref_number: { [Op.like]: q } },
+            { description: { [Op.like]: q } },
+          ],
+        },
+      ];
+    }
 
-    const offset = (page - 1) * limit;
-
-    const { count, rows } = await db.GeneralLedger.findAndCountAll({
+    const invoices = await db.Invoice.findAll({
       where,
-      attributes: [
-        "transaction_ref",
-        "transaction_date",
-        "description",
-        "debit",
-        "credit",
-        "account_code",
-        "account_name",
-        "transaction_category",
-        "created_at",
+      order: [
+        ["transaction_date", "DESC"],
+        ["invoice_id", "DESC"],
       ],
-      order: [["transaction_date", "DESC"], ["created_at", "DESC"]],
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      distinct: true,
     });
 
-    // Group by credit note number (extracted from description) to get unique credit notes
-    const creditNotesMap = new Map();
+    const cnNumbers = invoices.map((i) => i.invoice_ref);
+    const apps =
+      cnNumbers.length === 0
+        ? []
+        : await db.CreditNoteApplication.findAll({
+            where: {
+              facility_id: facilityId,
+              credit_note_number: { [Op.in]: cnNumbers },
+            },
+          });
 
-    rows.forEach((entry) => {
-      // Extract credit note number from description (format: "Credit Note CN-C-YY-0001 - ...")
-      const match = entry.description?.match(/Credit Note\s+([A-Z]+-\d{2}-\d+)/);
-      const creditNoteNumber = match ? match[1] : entry.transaction_ref;
+    const appliedMap = {};
+    for (const a of apps) {
+      const k = a.credit_note_number;
+      appliedMap[k] = (appliedMap[k] || 0) + (parseFloat(a.amount) || 0);
+    }
 
-      if (!creditNotesMap.has(creditNoteNumber)) {
-        creditNotesMap.set(creditNoteNumber, {
-          creditNoteNumber,
-          date: entry.transaction_date,
-          type: entry.transaction_category === "customer_credit_note" ? "customer" : "supplier",
-          description: entry.description,
-          totalAmount: 0,
-          entries: [],
+    const mapped = [];
+    for (const inv of invoices) {
+      const totalAmount = Math.abs(parseFloat(inv.amount) || 0);
+      const creditsApplied = appliedMap[inv.invoice_ref] || 0;
+      const creditsRemaining = Math.max(0, totalAmount - creditsApplied);
+      const docStatus = creditsRemaining <= 0.009 ? "closed" : "open";
+      const isCustomer = inv.type === "sales";
+
+      let entityId = "";
+      let entityName = "";
+      if (isCustomer) {
+        const ce = await db.CustomerEntry.findOne({
+          where: { facilityId, receiptNo: inv.invoice_ref },
+          order: [["created_at", "DESC"]],
         });
+        entityId = ce?.customerNo || "";
+        if (entityId) {
+          const c = await db.Customer.findOne({
+            where: { facilityId, customerNo: entityId },
+          });
+          entityName = c?.fullname || entityId;
+        }
+      } else {
+        const se = await db.SupplierEntry.findOne({
+          where: { facilityId, cheque_no: inv.invoice_ref },
+          order: [["created_at", "DESC"]],
+        });
+        entityId = se?.supplier_number || "";
+        if (entityId) {
+          const s = await db.SuppliersInfo.findOne({
+            where: { facilityId, supplier_number: entityId },
+          });
+          entityName = s?.supplier_name || entityId;
+        }
       }
 
-      const creditNote = creditNotesMap.get(creditNoteNumber);
-      creditNote.entries.push(entry);
-      creditNote.totalAmount += entry.credit || entry.debit;
-    });
+      mapped.push({
+        creditNoteNumber: inv.invoice_ref,
+        reference: inv.ref_number || "",
+        type: isCustomer ? "customer" : "supplier",
+        date: inv.transaction_date,
+        description: inv.description || "",
+        totalAmount,
+        creditsApplied,
+        creditsRemaining,
+        status: docStatus,
+        entityId,
+        entityName: entityName || entityId || "—",
+        vatAmount: parseFloat(inv.tax_amount) || 0,
+        createdBy: inv.created_by,
+        createdAt: inv.created_at,
+        invoiceId: inv.invoice_id,
+      });
+    }
 
-    const creditNotes = Array.from(creditNotesMap.values());
+    const filtered =
+      status === "open" || status === "closed"
+        ? mapped.filter((m) => m.status === status)
+        : mapped;
 
-    res.status(200).json({
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(200, parseInt(limit, 10) || 50));
+    const offset = (pageNum - 1) * limitNum;
+    const pageRows = filtered.slice(offset, offset + limitNum);
+
+    return res.status(200).json({
       success: true,
-      data: creditNotes,
+      data: pageRows,
       pagination: {
-        total: creditNotes.length,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        totalPages: Math.ceil(count / limit),
+        total: filtered.length,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(filtered.length / limitNum) || 1,
+      },
+      meta: {
+        openCount: mapped.filter((m) => m.status === "open").length,
+        closedCount: mapped.filter((m) => m.status === "closed").length,
       },
     });
   } catch (error) {
     console.error("Error fetching credit notes:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch credit notes",
       error: error.message,
@@ -797,11 +1224,6 @@ exports.getCreditNotes = async (req, res) => {
   }
 };
 
-/**
- * Search Invoices by Number (facility-wide, sales + purchase)
- * GET /api/credit-notes/search-invoices?facilityId=&invoiceRef=
- * Returns invoices with type (sales|purchase) - sales = customer credit note, purchase = supplier credit note
- */
 exports.searchInvoices = async (req, res) => {
   try {
     const { facilityId, invoiceRef, search } = req.query;
@@ -889,16 +1311,13 @@ exports.getInvoicesForEntity = async (req, res) => {
     }
 
     const invoiceSearch = (invoiceRef || search || "").trim().toLowerCase();
-
-    // For customer credit notes, we need sales invoices
-    // For supplier credit notes, we need purchase invoices/bills
     const invoiceType = type === "customer" ? "sales" : "purchase";
 
     const baseInvoiceWhere = {
       facility_id: facilityId,
       type: invoiceType,
       ref_number: entityId,
-      amount: { [Op.gt]: 0 }, // Only positive amounts (not credit notes)
+      amount: { [Op.gt]: 0 },
     };
     const invoiceWhere = invoiceSearch
       ? {
@@ -912,68 +1331,39 @@ exports.getInvoicesForEntity = async (req, res) => {
         }
       : baseInvoiceWhere;
 
-    // Get invoices from invoices table
     const invoices = await db.Invoice.findAll({
       where: invoiceWhere,
       order: [["transaction_date", "DESC"]],
-      attributes: ["invoice_id", "invoice_ref", "ref_number", "due_date", "transaction_date", "amount", "description"],
-    });
-
-    // Also get from general_ledger for receivable/payable entries
-    const ledgerType = type === "customer" ? "receivable" : "payable";
-    const ledgerEntries = await db.GeneralLedger.findAll({
-      where: {
-        facility_id: facilityId,
-        type: ledgerType,
-        transaction_ref: entityId,
-        [type === "customer" ? "dr" : "cr"]: { [Op.gt]: 0 },
-      },
-      order: [["transaction_date", "DESC"]],
-      attributes: ["transaction_id", "reference_number", "transaction_date", "dr", "cr", "transaction_description", "status"],
+      attributes: [
+        "invoice_id",
+        "invoice_ref",
+        "ref_number",
+        "type",
+        "due_date",
+        "transaction_date",
+        "amount",
+        "description",
+      ],
       limit: 100,
     });
 
-    // Combine and format results
-    const formattedInvoices = invoices.map((inv) => ({
+    let allInvoices = invoices.map((inv) => ({
       id: inv.invoice_id,
       invoice_id: inv.invoice_id,
-      invoice_ref: inv.invoice_ref,
       invoiceRef: inv.invoice_ref,
+      invoice_ref: inv.invoice_ref,
       ref_number: inv.ref_number,
+      type: inv.type,
+      entityId: inv.ref_number,
       date: inv.transaction_date,
       dueDate: inv.due_date,
       amount: parseFloat(inv.amount),
       description: inv.description,
-      source: "invoices",
     }));
 
-    const formattedLedger = ledgerEntries
-      .filter((entry) => entry.reference_number) // Only entries with reference numbers
-      .map((entry) => ({
-        id: entry.transaction_id,
-        invoice_id: entry.transaction_id,
-        invoice_ref: entry.reference_number,
-        invoiceRef: entry.reference_number,
-        date: entry.transaction_date,
-        amount: parseFloat(type === "customer" ? entry.dr : entry.cr),
-        description: entry.transaction_description,
-        status: entry.status,
-        source: "ledger",
-      }));
-
-    // Merge and deduplicate by invoice reference
-    let allInvoices = [...formattedInvoices];
-    formattedLedger.forEach((ledgerEntry) => {
-      if (!allInvoices.find((inv) => inv.invoiceRef === ledgerEntry.invoiceRef)) {
-        allInvoices.push(ledgerEntry);
-      }
-    });
-
-    // Filter by invoice number if search provided (for ledger-sourced entries)
     if (invoiceSearch) {
-      allInvoices = allInvoices.filter(
-        (inv) =>
-          (inv.invoiceRef || "").toLowerCase().includes(invoiceSearch)
+      allInvoices = allInvoices.filter((inv) =>
+        (inv.invoiceRef || "").toLowerCase().includes(invoiceSearch),
       );
     }
 
@@ -992,8 +1382,8 @@ exports.getInvoicesForEntity = async (req, res) => {
 };
 
 /**
- * Get Credit Note Details
- * GET /api/credit-notes/:creditNoteNumber
+ * Get Credit Note / Vendor Credit details (Zoho detail pane)
+ * GET /api/credit-notes/:creditNoteNumber?facilityId=
  */
 exports.getCreditNoteDetails = async (req, res) => {
   try {
@@ -1007,58 +1397,118 @@ exports.getCreditNoteDetails = async (req, res) => {
       });
     }
 
-    const entries = await db.GeneralLedger.findAll({
+    const invoice = await db.Invoice.findOne({
       where: {
         facility_id: facilityId,
-        description: {
-          [Op.like]: `%Credit Note ${creditNoteNumber}%`,
-        },
-        transaction_type: "credit_note",
+        invoice_ref: creditNoteNumber,
+        amount: { [Op.lt]: 0 },
       },
-      order: [["created_at", "ASC"]],
     });
 
-    if (entries.length === 0) {
+    if (!invoice) {
       return res.status(404).json({
         success: false,
         message: "Credit note not found",
       });
     }
 
-    // Extract credit note details
-    const firstEntry = entries[0];
-    const type = firstEntry.transaction_category === "customer_credit_note" ? "customer" : "supplier";
+    const isCustomer = invoice.type === "sales";
+    let entityId = "";
+    let entityName = "";
 
-    // Calculate totals
-    let subtotal = 0;
-    let vatAmount = 0;
-    let totalAmount = 0;
-
-    entries.forEach((entry) => {
-      if (entry.account_name?.includes("Returns") || entry.account_name?.includes("Adjustment")) {
-        subtotal += entry.debit || entry.credit;
-      } else if (entry.account_name?.includes("VAT")) {
-        vatAmount += entry.debit || entry.credit;
+    if (isCustomer) {
+      const ce = await db.CustomerEntry.findOne({
+        where: { facilityId, receiptNo: creditNoteNumber },
+        order: [["created_at", "DESC"]],
+      });
+      entityId = ce?.customerNo || "";
+      if (entityId) {
+        const c = await db.Customer.findOne({
+          where: { facilityId, customerNo: entityId },
+        });
+        entityName = c?.fullname || entityId;
       }
-      totalAmount += entry.credit || entry.debit;
+    } else {
+      const se = await db.SupplierEntry.findOne({
+        where: { facilityId, cheque_no: creditNoteNumber },
+        order: [["created_at", "DESC"]],
+      });
+      entityId = se?.supplier_number || "";
+      if (entityId) {
+        const s = await db.SuppliersInfo.findOne({
+          where: { facilityId, supplier_number: entityId },
+        });
+        entityName = s?.supplier_name || entityId;
+      }
+    }
+
+    const applications = await db.CreditNoteApplication.findAll({
+      where: { facility_id: facilityId, credit_note_number: creditNoteNumber },
+      order: [["created_at", "DESC"]],
     });
 
-    res.status(200).json({
+    const creditsApplied = applications.reduce(
+      (s, a) => s + (parseFloat(a.amount) || 0),
+      0,
+    );
+    const totalAmount = Math.abs(parseFloat(invoice.amount) || 0);
+    const creditsRemaining = Math.max(0, totalAmount - creditsApplied);
+
+    const glEntries = await db.GeneralLedger.findAll({
+      where: {
+        facility_id: facilityId,
+        [Op.or]: [
+          { reference_number: String(creditNoteNumber).slice(0, 15) },
+          { transaction_ref: { [Op.like]: `${creditNoteNumber}%` } },
+          {
+            transaction_description: {
+              [Op.like]: `%Credit Note ${creditNoteNumber}%`,
+            },
+          },
+        ],
+      },
+      order: [["transaction_id", "ASC"]],
+      limit: 50,
+    });
+
+    return res.status(200).json({
       success: true,
       data: {
         creditNoteNumber,
-        type,
-        date: firstEntry.transaction_date,
-        description: firstEntry.description,
-        subtotal,
-        vatAmount,
+        type: isCustomer ? "customer" : "supplier",
+        date: invoice.transaction_date,
+        reference: invoice.ref_number || "",
+        reason: invoice.description || "",
+        description: invoice.description || "",
+        entityId,
+        entityName: entityName || entityId || "—",
+        subtotal: totalAmount - (parseFloat(invoice.tax_amount) || 0),
+        vatAmount: parseFloat(invoice.tax_amount) || 0,
         totalAmount,
-        entries,
+        creditsApplied,
+        creditsRemaining,
+        status: creditsRemaining <= 0.009 ? "closed" : "open",
+        applications: applications.map((a) => ({
+          id: a.id,
+          invoiceRef: a.invoice_ref,
+          amount: parseFloat(a.amount) || 0,
+          date: a.created_at,
+          createdBy: a.created_by,
+        })),
+        entries: glEntries.map((e) => ({
+          account_code: e.account_code,
+          account_description: e.account_description,
+          dr: parseFloat(e.dr) || 0,
+          cr: parseFloat(e.cr) || 0,
+          transaction_description: e.transaction_description,
+          transaction_date: e.transaction_date,
+          reference_number: e.reference_number,
+        })),
       },
     });
   } catch (error) {
     console.error("Error fetching credit note details:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch credit note details",
       error: error.message,
@@ -1066,3 +1516,367 @@ exports.getCreditNoteDetails = async (req, res) => {
   }
 };
 
+/**
+ * Apply credit note / vendor credit to invoice(s) — Zoho "Apply to Invoices / Bills"
+ * POST /api/credit-notes/apply
+ * body: { facilityId, userId, creditNoteNumber, applications: [{ invoiceRef, amount }] }
+ */
+exports.applyCreditNote = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const { facilityId, userId, creditNoteNumber, applications } = req.body || {};
+
+    if (
+      !facilityId ||
+      !userId ||
+      !creditNoteNumber ||
+      !Array.isArray(applications) ||
+      applications.length === 0
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "facilityId, userId, creditNoteNumber, and applications[] are required",
+      });
+    }
+
+    const invoice = await db.Invoice.findOne({
+      where: {
+        facility_id: facilityId,
+        invoice_ref: creditNoteNumber,
+        amount: { [Op.lt]: 0 },
+      },
+      transaction,
+    });
+
+    if (!invoice) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Credit note not found",
+      });
+    }
+
+    const isCustomer = invoice.type === "sales";
+    const existingApps = await db.CreditNoteApplication.findAll({
+      where: { facility_id: facilityId, credit_note_number: creditNoteNumber },
+      transaction,
+    });
+    const alreadyApplied = existingApps.reduce(
+      (s, a) => s + (parseFloat(a.amount) || 0),
+      0,
+    );
+    const totalAmount = Math.abs(parseFloat(invoice.amount) || 0);
+    let remaining = Math.max(0, totalAmount - alreadyApplied);
+
+    const applyTotal = applications.reduce(
+      (s, a) => s + (parseFloat(a.amount) || 0),
+      0,
+    );
+    if (applyTotal <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Application amounts must be positive",
+      });
+    }
+    if (applyTotal > remaining + 0.009) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Cannot apply ${applyTotal}: only ${remaining.toFixed(2)} credits remaining`,
+      });
+    }
+
+    let entityId = "";
+    let entityName = "";
+    if (isCustomer) {
+      const ce = await db.CustomerEntry.findOne({
+        where: { facilityId, receiptNo: creditNoteNumber },
+        transaction,
+      });
+      entityId = ce?.customerNo || "";
+      const c = entityId
+        ? await db.Customer.findOne({
+            where: { facilityId, customerNo: entityId },
+            transaction,
+          })
+        : null;
+      entityName = c?.fullname || entityId;
+    } else {
+      const se = await db.SupplierEntry.findOne({
+        where: {
+          facilityId,
+          [Op.or]: [
+            { receiptNo: creditNoteNumber },
+            { cheque_no: creditNoteNumber },
+          ],
+        },
+        transaction,
+      });
+      entityId = se?.supplier_number || invoice.ref_number || "";
+      const s = entityId
+        ? await db.SuppliersInfo.findOne({
+            where: { facilityId, supplier_number: entityId },
+            transaction,
+          })
+        : null;
+      entityName = s?.supplier_name || entityId;
+    }
+
+    let balanceAccount = await db.AccountCategory.findOne({
+      where: {
+        facility_id: facilityId,
+        description: {
+          [Op.like]: isCustomer ? "%Accounts receivable%" : "%Accounts Payable%",
+        },
+      },
+      order: [["level", "ASC"]],
+      transaction,
+    });
+    if (!balanceAccount && isCustomer) {
+      balanceAccount = await db.AccountCategory.findOne({
+        where: {
+          facility_id: facilityId,
+          description: { [Op.like]: "%A/R%" },
+        },
+        order: [["level", "ASC"]],
+        transaction,
+      });
+    }
+    if (!balanceAccount && !isCustomer) {
+      balanceAccount = await db.AccountCategory.findOne({
+        where: {
+          facility_id: facilityId,
+          description: { [Op.like]: "%A/P%" },
+        },
+        order: [["level", "ASC"]],
+        transaction,
+      });
+    }
+    if (!balanceAccount) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `${isCustomer ? "Accounts Receivable" : "Accounts Payable"} account not found`,
+      });
+    }
+
+    const parent = String(
+      balanceAccount.parentCode ?? balanceAccount.parent_code ?? balanceAccount.code ?? "0",
+    );
+    const today = new Date();
+    const cnRef = String(creditNoteNumber).slice(0, 15);
+    const savedApps = [];
+
+    for (const app of applications) {
+      const invRef = String(app.invoiceRef || app.invoice_ref || "").trim();
+      const amt = parseFloat(app.amount);
+      if (!invRef || !Number.isFinite(amt) || amt <= 0) continue;
+
+      const targetInv = await db.Invoice.findOne({
+        where: {
+          facility_id: facilityId,
+          invoice_ref: invRef,
+          amount: { [Op.gt]: 0 },
+          type: isCustomer ? "sales" : "purchase",
+        },
+        transaction,
+      });
+      if (!targetInv) {
+        await transaction.rollback();
+        return res.status(404).json({
+          success: false,
+          message: `Invoice/bill ${invRef} not found`,
+        });
+      }
+
+      const purpose = `Apply ${creditNoteNumber} to ${invRef}`.slice(0, 150);
+      const desc = `Applied credit ${creditNoteNumber} to ${invRef} — ${entityName}`.slice(0, 500);
+
+      if (isCustomer) {
+        await db.GeneralLedger.bulkCreate(
+          [
+            {
+              facility_id: facilityId,
+              transaction_date: today,
+              transaction_ref: `${creditNoteNumber}-APPLY-${invRef}`.slice(0, 100),
+              reference_number: cnRef,
+              account_code: balanceAccount.code,
+              account_description: balanceAccount.description,
+              account_subhead: parent,
+              dr: Number(amt.toFixed(2)),
+              cr: 0,
+              transaction_description: desc,
+              purpose_of_payment: purpose,
+              payee: String(entityName || entityId).slice(0, 50),
+              mode_of_payment: "credit_note",
+              bank_account_id: "",
+              type: "receivable",
+              status: "saved",
+              created_by: userId,
+            },
+            {
+              facility_id: facilityId,
+              transaction_date: today,
+              transaction_ref: `${invRef}-CN-${creditNoteNumber}`.slice(0, 100),
+              reference_number: String(invRef).slice(0, 15),
+              account_code: balanceAccount.code,
+              account_description: balanceAccount.description,
+              account_subhead: parent,
+              dr: 0,
+              cr: Number(amt.toFixed(2)),
+              transaction_description: desc,
+              purpose_of_payment: purpose,
+              payee: String(entityName || entityId).slice(0, 50),
+              mode_of_payment: "credit_note",
+              bank_account_id: "",
+              type: "receivable",
+              status: "saved",
+              created_by: userId,
+            },
+          ],
+          { transaction },
+        );
+
+        await db.CustomerEntry.create(
+          {
+            customerNo: entityId,
+            description: desc.slice(0, 255),
+            qty_in: 0,
+            qty_out: amt,
+            cost: amt,
+            facilityId,
+            mode_of_payment: "credit_note",
+            receiptNo: creditNoteNumber,
+            link_id: invRef,
+            type: "discount",
+            bank_account_id: "",
+            created_by: userId,
+          },
+          { transaction },
+        );
+      } else {
+        // Move unapplied vendor credit onto the bill:
+        // CR A/P against the credit note, DR A/P (type=payment) against the bill
+        // so outstanding-bill queries pick up the settlement.
+        await db.GeneralLedger.bulkCreate(
+          [
+            {
+              facility_id: facilityId,
+              transaction_date: today,
+              transaction_ref: entityId || `${creditNoteNumber}-APPLY`,
+              reference_number: cnRef,
+              account_code: balanceAccount.code,
+              account_description: balanceAccount.description,
+              account_subhead: parent,
+              dr: 0,
+              cr: Number(amt.toFixed(2)),
+              transaction_description: desc,
+              purpose_of_payment: purpose,
+              payee: String(entityName || entityId).slice(0, 50),
+              mode_of_payment: "credit_note",
+              bank_account_id: "",
+              type: "payable",
+              status: "saved",
+              created_by: userId,
+            },
+            {
+              facility_id: facilityId,
+              transaction_date: today,
+              transaction_ref: entityId || `${invRef}-CN`,
+              reference_number: String(invRef).slice(0, 15),
+              account_code: balanceAccount.code,
+              account_description: balanceAccount.description,
+              account_subhead: parent,
+              dr: Number(amt.toFixed(2)),
+              cr: 0,
+              transaction_description: desc,
+              purpose_of_payment: purpose,
+              payee: String(entityName || entityId).slice(0, 50),
+              mode_of_payment: "credit_note",
+              bank_account_id: "",
+              type: "payment",
+              status: "saved",
+              created_by: userId,
+            },
+          ],
+          { transaction },
+        );
+
+        await db.SupplierEntry.create(
+          {
+            supplier_number: entityId,
+            description: desc.slice(0, 255),
+            qty_in: amt,
+            qty_out: 0,
+            cost: amt,
+            facilityId,
+            mode_of_payment: "credit_note",
+            receiptNo: creditNoteNumber,
+            cheque_no: creditNoteNumber,
+            link_id: invRef,
+            type: "discount",
+            bank_account_id: "",
+            created_by: userId,
+          },
+          { transaction },
+        );
+      }
+
+      const row = await db.CreditNoteApplication.create(
+        {
+          facility_id: facilityId,
+          credit_note_number: creditNoteNumber,
+          invoice_ref: invRef,
+          amount: amt,
+          created_by: userId,
+        },
+        { transaction },
+      );
+      savedApps.push({
+        id: row.id,
+        invoiceRef: invRef,
+        amount: amt,
+      });
+      remaining -= amt;
+    }
+
+    await transaction.commit();
+
+    await recordActivity({
+      facilityId,
+      userId: pickActor(req) || userId,
+      action: "apply",
+      entityType: "credit_note_application",
+      entityId: creditNoteNumber,
+      entityLabel: creditNoteNumber,
+      after: {
+        applications: savedApps,
+        creditsRemaining: Math.max(0, remaining),
+        status: remaining <= 0.009 ? "closed" : "open",
+      },
+      remark: "Credit note applied to invoice(s)",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Credits applied successfully",
+      data: {
+        creditNoteNumber,
+        applications: savedApps,
+        creditsRemaining: Math.max(0, remaining),
+        status: remaining <= 0.009 ? "closed" : "open",
+      },
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("Error applying credit note:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to apply credit note",
+      error: error.message,
+    });
+  }
+};
