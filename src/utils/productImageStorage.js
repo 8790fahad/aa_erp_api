@@ -31,17 +31,16 @@ const parseDataUrl = (value) => {
 const getUploadsRoot = () =>
   path.join(__dirname, "..", "..", "public", "uploads", "product-images");
 
-/** Apache serves /public/uploads under inventria_new, not flowbooks_api. */
+/** Public URL prefix for /public/uploads (must match Apache alias / BASE_PATH). */
 const getStaticPublicBasePath = () => {
   if (process.env.PUBLIC_STATIC_BASE_PATH) {
     const configured = String(process.env.PUBLIC_STATIC_BASE_PATH).trim();
     const withSlash = configured.startsWith("/") ? configured : `/${configured}`;
-    return withSlash.replace(/\/$/, "") || "/inventria_new";
+    return withSlash.replace(/\/$/, "") || "/flowbooks";
   }
 
-  const basePath = String(process.env.BASE_PATH || "/inventria_new").replace(/\/$/, "");
-  if (basePath === "/flowbooks_api") return "/inventria_new";
-  return basePath || "/inventria_new";
+  const basePath = String(process.env.BASE_PATH || "/flowbooks").replace(/\/$/, "");
+  return basePath || "/flowbooks";
 };
 
 const getStaticPublicOrigin = (req) => {

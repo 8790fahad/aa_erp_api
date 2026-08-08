@@ -32,13 +32,13 @@ if (trustProxyIps && trustProxyIps.trim()) {
 } else {
   app.set("trust proxy", 1);
 }
-// Base path under which the API is mounted (e.g. "/inventria_new")
-const BASE_PATH = process.env.BASE_PATH || "/inventria_new";
+// Base path under which the API is mounted (public URL prefix)
+const BASE_PATH = process.env.BASE_PATH || "/flowbooks";
 const welcomePayload = {
   msg: "Welcome",
   description: "FlowBooks API Server",
   version: "2.0.0",
-  documentation: `${process.env.APP_URL || ""}${BASE_PATH}/api-docs`,
+  documentation: `${(process.env.APP_URL || "").replace(/\/$/, "")}${BASE_PATH}/api-docs`,
   compliance:
     "Data compliance organization · Nigeria Data Protection Commission (NDPC) · ISO 27001 · ISO 9001",
 };
@@ -211,7 +211,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Apache/nginx often forwards the public URL path (e.g. /inventria_new/api/...) while routes are registered at /api/...
+// Apache/nginx often forwards the public URL path (e.g. /flowbooks/api/...) while routes are registered at /api/...
 // Strip BASE_PATH so OPTIONS preflight and POST hit the same handlers and cors() can attach headers.
 if (BASE_PATH && BASE_PATH !== "/") {
   const baseNoTrailing = BASE_PATH.endsWith("/")
@@ -274,7 +274,7 @@ app.use(
   helmet.permittedCrossDomainPolicies({ permittedPolicies: "none" }),
 );
 
-// Health / sanity checks — must be AFTER BASE_PATH strip so /inventria_new/ and /inventria_new/welcome match.
+// Health / sanity checks — must be AFTER BASE_PATH strip so /flowbooks/ and /flowbooks/welcome match.
 app.get("/", (req, res) => {
   res.json(welcomePayload);
 });

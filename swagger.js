@@ -9,7 +9,7 @@ const {
 } = require("./swagger/routeScanner");
 
 const PORT = process.env.PORT || 3000;
-const BASE_PATH = process.env.BASE_PATH || "/inventria_new";
+const BASE_PATH = process.env.BASE_PATH || "/flowbooks";
 const API_BASE_URL = (
   process.env.API_BASE_URL ||
   process.env.APP_URL ||

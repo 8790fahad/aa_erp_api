@@ -2079,7 +2079,7 @@ exports.uploadBusinessDocument = async (req, res) => {
       });
     }
 
-    const basePath = (process.env.BASE_PATH || "/inventria_new").replace(
+    const basePath = (process.env.BASE_PATH || "/flowbooks").replace(
       /\/$/,
       "",
     );
