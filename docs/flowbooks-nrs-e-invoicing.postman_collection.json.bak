@@ -65,12 +65,12 @@
   "variable": [
     {
       "key": "baseUrl",
-      "value": "https://server.brainstorm.ng/inventria_new",
+      "value": "https://server.brainstorm.ng/flowbooks",
       "type": "string"
     },
     {
       "key": "authUrl",
-      "value": "https://server.brainstorm.ng/inventria_new",
+      "value": "https://server.brainstorm.ng/flowbooks",
       "type": "string"
     },
     {

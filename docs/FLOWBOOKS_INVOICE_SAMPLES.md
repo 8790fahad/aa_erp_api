@@ -1,17 +1,17 @@
 # FlowBooks E-Invoicing API
 
-**Document Version:** 2.0  
-**Last Updated:** July 2026  
+**Document Version:** 2.0
+**Last Updated:** July 2026
 **Scope:** FIRS/NRS e-Invoicing — NRS/FIRS payload structure only
 
 **API documentation (single URL):**
 
-| | URL |
-|--|-----|
-| Documentation | `/e-invoicing-api-docs` (Redoc — NRS e-invoicing only) |
-| OpenAPI JSON | `/e-invoicing-api-docs.json` |
-| Try-it (Swagger) | `/e-invoicing-api-docs/try` |
-| Production | `https://server.brainstorm.ng/inventria_new/e-invoicing-api-docs` |
+|                  | URL                                                           |
+| ---------------- | ------------------------------------------------------------- |
+| Documentation    | `/e-invoicing-api-docs` (Redoc — NRS e-invoicing only)        |
+| OpenAPI JSON     | `/e-invoicing-api-docs.json`                                  |
+| Try-it (Swagger) | `/e-invoicing-api-docs/try`                                   |
+| Production       | `https://server.brainstorm.ng/flowbooks/e-invoicing-api-docs` |
 
 Reference: [FIRS e-Invoicing API](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
 
@@ -19,14 +19,14 @@ Reference: [FIRS e-Invoicing API](https://einvoice.firs.gov.ng/docs/introduction
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/invoice/create` | Submit NRS invoice |
-| POST | `/api/v1/invoice/status` | Lookup by `business_id` + `irn` |
-| POST | `/api/v1/invoice/payment/notify` | Notify payment status |
+| Method | Path                             | Description                     |
+| ------ | -------------------------------- | ------------------------------- |
+| POST   | `/api/v1/invoice/create`         | Submit NRS invoice              |
+| POST   | `/api/v1/invoice/status`         | Lookup by `business_id` + `irn` |
+| POST   | `/api/v1/invoice/payment/notify` | Notify payment status           |
 
-**Authentication:** OAuth 2.0 client credentials (system-to-system) — `POST /api/v1/invoice/oauth/token`.  
-Access tokens are short-lived Bearer JWTs (`expires_in` default 3600, `scope`: `e-invoicing`).  
+**Authentication:** OAuth 2.0 client credentials (system-to-system) — `POST /api/v1/invoice/oauth/token`.
+Access tokens are short-lived Bearer JWTs (`expires_in` default 3600, `scope`: `e-invoicing`).
 See [FIRS e-Invoicing](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
 
 ---

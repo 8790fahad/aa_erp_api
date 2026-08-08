@@ -65,12 +65,12 @@
   "variable": [
     {
       "key": "baseUrl",
-      "value": "https://server.brainstorm.ng/inventria_new",
+      "value": "https://server.brainstorm.ng/flowbooks",
       "type": "string"
     },
     {
       "key": "authUrl",
-      "value": "https://server.brainstorm.ng/inventria_new",
+      "value": "https://server.brainstorm.ng/flowbooks",
       "type": "string"
     },
     {
@@ -168,16 +168,8 @@
         },
         "url": {
           "raw": "{{authUrl}}/api/v1/invoice/oauth/token",
-          "host": [
-            "{{authUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "invoice",
-            "oauth",
-            "token"
-          ]
+          "host": ["{{authUrl}}"],
+          "path": ["api", "v1", "invoice", "oauth", "token"]
         },
         "description": "OAuth 2.0 client-credentials grant. Sends HTTP Basic auth with {{client_id}}:{{client_secret}} and grant_type=client_credentials, and returns a short-lived Bearer token. The test script stores {{access_token}} and {{token_expiry}} for the other requests. NOTE: the collection also auto-mints this token via a pre-request script, so running this request manually is optional — it's here so you can see/test the auth step directly."
       }
@@ -213,15 +205,8 @@
         },
         "url": {
           "raw": "{{baseUrl}}/api/v1/invoice/create",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "invoice",
-            "create"
-          ]
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "invoice", "create"]
         },
         "description": "Submit a standardized invoice to NRS. Credit notes (380) and debit notes (384) require a billing_reference array."
       }
@@ -257,15 +242,8 @@
         },
         "url": {
           "raw": "{{baseUrl}}/api/v1/invoice/status",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "invoice",
-            "status"
-          ]
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "invoice", "status"]
         },
         "description": "Retrieve clearance and transmission status for an invoice by business_id and irn."
       }
@@ -301,16 +279,8 @@
         },
         "url": {
           "raw": "{{baseUrl}}/api/v1/invoice/payment/notify",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "invoice",
-            "payment",
-            "notify"
-          ]
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "invoice", "payment", "notify"]
         },
         "description": "Update payment status for a cleared invoice.\n\nSame endpoint for every status — only change payment_status:\n  PENDING | PAID | REJECTED | PARTIAL\n\nExamples (same request, different status):\n\nPAID:\n{ \"business_id\": \"{{business_id}}\", \"irn\": \"{{irn}}\", \"payment_status\": \"PAID\" }\n\nPARTIAL (amount required — this installment):\n{ \"business_id\": \"{{business_id}}\", \"irn\": \"{{irn}}\", \"payment_status\": \"PARTIAL\", \"amount\": 50000 }\n\nControls for PARTIAL: amount cannot exceed payable or remaining balance;\nwhen fully paid, status becomes PAID automatically."
       }
@@ -346,16 +316,8 @@
         },
         "url": {
           "raw": "{{baseUrl}}/api/v1/invoice/transmit/{{irn}}",
-          "host": [
-            "{{baseUrl}}"
-          ],
-          "path": [
-            "api",
-            "v1",
-            "invoice",
-            "transmit",
-            "{{irn}}"
-          ],
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "invoice", "transmit", "{{irn}}"],
           "variable": [
             {
               "key": "irn",
