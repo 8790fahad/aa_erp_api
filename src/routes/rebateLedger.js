@@ -11,4 +11,8 @@ module.exports = (app) => {
     "/api/v1/rebate-ledger/issue-credit-note",
     rebate.issueCreditNote,
   );
+  app.post(
+    "/api/v1/rebate-ledger/issue-payment",
+    rebate.issuePayment,
+  );
 };

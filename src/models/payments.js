@@ -24,10 +24,8 @@ module.exports = (sequelize, DataTypes) => {
       Payment.belongsTo(models.Customer, { foreignKey: "customerNo" });
     }
 
-    // Payment has many PaymentApplications
-    if (models.PaymentApplication) {
-      Payment.hasMany(models.PaymentApplication, { foreignKey: "payment_id" });
-    }
+    // Payment applications table removed — unused by live controllers
+
   };
 
   return Payment;

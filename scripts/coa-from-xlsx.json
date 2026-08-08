@@ -1,0 +1,1532 @@
+[
+  {
+    "code": "100000",
+    "name": "ASSETS",
+    "type": "Header"
+  },
+  {
+    "code": "111000",
+    "name": "NON-CURRENT ASSET",
+    "type": "Group"
+  },
+  {
+    "code": "111001",
+    "name": "Land",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111002",
+    "name": "Buildings",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111003",
+    "name": "Motor Vehicles",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111004",
+    "name": "Furniture and Fittings",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111005",
+    "name": "Office Equipment",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111006",
+    "name": "Computers and Laptops",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111007",
+    "name": "Generator",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111008",
+    "name": "Air Conditioners",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "111009",
+    "name": "Intangible Assets (Software & Licenses)",
+    "type": "Non- Current Asset"
+  },
+  {
+    "code": "112000",
+    "name": "CURRENT ASSETS",
+    "type": "Header"
+  },
+  {
+    "code": "112100",
+    "name": "Accounts Receivable",
+    "type": ""
+  },
+  {
+    "code": "112101",
+    "name": "Other Receivables",
+    "type": ""
+  },
+  {
+    "code": "112102",
+    "name": "Prepaid Expenses",
+    "type": ""
+  },
+  {
+    "code": "112103",
+    "name": "Input VAT Recoverable",
+    "type": ""
+  },
+  {
+    "code": "112104",
+    "name": "Staff Advances and Imprests",
+    "type": ""
+  },
+  {
+    "code": "112200",
+    "name": "Cash & Cash Equivalents",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112201",
+    "name": "Banks",
+    "type": "Group"
+  },
+  {
+    "code": "112202",
+    "name": "Access Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112203",
+    "name": "Citibank Nigeria",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112204",
+    "name": "Ecobank Nigeria",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112205",
+    "name": "Fidelity Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112206",
+    "name": "First Bank of Nigeria",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112207",
+    "name": "First City Monument Bank (FCMB)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112208",
+    "name": "Globus Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112209",
+    "name": "Guaranty Trust Bank (GTBank)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112210",
+    "name": "Keystone Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112211",
+    "name": "Lotus Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112212",
+    "name": "Nova Merchant Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112213",
+    "name": "Optimus Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112214",
+    "name": "Parallex Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112215",
+    "name": "Polaris Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112216",
+    "name": "PremiumTrust Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112217",
+    "name": "Providus Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112218",
+    "name": "Signature Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112219",
+    "name": "Stanbic IBTC Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112220",
+    "name": "Standard Chartered Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112221",
+    "name": "Sterling Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112222",
+    "name": "SunTrust Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112223",
+    "name": "Abbey Mortgage Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112224",
+    "name": "Coronation Merchant Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112225",
+    "name": "Jaiz Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112226",
+    "name": "TAJ Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112227",
+    "name": "Titan Trust Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112228",
+    "name": "Unity Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112229",
+    "name": "Wema Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112230",
+    "name": "Zenith Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112231",
+    "name": "Opay Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112232",
+    "name": "Moniepoint Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112233",
+    "name": "PalmPay Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112234",
+    "name": "Kuda Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112235",
+    "name": "VFD Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112236",
+    "name": "Mint Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112237",
+    "name": "Sparkle Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112238",
+    "name": "Accion Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112239",
+    "name": "LAPO Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112240",
+    "name": "Bosak Microfinance Bank",
+    "type": "Current Asset"
+  },
+  {
+    "code": "112300",
+    "name": "INVENTORY",
+    "type": "Header"
+  },
+  {
+    "code": "120100",
+    "name": "IRS PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120101",
+    "name": "IRS Flour",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120102",
+    "name": "IRS Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120103",
+    "name": "IRS Macaroni",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120104",
+    "name": "IRS Bran (Dusa)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120200",
+    "name": "BUA PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120201",
+    "name": "BUA Thailand Rice",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120202",
+    "name": "BUA Sugar (50kg)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120203",
+    "name": "BUA Sugar (25kg)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120204",
+    "name": "BUA Cement",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120205",
+    "name": "BUA Rice",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120206",
+    "name": "Sokoto Cement",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120300",
+    "name": "OLAM PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120301",
+    "name": "Crown Flour",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120302",
+    "name": "Crown Pasta (Slim)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120303",
+    "name": "Crown Thick Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120304",
+    "name": "Crown Premium Thick Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120305",
+    "name": "Crown Macaroni",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120306",
+    "name": "Crown Premium Macaroni",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120307",
+    "name": "Crown Premium Slim Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120400",
+    "name": "RAFA PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120401",
+    "name": "Rafa Detagent      (850x7pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120402",
+    "name": "Rafa Detagent      (170x26pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120403",
+    "name": "Rafa Detagent      (150x26pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120404",
+    "name": "Rafa Detagent     (120x36pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120405",
+    "name": "Rafa Detagent     (85x52pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120406",
+    "name": "Rafa Detagent     (55x84pcs)",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120500",
+    "name": "DANGOTE PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120501",
+    "name": "Dangote   Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120502",
+    "name": "Dangote  Salt",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120503",
+    "name": "Dangote  Sugar 25kg",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120504",
+    "name": "Dangote  Sugar 50kg",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120505",
+    "name": "Dangote  Crude Salt",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120506",
+    "name": "Dangote  Refined Salt  By 20",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120507",
+    "name": "Dangote  Refined Salt  By 40",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120508",
+    "name": "Dangote Refined Salt  By 80",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120509",
+    "name": "Dangote  Bread Flour",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120600",
+    "name": "HONEY WELL PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "120601",
+    "name": "Honey  Cavatto",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120602",
+    "name": "Honey Pasta",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120603",
+    "name": "Honey Pasta Slim",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120604",
+    "name": "Honey  Flour",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120700",
+    "name": "GOLDEN PENNY",
+    "type": "Group"
+  },
+  {
+    "code": "120701",
+    "name": "Golden penny Maccarony",
+    "type": "Current Asset"
+  },
+  {
+    "code": "120702",
+    "name": "Golden Penny Sphagetty",
+    "type": "Current Asset"
+  },
+  {
+    "code": "600000",
+    "name": "SALES REVENUE",
+    "type": "Header"
+  },
+  {
+    "code": "610100",
+    "name": "IRS PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610101",
+    "name": "IRS Flour",
+    "type": "Revenue"
+  },
+  {
+    "code": "610102",
+    "name": "IRS Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610103",
+    "name": "IRS Macaroni",
+    "type": "Revenue"
+  },
+  {
+    "code": "610104",
+    "name": "IRS Bran (Dusa)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610200",
+    "name": "BUA  PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610201",
+    "name": "BUA Thailand Rice",
+    "type": "Revenue"
+  },
+  {
+    "code": "610202",
+    "name": "BUA Sugar (50kg)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610203",
+    "name": "BUA Sugar (25kg)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610204",
+    "name": "BUA Cement",
+    "type": "Revenue"
+  },
+  {
+    "code": "610205",
+    "name": "BUA Rice",
+    "type": "Revenue"
+  },
+  {
+    "code": "610206",
+    "name": "Sokoto Cement",
+    "type": "Revenue"
+  },
+  {
+    "code": "610300",
+    "name": "OLAM PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610301",
+    "name": "Crown Flour",
+    "type": "Revenue"
+  },
+  {
+    "code": "610302",
+    "name": "Crown Pasta (Slim)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610303",
+    "name": "Crown Thick Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610304",
+    "name": "Crown Premium Thick Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610305",
+    "name": "Crown Macaroni",
+    "type": "Revenue"
+  },
+  {
+    "code": "610306",
+    "name": "Crown Premium Macaroni",
+    "type": "Revenue"
+  },
+  {
+    "code": "610307",
+    "name": "Crown Premium Slim Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610500",
+    "name": "RAFA PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610501",
+    "name": "Rafa Detagent      (850x7pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610502",
+    "name": "Rafa Detagent      (170x26pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610503",
+    "name": "Rafa Detagent      (150x26pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610504",
+    "name": "Rafa Detagent     (120x36pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610505",
+    "name": "Rafa Detagent     (85x52pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610506",
+    "name": "Rafa Detagent     (55x84pcs)",
+    "type": "Revenue"
+  },
+  {
+    "code": "610510",
+    "name": "DANGOTE PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610511",
+    "name": "Dangote   Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610512",
+    "name": "Dangote  Salt",
+    "type": "Revenue"
+  },
+  {
+    "code": "610513",
+    "name": "Dangote  Sugar 25kg",
+    "type": "Revenue"
+  },
+  {
+    "code": "610514",
+    "name": "Dangote  Sugar 50kg",
+    "type": "Revenue"
+  },
+  {
+    "code": "610515",
+    "name": "Dangote  Crude Salt",
+    "type": "Revenue"
+  },
+  {
+    "code": "610516",
+    "name": "Dangote  Refined Salt  By 20",
+    "type": "Revenue"
+  },
+  {
+    "code": "610507",
+    "name": "Dangote  Refined Salt  By 40",
+    "type": "Revenue"
+  },
+  {
+    "code": "610508",
+    "name": "Dangote Refined Salt  By 80",
+    "type": "Revenue"
+  },
+  {
+    "code": "610509",
+    "name": "Dangote  Bread Flour",
+    "type": "Revenue"
+  },
+  {
+    "code": "610600",
+    "name": "HONEY WELL PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610601",
+    "name": "Honey  Cavatto",
+    "type": "Revenue"
+  },
+  {
+    "code": "610602",
+    "name": "Honey Pasta",
+    "type": "Revenue"
+  },
+  {
+    "code": "610603",
+    "name": "Honey Pasta Slim",
+    "type": "Revenue"
+  },
+  {
+    "code": "610604",
+    "name": "Honey  Flour",
+    "type": "Revenue"
+  },
+  {
+    "code": "610700",
+    "name": "GOLDEN PENNY PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "610701",
+    "name": "Golden penny Maccarony",
+    "type": "Revenue"
+  },
+  {
+    "code": "610702",
+    "name": "Golden Penny Sphagetty",
+    "type": "Revenue"
+  },
+  {
+    "code": "700000",
+    "name": "COST OF SALES",
+    "type": "Header"
+  },
+  {
+    "code": "710100",
+    "name": "IRS PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710101",
+    "name": "IRS Flour",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710102",
+    "name": "IRS Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710103",
+    "name": "IRS Macaroni",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710104",
+    "name": "IRS Bran (Dusa)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710200",
+    "name": "BUA PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710201",
+    "name": "BUA Thailand Rice",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710202",
+    "name": "BUA Sugar (50kg)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710203",
+    "name": "BUA Sugar (25kg)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710204",
+    "name": "BUA Cement",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710205",
+    "name": "BUA Rice",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710206",
+    "name": "Sokoto Cement",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710300",
+    "name": "OLAM PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710301",
+    "name": "Crown Flour",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710302",
+    "name": "Crown Pasta (Slim)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710303",
+    "name": "Crown Thick Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710304",
+    "name": "Crown Premium Thick Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710305",
+    "name": "Crown Macaroni",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710306",
+    "name": "Crown Premium Macaroni",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710307",
+    "name": "Crown Premium Slim Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710400",
+    "name": "RAFA PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710401",
+    "name": "Rafa Detagent      (850x7pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710402",
+    "name": "Rafa Detagent      (170x26pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710403",
+    "name": "Rafa Detagent      (150x26pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710404",
+    "name": "Rafa Detagent     (120x36pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710405",
+    "name": "Rafa Detagent     (85x52pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710406",
+    "name": "Rafa Detagent     (55x84pcs)",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710500",
+    "name": "DANGOTE PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710501",
+    "name": "Dangote   Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710502",
+    "name": "Dangote  Salt",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710503",
+    "name": "Dangote  Sugar 25kg",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710504",
+    "name": "Dangote  Sugar 50kg",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710505",
+    "name": "Dangote  Crude Salt",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710506",
+    "name": "Dangote  Refined Salt  By 20",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710507",
+    "name": "Dangote  Refined Salt  By 40",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710508",
+    "name": "Dangote Refined Salt  By 80",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710509",
+    "name": "Dangote  Bread Flour",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710600",
+    "name": "HONEY WELL PRODUCTS",
+    "type": "Group"
+  },
+  {
+    "code": "710601",
+    "name": "Honey  Cavatto",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710602",
+    "name": "Honey Pasta",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710603",
+    "name": "Honey Pasta Slim",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710604",
+    "name": "Honey  Flour",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710700",
+    "name": "GOLDEN PENNY",
+    "type": "Group"
+  },
+  {
+    "code": "710701",
+    "name": "Golden penny Maccarony",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "710702",
+    "name": "Golden Penny Sphagetty",
+    "type": "Cost of Sales"
+  },
+  {
+    "code": "800000",
+    "name": "Oprating Expenses",
+    "type": "Header"
+  },
+  {
+    "code": "800100",
+    "name": "Staff Expenses",
+    "type": "Group"
+  },
+  {
+    "code": "800101",
+    "name": "Salaries and Wages",
+    "type": "Expenses"
+  },
+  {
+    "code": "800102",
+    "name": "Staff Allowances",
+    "type": "Expenses"
+  },
+  {
+    "code": "800103",
+    "name": "Casual Labour Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800104",
+    "name": "Staff Welfare",
+    "type": "Expenses"
+  },
+  {
+    "code": "800105",
+    "name": "Staff Training",
+    "type": "Expenses"
+  },
+  {
+    "code": "800106",
+    "name": "Pension Contribution (Employer)",
+    "type": "Expenses"
+  },
+  {
+    "code": "800107",
+    "name": "NSITF Contribution",
+    "type": "Expenses"
+  },
+  {
+    "code": "800108",
+    "name": "Medical Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800109",
+    "name": "Leave Allowance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800200",
+    "name": "Shop & Office Expenses",
+    "type": "Group"
+  },
+  {
+    "code": "800201",
+    "name": "Shop Rent",
+    "type": "Expenses"
+  },
+  {
+    "code": "800202",
+    "name": "Shop Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800203",
+    "name": "Office Rent",
+    "type": "Expenses"
+  },
+  {
+    "code": "800204",
+    "name": "Office Cleaning",
+    "type": "Expenses"
+  },
+  {
+    "code": "800205",
+    "name": "Security Services",
+    "type": "Expenses"
+  },
+  {
+    "code": "800206",
+    "name": "Waste Disposal",
+    "type": "Expenses"
+  },
+  {
+    "code": "800207",
+    "name": "Office Supplies",
+    "type": "Expenses"
+  },
+  {
+    "code": "800208",
+    "name": "Printing and Stationery",
+    "type": "Expenses"
+  },
+  {
+    "code": "800300",
+    "name": "Utilities",
+    "type": "Group"
+  },
+  {
+    "code": "800301",
+    "name": "Electricity Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800302",
+    "name": "Generator Fuel",
+    "type": "Expenses"
+  },
+  {
+    "code": "800303",
+    "name": "Generator Repairs and Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800304",
+    "name": "Water Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800305",
+    "name": "Internet Subscription",
+    "type": "Expenses"
+  },
+  {
+    "code": "800306",
+    "name": "Telephone Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800400",
+    "name": "Sales & Marketing Expenses",
+    "type": "Group"
+  },
+  {
+    "code": "800401",
+    "name": "Advertising and Promotion",
+    "type": "Expenses"
+  },
+  {
+    "code": "800402",
+    "name": "Marketing Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800403",
+    "name": "Branding and Signage",
+    "type": "Expenses"
+  },
+  {
+    "code": "800404",
+    "name": "Customer Entertainment",
+    "type": "Expenses"
+  },
+  {
+    "code": "800405",
+    "name": "Sales Commission",
+    "type": "Expenses"
+  },
+  {
+    "code": "800406",
+    "name": "Product Demonstration Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800500",
+    "name": "Transportation & Logistics",
+    "type": "Group"
+  },
+  {
+    "code": "800501",
+    "name": "Transportation Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800502",
+    "name": "Delivery Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800503",
+    "name": "Courier and Dispatch Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800504",
+    "name": "Vehicle Fuel",
+    "type": "Expenses"
+  },
+  {
+    "code": "800505",
+    "name": "Vehicle Repairs and Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800506",
+    "name": "Vehicle Insurance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800507",
+    "name": "Vehicle Licensing",
+    "type": "Expenses"
+  },
+  {
+    "code": "800508",
+    "name": "Travel Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "800509",
+    "name": "Hotel and Accommodation",
+    "type": "Expenses"
+  },
+  {
+    "code": "800600",
+    "name": "Banking & Finance",
+    "type": "Group"
+  },
+  {
+    "code": "800601",
+    "name": "Bank Charges",
+    "type": "Expenses"
+  },
+  {
+    "code": "800602",
+    "name": "POS Charges",
+    "type": "Expenses"
+  },
+  {
+    "code": "800603",
+    "name": "Transfer Charges",
+    "type": "Expenses"
+  },
+  {
+    "code": "800604",
+    "name": "Loan Interest Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800605",
+    "name": "Finance Charges",
+    "type": "Expenses"
+  },
+  {
+    "code": "800606",
+    "name": "Cash Handling Charges",
+    "type": "Expenses"
+  },
+  {
+    "code": "800700",
+    "name": "Repairs & Technical Support",
+    "type": "Group"
+  },
+  {
+    "code": "800701",
+    "name": "Computer Repairs and Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800702",
+    "name": "Office Equipment Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800703",
+    "name": "Generator Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800704",
+    "name": "Air Conditioner Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800705",
+    "name": "CCTV Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800706",
+    "name": "Networking Equipment Maintenance",
+    "type": "Expenses"
+  },
+  {
+    "code": "800800",
+    "name": "Professional & Administrative",
+    "type": "Group"
+  },
+  {
+    "code": "800801",
+    "name": "Audit Fees",
+    "type": "Expenses"
+  },
+  {
+    "code": "800802",
+    "name": "Legal Fees",
+    "type": "Expenses"
+  },
+  {
+    "code": "800803",
+    "name": "Consultancy Fees",
+    "type": "Expenses"
+  },
+  {
+    "code": "800804",
+    "name": "Professional Fees",
+    "type": "Expenses"
+  },
+  {
+    "code": "800805",
+    "name": "Business Registration Renewal",
+    "type": "Expenses"
+  },
+  {
+    "code": "800806",
+    "name": "Licenses and Permits",
+    "type": "Expenses"
+  },
+  {
+    "code": "800807",
+    "name": "Regulatory Fees",
+    "type": "Expenses"
+  },
+  {
+    "code": "800808",
+    "name": "Membership and Subscription",
+    "type": "Expenses"
+  },
+  {
+    "code": "800900",
+    "name": "Inventory & Operational Losses",
+    "type": "Group"
+  },
+  {
+    "code": "800901",
+    "name": "Inventory Write-off",
+    "type": "Expenses"
+  },
+  {
+    "code": "800902",
+    "name": "Inventory Shortage",
+    "type": "Expenses"
+  },
+  {
+    "code": "800903",
+    "name": "Damaged Goods",
+    "type": "Expenses"
+  },
+  {
+    "code": "800904",
+    "name": "Goods in Transit Loss",
+    "type": "Expenses"
+  },
+  {
+    "code": "800905",
+    "name": "Warranty Claims Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800906",
+    "name": "Bad Debt Expense",
+    "type": "Expenses"
+  },
+  {
+    "code": "800907",
+    "name": "Exchange Loss",
+    "type": "Expenses"
+  },
+  {
+    "code": "801000",
+    "name": "Insurance",
+    "type": "Group"
+  },
+  {
+    "code": "801001",
+    "name": "Business Insurance",
+    "type": "Expenses"
+  },
+  {
+    "code": "801002",
+    "name": "Vehicle Insurance",
+    "type": "Expenses"
+  },
+  {
+    "code": "801003",
+    "name": "Fire Insurance",
+    "type": "Expenses"
+  },
+  {
+    "code": "801004",
+    "name": "Goods-in-Transit Insurance",
+    "type": "Expenses"
+  },
+  {
+    "code": "801100",
+    "name": "Depreciation",
+    "type": "Group"
+  },
+  {
+    "code": "801101",
+    "name": "Depreciation \u2013 Furniture & Fittings",
+    "type": "Expenses"
+  },
+  {
+    "code": "801102",
+    "name": "Depreciation \u2013 Office Equipment",
+    "type": "Expenses"
+  },
+  {
+    "code": "801103",
+    "name": "Depreciation \u2013 Motor Vehicles",
+    "type": "Expenses"
+  },
+  {
+    "code": "801104",
+    "name": "Depreciation \u2013 Computers & Laptops",
+    "type": "Expenses"
+  },
+  {
+    "code": "801105",
+    "name": "Depreciation \u2013 Generator",
+    "type": "Expenses"
+  },
+  {
+    "code": "801106",
+    "name": "Depreciation \u2013 Air Conditioners",
+    "type": "Expenses"
+  },
+  {
+    "code": "801200",
+    "name": "General Expenses",
+    "type": "Group"
+  },
+  {
+    "code": "801201",
+    "name": "Refreshments",
+    "type": "Expenses"
+  },
+  {
+    "code": "801202",
+    "name": "Meeting Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "801203",
+    "name": "Donations and Gifts",
+    "type": "Expenses"
+  },
+  {
+    "code": "801204",
+    "name": "Corporate Social Responsibility (CSR)",
+    "type": "Expenses"
+  },
+  {
+    "code": "801205",
+    "name": "Miscellaneous Expenses",
+    "type": "Expenses"
+  },
+  {
+    "code": "900000",
+    "name": "LIABILITY",
+    "type": "Header"
+  },
+  {
+    "code": "900100",
+    "name": "NON-CURRENT LIABILITY",
+    "type": "Group"
+  },
+  {
+    "code": "900101",
+    "name": "Long-Term Bank Loan",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900102",
+    "name": "Director's Loan",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900103",
+    "name": "Shareholder Loan",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900104",
+    "name": "Lease Liability",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900105",
+    "name": "Deferred Tax Liability",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900106",
+    "name": "Employee Gratuity Liability",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900107",
+    "name": "Other Long-Term Borrowings",
+    "type": "Non- Current liabilities"
+  },
+  {
+    "code": "900200",
+    "name": "CURRENT LIABILITY",
+    "type": "Group"
+  },
+  {
+    "code": "900201",
+    "name": "Trade Creditors (Accounts Payable)",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900202",
+    "name": "Suppliers Payable",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900203",
+    "name": "VAT Payable",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900204",
+    "name": "Withholding Tax (WHT) Payable",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900205",
+    "name": "PAYE Tax Payable",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900206",
+    "name": "Accrued Expenses",
+    "type": "Current Liability"
+  },
+  {
+    "code": "900207",
+    "name": "Short-Term Bank Loan / Bank Overdraft",
+    "type": "Current Liability"
+  }
+]

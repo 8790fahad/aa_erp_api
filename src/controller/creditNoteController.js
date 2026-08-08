@@ -5,11 +5,16 @@ const moment = require("moment");
 const {
   reasonRequiresInventoryProductLines,
   getInventoryExplanationPrompt,
+  getReasonByCategory,
+  reasonRequiresInventoryRestock,
 } = require("./creditNoteReasonController");
 const {
   recordActivity,
   pickActor,
 } = require("../services/activityAuditService");
+const {
+  applyCreditNoteInventoryMovement,
+} = require("../services/creditNoteInventoryService");
 
 const PAYMENT_ADJUSTMENT_LABELS = {
   offset_outstanding: "Offset against outstanding invoice",
@@ -282,6 +287,33 @@ exports.createCreditNote = async (req, res) => {
             : "Please add a short inventory explanation (how stock or goods are affected).",
         });
       }
+    } else if (
+      reasonCategory &&
+      getReasonByCategory(reasonCategory, type)?.inventoryRelated
+    ) {
+      const catDef = getReasonByCategory(reasonCategory, type);
+      const hasServiceLine = lineItems.some(
+        (li) => String(li.lineKind || "").toLowerCase() === "service",
+      );
+      if (hasServiceLine) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "This reason applies to inventory (products). Remove or change Service lines to Product.",
+        });
+      }
+      const invNote =
+        inventoryExplanation != null ? String(inventoryExplanation).trim() : "";
+      if (invNote.length < 5) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            catDef?.inventoryExplanationPrompt ||
+            "Please add a short inventory explanation (how stock or goods are affected).",
+        });
+      }
     }
 
     if (type === "customer" && !customerId) {
@@ -336,21 +368,23 @@ exports.createCreditNote = async (req, res) => {
       entityId = customerId;
       entityName = customer.fullname || customer.customerNo;
 
-      // Get Accounts Receivable account (A/R naming varies)
+      // Get Accounts Receivable account (A/R naming / levels vary by CoA)
       let arAccount = await db.AccountCategory.findOne({
         where: {
           facility_id: facilityId,
           description: { [Op.like]: "%Accounts Receivable%" },
-          level: 2,
+          display: 1,
         },
+        order: [["level", "ASC"]],
       });
       if (!arAccount) {
         arAccount = await db.AccountCategory.findOne({
           where: {
             facility_id: facilityId,
             description: { [Op.like]: "%Accounts receivable%" },
-            level: 2,
+            display: 1,
           },
+          order: [["level", "ASC"]],
         });
       }
       if (!arAccount) {
@@ -358,8 +392,19 @@ exports.createCreditNote = async (req, res) => {
           where: {
             facility_id: facilityId,
             description: { [Op.like]: "%A/R%" },
-            level: 2,
+            display: 1,
           },
+          order: [["level", "ASC"]],
+        });
+      }
+      if (!arAccount) {
+        arAccount = await db.AccountCategory.findOne({
+          where: {
+            facility_id: facilityId,
+            account_role: "receivable",
+            display: 1,
+          },
+          order: [["level", "ASC"]],
         });
       }
 
@@ -686,6 +731,41 @@ exports.createCreditNote = async (req, res) => {
       }
     }
 
+    // Return inward / purchase return — update stock (+ reverse COGS into ledgerEntries)
+    let inventoryMovement = { storeRows: 0, cogsReversed: 0 };
+    try {
+      const effectiveReason =
+        reason ||
+        getReasonByCategory(reasonCategory, type)?.value ||
+        "";
+      if (
+        reasonRequiresInventoryRestock(effectiveReason, type) ||
+        getReasonByCategory(reasonCategory, type)?.restockInventory
+      ) {
+        inventoryMovement = await applyCreditNoteInventoryMovement({
+          facilityId,
+          userId,
+          type,
+          reason: effectiveReason,
+          reasonCategory,
+          creditNoteNumber,
+          transactionDate,
+          lineItems,
+          entityId,
+          entityName,
+          inventoryExplanation,
+          transaction,
+          pushGl,
+        });
+      }
+    } catch (invErr) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: invErr.message || "Failed to update inventory for return",
+      });
+    }
+
     // Bulk create general ledger entries
     await db.GeneralLedger.bulkCreate(ledgerEntries, { transaction });
 
@@ -989,6 +1069,8 @@ exports.createCreditNote = async (req, res) => {
         totalAmount,
         status: docStatusOnCreate,
         paymentAdjustmentMethod,
+        inventoryStoreRows: inventoryMovement.storeRows,
+        cogsReversed: inventoryMovement.cogsReversed,
       },
       remark: reason || "Credit note created",
     });
@@ -998,7 +1080,11 @@ exports.createCreditNote = async (req, res) => {
       message:
         paymentAdjustmentMethod === "refund_bank"
           ? "Credit note created and refunded successfully"
-          : "Credit note created successfully",
+          : inventoryMovement.storeRows > 0
+            ? `Credit note created; inventory updated (${inventoryMovement.storeRows} line${
+                inventoryMovement.storeRows === 1 ? "" : "s"
+              })`
+            : "Credit note created successfully",
       data: {
         creditNoteNumber,
         type,
@@ -1015,6 +1101,9 @@ exports.createCreditNote = async (req, res) => {
         creditsRemaining: creditsRemainingOnCreate,
         status: docStatusOnCreate,
         paymentAdjustmentMethod: paymentAdjustmentMethod || "offset_outstanding",
+        inventoryUpdated: inventoryMovement.storeRows > 0,
+        inventoryStoreRows: inventoryMovement.storeRows,
+        cogsReversed: inventoryMovement.cogsReversed,
         refundModeOfPayment:
           paymentAdjustmentMethod === "refund_bank"
             ? refundModeOfPayment || null

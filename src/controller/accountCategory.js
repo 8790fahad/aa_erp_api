@@ -455,16 +455,26 @@ exports.getAccountCategories = async (req, res) => {
     );
 
     // Convert to tree structure
+    // Roots use parent_code NULL, "", or "0"
+    const isRootParent = (parent) => {
+      const p = parent == null ? "" : String(parent).trim();
+      return p === "" || p === "0" || p.toLowerCase() === "null";
+    };
+
     const buildTree = (items, parentCode = null) => {
       return items
         .filter((item) => {
-          const itemParent = item.subhead || null;
-          return itemParent === parentCode;
+          const itemParent = item.subhead;
+          if (parentCode == null) return isRootParent(itemParent);
+          return String(itemParent || "").trim() === String(parentCode).trim();
         })
         .map((item) => {
           const children = buildTree(items, item.head);
           return {
             ...item,
+            code: item.head,
+            parentCode: item.subhead,
+            accountNature: item.account_nature,
             children: children.length > 0 ? children : [],
             balance: 0,
           };

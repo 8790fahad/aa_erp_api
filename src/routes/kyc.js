@@ -164,7 +164,7 @@ module.exports = (app) => {
   app.get("/api/kyc/verify-user", kycAuth.resendVerification);
   app.get("/api/kyc/verify", kycAuth.verifyEmail);
 
-  // Admin: mark KYC complete → issue PRODUCTION credentials
+  // Admin: mark KYC complete
   app.post("/api/kyc/complete", optionalUserJwt, kycAuth.completeKyc);
 
   // Authenticated KYC client credential management

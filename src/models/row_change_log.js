@@ -1,8 +1,8 @@
 "use strict";
 
 module.exports = (sequelize, DataTypes) => {
-  const ActivityAudit = sequelize.define(
-    "activity_audit",
+  const RowChangeLog = sequelize.define(
+    "row_change_log",
     {
       id: {
         type: DataTypes.BIGINT,
@@ -10,28 +10,24 @@ module.exports = (sequelize, DataTypes) => {
         primaryKey: true,
         autoIncrement: true,
       },
+      table_name: {
+        type: DataTypes.STRING(120),
+        allowNull: false,
+      },
+      action: {
+        type: DataTypes.ENUM("INSERT", "UPDATE", "DELETE"),
+        allowNull: false,
+      },
       facility_id: {
         type: DataTypes.STRING(50),
         allowNull: false,
       },
+      row_pk: {
+        type: DataTypes.STRING(191),
+        allowNull: true,
+      },
       user_id: {
         type: DataTypes.STRING(50),
-        allowNull: true,
-      },
-      action: {
-        type: DataTypes.STRING(40),
-        allowNull: false,
-      },
-      entity_type: {
-        type: DataTypes.STRING(80),
-        allowNull: false,
-      },
-      entity_id: {
-        type: DataTypes.STRING(120),
-        allowNull: true,
-      },
-      entity_label: {
-        type: DataTypes.STRING(255),
         allowNull: true,
       },
       before_data: {
@@ -42,14 +38,6 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.JSON,
         allowNull: true,
       },
-      remark: {
-        type: DataTypes.STRING(500),
-        allowNull: true,
-      },
-      meta: {
-        type: DataTypes.JSON,
-        allowNull: true,
-      },
       created_at: {
         type: DataTypes.DATE,
         allowNull: false,
@@ -57,17 +45,17 @@ module.exports = (sequelize, DataTypes) => {
       },
     },
     {
-      tableName: "activity_audits",
+      tableName: "row_change_logs",
       timestamps: false,
       underscored: true,
       freezeTableName: true,
     },
   );
 
-  ActivityAudit.associate = (models) => {
+  RowChangeLog.associate = (models) => {
     if (models.business || models.Business) {
       const Business = models.business || models.Business;
-      ActivityAudit.belongsTo(Business, {
+      RowChangeLog.belongsTo(Business, {
         foreignKey: "facility_id",
         targetKey: "id",
         as: "business",
@@ -75,7 +63,7 @@ module.exports = (sequelize, DataTypes) => {
       });
     }
     if (models.users) {
-      ActivityAudit.belongsTo(models.users, {
+      RowChangeLog.belongsTo(models.users, {
         foreignKey: "user_id",
         targetKey: "id",
         as: "user",
@@ -84,5 +72,5 @@ module.exports = (sequelize, DataTypes) => {
     }
   };
 
-  return ActivityAudit;
+  return RowChangeLog;
 };

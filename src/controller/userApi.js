@@ -1,8 +1,5 @@
 const db = require("../models");
 const moment = require("moment");
-const {
-  issueCredentialForBusiness,
-} = require("../utils/einvoicingCredentials");
 
 const _getBusinessProfile = async (
   callback = (f) => f,
@@ -526,30 +523,8 @@ const _createBusiness = async (obj, callback = (f) => f, error = (f) => f) => {
       // Continue even if seeding fails to avoid blocking business creation
     }
 
-    // Auto-issue e-invoicing API credentials for the new business.
-    // The plaintext secret is surfaced ONCE here; only its hash is stored.
-    const businessJson = business.toJSON();
-    try {
-      const cred = await issueCredentialForBusiness({
-        businessId: facilityId,
-        name: business_name,
-        transaction,
-      });
-      businessJson.einvoicing = {
-        client_id: cred.client_id,
-        client_secret: cred.client_secret,
-        environment: cred.environment || "production",
-        note: "Store client_secret securely — it will not be shown again. Rotate via POST /api/v1/invoice/credentials/rotate.",
-      };
-    } catch (credError) {
-      console.warn(
-        "Warning: Could not issue e-invoicing credentials:",
-        credError.message,
-      );
-      // Do not block business creation if credential issuance fails.
-    }
-
     // Format response to match stored procedure output format: [[{...}]]
+    const businessJson = business.toJSON();
     const result = [[businessJson]];
     callback(result);
   } catch (err) {

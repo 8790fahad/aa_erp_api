@@ -1,0 +1,62 @@
+DELETE account_category.facility_id other/null → 1060 rows
+DELETE account_type.facility_id other/null → 422 rows
+DELETE bank_accounts.facility_id other/null → 13 rows
+DELETE bank_list.facilityId other/null → 436 rows
+FAIL bank_list_data: The target table bank_list_data of the DELETE is not updatable
+DELETE bank_matching_rules.facility_id other/null → 1 rows
+DELETE bank_statements.facility_id other/null → 1 rows
+DELETE budget.facility_id other/null → 1 rows
+DELETE cash_transfers.facilityId other/null → 27 rows
+DELETE customers.facilityId other/null → 431 rows
+DELETE customer_entries.facilityId other/null → 227 rows
+DELETE customer_types.facilityId other/null → 3 rows
+DELETE Departments.facilityId other/null → 9 rows
+DELETE einvoicing_clients.business_id other/null → 2 rows
+FAIL general_inventory: The target table general_inventory of the DELETE is not updatable
+DELETE general_ledger.facility_id other/null → 8839 rows
+DELETE impress.facility_id other/null → 2 rows
+DELETE inventory_valuation.facility_id other/null → 36 rows
+DELETE item_list.facilityId other/null → 1052 rows
+DELETE justification.facilityId other/null → 178 rows
+DELETE kyc_users.facility_id other/null → 4 rows
+DELETE lab_inventory_table.facilityId other/null → 1 rows
+DELETE logs.facilityId other/null → 186 rows
+DELETE material_requisitions.facility_id other/null → 3 rows
+DELETE material_requisition_items.facilityId other/null → 3 rows
+DELETE membership.business_id other/null → 24 rows
+DELETE memo.facilityId other/null → 444 rows
+DELETE memo_documents.facilityId other/null → 2 rows
+DELETE nrs_einvoices.business_id other/null → 13 rows
+DELETE number_generator.facilityId other/null → 840 rows
+DELETE rate_table.facilityId other/null → 2 rows
+DELETE roles.facilityId other/null → 7 rows
+DELETE row_change_logs.facility_id other/null → 440 rows
+FAIL sales_dep: The target table sales_dep of the DELETE is not updatable
+DELETE saved_reports.facility_id other/null → 11 rows
+DELETE supplier_entries.facilityId other/null → 487 rows
+DELETE taxes.facilityId other/null → 20 rows
+DELETE Teams.facilityId other/null → 3 rows
+DELETE team_table.facilityId other/null → 2 rows
+DELETE unit_of_measurement.facilityId other/null → 4 rows
+DELETE users.facilityId other/null → 26 rows
+DELETE user_branches.facility_id other/null → 1 rows
+FAIL wip_inventory: The target table wip_inventory of the DELETE is not updatable
+memo cols: from_name,date,subject,purpose,details,createdAt,updatedAt,memo_id,pr_no,amount,total,remark,description,supplier_name,supplier_code,supplier_number,account_code,user_id,review_by,verify_by
+DELETE bank_statement_transactions orphans → 347
+DELETE kyc_business_documents orphans → 3
+DELETE kyc_contact_information orphans → 1
+DELETE kyc_service_settings orphans → 1
+DELETE kyc_stakeholders orphans → 1
+SKIP pv_collection: Unknown column 'id' in 'field list'
+TRUNCATE legacy category (5 rows)
+TRUNCATE legacy status_form (2 rows)
+TRUNCATE legacy supplier_contact (2 rows)
+TRUNCATE legacy transactions_data (3 rows)
+TRUNCATE legacy transaction_data_items (5 rows)
+DELETE other businesses → 14
+
+=== VERIFY ===
+businesses left: 1 → YAMMUSA GLOBAL FARMS & AGRO ALLIED SERVICES
+general_ledger keep/other: 23/0
+customers keep/other: 366/0
+users keep/other+null: 14/0

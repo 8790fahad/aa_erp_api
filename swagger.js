@@ -7,7 +7,6 @@ const {
   scanRoutesFromFiles,
   mergeOpenApiPaths,
 } = require("./swagger/routeScanner");
-const { buildEInvoicingSpec } = require("./swagger/eInvoicingSpec");
 
 const PORT = process.env.PORT || 3000;
 const BASE_PATH = process.env.BASE_PATH || "/inventria_new";
@@ -150,22 +149,6 @@ const specs = {
   paths: specsPaths,
 };
 
-// Dedicated E-Invoicing API — programmatic OpenAPI (NRS only, no ERP routes)
-const eInvoicingSpecs = buildEInvoicingSpec();
-
-const eInvoicingUiOptions = {
-  explorer: false,
-  customSiteTitle: "FlowBooks E-Invoicing API",
-  swaggerOptions: {
-    persistAuthorization: true,
-    displayRequestDuration: true,
-    filter: false,
-    tryItOutEnabled: true,
-    docExpansion: "list",
-    defaultModelsExpandDepth: 2,
-  },
-};
-
 const swaggerUiOptions = {
   explorer: true,
   swaggerOptions: {
@@ -179,7 +162,5 @@ const swaggerUiOptions = {
 module.exports = {
   swaggerUi,
   specs,
-  eInvoicingSpecs,
-  eInvoicingUiOptions,
   swaggerUiOptions,
 };

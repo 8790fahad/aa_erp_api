@@ -343,13 +343,11 @@ module.exports = (sequelize, DataTypes) => {
       customer_notes: {
         type: DataTypes.TEXT,
         allowNull: true,
-        defaultValue: "Thanks for your business.",
         comment: "Default customer notes shown on sales invoices",
       },
       terms_conditions: {
         type: DataTypes.TEXT,
         allowNull: true,
-        defaultValue: null,
         comment: "Default terms & conditions shown on sales invoices",
       },
     },

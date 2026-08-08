@@ -1,7 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const SKIP_SCAN_FILES = new Set(["firsInvoice.js"]);
+const SKIP_SCAN_FILES = new Set([]);
 
 const ROUTE_METHOD_REGEX =
   /app\.(get|post|put|delete|patch)\s*\(\s*[`'"]([^`'"]+)[`'"]/gi;

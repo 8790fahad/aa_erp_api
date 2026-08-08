@@ -5420,6 +5420,7 @@ exports.getSalesLineReport = async (req, res) => {
       product_name: row.product_name || "—",
       product_sku: row.product_sku || "",
       line_type: row.line_type || "sales",
+      basis: "sales",
       qty: parseFloat(row.qty || 0) || 0,
       unit_price: parseFloat(row.unit_price || 0) || 0,
       line_total: parseFloat(row.line_total || 0) || 0,
@@ -5447,6 +5448,226 @@ exports.getSalesLineReport = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error fetching sales line report",
+      error: err.message,
+    });
+  }
+};
+
+/**
+ * Flat purchase line report — one row per store_entries purchase line (qty_in).
+ * GET /api/v1/transactions/purchase-line-report?facilityId=&userId=&fromDate=&toDate=&branchId=&search=
+ */
+exports.getPurchaseLineReport = async (req, res) => {
+  try {
+    const {
+      facilityId,
+      userId,
+      fromDate,
+      toDate,
+      branchId,
+      search = "",
+      page,
+      pageSize,
+    } = req.query;
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "userId is required",
+      });
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(500, Math.max(1, parseInt(pageSize, 10) || 100));
+    const offset = (pageNum - 1) * limitNum;
+
+    const replacements = {
+      facilityId,
+      userId: String(userId),
+      limit: limitNum,
+      offset,
+    };
+
+    const whereParts = [
+      "se.facilityId = :facilityId",
+      "se.qty_in > 0",
+      `(
+        LOWER(TRIM(COALESCE(se.type, ''))) = 'purchase'
+        OR LOWER(TRIM(COALESCE(se.source, ''))) LIKE '%purchase%'
+      )`,
+      "se.reference_number IS NOT NULL",
+      "TRIM(se.reference_number) != ''",
+    ];
+
+    if (fromDate && String(fromDate).trim()) {
+      whereParts.push(
+        "DATE(COALESCE(i.transaction_date, se.createdAt, se.receive_date)) >= :fromDate",
+      );
+      replacements.fromDate = String(fromDate).trim();
+    }
+    if (toDate && String(toDate).trim()) {
+      whereParts.push(
+        "DATE(COALESCE(i.transaction_date, se.createdAt, se.receive_date)) <= :toDate",
+      );
+      replacements.toDate = String(toDate).trim();
+    }
+
+    const branchIdList = [
+      ...new Set(
+        (Array.isArray(branchId) ? branchId : [branchId])
+          .filter((v) => v != null)
+          .flatMap((v) => String(v).split(","))
+          .map((v) => parseInt(String(v).trim(), 10))
+          .filter((v) => Number.isFinite(v) && v > 0),
+      ),
+    ];
+
+    if (branchIdList.length > 0) {
+      replacements.branchIds = branchIdList;
+      whereParts.push("COALESCE(se.branchId, i.branchId, 0) IN (:branchIds)");
+    } else {
+      const userBranches = await db.sequelize.query(
+        `SELECT branch_id
+         FROM user_branches
+         WHERE user_id = :userId
+           AND facility_id = :facilityId`,
+        {
+          replacements: { userId: String(userId), facilityId },
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+      if (userBranches.length > 0) {
+        replacements.branchIds = userBranches.map((r) => r.branch_id);
+        whereParts.push(
+          "(COALESCE(se.branchId, i.branchId, 0) IN (:branchIds) OR COALESCE(se.branchId, i.branchId) IS NULL)",
+        );
+      }
+    }
+
+    const searchTerm = String(search || "").trim();
+    if (searchTerm) {
+      whereParts.push(`(
+        se.reference_number LIKE :search
+        OR COALESCE(s_inv.supplier_name, s_code.supplier_name, '') LIKE :search
+        OR COALESCE(i.ref_number, se.supplier_code, '') LIKE :search
+        OR COALESCE(p.name, se.product_id, '') LIKE :search
+      )`);
+      replacements.search = `%${searchTerm}%`;
+    }
+
+    const whereSql = whereParts.join(" AND ");
+
+    const fromSql = `
+      FROM store_entries se
+      LEFT JOIN invoices i
+        ON i.facility_id = se.facilityId
+       AND i.type = 'purchase'
+       AND i.invoice_ref = se.reference_number
+      LEFT JOIN suppliersinfo s_inv
+        ON s_inv.facilityId = se.facilityId
+       AND s_inv.supplier_number = i.ref_number
+      LEFT JOIN suppliersinfo s_code
+        ON s_code.facilityId = se.facilityId
+       AND s_code.supplier_number = se.supplier_code
+      LEFT JOIN products p
+        ON p.facility_id = se.facilityId
+       AND p.sku = se.product_id
+      LEFT JOIN branches b
+        ON b.id = COALESCE(NULLIF(se.branchId, 0), NULLIF(i.branchId, 0))
+    `;
+
+    const countRows = await db.sequelize.query(
+      `SELECT COUNT(*) AS total ${fromSql} WHERE ${whereSql}`,
+      {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const totalCount = parseInt(countRows[0]?.total || 0, 10);
+
+    const rows = await db.sequelize.query(
+      `SELECT
+         se.reference_number AS invoice_no,
+         COALESCE(i.transaction_date, se.createdAt, se.receive_date) AS invoice_date,
+         COALESCE(
+           s_inv.supplier_name,
+           s_code.supplier_name,
+           se.supplier_code,
+           '—'
+         ) AS supplier_name,
+         COALESCE(
+           i.ref_number,
+           se.supplier_code,
+           ''
+         ) AS supplier_no,
+         COALESCE(p.name, se.product_id, '—') AS product_name,
+         COALESCE(p.sku, se.product_id, '') AS product_sku,
+         'purchase' AS line_type,
+         se.qty_in AS qty,
+         COALESCE(NULLIF(se.cost_price, 0), se.selling_price, 0) AS unit_price,
+         se.qty_in * COALESCE(NULLIF(se.cost_price, 0), se.selling_price, 0) AS line_total,
+         COALESCE(NULLIF(se.branchId, 0), i.branchId) AS branch_id,
+         COALESCE(b.branch_name, se.branch_name, '') AS branch_name,
+         se.id AS store_entry_id
+       ${fromSql}
+       WHERE ${whereSql}
+       ORDER BY
+         COALESCE(i.transaction_date, se.createdAt, se.receive_date) DESC,
+         se.reference_number DESC,
+         se.id ASC
+       LIMIT :limit OFFSET :offset`,
+      {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const results = rows.map((row) => ({
+      invoice_no: row.invoice_no,
+      invoice_date: row.invoice_date,
+      // Aliases so rebate ledger can reuse the same field names as sales
+      customer_name: row.supplier_name || "",
+      customer_no: row.supplier_no || "",
+      supplier_name: row.supplier_name || "",
+      supplier_no: row.supplier_no || "",
+      product_name: row.product_name || "—",
+      product_sku: row.product_sku || "",
+      line_type: "purchase",
+      basis: "purchase",
+      qty: parseFloat(row.qty || 0) || 0,
+      unit_price: parseFloat(row.unit_price || 0) || 0,
+      line_total: parseFloat(row.line_total || 0) || 0,
+      branch_id: row.branch_id,
+      branch_name: row.branch_name || "",
+      store_entry_id: row.store_entry_id,
+    }));
+
+    const lineTotalSum = results.reduce((s, r) => s + r.line_total, 0);
+
+    return res.json({
+      success: true,
+      results,
+      count: results.length,
+      totalCount,
+      page: pageNum,
+      pageSize: limitNum,
+      totalPages: Math.ceil(totalCount / limitNum) || 0,
+      summary: { line_total: lineTotalSum },
+      userId: String(userId),
+      source: "store_entries",
+      basis: "purchase",
+    });
+  } catch (err) {
+    console.error("getPurchaseLineReport error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching purchase line report",
       error: err.message,
     });
   }

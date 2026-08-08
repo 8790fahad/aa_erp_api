@@ -8,13 +8,7 @@ const logger = require("morgan");
 const cors = require("cors");
 require("./config/cloudinary"); // CLOUDINARY_* from .env
 const helmet = require("helmet");
-const {
-  swaggerUi,
-  specs,
-  eInvoicingSpecs,
-  eInvoicingUiOptions,
-  swaggerUiOptions,
-} = require("../swagger");
+const { swaggerUi, specs, swaggerUiOptions } = require("../swagger");
 
 var cluster = require("cluster");
 const os = require("os");
@@ -45,13 +39,22 @@ const welcomePayload = {
   description: "FlowBooks API Server",
   version: "2.0.0",
   documentation: `${process.env.APP_URL || ""}${BASE_PATH}/api-docs`,
-  eInvoicingApiDocs: `${process.env.APP_URL || ""}${BASE_PATH}/e-invoicing-api-docs`,
   compliance:
     "Data compliance organization · Nigeria Data Protection Commission (NDPC) · ISO 27001 · ISO 9001",
 };
 
 app.use(bodyParser.json({ limit: "1mb" }));
 app.use(bodyParser.urlencoded({ limit: "1mb", extended: true }));
+
+// Stamp MySQL session vars so row-change audit triggers can attribute actors
+try {
+  const {
+    auditContextMiddleware,
+  } = require("./middleware/auditContext");
+  app.use(auditContextMiddleware);
+} catch (err) {
+  console.warn("[auditContext] middleware not loaded:", err.message);
+}
 
 // CORS must run before any routes so OPTIONS preflight always gets allowlist headers.
 const DEFAULT_ALLOWED_ORIGINS = [
@@ -290,83 +293,6 @@ app.get(`${BASE_PATH}/api-docs.json`, (req, res) => {
   res.json(specs);
 });
 
-// E-Invoicing API docs — full NRS technical documentation (FIRS-aligned)
-const { renderEInvoicingDocsPage } = require("../swagger/renderEInvoicingDocs");
-const { getSampleInvoiceHtml } = require("../swagger/eInvoicingContent");
-const {
-  buildEInvoicingPostmanCollection,
-} = require("../swagger/eInvoicingPostman");
-
-// API base advertised in the docs: host origin + BASE_PATH (e.g.
-// https://server.brainstorm.ng/inventria_new). Derived from APP_URL's origin
-// so it doesn't inherit any unrelated path segment on APP_URL.
-const docsBaseUrl = (() => {
-  if (process.env.APP_URL) {
-    try {
-      return `${new URL(process.env.APP_URL).origin}${BASE_PATH}`;
-    } catch {
-      // fall through to localhost default
-    }
-  }
-  return `http://localhost:${process.env.PORT || 3000}${BASE_PATH}`;
-})();
-
-app.get(["/e-invoicing-api-docs", "/e-invoicing-api-docs/"], (req, res) => {
-  res.type("html").send(renderEInvoicingDocsPage({ baseUrl: docsBaseUrl }));
-});
-app.get("/e-invoicing-api-docs/sample-invoice", (req, res) => {
-  // Allow same-origin embedding if docs still use an iframe src (helmet defaults to DENY).
-  res.setHeader("X-Frame-Options", "SAMEORIGIN");
-  res.setHeader(
-    "Content-Security-Policy",
-    "frame-ancestors 'self'; default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'",
-  );
-  res.type("html").send(getSampleInvoiceHtml());
-});
-app.get("/e-invoicing-api-docs.json", (req, res) => {
-  res.json(eInvoicingSpecs);
-});
-
-// Diagram assets (system architecture + data flow) embedded in the docs page
-app.use(
-  "/e-invoicing-api-docs/assets",
-  express.static(path.join(__dirname, "..", "swagger", "assets")),
-);
-
-// Downloadable Postman collection for the e-invoicing API
-app.get("/e-invoicing-api-docs/postman.json", (req, res) => {
-  const collection = buildEInvoicingPostmanCollection({ baseUrl: docsBaseUrl });
-  res.set(
-    "Content-Disposition",
-    'attachment; filename="flowbooks-nrs-e-invoicing.postman_collection.json"',
-  );
-  res.json(collection);
-});
-
-// Optional Postman collection endpoint for e-invoicing only
-app.use(
-  "/e-invoicing-api-docs/try",
-  swaggerUi.serveFiles(eInvoicingSpecs, eInvoicingUiOptions),
-  swaggerUi.setup(eInvoicingSpecs, eInvoicingUiOptions),
-);
-
-// Legacy aliases → canonical e-invoicing docs
-app.get("/flowbooks-api-docs", (req, res) =>
-  res.redirect(301, "/e-invoicing-api-docs"),
-);
-app.get("/flowbooks-api-docs.json", (req, res) =>
-  res.redirect(301, "/e-invoicing-api-docs.json"),
-);
-app.get(`${BASE_PATH}/flowbooks-api-docs`, (req, res) =>
-  res.redirect(301, "/e-invoicing-api-docs"),
-);
-app.get(`${BASE_PATH}/flowbooks-api-docs.json`, (req, res) =>
-  res.redirect(301, "/e-invoicing-api-docs.json"),
-);
-app.get(`${BASE_PATH}/e-invoicing-api-docs`, (req, res) =>
-  res.redirect(301, "/e-invoicing-api-docs"),
-);
-
 // Convenience Swagger UI route without base path for local access (e.g. http://localhost:3000/api-docs)
 // This avoids confusing "Route not found" when BASE_PATH is enabled.
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs, swaggerUiOptions));
@@ -488,7 +414,6 @@ require("./routes/creditNote")(app);
 require("./routes/catalog")(app);
 require("./routes/project")(app);
 require("./routes/estimate.routes")(app);
-require("./routes/firsInvoice")(app);
 
 app.post(
   "/account/multer/file",
@@ -603,6 +528,23 @@ const startServer = () => {
   return server;
 };
 
+async function boot() {
+  // Create/upgrade schema + audit triggers before accepting traffic
+  try {
+    const {
+      runPendingMigrations,
+    } = require("./bootstrap/runPendingMigrations");
+    await runPendingMigrations();
+  } catch (err) {
+    console.error(
+      `[pid ${process.pid}] Auto-migrate failed:`,
+      err.message,
+    );
+    // Continue boot — app may still serve if DB already exists
+  }
+  startServer();
+}
+
 const shouldUseCluster =
   process.env.ENABLE_CLUSTER?.toLowerCase() !== "false" &&
   (os.cpus()?.length || 1) > 1;
@@ -610,21 +552,39 @@ const shouldUseCluster =
 if ((cluster.isPrimary || cluster.isMaster) && shouldUseCluster) {
   const cpuCount =
     parseInt(process.env.CLUSTER_WORKERS, 10) || os.cpus().length;
-  console.log(
-    `[Master ${process.pid}] Starting ${cpuCount} worker${
-      cpuCount > 1 ? "s" : ""
-    }`,
-  );
-  for (let i = 0; i < cpuCount; i += 1) {
-    cluster.fork();
-  }
 
-  cluster.on("exit", (worker, code, signal) => {
-    console.warn(
-      `[Master ${process.pid}] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`,
+  (async () => {
+    try {
+      const {
+        runPendingMigrations,
+      } = require("./bootstrap/runPendingMigrations");
+      await runPendingMigrations();
+    } catch (err) {
+      console.error(
+        `[Master ${process.pid}] Auto-migrate failed:`,
+        err.message,
+      );
+    }
+
+    console.log(
+      `[Master ${process.pid}] Starting ${cpuCount} worker${
+        cpuCount > 1 ? "s" : ""
+      }`,
     );
-    cluster.fork();
-  });
-} else {
+    for (let i = 0; i < cpuCount; i += 1) {
+      cluster.fork();
+    }
+
+    cluster.on("exit", (worker, code, signal) => {
+      console.warn(
+        `[Master ${process.pid}] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`,
+      );
+      cluster.fork();
+    });
+  })();
+} else if (shouldUseCluster) {
+  // Worker process — migrations already ran in master
   startServer();
+} else {
+  boot();
 }

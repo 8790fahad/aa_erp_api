@@ -326,6 +326,10 @@ module.exports = (app) => {
     transactions.getSalesLineReport
   );
   app.get(
+    "/api/v1/transactions/purchase-line-report",
+    transactions.getPurchaseLineReport
+  );
+  app.get(
     "/api/v1/transactions/sale-taxes/:saleReference",
     transactions.getSaleTaxes
   );

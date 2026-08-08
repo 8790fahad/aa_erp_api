@@ -5865,21 +5865,24 @@ async function addLog(
   callback = (f) => f,
   error = (f) => f,
 ) {
+  // Direct INSERT — no stored procedure required
   db.sequelize
     .query(
-      "CALL addLog(:type, :name, :role, :id_link, :remark, :user_id,:query_type,:status, :amount,:facilityId)",
+      `INSERT INTO logs
+        (type, name, amount, role, id_link, remark, user_id, status, facilityId, date)
+       VALUES
+        (:type, :name, :amount, :role, :id_link, :remark, :user_id, :status, :facilityId, NOW())`,
       {
         replacements: {
-          type,
-          name,
-          role,
-          id_link,
-          remark,
-          user_id,
-          query_type,
-          status,
-          amount: 0,
-          facilityId,
+          type: String(type || "").slice(0, 250),
+          name: name != null ? String(name).slice(0, 250) : null,
+          amount: amount != null ? amount : null,
+          role: role != null ? String(role).slice(0, 250) : null,
+          id_link: String(id_link || "").slice(0, 250),
+          remark: String(remark || "").slice(0, 250),
+          user_id: String(user_id || "0").slice(0, 250),
+          status: String(status || "REQUESTED").slice(0, 100),
+          facilityId: String(facilityId || "").slice(0, 100),
         },
       },
     )

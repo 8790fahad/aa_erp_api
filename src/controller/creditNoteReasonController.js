@@ -15,9 +15,22 @@ const CREDIT_NOTE_REASONS = [
     label: "Customer returns goods",
     explanation: "Items sold are returned, so you reduce the invoice value.",
     inventoryRelated: true,
+    restockInventory: true,
     lineKind: "product",
     inventoryExplanationPrompt:
       "Describe how inventory is affected (e.g. goods returned to stock, quantity, condition).",
+  },
+  {
+    category: "INCORRECT_SUPPLY",
+    value:
+      "Incorrect supply — wrong item or quantity delivered to the customer",
+    label: "Incorrect supply",
+    explanation: "Wrong item or quantity was supplied; goods are returned inward.",
+    inventoryRelated: true,
+    restockInventory: true,
+    lineKind: "product",
+    inventoryExplanationPrompt:
+      "Describe the incorrect supply and how stock should be updated.",
   },
   {
     category: "OVERCHARGE",
@@ -25,6 +38,7 @@ const CREDIT_NOTE_REASONS = [
     label: "Overcharged customer",
     explanation: "Invoice amount is higher than it should be.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
   {
@@ -33,6 +47,7 @@ const CREDIT_NOTE_REASONS = [
     label: "Pricing error",
     explanation: "Wrong price, wrong calculation, or missing discount.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
   {
@@ -42,6 +57,7 @@ const CREDIT_NOTE_REASONS = [
     label: "Damaged or defective goods",
     explanation: "Customer should not pay full amount.",
     inventoryRelated: true,
+    restockInventory: true,
     lineKind: "product",
     inventoryExplanationPrompt:
       "Explain the defect/damage and how stock or inventory should be adjusted.",
@@ -52,6 +68,7 @@ const CREDIT_NOTE_REASONS = [
     label: "Post-sale discount or rebate",
     explanation: "Discount given after invoice was already issued.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
 ];
@@ -64,6 +81,7 @@ const DEBIT_NOTE_REASONS = [
     label: "Return goods to supplier",
     explanation: "You reduce what you owe the supplier.",
     inventoryRelated: true,
+    restockInventory: true,
     lineKind: "product",
     inventoryExplanationPrompt:
       "Describe returned goods and how inventory or stock should be updated.",
@@ -74,6 +92,7 @@ const DEBIT_NOTE_REASONS = [
     label: "Supplier overcharged",
     explanation: "You request adjustment for excess billing.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
   {
@@ -83,6 +102,7 @@ const DEBIT_NOTE_REASONS = [
     label: "Supplier pricing error",
     explanation: "Incorrect price or calculation on their invoice.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
   {
@@ -92,6 +112,7 @@ const DEBIT_NOTE_REASONS = [
     label: "Damaged or incomplete goods received",
     explanation: "You should not pay full invoice amount.",
     inventoryRelated: true,
+    restockInventory: true,
     lineKind: "product",
     inventoryExplanationPrompt:
       "Explain what was damaged/missing and the expected inventory impact.",
@@ -102,6 +123,7 @@ const DEBIT_NOTE_REASONS = [
     label: "Discount or rebate claimed",
     explanation: "After purchase invoice was already issued.",
     inventoryRelated: false,
+    restockInventory: false,
     lineKind: null,
   },
 ];
@@ -172,7 +194,19 @@ exports.reasonRequiresInventoryProductLines = (reasonValue, entityType) => {
   return !!(def?.inventoryRelated && def?.lineKind === "product");
 };
 
+/** Reasons that must move stock (return inward / return to supplier). */
+exports.reasonRequiresInventoryRestock = (reasonValue, entityType) => {
+  const def = exports.getReasonDefinition(reasonValue, entityType);
+  return !!(def?.restockInventory && def?.inventoryRelated);
+};
+
 exports.getInventoryExplanationPrompt = (reasonValue, entityType) => {
   const def = exports.getReasonDefinition(reasonValue, entityType);
   return def?.inventoryExplanationPrompt || null;
+};
+
+exports.getReasonByCategory = (category, entityType) => {
+  const list =
+    entityType === "supplier" ? DEBIT_NOTE_REASONS : CREDIT_NOTE_REASONS;
+  return list.find((r) => r.category === String(category || "").toUpperCase()) || null;
 };

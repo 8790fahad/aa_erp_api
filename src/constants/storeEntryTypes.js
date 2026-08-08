@@ -15,6 +15,10 @@ const STORE_ENTRY_TYPE = {
   MATERIAL_ISSUE: "material_issue",
   TRANSFER: "transfer",
   ADJUSTMENT: "adjustment",
+  /** Customer return inward — qty back into stock */
+  SALES_RETURN: "sales_return",
+  /** Goods returned to supplier — qty out of stock */
+  PURCHASE_RETURN: "purchase_return",
 };
 
 /** Types that count as sales outflows (goods, services, pro-bono). */

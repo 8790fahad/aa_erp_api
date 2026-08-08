@@ -42,6 +42,26 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         defaultValue: null,
       },
+      mode_of_payment: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        defaultValue: null,
+      },
+      payment_reference: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: null,
+      },
+      bank_account_id: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: null,
+      },
+      cheque_no: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: null,
+      },
       updated_by: {
         type: DataTypes.STRING(50),
         allowNull: true,

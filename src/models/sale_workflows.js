@@ -1,7 +1,7 @@
 "use strict";
 const { Model } = require("sequelize");
 
-/** Sales Management flowchart stages (AA ERP). */
+/** Sales Management flowchart stages (Alh. Ashiru Yanmusa). */
 const SALE_WORKFLOW_STAGES = [
   { id: "sales_order", label: "Create Sales Order", phase: "order", color: "slate" },
   { id: "invoice_generated", label: "Generate Invoice", phase: "order", color: "slate" },

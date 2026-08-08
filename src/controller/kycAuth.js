@@ -13,15 +13,6 @@ const { MailtrapTransport } = require("mailtrap");
 const db = require("../models");
 const SMS = require("../services/smsApi");
 const { verifyRecaptchaToken } = require("../utils/recaptcha");
-const {
-  issueTestingCredentialForKycUser,
-  issueProductionCredentialForKycUser,
-  listCredentialsForKycUser,
-  issueCredential,
-  normalizeEnvironment,
-  resolveKycNrsBusinessId,
-  ENVIRONMENTS,
-} = require("../utils/einvoicingCredentials");
 
 const JWT_SECRET = (() => {
   const secret = process.env.JWT_SECRET_KEY || process.env.JWT_SECRET;
@@ -568,23 +559,7 @@ exports.signup = async (req, res) => {
       console.error("[kycAuth] phone OTP setup failed:", phoneErr);
     }
 
-    // TESTING e-invoicing credentials — issued at signup only.
-    // Plaintext client_secret is returned ONCE in this response.
-    let einvoicing = null;
-    try {
-      const cred = await issueTestingCredentialForKycUser({
-        kycUserId: kycUser.id,
-        name: busName || trimmedEmail,
-      });
-      einvoicing = {
-        environment: cred.environment,
-        client_id: cred.client_id,
-        client_secret: cred.client_secret,
-        note: "Store client_secret securely — it will not be shown again. These are TESTING credentials.",
-      };
-    } catch (credErr) {
-      console.error("[kycAuth] testing credential issue failed:", credErr);
-    }
+    // TESTING e-invoicing credentials removed — e-invoicing is not enabled for this build.
 
     const payload = {
       success: true,
@@ -594,7 +569,6 @@ exports.signup = async (req, res) => {
       phoneVerificationRequired: true,
       smsSent,
       user: publicKycUser(kycUser),
-      einvoicing,
     };
     // Local/dev only — helps verify flow when carrier delivery is delayed.
     if (process.env.NODE_ENV !== "production" && phoneOtp) {
@@ -1860,38 +1834,12 @@ exports.completeKyc = async (req, res) => {
     if (!user.email_verified) user.email_verified = true;
     await user.save();
 
-    let einvoicing = null;
-    try {
-      const nrsBusinessId = await resolveKycNrsBusinessId(user.id);
-      const cred = await issueProductionCredentialForKycUser({
-        kycUserId: user.id,
-        businessId: nrsBusinessId || user.facility_id || null,
-        name: user.business_name || user.email,
-      });
-      einvoicing = {
-        environment: cred.environment,
-        client_id: cred.client_id,
-        client_secret: cred.client_secret,
-        business_id: cred.business_id,
-        rotated: cred.rotated,
-        note: "Store client_secret securely — it will not be shown again. These are PRODUCTION credentials.",
-      };
-    } catch (credErr) {
-      console.error("[kycAuth] production credential issue failed:", credErr);
-      return res.status(500).json({
-        success: false,
-        message: "KYC approved but failed to issue production credentials",
-        user: publicKycUser(user),
-      });
-    }
-
     return res.json({
       success: true,
       message: alreadyApproved
-        ? "KYC already approved; production credentials rotated."
-        : "KYC completed. Production credentials issued.",
+        ? "KYC already approved."
+        : "KYC completed.",
       user: publicKycUser(user),
-      einvoicing,
     });
   } catch (err) {
     console.error("[kycAuth] completeKyc:", err);
@@ -1902,83 +1850,22 @@ exports.completeKyc = async (req, res) => {
   }
 };
 
-/** GET /api/kyc/credentials — metadata for all envs (no secrets). */
-exports.listKycCredentials = async (req, res) => {
-  try {
-    const credentials = await listCredentialsForKycUser(req.kycUser.id);
-    return res.json({
-      success: true,
-      credentials,
-    });
-  } catch (err) {
-    console.error("[kycAuth] listKycCredentials:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to load credentials",
-    });
-  }
+/** GET /api/kyc/credentials — e-invoicing removed */
+exports.listKycCredentials = async (_req, res) => {
+  return res.status(410).json({
+    success: false,
+    message: "E-invoicing credentials are no longer available",
+  });
 };
 
 /**
- * POST /api/kyc/credentials/rotate
- * Body: { environment: "testing" | "production" }
- * Returns plaintext secret ONCE.
+ * POST /api/kyc/credentials/rotate — e-invoicing removed
  */
-exports.rotateKycCredentials = async (req, res) => {
-  try {
-    let environment;
-    try {
-      environment = normalizeEnvironment(
-        req.body?.environment || ENVIRONMENTS.TESTING,
-      );
-    } catch {
-      return res.status(400).json({
-        success: false,
-        message: 'environment must be "testing" or "production"',
-      });
-    }
-
-    // Production rotate only after KYC is approved.
-    if (
-      environment === ENVIRONMENTS.PRODUCTION &&
-      req.kycUser.status !== "approved"
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Production credentials are available only after KYC is completed",
-      });
-    }
-
-    const nrsBusinessId = await resolveKycNrsBusinessId(req.kycUser.id);
-    const cred = await issueCredential({
-      kycUserId: req.kycUser.id,
-      businessId: nrsBusinessId || req.kycUser.facility_id || null,
-      environment,
-      name: req.body?.name || req.kycUser.business_name || req.kycUser.email,
-    });
-
-    return res.json({
-      success: true,
-      message: cred.rotated
-        ? "Credentials rotated. Previous client_id and client_secret are now invalid."
-        : "Credentials created.",
-      data: {
-        client_id: cred.client_id,
-        client_secret: cred.client_secret,
-        environment: cred.environment,
-        kyc_user_id: cred.kyc_user_id,
-        business_id: cred.business_id,
-        note: "Store client_secret securely — it will not be shown again.",
-      },
-    });
-  } catch (err) {
-    console.error("[kycAuth] rotateKycCredentials:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to rotate credentials",
-    });
-  }
+exports.rotateKycCredentials = async (_req, res) => {
+  return res.status(410).json({
+    success: false,
+    message: "E-invoicing credentials are no longer available",
+  });
 };
 
 const ALLOWED_KYC_DOC_TYPES = new Set([
