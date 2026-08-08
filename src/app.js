@@ -58,6 +58,10 @@ try {
 
 // CORS must run before any routes so OPTIONS preflight always gets allowlist headers.
 const DEFAULT_ALLOWED_ORIGINS = [
+  "https://ashiru-ali.com",
+  "http://ashiru-ali.com",
+  "https://www.ashiru-ali.com",
+  "http://www.ashiru-ali.com",
   "https://dashboard.inventria.app",
   "http://flowbooks.org",
   "https://flowbooks.org",
