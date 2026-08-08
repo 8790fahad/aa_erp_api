@@ -123,3 +123,27 @@ jobs:
             npm run build
             pm2 restart flowbooks || pm2 start build/app.js --name=flowbooks
             pm2 save
+
+            # Ensure Apache publicly serves /flowbooks → Node (same idea as inventria_new).
+            # Without this, https://server.brainstorm.ng/flowbooks returns Apache 404.
+            APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+            APP_PORT="${APP_PORT:-42843}"
+            CONF_DIR="/etc/apache2/conf-available"
+            CONF_FILE="${CONF_DIR}/flowbooks-proxy.conf"
+            if [ -d "$CONF_DIR" ] && command -v sudo >/dev/null 2>&1; then
+              printf '%s\n' \
+                '# Managed by aa_erp_api GitHub Actions deploy' \
+                'ProxyPreserveHost On' \
+                'RequestHeader set X-Forwarded-Proto "expr=%{REQUEST_SCHEME}"' \
+                "ProxyPass /flowbooks http://127.0.0.1:${APP_PORT}/flowbooks" \
+                "ProxyPassReverse /flowbooks http://127.0.0.1:${APP_PORT}/flowbooks" \
+                "ProxyPass /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
+                "ProxyPassReverse /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
+                | sudo tee "$CONF_FILE" >/dev/null
+              sudo a2enmod proxy proxy_http headers >/dev/null 2>&1 || true
+              sudo a2enconf flowbooks-proxy >/dev/null 2>&1 || true
+              sudo apache2ctl configtest && sudo systemctl reload apache2
+              echo "Apache /flowbooks proxy enabled → 127.0.0.1:${APP_PORT}"
+            else
+              echo "::warning::Could not write Apache proxy config (missing sudo or conf-available)."
+            fi
