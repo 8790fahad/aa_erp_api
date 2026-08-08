@@ -13600,7 +13600,13 @@ exports.directPurchaseExpenses = async (req, res) => {
     tax_amount = 0,
     taxes = [],
     apply_prepayment = false,
+    mode_of_payment = "credit", // credit | cash | bank | cheque
+    bankAccount = {},
+    accountHead = {},
+    cheque_number,
   } = req.body;
+
+  const isCashLike = ["cash", "bank", "cheque"].includes(mode_of_payment);
 
   // === VALIDATIONS ===
   if (!facilityId)
@@ -13680,6 +13686,53 @@ exports.directPurchaseExpenses = async (req, res) => {
     const dpCode = `DE/${moment().format("YY")}/${pvCode}`;
     const narration = remark || `Direct Expense - ${dpCode}`;
 
+    // === CASH/BANK/CHEQUE PAYMENT ACCOUNT (when not credit) ===
+    let paymentAccount = null;
+    let paymentName = "";
+    let bankAcc = null;
+    if (isCashLike) {
+      if (mode_of_payment === "cash") {
+        if (!accountHead?.head) {
+          throw new Error("accountHead.head is required for cash payment");
+        }
+        paymentAccount = await db.AccountCategory.findOne({
+          where: { code: accountHead.head, facility_id: facilityId },
+          transaction,
+        });
+        if (!paymentAccount) {
+          throw new Error(`Cash account not found: ${accountHead.head}`);
+        }
+        paymentName = paymentAccount.description || "Cash in Hand";
+      } else {
+        if (!bankAccount?.id) {
+          throw new Error("bankAccount.id is required for bank/cheque payment");
+        }
+        if (mode_of_payment === "cheque" && !cheque_number) {
+          throw new Error("cheque_number is required for cheque payment");
+        }
+        bankAcc = await db.bank_account.findOne({
+          where: { id: bankAccount.id, facilityId, status: "active" },
+          transaction,
+        });
+        if (!bankAcc) throw new Error("Bank account not found or inactive");
+        if (!bankAcc.head) {
+          throw new Error(
+            `Bank account '${bankAcc.account_name}' has no GL head assigned`,
+          );
+        }
+        paymentAccount = await db.AccountCategory.findOne({
+          where: { code: bankAcc.head, facility_id: facilityId },
+          transaction,
+        });
+        if (!paymentAccount) {
+          throw new Error(
+            `GL account not found for bank head: ${bankAcc.head}`,
+          );
+        }
+        paymentName = bankAcc.account_name || paymentAccount.description;
+      }
+    }
+
     let totalExpenseAmount = 0;
     let totalSettledUsingAdvance = 0;
     const ledgerEntries = [];
@@ -13741,9 +13794,9 @@ exports.directPurchaseExpenses = async (req, res) => {
         item.description || expenseAccount.description || "Expense";
       expenseLineDescriptions.push(description);
 
-      // === AUTO-SETTLE USING ADVANCE IF AVAILABLE (only if negative balance) ===
+      // === AUTO-SETTLE USING ADVANCE IF AVAILABLE (credit bills only) ===
       let settledThisItem = 0;
-      if (currentBalance < 0) {
+      if (!isCashLike && currentBalance < 0) {
         const availableAdvance = Math.abs(currentBalance);
         settledThisItem = Math.min(itemTotal, availableAdvance);
         currentBalance += settledThisItem; // Reduce advance (make less negative)
@@ -13765,7 +13818,7 @@ exports.directPurchaseExpenses = async (req, res) => {
           link_id: linkId, // Use SKU if available, otherwise use account head
           receiptNo: pvCode, // Use receiptNo as the reference number
           facilityId,
-          mode_of_payment: "credit",
+          mode_of_payment: isCashLike ? mode_of_payment : "credit",
           type: "purchase",
           item_name: description,
           account_head: head,
@@ -13790,7 +13843,8 @@ exports.directPurchaseExpenses = async (req, res) => {
       });
 
       // === 3. If advance was used → Credit Payable (consume advance) ===
-      if (settledThisItem > 0) {
+      // Advances only apply on credit bills.
+      if (!isCashLike && settledThisItem > 0) {
         const accountToUse = accruedAccount || payableAccount;
         addSupplierPayableCredit(accountToUse, settledThisItem);
 
@@ -13817,7 +13871,7 @@ exports.directPurchaseExpenses = async (req, res) => {
       }
 
       // === 4. Credit New Payable (remaining) — merged into one A/P line per account at end ===
-      if (newPayableAmount > 0) {
+      if (!isCashLike && newPayableAmount > 0) {
         const accountToUse = payableAccount || accruedAccount;
         addSupplierPayableCredit(accountToUse, newPayableAmount);
       }
@@ -13956,11 +14010,11 @@ exports.directPurchaseExpenses = async (req, res) => {
       }
     }
 
-    // === CREDIT A/P FOR EXCLUSIVE TAX (ledger balancing) ===
+    // === CREDIT A/P FOR EXCLUSIVE TAX (ledger balancing) — credit bills only ===
     // For vat_exclusive (and exclusive taxes in "all"), we debit Input VAT but the A/P
     // credits above only cover the expense amount. The supplier is owed expense + tax,
     // so we must credit A/P for the tax amount to balance the ledger.
-    if (vatPolicy !== "vat_inclusive") {
+    if (!isCashLike && vatPolicy !== "vat_inclusive") {
       let taxToCredit = 0;
       if (vatPolicy === "vat_exclusive") {
         taxToCredit = totalTaxAmount;
@@ -13984,21 +14038,40 @@ exports.directPurchaseExpenses = async (req, res) => {
       .filter(Boolean)
       .join(", ");
 
-    for (const [, agg] of supplierPayableCreditAgg) {
-      if (!(agg.cr > 0)) continue;
-      const acc = agg.account;
+    if (isCashLike && paymentAccount) {
+      // Immediate payment: Cr Cash/Bank for the bill total (expense + exclusive VAT).
       ledgerEntries.push({
-        account_code: acc.code,
-        account_subhead: acc.parent_code || 0,
+        account_code: paymentAccount.code,
+        account_subhead: paymentAccount.parent_code || 0,
         dr: 0,
-        cr: agg.cr,
-        account_description: acc.description,
+        cr: grandTotal,
+        account_description: paymentAccount.description || paymentName,
         transaction_description: expenseLineNamesList
-          ? `Direct Expense - Credit ${acc.description} - ${pvCode}: ${expenseLineNamesList}`
-          : `Direct Expense - Credit ${acc.description} - ${pvCode}`,
-        type: "payable",
+          ? `Direct Expense - Paid via ${String(mode_of_payment).toUpperCase()} (${paymentName}) - ${pvCode}: ${expenseLineNamesList}`
+          : `Direct Expense - Paid via ${String(mode_of_payment).toUpperCase()} (${paymentName}) - ${pvCode}`,
+        type: "payment",
+        bank_account_id: bankAcc?.id || bankAccount?.id || null,
+        mode_of_payment,
+        cheque_no: cheque_number || null,
         transaction_ref: supplier_no,
       });
+    } else {
+      for (const [, agg] of supplierPayableCreditAgg) {
+        if (!(agg.cr > 0)) continue;
+        const acc = agg.account;
+        ledgerEntries.push({
+          account_code: acc.code,
+          account_subhead: acc.parent_code || 0,
+          dr: 0,
+          cr: agg.cr,
+          account_description: acc.description,
+          transaction_description: expenseLineNamesList
+            ? `Direct Expense - Credit ${acc.description} - ${pvCode}: ${expenseLineNamesList}`
+            : `Direct Expense - Credit ${acc.description} - ${pvCode}`,
+          type: "payable",
+          transaction_ref: supplier_no,
+        });
+      }
     }
 
     // === ADJUST EXPENSE DEBITS FOR INCLUSIVE TAXES ===
@@ -14027,12 +14100,16 @@ exports.directPurchaseExpenses = async (req, res) => {
       }
     }
 
-    // === FINAL: Update supplier balance once (atomic) ===
-    const netIncreaseInLiability = grandTotal - totalSettledUsingAdvance;
-    await db.SuppliersInfo.increment(
-      { balance: netIncreaseInLiability },
-      { where: { supplier_number: supplier_no, facilityId }, transaction },
-    );
+    // === FINAL: Update supplier balance once (atomic) — credit bills only ===
+    const netIncreaseInLiability = isCashLike
+      ? 0
+      : grandTotal - totalSettledUsingAdvance;
+    if (!isCashLike && netIncreaseInLiability !== 0) {
+      await db.SuppliersInfo.increment(
+        { balance: netIncreaseInLiability },
+        { where: { supplier_number: supplier_no, facilityId }, transaction },
+      );
+    }
 
     // === SAVE LEDGER ENTRIES ===
     for (const entry of ledgerEntries) {
@@ -14053,13 +14130,16 @@ exports.directPurchaseExpenses = async (req, res) => {
           created_by: userId,
           facility_id: facilityId,
           status:
-            totalSettledUsingAdvance >= grandTotal
+            isCashLike || totalSettledUsingAdvance >= grandTotal
               ? "paid"
               : totalSettledUsingAdvance > 0
                 ? "partial"
                 : "unpaid",
           type: entry.type,
           transaction_ref: entry.transaction_ref || "",
+          bank_account_id: entry.bank_account_id || null,
+          mode_of_payment: entry.mode_of_payment || null,
+          cheque_no: entry.cheque_no || null,
         },
         { transaction },
       );
@@ -14073,20 +14153,24 @@ exports.directPurchaseExpenses = async (req, res) => {
       {
         ref_number: supplier_no,
         invoice_ref: pvCode,
-        due_date:
-          due_date ||
-          moment()
-            .add(terms || 30, "days")
-            .format("YYYY-MM-DD"),
+        due_date: isCashLike
+          ? transaction_date || moment().format("YYYY-MM-DD")
+          : due_date ||
+            moment()
+              .add(terms || 30, "days")
+              .format("YYYY-MM-DD"),
         transaction_date: transaction_date || moment().format("YYYY-MM-DD"),
         description: narration,
         amount: Number(grandTotal.toFixed(2)),
-        payment_method: "credit",
+        payment_method: isCashLike ? mode_of_payment : "credit",
         user_id: userId,
         created_by: userId,
         facility_id: facilityId,
         type: "purchase",
-        status: totalSettledUsingAdvance >= grandTotal ? "paid" : "unpaid",
+        status:
+          isCashLike || totalSettledUsingAdvance >= grandTotal
+            ? "paid"
+            : "unpaid",
       },
       { transaction },
     );
