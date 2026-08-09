@@ -6,53 +6,54 @@ const db = require("../models");
  * Double-entry for Acquisition, Depreciation, and Disposal.
  */
 
-const DEFAULT_PAYMENT_CODE = "1010";
-const DEFAULT_GAIN_CODE = "4020";
-const DEFAULT_LOSS_CODE = "5020";
+const DEFAULT_PAYMENT_CODE = "112199";
+const DEFAULT_GAIN_CODE = "610900";
+const DEFAULT_LOSS_CODE = "801900";
 
-// Asset cost (SFP) codes. Both legacy and new category labels map to the same
-// numeric defaults so existing data keeps working after the re-brand.
+// Asset cost (SFP) — 6-digit CoA standard (e.g. 111005 Office Equipment).
 const CATEGORY_ASSET_CODES = {
-  Land: "1510",
-  Buildings: "1520",
-  "Land & Building": "1520",
-  "Plant and Machinery": "1530",
-  "Plant & Machinery": "1530",
-  "Motor Vehicles": "1540",
-  "Furniture and Fittings": "1550",
-  "Furniture & Fittings": "1550",
-  "Computer Equipment": "1560",
-  "IT Equipment": "1560",
-  "Office Equipment": "1570",
-  "Other Assets": "1580",
+  Land: "111001",
+  Buildings: "111002",
+  "Land & Building": "111002",
+  "Plant and Machinery": "111007",
+  "Plant & Machinery": "111007",
+  "Motor Vehicles": "111003",
+  "Furniture and Fittings": "111004",
+  "Furniture & Fittings": "111004",
+  "Computer Equipment": "111006",
+  "IT Equipment": "111006",
+  "Office Equipment": "111005",
+  "Other Assets": "111009",
 };
 
+// Accumulated depreciation (contra-asset) — 6-digit under Non Current Assets.
 const CATEGORY_ACCUM_DEP_CODES = {
-  Buildings: "1521",
-  "Land & Building": "1521",
-  "Plant and Machinery": "1531",
-  "Plant & Machinery": "1531",
-  "Motor Vehicles": "1541",
-  "Furniture and Fittings": "1551",
-  "Furniture & Fittings": "1551",
-  "Computer Equipment": "1561",
-  "IT Equipment": "1561",
-  "Office Equipment": "1571",
-  "Other Assets": "1581",
+  Buildings: "111012",
+  "Land & Building": "111012",
+  "Plant and Machinery": "111017",
+  "Plant & Machinery": "111017",
+  "Motor Vehicles": "111013",
+  "Furniture and Fittings": "111014",
+  "Furniture & Fittings": "111014",
+  "Computer Equipment": "111016",
+  "IT Equipment": "111016",
+  "Office Equipment": "111015",
+  "Other Assets": "111019",
 };
 
+// Depreciation expense — 6-digit under Operating expenses / Depreciation.
 const CATEGORY_DEP_EXPENSE_CODES = {
-  Buildings: "5210",
-  "Land & Building": "5210",
-  "Plant and Machinery": "5220",
-  "Plant & Machinery": "5220",
-  "Motor Vehicles": "5230",
-  "Furniture and Fittings": "5240",
-  "Furniture & Fittings": "5240",
-  "Computer Equipment": "5250",
-  "IT Equipment": "5250",
-  "Office Equipment": "5260",
-  "Other Assets": "5270",
+  Buildings: "801101",
+  "Land & Building": "801101",
+  "Plant and Machinery": "801105",
+  "Plant & Machinery": "801105",
+  "Motor Vehicles": "801103",
+  "Furniture and Fittings": "801101",
+  "Furniture & Fittings": "801101",
+  "Computer Equipment": "801104",
+  "IT Equipment": "801104",
+  "Office Equipment": "801102",
+  "Other Assets": "801106",
 };
 
 // Nigerian-style capital allowance rates by asset class. `initial` is the
@@ -79,15 +80,15 @@ function getFirsRates(category) {
 }
 
 function getAssetAccountCode(category) {
-  return CATEGORY_ASSET_CODES[category] || "1580";
+  return CATEGORY_ASSET_CODES[category] || "111009";
 }
 
 function getAccumulatedDepreciationAccountCode(category) {
-  return CATEGORY_ACCUM_DEP_CODES[category] || "1581";
+  return CATEGORY_ACCUM_DEP_CODES[category] || "111019";
 }
 
 function getDepreciationExpenseAccountCode(category) {
-  return CATEGORY_DEP_EXPENSE_CODES[category] || "5270";
+  return CATEGORY_DEP_EXPENSE_CODES[category] || "801106";
 }
 
 function resolveAssetCodes(asset = {}, overrides = {}) {

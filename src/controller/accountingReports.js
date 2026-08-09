@@ -846,6 +846,53 @@ exports.getTrialBalance = async (req, res) => {
       childrenByParent.get(parent).push(node._code);
     });
 
+    // ── 3b. Re-home balance_switch accounts by net sign ───────────────────
+    // Debit balance → Current Assets (112000); credit → Current Liabilities (900200).
+    // Display name flips for VAT Control (Recoverable vs Payable).
+    const SWITCH_ASSET_PARENT = "112000";
+    const SWITCH_LIAB_PARENT = "900200";
+
+    byCode.forEach((node) => {
+      if (String(node.reporting_behavior || "fixed") !== "balance_switch") {
+        return;
+      }
+      const net =
+        (parseFloat(node.total_debit) || 0) - (parseFloat(node.total_credit) || 0);
+      if (Math.abs(net) < 0.005) return;
+
+      const wantAsset = net > 0.005;
+      const newParent = wantAsset
+        ? byCode.has(SWITCH_ASSET_PARENT)
+          ? SWITCH_ASSET_PARENT
+          : String(node.parent_code || "").trim()
+        : byCode.has(SWITCH_LIAB_PARENT)
+          ? SWITCH_LIAB_PARENT
+          : String(node.parent_code || "").trim();
+
+      const oldParent = String(node.parent_code || "").trim();
+      if (newParent && newParent !== oldParent && byCode.has(newParent)) {
+        if (oldParent && childrenByParent.has(oldParent)) {
+          childrenByParent.set(
+            oldParent,
+            childrenByParent.get(oldParent).filter((c) => c !== node._code)
+          );
+        }
+        if (!childrenByParent.has(newParent)) {
+          childrenByParent.set(newParent, []);
+        }
+        if (!childrenByParent.get(newParent).includes(node._code)) {
+          childrenByParent.get(newParent).push(node._code);
+        }
+        node.parent_code = newParent;
+      }
+
+      const baseName = String(node.account_name || "");
+      // Single generic VAT head — keep name stable for input/output/payable.
+      if (/vat/i.test(baseName)) {
+        node.account_name = "VAT Recoverable";
+      }
+    });
+
     // ── 4. Compute 0-based hierarchy depth (memoised DFS) ─────────────────
     const hierarchyMemo = new Map();
     const computeHierarchy = (code, visited = new Set()) => {

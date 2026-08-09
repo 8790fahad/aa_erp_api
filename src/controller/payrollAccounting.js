@@ -21,15 +21,15 @@ const db = require("../models");
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_CODES = {
-  SALARY_EXPENSE:    "6010", // Wages & Salaries Expense
-  ALLOWANCE_EXPENSE: "6011", // Staff Allowances Expense
-  BONUS_EXPENSE:     "6012", // Bonus Expense
-  OVERTIME_EXPENSE:  "6013", // Overtime Expense
-  BANK_ACCOUNT:      "1020", // Bank / Cash (Net Pay)
-  PAYE_PAYABLE:      "2110", // PAYE Tax Payable (Liability)
-  PENSION_PAYABLE:   "2120", // Pension Payable (Liability)
-  LOAN_DEDUCTION:    "2130", // Staff Loan Deduction Payable
-  OTHER_DEDUCTION:   "2140", // Other Deductions Payable
+  SALARY_EXPENSE:    "800101", // Salaries and Wages
+  ALLOWANCE_EXPENSE: "800102", // Staff Allowances
+  BONUS_EXPENSE:     "800110", // Staff Bonus
+  OVERTIME_EXPENSE:  "800111", // Overtime Expense
+  BANK_ACCOUNT:      "112225", // Default bank (Jaiz) / cash head
+  PAYE_PAYABLE:      "900205", // PAYE Tax Payable
+  PENSION_PAYABLE:   "900215", // Pension Payable
+  LOAN_DEDUCTION:    "900213", // Staff Loan Deduction Payable
+  OTHER_DEDUCTION:   "900214", // Other Deductions Payable
 };
 
 /**
