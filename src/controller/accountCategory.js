@@ -286,17 +286,59 @@ exports.getAccountCategoriesForDropdown = async (req, res) => {
        FROM account_category
        WHERE facility_id = :facilityId
        AND is_active = 1
-       ORDER BY category ASC, code ASC`,
+       ORDER BY
+         FIELD(UPPER(COALESCE(account_nature, '')), 'ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'),
+         code ASC`,
       {
         replacements: { facilityId },
         type: QueryTypes.SELECT,
       },
     );
 
+    const NATURE_SORT_DD = {
+      ASSET: 1,
+      LIABILITY: 2,
+      EQUITY: 3,
+      REVENUE: 4,
+      EXPENSE: 5,
+    };
+    const typeRankDd = (item) => {
+      const t = String(item?.type || item?.description || "")
+        .toLowerCase()
+        .replace(/_/g, " ");
+      if (t.includes("cost of sales")) return 10;
+      if (t.includes("non") && t.includes("operating")) return 22;
+      if (t.includes("operating") && t.includes("revenue")) return 20;
+      if (t.includes("operating") && t.includes("expense")) return 21;
+      if (t.includes("non") && t.includes("current")) return 2;
+      if (t.includes("current")) return 1;
+      if (t.includes("operating")) return 20;
+      return 50;
+    };
+    const compareCoaNodesDd = (a, b) => {
+      const na =
+        NATURE_SORT_DD[String(a.account_nature || "").toUpperCase()] || 99;
+      const nb =
+        NATURE_SORT_DD[String(b.account_nature || "").toUpperCase()] || 99;
+      if (na !== nb) return na - nb;
+      const ra = typeRankDd(a);
+      const rb = typeRankDd(b);
+      if (ra !== rb) return ra - rb;
+      const ca = String(a.head || a.code || "");
+      const cb = String(b.head || b.code || "");
+      const numA = Number(ca);
+      const numB = Number(cb);
+      if (!Number.isNaN(numA) && !Number.isNaN(numB) && numA !== numB) {
+        return numA - numB;
+      }
+      return ca.localeCompare(cb, undefined, { numeric: true });
+    };
+
     // Build tree structure from flat list
     const buildTree = (items, parentCode = null) => {
       return items
         .filter((item) => (item.subhead || null) === parentCode)
+        .sort(compareCoaNodesDd)
         .map((item) => ({
           ...item,
           code: item.head,
@@ -447,7 +489,9 @@ exports.getAccountCategories = async (req, res) => {
       FROM account_category
       WHERE facility_id = :facilityId
         AND (is_active = 1 OR is_active IS NULL)
-      ORDER BY category ASC, code ASC`,
+      ORDER BY
+        FIELD(UPPER(COALESCE(account_nature, '')), 'ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'),
+        code ASC`,
       {
         replacements: { facilityId },
         type: db.sequelize.QueryTypes.SELECT,
@@ -461,6 +505,46 @@ exports.getAccountCategories = async (req, res) => {
       return p === "" || p === "0" || p.toLowerCase() === "null";
     };
 
+    // Match Add Account form: natures 1→5; Current before Non-current; Cos before OpEx
+    const NATURE_SORT = {
+      ASSET: 1,
+      LIABILITY: 2,
+      EQUITY: 3,
+      REVENUE: 4,
+      EXPENSE: 5,
+    };
+
+    const typeRank = (item) => {
+      const t = String(item?.type || item?.description || "")
+        .toLowerCase()
+        .replace(/_/g, " ");
+      if (t.includes("cost of sales")) return 10;
+      if (t.includes("non") && t.includes("operating")) return 22;
+      if (t.includes("operating") && t.includes("revenue")) return 20;
+      if (t.includes("operating") && t.includes("expense")) return 21;
+      if (t.includes("non") && t.includes("current")) return 2;
+      if (t.includes("current")) return 1;
+      if (t.includes("operating")) return 20;
+      return 50;
+    };
+
+    const compareCoaNodes = (a, b) => {
+      const na = NATURE_SORT[String(a.account_nature || "").toUpperCase()] || 99;
+      const nb = NATURE_SORT[String(b.account_nature || "").toUpperCase()] || 99;
+      if (na !== nb) return na - nb;
+      const ra = typeRank(a);
+      const rb = typeRank(b);
+      if (ra !== rb) return ra - rb;
+      const ca = String(a.head || a.code || "");
+      const cb = String(b.head || b.code || "");
+      const numA = Number(ca);
+      const numB = Number(cb);
+      if (!Number.isNaN(numA) && !Number.isNaN(numB) && numA !== numB) {
+        return numA - numB;
+      }
+      return ca.localeCompare(cb, undefined, { numeric: true });
+    };
+
     const buildTree = (items, parentCode = null) => {
       return items
         .filter((item) => {
@@ -468,6 +552,7 @@ exports.getAccountCategories = async (req, res) => {
           if (parentCode == null) return isRootParent(itemParent);
           return String(itemParent || "").trim() === String(parentCode).trim();
         })
+        .sort(compareCoaNodes)
         .map((item) => {
           const children = buildTree(items, item.head);
           return {

@@ -298,7 +298,7 @@ exports.runPayroll = async (req, res) => {
         pension = 0;
       }
 
-      // ── Loan Repayments via Salary Deduction ───────────────────────────
+      // ── Loan Repayments (preview only on Draft — do not mutate loans) ──
       let loanRepaymentTotal = 0;
       const activeLoans = await db.loans.findAll({
         where: {
@@ -315,19 +315,6 @@ exports.runPayroll = async (req, res) => {
           const deduction = Math.min(parseFloat(loan.monthlyDeductionAmount || 0), remainingBalance);
           if (deduction > 0) {
             loanRepaymentTotal += deduction;
-            await db.loan_repayments.create({
-              id: uuidv4(),
-              loanId: loan.id,
-              facilityId,
-              amount: deduction,
-              paymentMethod: "Payroll Deduction",
-              reference: `Payroll ${month}/${year}`,
-              createdBy,
-            });
-            const newAmountPaid = parseFloat(loan.amountPaid || 0) + deduction;
-            loan.amountPaid = newAmountPaid;
-            loan.status = newAmountPaid >= parseFloat(loan.amount) ? "Paid Off" : "Repaying";
-            await loan.save();
           }
         }
       }
@@ -655,7 +642,33 @@ exports.markPayrollAsPaid = async (req, res) => {
       });
     }
 
-    // Update all payrolls to paid status
+    // ── Generate General Ledger Entries BEFORE marking Paid ──────────────
+    const accountingResult = await payrollAccounting.createPayrollJournalEntries(
+      { month, year, payrolls },
+      facilityId,
+      updatedBy,
+      sourceAccountCode,
+      bankAccountId,
+      mode_of_payment,
+      cheque_number,
+      payment_date
+    );
+
+    if (!accountingResult.success) {
+      return res.status(500).json({
+        success: false,
+        message:
+          accountingResult.message ||
+          "Payroll GL posting failed — records were not marked as Paid",
+      });
+    }
+    if (accountingResult.balanced === false) {
+      return res.status(500).json({
+        success: false,
+        message: "Payroll GL imbalance detected — records were not marked as Paid",
+      });
+    }
+
     await db.payroll.update(
       {
         status: "Paid",
@@ -672,24 +685,6 @@ exports.markPayrollAsPaid = async (req, res) => {
       }
     );
 
-    // ── Generate General Ledger Entries ──────────────────────────────────
-    const accountingResult = await payrollAccounting.createPayrollJournalEntries(
-      { month, year, payrolls },
-      facilityId,
-      updatedBy,
-      sourceAccountCode,
-      bankAccountId,
-      mode_of_payment,
-      cheque_number,
-      payment_date
-    );
-
-    if (!accountingResult.success) {
-      console.error("[Payroll] GL entry failed on payment release:", accountingResult.message);
-    } else if (!accountingResult.balanced) {
-      console.warn("[Payroll] GL imbalance detected on payment release");
-    }
-
     res.json({
       success: true,
       message: "Payroll marked as paid successfully",
@@ -697,7 +692,7 @@ exports.markPayrollAsPaid = async (req, res) => {
         month,
         year,
         totalRecords: payrolls.length,
-        payrollTemplate, // Send template string (e.g. Base64) to the frontend for download extraction
+        payrollTemplate,
       },
     });
   } catch (error) {
@@ -831,14 +826,70 @@ exports.updatePayrollStatus = async (req, res) => {
        return res.status(400).json({ success: false, message: "Cannot change status of a paid record" });
     }
 
+    const nextStatus = status === "Stopped" ? "Cancelled" : status;
+    if (nextStatus === "Paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Use mark-paid endpoint to mark payroll as Paid (posts GL)",
+      });
+    }
+
+    // Apply loan deductions when confirming Draft → Processed (single record)
+    if (nextStatus === "Processed" && payroll.status === "Draft") {
+      const deduction = parseFloat(payroll.loanRepayment || 0);
+      if (deduction > 0) {
+        const periodRef = `Payroll ${payroll.month}/${payroll.year}`;
+        const activeLoans = await db.loans.findAll({
+          where: {
+            employeeId: payroll.employeeId,
+            facilityId,
+            status: { [Op.in]: ["Approved", "Repaying"] },
+            repaymentMethod: "Salary Deduction",
+          },
+        });
+        let remainingToApply = deduction;
+        for (const loan of activeLoans) {
+          if (remainingToApply <= 0) break;
+          const already = await db.loan_repayments.findOne({
+            where: { loanId: loan.id, facilityId, reference: periodRef },
+          });
+          if (already) continue;
+          const remainingBalance =
+            parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+          if (remainingBalance <= 0) continue;
+          const applyAmt = Math.min(
+            remainingToApply,
+            parseFloat(loan.monthlyDeductionAmount || remainingToApply),
+            remainingBalance,
+          );
+          if (applyAmt <= 0) continue;
+          await db.loan_repayments.create({
+            id: uuidv4(),
+            loanId: loan.id,
+            facilityId,
+            amount: applyAmt,
+            paymentMethod: "Payroll Deduction",
+            reference: periodRef,
+            createdBy: userId,
+          });
+          const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
+          loan.amountPaid = newAmountPaid;
+          loan.status =
+            newAmountPaid >= parseFloat(loan.amount) ? "Paid Off" : "Repaying";
+          await loan.save();
+          remainingToApply -= applyAmt;
+        }
+      }
+    }
+
     await payroll.update({
-      status,
+      status: nextStatus,
       updatedBy: userId
     });
 
     res.json({
       success: true,
-      message: `Payroll status updated to ${status}`,
+      message: `Payroll status updated to ${nextStatus}`,
       data: payroll
     });
   } catch (error) {
@@ -859,14 +910,91 @@ exports.batchUpdateStatus = async (req, res) => {
       return res.status(400).json({ success: false, message: "IDs, Status, and Facility ID are required" });
     }
 
+    const allowed = new Set(["Draft", "Processed", "Paid", "Cancelled"]);
+    const nextStatus = status === "Stopped" ? "Cancelled" : status;
+    if (!allowed.has(nextStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Allowed: ${Array.from(allowed).join(", ")}`,
+      });
+    }
+
+    // When moving Draft → Processed, apply loan deductions once (idempotent by period ref)
+    if (nextStatus === "Processed") {
+      const drafts = await db.payroll.findAll({
+        where: {
+          id: { [Op.in]: ids },
+          facilityId,
+          status: "Draft",
+        },
+      });
+      for (const row of drafts) {
+        const deduction = parseFloat(row.loanRepayment || 0);
+        if (deduction <= 0) continue;
+        const periodRef = `Payroll ${row.month}/${row.year}`;
+        const activeLoans = await db.loans.findAll({
+          where: {
+            employeeId: row.employeeId,
+            facilityId,
+            status: { [Op.in]: ["Approved", "Repaying"] },
+            repaymentMethod: "Salary Deduction",
+          },
+        });
+        let remainingToApply = deduction;
+        for (const loan of activeLoans) {
+          if (remainingToApply <= 0) break;
+          const already = await db.loan_repayments.findOne({
+            where: {
+              loanId: loan.id,
+              facilityId,
+              reference: periodRef,
+            },
+          });
+          if (already) continue;
+          const remainingBalance =
+            parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+          if (remainingBalance <= 0) continue;
+          const applyAmt = Math.min(
+            remainingToApply,
+            parseFloat(loan.monthlyDeductionAmount || remainingToApply),
+            remainingBalance,
+          );
+          if (applyAmt <= 0) continue;
+          await db.loan_repayments.create({
+            id: uuidv4(),
+            loanId: loan.id,
+            facilityId,
+            amount: applyAmt,
+            paymentMethod: "Payroll Deduction",
+            reference: periodRef,
+            createdBy: userId,
+          });
+          const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
+          loan.amountPaid = newAmountPaid;
+          loan.status =
+            newAmountPaid >= parseFloat(loan.amount) ? "Paid Off" : "Repaying";
+          await loan.save();
+          remainingToApply -= applyAmt;
+        }
+      }
+    }
+
+    // Paid must go through markPayrollAsPaid (GL posting)
+    if (nextStatus === "Paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Use mark-paid endpoint to mark payroll as Paid (posts GL)",
+      });
+    }
+
     const [updatedCount] = await db.payroll.update(
-      { status, updatedBy: userId },
+      { status: nextStatus, updatedBy: userId },
       { where: { id: { [Op.in]: ids }, facilityId } }
     );
 
     res.json({
       success: true,
-      message: `${updatedCount} payroll record(s) updated to ${status}`,
+      message: `${updatedCount} payroll record(s) updated to ${nextStatus}`,
       data: { updatedCount }
     });
   } catch (error) {

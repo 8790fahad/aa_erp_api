@@ -619,7 +619,7 @@ exports.createCreditNote = async (req, res) => {
 
     const purpose = `Credit Note ${creditNoteNumber}`;
     const glType = type === "customer" ? "discount" : "payable";
-    const refNum = String(creditNoteNumber).slice(0, 15);
+    const refNum = String(creditNoteNumber).slice(0, 100);
 
     const pushGl = (account, dr, cr, desc, lineKey) => {
       const parent =
@@ -1547,7 +1547,7 @@ exports.getCreditNoteDetails = async (req, res) => {
       where: {
         facility_id: facilityId,
         [Op.or]: [
-          { reference_number: String(creditNoteNumber).slice(0, 15) },
+          { reference_number: String(creditNoteNumber).slice(0, 100) },
           { transaction_ref: { [Op.like]: `${creditNoteNumber}%` } },
           {
             transaction_description: {
@@ -1756,7 +1756,7 @@ exports.applyCreditNote = async (req, res) => {
       balanceAccount.parentCode ?? balanceAccount.parent_code ?? balanceAccount.code ?? "0",
     );
     const today = new Date();
-    const cnRef = String(creditNoteNumber).slice(0, 15);
+    const cnRef = String(creditNoteNumber).slice(0, 100);
     const savedApps = [];
 
     for (const app of applications) {
@@ -1810,7 +1810,7 @@ exports.applyCreditNote = async (req, res) => {
               facility_id: facilityId,
               transaction_date: today,
               transaction_ref: `${invRef}-CN-${creditNoteNumber}`.slice(0, 100),
-              reference_number: String(invRef).slice(0, 15),
+              reference_number: String(invRef).slice(0, 100),
               account_code: balanceAccount.code,
               account_description: balanceAccount.description,
               account_subhead: parent,
@@ -1875,7 +1875,7 @@ exports.applyCreditNote = async (req, res) => {
               facility_id: facilityId,
               transaction_date: today,
               transaction_ref: entityId || `${invRef}-CN`,
-              reference_number: String(invRef).slice(0, 15),
+              reference_number: String(invRef).slice(0, 100),
               account_code: balanceAccount.code,
               account_description: balanceAccount.description,
               account_subhead: parent,

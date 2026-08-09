@@ -2370,7 +2370,8 @@ exports.getReviewedMemosWithItems = async (req, res) => {
     // but hide memos that have already been fully processed/closed.
     const whereClause = {
       facilityId: facilityId,
-      status: { [Op.ne]: "closed" },
+      // Only approved memos may be converted to expense bills
+      status: "approved",
     };
 
     // Add optional filters
@@ -2576,7 +2577,7 @@ exports.getApprovedPRsWithItems = async (req, res) => {
     // Build where clause for purchase requisitions
     const whereClause = {
       facilityId: facilityId,
-      status: { [Op.in]: ["Approved", "Pending"] },
+      status: "Approved",
     };
 
     // Add optional filters
@@ -6131,7 +6132,6 @@ exports.insertUpdateMemoData = (req, res) => {
         :pr_no,
         :reference_number,
         :status,
-        :priority,
         :supplier_name,
         :supplier_code,
         :account_code,
@@ -6157,7 +6157,6 @@ exports.insertUpdateMemoData = (req, res) => {
           pr_no,
           reference_number,
           status,
-          priority,
           supplier_name: supplier_name || "",
           supplier_code: supplier_code || "",
           account_code: account_code || "",
@@ -6243,12 +6242,31 @@ exports.insertMemo = async (req, res) => {
 
     try {
       const generatedNumber = await getAndUpdateNumber("mm", facilityId);
-      const code = parseInt(generatedNumber, 10);
+      let code = parseInt(generatedNumber, 10);
       if (!Number.isFinite(code)) {
         throw new Error(
           `Invalid memo number generated for facility ${facilityId}: ${generatedNumber}`,
         );
       }
+
+      // Keep sequence ahead of any memo_ids created outside the generator
+      const [[{ maxn }]] = await db.sequelize.query(
+        `SELECT COALESCE(MAX(CAST(SUBSTRING_INDEX(memo_id, '/', -1) AS UNSIGNED)), 0) AS maxn
+         FROM memo
+         WHERE facilityId COLLATE utf8mb4_unicode_ci = :facilityId
+           AND memo_id LIKE 'MEMO/%'`,
+        { replacements: { facilityId } },
+      );
+      if (Number(maxn) >= code) {
+        code = Number(maxn) + 1;
+        await db.sequelize.query(
+          `UPDATE number_generator
+           SET code_no = :next
+           WHERE prefix = 'mm' AND facilityId = :facilityId`,
+          { replacements: { next: code + 1, facilityId } },
+        );
+      }
+
       const newCode = `MEMO/${moment().format("YY")}/${code}`;
       const transaction = await db.sequelize.transaction();
 
@@ -6534,7 +6552,6 @@ exports.updateMemoNew = async (req, res) => {
         :pr_no,
         :reference_number,
         :status,
-        :priority,
         :supplier_name,
         :supplier_code,
         :account_code,
@@ -6559,7 +6576,6 @@ exports.updateMemoNew = async (req, res) => {
           pr_no,
           reference_number: reference_number || "",
           status,
-          priority,
           supplier_name: supplier_name || "",
           supplier_code: supplier_code || "",
           account_code: account_code || "",
@@ -6751,7 +6767,6 @@ exports.memoItemList = async (req, res) => {
       pr_no = "",
       reference_number = "",
       status = "",
-      priority = "Medium",
       supplier_name = "",
       supplier_code = "",
       supplier_number = "",
@@ -6760,6 +6775,45 @@ exports.memoItemList = async (req, res) => {
 
     console.log("📥 Incoming Body:", req.body);
 
+    const qt = String(query_type || "").toLowerCase();
+
+    // Select paths: direct SQL — insertMemo/getDocument SPs mix collations with app connection
+    if (qt === "select" || qt === "new_select") {
+      if (!memo_id) {
+        return res.status(400).json({
+          success: false,
+          message: "memo_id is required",
+        });
+      }
+
+      const [results] = await db.sequelize.query(
+        `SELECT * FROM item_list
+         WHERE memo_id COLLATE utf8mb4_general_ci = CONVERT(:memo_id USING utf8mb4) COLLATE utf8mb4_general_ci
+         ${
+           facilityId
+             ? "AND facilityId COLLATE utf8mb4_general_ci = CONVERT(:facilityId USING utf8mb4) COLLATE utf8mb4_general_ci"
+             : ""
+         }`,
+        {
+          replacements: facilityId ? { memo_id, facilityId } : { memo_id },
+        },
+      );
+
+      const [attachments] = await db.sequelize.query(
+        `SELECT * FROM memo_documents
+         WHERE memo_id COLLATE utf8mb4_general_ci = CONVERT(:memo_id USING utf8mb4) COLLATE utf8mb4_general_ci`,
+        { replacements: { memo_id } },
+      );
+
+      return res.json({
+        success: true,
+        message: "Memo processed successfully",
+        results: results || [],
+        attachments: attachments || [],
+      });
+    }
+
+    // insertMemo expects 22 args (no priority)
     const results = await db.sequelize.query(
       `CALL insertMemo(
         :query_type,
@@ -6780,7 +6834,6 @@ exports.memoItemList = async (req, res) => {
         :pr_no,
         :reference_number,
         :status,
-        :priority,
         :supplier_name,
         :supplier_code,
         :account_code,
@@ -6806,7 +6859,6 @@ exports.memoItemList = async (req, res) => {
           pr_no,
           reference_number,
           status,
-          priority,
           supplier_name: supplier_name || "",
           supplier_code: supplier_code || "",
           account_code: account_code || "",
@@ -6815,22 +6867,11 @@ exports.memoItemList = async (req, res) => {
       },
     );
 
-    const attachments = await db.sequelize.query(
-      `CALL getDocument(
-          :query_type,
-          :in_id,
-          :facilityId
-        )`,
-      {
-        replacements: {
-          query_type: "byId",
-          in_id: memo_id,
-          facilityId,
-        },
-      },
+    const [attachments] = await db.sequelize.query(
+      `SELECT * FROM memo_documents
+       WHERE memo_id COLLATE utf8mb4_general_ci = CONVERT(:memo_id USING utf8mb4) COLLATE utf8mb4_general_ci`,
+      { replacements: { memo_id } },
     );
-
-    console.log(attachments);
 
     console.log("✅ Query Results:", results);
 
@@ -6838,7 +6879,7 @@ exports.memoItemList = async (req, res) => {
       success: true,
       message: "Memo processed successfully",
       results,
-      attachments: attachments,
+      attachments: attachments || [],
     });
   } catch (err) {
     console.error("❌ Error inserting memo:", err);
@@ -6901,7 +6942,6 @@ exports.updateMemo = async (req, res) => {
         :pr_no,
         :reference_number,
         :status,
-        :priority,
         :supplier_name,
         :supplier_code,
         :account_code,
@@ -6927,7 +6967,6 @@ exports.updateMemo = async (req, res) => {
           pr_no,
           reference_number,
           status,
-          priority,
           supplier_name: supplier_name || "",
           supplier_code: supplier_code || "",
           account_code: account_code || "",
@@ -13530,10 +13569,10 @@ exports.getExpenseBill = async (req, res) => {
       items: items.map((item) => ({
         item_name: item.description || item.product_name || "N/A",
         sku: item.product_sku || "N/A",
-        quantity: item.qty_out || 0,
+        quantity: item.qty_out || item.qty_in || 0,
         cost: item.cost || item.product_cost_price || 0,
         total:
-          parseFloat(item.qty_in || 0) *
+          parseFloat(item.qty_out || item.qty_in || 0) *
           parseFloat(item.cost || item.product_cost_price || 0),
         unit_measure: item.product_unit_of_measure || "pcs",
         item_type: item.product_item_type || "N/A",
@@ -15222,6 +15261,19 @@ exports.paySupplierBills = async (req, res) => {
       });
 
       if (!invoice) throw new Error(`Invoice ${invoice_ref} not found`);
+
+      const invoiceAmount = parseFloat(invoice.amount || 0);
+      const alreadyPaid = parseFloat(invoice.total_paid || invoice.amount_paid || 0);
+      // Prefer balance field when present
+      const amountDue = Math.max(
+        0,
+        parseFloat(invoice.balance != null ? invoice.balance : invoiceAmount - alreadyPaid),
+      );
+      if (amountPayable > amountDue + 0.01) {
+        throw new Error(
+          `Overpayment blocked for ${invoice_ref}: paying ${amountPayable.toFixed(2)} but due is ${amountDue.toFixed(2)}`,
+        );
+      }
 
       const supplier_no = invoice.ref_number;
       supplierData.push(supplier_no);

@@ -282,18 +282,24 @@ exports.getAllAssets = async (req, res) => {
       offset: parseInt(offset)
     });
 
-    // Calculate depreciation values for each asset
+    // Prefer posted register balances over calendar recalculation
     const assetsWithDepreciation = assets.map(asset => {
       const assetData = asset.toJSON();
-      const accumulatedDepreciation = asset.calculateAccumulatedDepreciation();
+      const storedAccum = parseFloat(assetData.accumulated_depreciation || 0);
+      const accumulatedDepreciation = storedAccum > 0
+        ? storedAccum
+        : asset.calculateAccumulatedDepreciation();
       const currentYearDepreciation = asset.calculateCurrentYearDepreciation();
-      const netBookValue = assetData.acquisition_cost - accumulatedDepreciation;
+      const storedNbv = parseFloat(assetData.net_book_value || 0);
+      const netBookValue = storedNbv > 0 || storedAccum > 0
+        ? (storedNbv || (assetData.acquisition_cost - accumulatedDepreciation))
+        : (assetData.acquisition_cost - accumulatedDepreciation);
 
       return {
         ...assetData,
-        accumulatedDepreciation: parseFloat(accumulatedDepreciation.toFixed(2)),
+        accumulatedDepreciation: parseFloat(Number(accumulatedDepreciation).toFixed(2)),
         currentYearDepreciation: parseFloat(currentYearDepreciation.toFixed(2)),
-        netBookValue: parseFloat(netBookValue.toFixed(2))
+        netBookValue: parseFloat(Number(netBookValue).toFixed(2))
       };
     });
 
@@ -1175,19 +1181,31 @@ exports.runBulkDepreciation = async ({
 
   for (const asset of assets) {
     try {
-      // Cost already booked via purchase — skip depreciation GL / register updates.
-      if (asset.recorded_in_purchase) {
-        depreciationResults.push({
-          assetId: asset.id,
-          assetCode: asset.asset_code,
-          description: asset.description,
-          category: asset.category,
-          depreciationAmount: 0,
-          skipped: true,
-          skipReason: "recorded_in_purchase",
-        });
-        continue;
+      // Period lock: skip if already depreciated for this run date / period
+      if (asset.last_depreciation_date) {
+        const last = new Date(asset.last_depreciation_date);
+        const run = new Date(runDate);
+        if (
+          !Number.isNaN(last.getTime()) &&
+          !Number.isNaN(run.getTime()) &&
+          last.getFullYear() === run.getFullYear() &&
+          last.getMonth() === run.getMonth()
+        ) {
+          depreciationResults.push({
+            assetId: asset.id,
+            assetCode: asset.asset_code,
+            description: asset.description,
+            category: asset.category,
+            depreciationAmount: 0,
+            skipped: true,
+            skipReason: "already_depreciated_this_period",
+          });
+          continue;
+        }
       }
+
+      // recorded_in_purchase only skips acquisition capitalization JE elsewhere;
+      // book depreciation and NBV updates still run here.
 
       const depreciationAmount = computePeriodBookDepreciation(asset, months);
 

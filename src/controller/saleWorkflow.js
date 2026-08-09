@@ -254,31 +254,23 @@ async function createSaleWorkflowRecord(
 ) {
   if (!db.SaleWorkflow || !facilityId || !saleCode) return null;
 
-  const isPaid = paymentType !== "credit";
-  // Cash/transfer → cashier. Credit → skip cashier, go straight to separation.
+    const isPaid = paymentType !== "credit";
+  // Cash/transfer → cashier. Credit → credit approval before separation.
   const initialStatus = isPaid
     ? "awaiting_cashier_confirm"
-    : "invoice_separation";
+    : "awaiting_credit_approval";
 
   let history = [];
   history = pushHistory(history, "sales_order", createdBy, "Order created");
   history = pushHistory(history, "invoice_generated", createdBy, "Invoice generated");
   history = pushHistory(history, "submitted", createdBy, "Submitted for processing");
-  if (!isPaid) {
-    history = pushHistory(
-      history,
-      "credit_approved",
-      createdBy,
-      "Credit sale — cashier skipped",
-    );
-  }
   history = pushHistory(
     history,
     initialStatus,
     createdBy,
     isPaid
       ? "Awaiting cashier payment confirmation"
-      : "Credit sale — ready for invoice separation by branch",
+      : "Awaiting credit approval",
   );
 
   const [row] = await db.SaleWorkflow.findOrCreate({
@@ -300,21 +292,7 @@ async function createSaleWorkflowRecord(
     transaction,
   });
 
-  if (!isPaid && row) {
-    try {
-      await ensureSaleFulfillments(
-        {
-          facilityId,
-          saleCode,
-          createdBy,
-        },
-        transaction,
-      );
-    } catch (packErr) {
-      console.warn("Credit sale pack create:", packErr.message);
-    }
-  }
-
+  // Packs / fulfillments are created after credit approval (not at invoice create)
   return row;
 }
 

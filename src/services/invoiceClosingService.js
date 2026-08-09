@@ -81,21 +81,67 @@ async function voidUnpaidNonCreditSale({
       transaction,
     });
 
-    const deletedLedgerCount = await db.GeneralLedger.destroy({
+    // Soft void: reverse GL with compensating lines (keep audit trail)
+    const ledgerRows = await db.GeneralLedger.findAll({
       where: {
         facility_id: facilityId,
         reference_number: normalizedRef,
       },
       transaction,
     });
+    let reversedLedgerCount = 0;
+    for (const row of ledgerRows) {
+      const plain = row.get ? row.get({ plain: true }) : row;
+      const dr = parseFloat(plain.dr || plain.debit || 0);
+      const cr = parseFloat(plain.cr || plain.credit || 0);
+      if (dr === 0 && cr === 0) continue;
+      const clone = { ...plain };
+      delete clone.id;
+      delete clone.createdAt;
+      delete clone.updatedAt;
+      delete clone.created_at;
+      delete clone.updated_at;
+      // Flip debit/credit for reversing entry
+      clone.dr = cr;
+      clone.cr = dr;
+      clone.transaction_description = `VOID: ${plain.transaction_description || normalizedRef}`;
+      clone.transaction_ref =
+        plain.transaction_ref
+          ? `VOID-${plain.transaction_ref}`.slice(0, 100)
+          : `VOID-${normalizedRef}`.slice(0, 100);
+      await db.GeneralLedger.create(clone, { transaction });
+      reversedLedgerCount += 1;
+    }
 
-    const deletedStoreEntries = await db.StoreEntry.destroy({
+    // Soft reverse stock movements (qty_out → compensating qty_in)
+    const storeRows = await db.StoreEntry.findAll({
       where: {
         facilityId,
         reference_number: normalizedRef,
       },
       transaction,
     });
+    let reversedStoreEntries = 0;
+    for (const row of storeRows) {
+      const plain = row.get ? row.get({ plain: true }) : row;
+      const qtyOut = parseFloat(plain.qty_out || 0);
+      const qtyIn = parseFloat(plain.qty_in || 0);
+      if (qtyOut <= 0 && qtyIn <= 0) continue;
+      const clone = { ...plain };
+      delete clone.id;
+      delete clone.createdAt;
+      delete clone.updatedAt;
+      delete clone.created_at;
+      delete clone.updated_at;
+      clone.qty_in = qtyOut;
+      clone.qty_out = qtyIn;
+      clone.type = plain.type || "sales";
+      clone.status = "voided";
+      clone.destination = "void";
+      clone.reference_number = normalizedRef;
+      await db.StoreEntry.create(clone, { transaction });
+      reversedStoreEntries += 1;
+    }
 
     const deletedCustomerEntries = await db.CustomerEntry.destroy({
       where: {
@@ -106,34 +152,20 @@ async function voidUnpaidNonCreditSale({
     });
 
     if (invoice) {
-      await db.Invoice.destroy({
-        where: {
-          facility_id: facilityId,
-          invoice_ref: normalizedRef,
+      await invoice.update(
+        {
+          status: "Cancelled",
+          balance: 0,
+          description: [invoice.description, reason].filter(Boolean).join(" | "),
         },
-        transaction,
-      });
+        { transaction },
+      );
     }
 
-    // Clean fulfillments
-    if (db.SaleFulfillment) {
-      const packs = await db.SaleFulfillment.findAll({
-        where: { facility_id: facilityId, sale_code: normalizedRef },
-        attributes: ["id"],
-        transaction,
-      });
-      const packIds = packs.map((p) => p.id);
-      if (packIds.length && db.SaleFulfillmentLine) {
-        await db.SaleFulfillmentLine.destroy({
-          where: { fulfillment_id: { [Op.in]: packIds } },
-          transaction,
-        });
-      }
-      await db.SaleFulfillment.destroy({
-        where: { facility_id: facilityId, sale_code: normalizedRef },
-        transaction,
-      });
-    }
+    // Soft-cancel: leave fulfillment rows for audit (no hard-delete)
+
+    const deletedLedgerCount = reversedLedgerCount;
+    const deletedStoreEntries = reversedStoreEntries;
 
     const prevStatus = workflow?.status || null;
     const prevPaymentType = workflow?.payment_type || null;

@@ -53,7 +53,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
       reference_number: {
-        type: DataTypes.STRING(15),
+        type: DataTypes.STRING(100),
         allowNull: true,
       },
       purpose_of_payment: {

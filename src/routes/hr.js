@@ -17,6 +17,9 @@ const payeSettingsController = require("../controller/payeSettings");
 const authenticate = passport.authenticate("jwt", { session: false });
 
 module.exports = (app) => {
+  // Require JWT for all HR / payroll endpoints
+  app.use("/api/hr", authenticate);
+
   // Employee Management Routes
   app.post("/api/hr/employees", employeesController.createEmployee);
   app.post("/api/hr/employees/bulk", employeesController.bulkCreateEmployees);

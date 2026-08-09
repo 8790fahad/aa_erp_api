@@ -2336,6 +2336,7 @@ exports.createSale = async (req, res) => {
       inventory_account,
       taxes: taxesRaw = [],
       transaction_date,
+      saleDate: saleDateFromClient,
       sale_branch_id = 0,
       apply_prepayment = false,
       amountPaid: amountPaidFromClient = 0,
@@ -2596,8 +2597,8 @@ exports.createSale = async (req, res) => {
       } // end !deferPaymentToCashier
     }
 
-    saleDate = transaction_date
-      ? moment(transaction_date).format("YYYY-MM-DD")
+    saleDate = transaction_date || saleDateFromClient
+      ? moment(transaction_date || saleDateFromClient).format("YYYY-MM-DD")
       : moment().format("YYYY-MM-DD");
     saleRef = `INV-${await getAndUpdateNumber("sale", facilityId)}`;
 
@@ -2633,6 +2634,31 @@ exports.createSale = async (req, res) => {
       return res
         .status(404)
         .json({ success: false, message: "Customer not found" });
+    }
+
+    // Enforce credit limit for credit sales when limit is configured
+    const creditLimit = parseFloat(customer.credit_limit || 0);
+    if (isCreditSale && creditLimit > 0) {
+      const outstanding =
+        parseFloat(customer.balance || customer.amount || 0) || 0;
+      const thisSale =
+        parseFloat(total_amount) ||
+        (Array.isArray(items)
+          ? items.reduce(
+              (s, it) =>
+                s +
+                parseFloat(it.quantity || it.qty || 0) *
+                  parseFloat(it.price || it.selling_price || 0),
+              0,
+            )
+          : 0);
+      if (outstanding + thisSale > creditLimit + 0.01) {
+        await t.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(2)}, Outstanding: ${outstanding.toFixed(2)}, This sale: ${thisSale.toFixed(2)}`,
+        });
+      }
     }
 
     if (!customer.receivable_code) {
@@ -3135,11 +3161,11 @@ exports.createSale = async (req, res) => {
 
           unitCost = parseFloat(productForCost?.cost_price || 0);
 
-          // If still no cost price, use unit cost of 1 (placeholder when selling without stock)
+          // Never invent a placeholder cost of 1 — use 0 COGS if no cost exists
           if (unitCost <= 0) {
-            unitCost = 1;
+            unitCost = 0;
             console.log(
-              `Warning: No inventory available for ${sku}. Using fallback unit cost: 1`
+              `Warning: No inventory/cost for ${sku}. Using unit cost 0 (allow_sales_without_stock).`
             );
           } else {
             console.log(
@@ -3318,6 +3344,7 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     // Aggregate qty by SKU so multi-line same-SKU carts cannot bypass limits
     const qtyBySku = new Map();
+    const remainingSellableByKey = new Map();
     for (const itm of items) {
       const sku = itm.product_id;
       const qty = Number(itm.quantity);
@@ -3383,22 +3410,28 @@ exports.createSale = async (req, res) => {
           parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
           saleBranchId ||
           0;
+        const stockKey = `${sku}|${stockBranchId}`;
 
-        const currentBalance = await getSellableQtyAtBranch({
-          sku,
-          facilityId,
-          branchId: stockBranchId,
-          transaction: t,
-        });
+        if (!remainingSellableByKey.has(stockKey)) {
+          const currentBalance = await getSellableQtyAtBranch({
+            sku,
+            facilityId,
+            branchId: stockBranchId,
+            transaction: t,
+          });
+          remainingSellableByKey.set(stockKey, currentBalance);
+        }
 
-        if (!allowSalesWithoutStock && currentBalance < qty) {
+        const available = remainingSellableByKey.get(stockKey) || 0;
+        if (!allowSalesWithoutStock && available < qty) {
           const productLabel = (product.name || sku).trim();
           const branchHint =
             stockBranchId > 0 ? ` (branch id ${stockBranchId})` : "";
           throw new Error(
-            `Insufficient quantity for ${productLabel}${branchHint}. Available: ${currentBalance}, Requested: ${qty}`,
+            `Insufficient quantity for ${productLabel}${branchHint}. Available: ${available}, Requested: ${qty}`,
           );
         }
+        remainingSellableByKey.set(stockKey, available - qty);
       }
 
       const lineTotal = qty * price;
