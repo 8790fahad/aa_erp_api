@@ -44,8 +44,9 @@ jobs:
             echo "::warning::VPS_HOST should be a bare IP or hostname (got: $VPS_HOST). Using: $host"
           fi
 
-          if [ "$port" = "42843" ] || [ "$port" = "5173" ] || [ "$port" = "5175" ]; then
-            echo "::error::VPS_PORT looks like an app port ($port), not SSH. Use your SSH port (usually 22)."
+          # App/API ports are not SSH — GitHub Actions must reach the SSH daemon.
+          if [ "$port" = "42843" ] || [ "$port" = "42844" ] || [ "$port" = "5173" ] || [ "$port" = "5175" ] || [ "$port" = "80" ] || [ "$port" = "443" ]; then
+            echo "::error::VPS_PORT looks like an app/HTTP port ($port), not SSH. Set VPS_PORT to your SSH port (usually 22)."
             exit 1
           fi
 
