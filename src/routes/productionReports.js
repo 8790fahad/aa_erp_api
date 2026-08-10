@@ -55,4 +55,8 @@ module.exports = (app) => {
     "/api/reports/sales/per-product",
     productionReports.getSalesPerProductReport,
   );
+  app.post(
+    "/api/reports/sales/by-supplier",
+    productionReports.getSalesBySupplierReport,
+  );
 };

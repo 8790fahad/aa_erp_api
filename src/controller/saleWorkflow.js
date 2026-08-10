@@ -15,8 +15,25 @@ function normalizePaymentType(modeOfPayment, isCashSale) {
   return "cash";
 }
 
+function normalizeHistory(history) {
+  if (Array.isArray(history)) return history;
+  if (typeof history === "string" && history.trim()) {
+    try {
+      const parsed = JSON.parse(history);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  if (history && typeof history === "object") {
+    // Occasionally drivers return a single object instead of an array.
+    return [history];
+  }
+  return [];
+}
+
 function pushHistory(history, status, userId, note) {
-  const list = Array.isArray(history) ? [...history] : [];
+  const list = [...normalizeHistory(history)];
   list.push({
     status,
     at: new Date().toISOString(),
@@ -220,14 +237,45 @@ async function maybeAdvanceAfterAllCollected({
     where: { facility_id: facilityId, sale_code: saleCode },
     transaction,
   });
-  if (!row || row.status !== "warehouse_picking") return row;
+  if (!row) return null;
+  if (row.status === "completed") return row;
 
-  row.status = "dual_signature";
+  // After warehouse collection, sale is done (collection receipt covers dual sign).
+  const warehousePipeline = [
+    "warehouse_picking",
+    "dual_signature",
+    "goods_released",
+  ];
+  if (!warehousePipeline.includes(row.status)) return row;
+
+  if (row.status === "warehouse_picking") {
+    row.history = pushHistory(
+      row.history,
+      "dual_signature",
+      updatedBy,
+      "All warehouse packs collected",
+    );
+    row.history = pushHistory(
+      row.history,
+      "goods_released",
+      updatedBy,
+      "Goods released to customer",
+    );
+  } else if (row.status === "dual_signature") {
+    row.history = pushHistory(
+      row.history,
+      "goods_released",
+      updatedBy,
+      "Goods released to customer",
+    );
+  }
+
+  row.status = "completed";
   row.history = pushHistory(
     row.history,
-    "dual_signature",
+    "completed",
     updatedBy,
-    "All warehouse packs collected",
+    "Sale completed after warehouse collection",
   );
   row.updated_by = updatedBy || row.updated_by;
   await row.save({ transaction });
@@ -254,11 +302,13 @@ async function createSaleWorkflowRecord(
 ) {
   if (!db.SaleWorkflow || !facilityId || !saleCode) return null;
 
-    const isPaid = paymentType !== "credit";
-  // Cash/transfer → cashier. Credit → credit approval before separation.
+    const isPaid = paymentType !== "credit" && paymentType !== "warehouse";
+  // Cash/transfer → cashier. Warehouse → separation. Credit → credit approval.
   const initialStatus = isPaid
     ? "awaiting_cashier_confirm"
-    : "awaiting_credit_approval";
+    : paymentType === "warehouse"
+      ? "invoice_separation"
+      : "awaiting_credit_approval";
 
   let history = [];
   history = pushHistory(history, "sales_order", createdBy, "Order created");
@@ -270,7 +320,9 @@ async function createSaleWorkflowRecord(
     createdBy,
     isPaid
       ? "Awaiting cashier payment confirmation"
-      : "Awaiting credit approval",
+      : paymentType === "warehouse"
+        ? "Warehouse invoice treatment — ready for separation"
+        : "Awaiting credit approval",
   );
 
   const [row] = await db.SaleWorkflow.findOrCreate({
@@ -292,7 +344,14 @@ async function createSaleWorkflowRecord(
     transaction,
   });
 
-  // Packs / fulfillments are created after credit approval (not at invoice create)
+  // Packs for warehouse treatment / separation; credit packs created after approval
+  if (initialStatus === "invoice_separation") {
+    await ensureSaleFulfillments(
+      { facilityId, saleCode, createdBy },
+      transaction,
+    );
+  }
+
   return row;
 }
 
@@ -351,6 +410,7 @@ exports.listSaleWorkflows = async (req, res) => {
       const meta = stageMeta(plain.status);
       return {
         ...plain,
+        history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         next_status: next,
@@ -394,6 +454,7 @@ exports.getSaleWorkflow = async (req, res) => {
       success: true,
       results: {
         ...plain,
+        history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         next_status: next,
@@ -460,10 +521,27 @@ exports.advanceSaleWorkflow = async (req, res) => {
       });
     }
 
+    let advanceNote = note;
     let next =
       action === "set_status" && forcedStatus
         ? forcedStatus
         : nextStageFor(row.status, row.payment_type);
+
+    // Credit approval → land on separation (same as cashier confirm → separation)
+    if (
+      (!action || action === "advance") &&
+      row.status === "awaiting_credit_approval" &&
+      next === "credit_approved"
+    ) {
+      row.history = pushHistory(
+        row.history,
+        "credit_approved",
+        updated_by,
+        advanceNote || "Credit approved",
+      );
+      next = "invoice_separation";
+      advanceNote = "Ready for invoice separation by branch";
+    }
 
     if (!next) {
       await transaction.rollback();
@@ -483,9 +561,12 @@ exports.advanceSaleWorkflow = async (req, res) => {
     }
 
     row.status = next;
-    row.history = pushHistory(row.history, next, updated_by, note);
+    row.history = pushHistory(row.history, next, updated_by, advanceNote);
     row.updated_by = updated_by || row.updated_by;
     if (next === "payment_confirmed" || next === "credit_approved") {
+      row.hold_overnight = false;
+    }
+    if (next === "invoice_separation" && row.payment_type === "credit") {
       row.hold_overnight = false;
     }
     await row.save({ transaction });
@@ -690,6 +771,7 @@ exports.getCashierDashboard = async (req, res) => {
           const plain = r.toJSON();
           return {
             ...plain,
+            history: normalizeHistory(plain.history),
             status_label:
               SALE_WORKFLOW_STAGES.find((s) => s.id === plain.status)?.label ||
               plain.status,
@@ -1489,6 +1571,178 @@ exports.listWarehouseRequests = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: err.message || "Failed to list warehouse requests",
+    });
+  }
+};
+
+const SPECIAL_TREATMENT_TYPES = ["cash", "transfer", "warehouse"];
+
+/**
+ * Special invoice treatment: switch sales between cash, transfer, and warehouse.
+ * Warehouse skips cashier and goes to separation / warehouse collection.
+ */
+exports.applySpecialInvoiceTreatment = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      saleCodes,
+      paymentType: rawType,
+      updated_by,
+      note,
+    } = req.body;
+
+    const paymentType = String(rawType || "")
+      .toLowerCase()
+      .trim();
+    const codes = Array.isArray(saleCodes)
+      ? [...new Set(saleCodes.map((c) => String(c || "").trim()).filter(Boolean))]
+      : [];
+
+    if (!facilityId || !codes.length) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and saleCodes are required",
+      });
+    }
+    if (!SPECIAL_TREATMENT_TYPES.includes(paymentType)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "paymentType must be cash, transfer, or warehouse",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      await transaction.rollback();
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+
+    const rows = await db.SaleWorkflow.findAll({
+      where: {
+        facility_id: facilityId,
+        sale_code: { [Op.in]: codes },
+      },
+      transaction,
+    });
+
+    if (!rows.length) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "No matching sales found",
+      });
+    }
+
+    const earlyCashier = new Set([
+      "submitted",
+      "awaiting_payment",
+      "awaiting_cashier_confirm",
+    ]);
+    const earlyWarehouse = new Set([
+      "invoice_separation",
+      "credit_approved",
+      "final_invoice",
+      "payment_confirmed",
+    ]);
+
+    const updated = [];
+    for (const row of rows) {
+      const prevType = String(row.payment_type || "").toLowerCase();
+      if (prevType === paymentType) {
+        updated.push({
+          sale_code: row.sale_code,
+          payment_type: row.payment_type,
+          status: row.status,
+          changed: false,
+        });
+        continue;
+      }
+
+      row.payment_type = paymentType;
+      row.history = pushHistory(
+        row.history,
+        row.status,
+        updated_by,
+        note ||
+          `Special treatment: switched from ${prevType || "—"} to ${paymentType}`,
+      );
+
+      // Cash/transfer → warehouse: skip cashier, send to separation
+      if (
+        paymentType === "warehouse" &&
+        earlyCashier.has(row.status)
+      ) {
+        row.status = "invoice_separation";
+        row.hold_overnight = false;
+        row.history = pushHistory(
+          row.history,
+          "invoice_separation",
+          updated_by,
+          "Warehouse treatment — ready for separation",
+        );
+        await ensureSaleFulfillments(
+          {
+            facilityId,
+            saleCode: row.sale_code,
+            createdBy: updated_by,
+          },
+          transaction,
+        );
+      }
+
+      // Warehouse → cash/transfer: send back to cashier if not yet collected
+      if (
+        (paymentType === "cash" || paymentType === "transfer") &&
+        earlyWarehouse.has(row.status) &&
+        prevType === "warehouse"
+      ) {
+        row.status = "awaiting_cashier_confirm";
+        row.history = pushHistory(
+          row.history,
+          "awaiting_cashier_confirm",
+          updated_by,
+          `Switched to ${paymentType} — awaiting cashier`,
+        );
+      }
+
+      // Cash ↔ transfer while still at cashier
+      if (
+        (paymentType === "cash" || paymentType === "transfer") &&
+        earlyCashier.has(row.status) &&
+        (prevType === "cash" ||
+          prevType === "transfer" ||
+          prevType === "bank" ||
+          prevType === "split")
+      ) {
+        // payment_type already updated; stay on cashier stage
+      }
+
+      row.updated_by = updated_by || row.updated_by;
+      await row.save({ transaction });
+      updated.push({
+        sale_code: row.sale_code,
+        payment_type: row.payment_type,
+        status: row.status,
+        changed: true,
+      });
+    }
+
+    await transaction.commit();
+    return res.json({
+      success: true,
+      message: `Updated ${updated.filter((u) => u.changed).length} invoice(s) to ${paymentType}`,
+      results: updated,
+    });
+  } catch (err) {
+    await transaction.rollback();
+    console.error("applySpecialInvoiceTreatment:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to apply special invoice treatment",
     });
   }
 };

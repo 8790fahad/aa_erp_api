@@ -975,6 +975,7 @@ exports.create = async (req, res) => {
       `('Short-Term Investments',     1, '100007', '100001', 3, 'assets', 'Current Assets', 'ASSET', '${_facilityId}', 1, NOW(), NOW(), 'Short-Term Investments')`,
       `('Assets Held for Sale',       1, '100008', '100001', 3, 'assets', 'Current Assets', 'ASSET', '${_facilityId}', 1, NOW(), NOW(), 'Assets Held for Sale')`,
       `('Other Current Assets',       1, '100009', '100001', 3, 'assets', 'Current Assets', 'ASSET', '${_facilityId}', 1, NOW(), NOW(), 'Other Current Assets')`,
+      `('Goods in Transit',           1, '100022', '100004', 3, 'assets', 'Current Assets', 'ASSET', '${_facilityId}', 1, NOW(), NOW(), 'Goods in Transit')`,
     );
 
     // ── ASSETS: Level 3 — non_current_assets subcategories ───────────────
@@ -1130,7 +1131,8 @@ exports.create = async (req, res) => {
     );
 
     // ── BUSINESS-TYPE SPECIFIC ACCOUNTS ──────────────────────────────────
-    // Codes 100018-100021 and 200019 reserved for business-specific sub-accounts
+    // Codes 100018-100022 and 200019 reserved for business-specific sub-accounts
+    // (100022 Goods in Transit is seeded for all facilities under Inventory)
 
     // MANUFACTURING & RECYCLING
     if (hasManufacturing || hasRecycling) {
@@ -1194,6 +1196,7 @@ exports.create = async (req, res) => {
       `('100007', 'assets', 'Current Assets',       'Short-term Investments',     'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,
       `('100008', 'assets', 'Current Assets',       'Other Current Assets',       'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,
       `('100009', 'assets', 'Current Assets',       'Prepayments and Deposits',   'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,
+      `('100022', 'assets', 'Current Assets',       'Goods in Transit',           'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,
       `('100010', 'assets', 'Non-Current Assets',   'Property Plant and Equipment','ASSET',    'DEBIT',  'BS', '${_facilityId}', 1)`,
       `('100011', 'assets', 'Non-Current Assets',   'Intangible Assets',          'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,
       `('100012', 'assets', 'Non-Current Assets',   'Long-term Investments',      'ASSET',     'DEBIT',  'BS', '${_facilityId}', 1)`,

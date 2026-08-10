@@ -97,8 +97,8 @@ function applyLiabilityClassification(rows) {
 
 /**
  * Core balance sheet data from general_ledger + account_category (single as-of date).
- * BS sections use account code first digit only (not account_nature / not ac.type):
- * 1 = assets, 2 = liabilities, 3 = equity.
+ * BS sections use account_nature (ASSET / LIABILITY / EQUITY) so Inventria CoAs that put
+ * liabilities under 9xxxx (not 2xxxx) still balance. No GL status filter — all postings count.
  * Current / non-current uses parent_code + segment head (balanceSheetHead3).
  * @param {{ includeZeroHeadAccounts?: boolean }} [options] — When true (SOFP only), include chart
  *   codes with zero balance when they are valid Inventria heads (odd length: 1,3,5,7…) so parents
@@ -151,7 +151,7 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
       AND gl.facility_id = :facilityId
       AND gl.transaction_date <= :asOfDate
     WHERE ac.facility_id = :facilityId
-      AND SUBSTRING(TRIM(ac.code), 1, 1) = '1'
+      AND ac.account_nature = 'ASSET'
       AND ac.is_active = 1
       ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
@@ -174,7 +174,7 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
       AND gl.facility_id = :facilityId
       AND gl.transaction_date <= :asOfDate
     WHERE ac.facility_id = :facilityId
-      AND SUBSTRING(TRIM(ac.code), 1, 1) = '2'
+      AND ac.account_nature = 'LIABILITY'
       AND ac.is_active = 1
       ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
@@ -197,7 +197,7 @@ async function fetchBalanceSheetRows(facilityId, asOfDate, options = {}) {
       AND gl.facility_id = :facilityId
       AND gl.transaction_date <= :asOfDate
     WHERE ac.facility_id = :facilityId
-      AND SUBSTRING(TRIM(ac.code), 1, 1) = '3'
+      AND ac.account_nature = 'EQUITY'
       AND ac.is_active = 1
       ${excludeBalanceSwitch}
     GROUP BY ac.code, ac.description, ac.category, ac.type, ac.level, ac.parent_code
@@ -1712,7 +1712,6 @@ exports.getIncomeStatement = async (req, res) => {
         `SELECT MIN(transaction_date) AS earliest
          FROM general_ledger
          WHERE facility_id = :facilityId
-           AND status      IN ('paid', 'posted')
            AND type        != 'opening_balance'`,
         { replacements: { facilityId }, type: QueryTypes.SELECT }
       );
@@ -1757,7 +1756,6 @@ exports.getIncomeStatement = async (req, res) => {
          ON  gl.account_code     = ac.code
          AND gl.facility_id      = :facilityId
          AND gl.transaction_date BETWEEN :startDate AND :endDate
-         AND gl.status           IN ('paid', 'posted')
          AND gl.type             != 'opening_balance'
        WHERE ac.facility_id    = :facilityId
          AND ac.account_nature IN ('REVENUE', 'EXPENSE')
@@ -2067,7 +2065,6 @@ async function fetchPreferenceDividends(facilityId, startDate, endDate) {
        ON  gl.account_code = ac.code
        AND gl.facility_id  = :facilityId
        AND gl.transaction_date BETWEEN :startDate AND :endDate
-       AND gl.status IN ('paid', 'posted', 'saved', 'pending', 'partial')
        AND gl.type   != 'opening_balance'
      WHERE ac.facility_id    = :facilityId
        AND ac.subcategory    = 'preference_dividends'
@@ -2167,14 +2164,15 @@ exports.getStatementOfFinancialPosition = async (req, res) => {
     ]);
 
     // ── 2. Fetch net income for BOTH periods ──────────────────────────────────
-    // Net income = (sum of revenue cr-dr) - (sum of expense dr-cr)
-    // Uses all 4xx and 5xx accounts, is_active only, no display filter
+    // Net income = revenue (cr-dr) − expense (dr-cr) via account_nature.
+    // Inventria CoA uses 6xx revenue / 7–8xx expense (not classic 4/5). No status filter.
     const netIncomeQuery = `
       SELECT
         COALESCE(SUM(
-          CASE WHEN SUBSTRING(TRIM(ac.code), 1, 1) = '4'
-               THEN gl.cr - gl.dr
-               ELSE -(gl.dr - gl.cr)      /* expenses flip sign */
+          CASE
+            WHEN ac.account_nature = 'REVENUE' THEN (gl.cr - gl.dr)
+            WHEN ac.account_nature = 'EXPENSE' THEN -(gl.dr - gl.cr)
+            ELSE 0
           END
         ), 0) AS net_income
       FROM account_category ac
@@ -2183,7 +2181,7 @@ exports.getStatementOfFinancialPosition = async (req, res) => {
         AND gl.facility_id = :facilityId
         AND gl.transaction_date <= :asOfDate
       WHERE ac.facility_id = :facilityId
-        AND SUBSTRING(TRIM(ac.code), 1, 1) IN ('4', '5')
+        AND ac.account_nature IN ('REVENUE', 'EXPENSE')
         AND ac.is_active = 1
     `;
 
@@ -2417,16 +2415,33 @@ exports.getCashFlowStatement = async (req, res) => {
       const [[earliest]] = await db.sequelize.query(
         `SELECT MIN(transaction_date) AS earliest_date
          FROM general_ledger
-         WHERE facility_id = :facilityId
-           AND status IN ('paid','posted')`,
+         WHERE facility_id = :facilityId`,
         { replacements: { facilityId }, type: QueryTypes.SELECT }
       );
       startDate = earliest?.earliest_date || new Date().getFullYear() + "-01-01";
     }
 
+    // Inventria CoA often leaves subcategory null and tags banks as "Current assets".
+    // Match cash/bank by subcategory, type, category, description, or cash hierarchy codes.
+    const SQL_IS_CASH_OR_BANK = `(
+      LOWER(COALESCE(ac.subcategory, '')) IN (
+        'cash','bank','cash and bank','cash & bank','petty cash','overdraft','bank overdraft'
+      )
+      OR LOWER(COALESCE(ac.type, '')) IN (
+        'cash','bank','cash and bank','cash & bank','overdraft'
+      )
+      OR LOWER(COALESCE(ac.category, '')) IN (
+        'cash','bank','cash and cash equivalents'
+      )
+      OR LOWER(COALESCE(ac.description, '')) LIKE '%cash%'
+      OR LOWER(COALESCE(ac.description, '')) LIKE '%bank%'
+      OR ac.code IN ('112199', '112200', '112201')
+      OR ac.parent_code IN ('112200', '112201')
+    )`;
+
     // ════════════════════════════════════════════════════════════════════════
     // 1. NET PROFIT FOR THE PERIOD
-    //    Revenue (cr - dr)  minus  Expense (dr - cr)
+    //    Revenue (cr - dr)  minus  Expense (dr - cr) — no GL status filter
     // ════════════════════════════════════════════════════════════════════════
     const netProfitQuery = `
       SELECT
@@ -2438,7 +2453,6 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id    = :facilityId
         AND ac.account_nature IN ('REVENUE','EXPENSE')
         AND ac.is_active = 1
@@ -2447,11 +2461,6 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ════════════════════════════════════════════════════════════════════════
     // 2. NON-CASH / ADJUSTMENT ITEMS
-    //    These are accounts whose category / subcategory signals a non-cash
-    //    item (Depreciation, Amortisation, Provisions, Prior Year Adjustments,
-    //    Profit/Loss on disposal, etc.).
-    //    We rely entirely on the account_category fields:
-    //      category, type, subcategory — no hardcoded descriptions.
     // ════════════════════════════════════════════════════════════════════════
     const adjustmentsQuery = `
       SELECT
@@ -2463,8 +2472,6 @@ exports.getCashFlowStatement = async (req, res) => {
         ac.account_nature,
         COALESCE(SUM(gl.dr), 0) AS debit,
         COALESCE(SUM(gl.cr), 0) AS credit,
-        /* For expense-nature adjustment items, net movement = dr - cr  */
-        /* For asset-nature items (e.g. accumulated depreciation), cr - dr */
         CASE
           WHEN ac.account_nature IN ('EXPENSE','ASSET')
                THEN COALESCE(SUM(gl.dr - gl.cr), 0)
@@ -2475,27 +2482,26 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND ac.display     = 1
         AND (
-          /* Depreciation & amortisation */
-          LOWER(ac.subcategory) LIKE '%depreciation%'
-          OR LOWER(ac.subcategory) LIKE '%amortisation%'
-          OR LOWER(ac.subcategory) LIKE '%amortization%'
-          /* Provisions (gratuity, bad debts, etc.) */
-          OR LOWER(ac.subcategory) LIKE '%provision%'
-          /* Prior year adjustments */
-          OR LOWER(ac.subcategory) LIKE '%prior year%'
-          OR LOWER(ac.subcategory) LIKE '%prior-year%'
-          /* Profit / Loss on disposal */
-          OR LOWER(ac.subcategory) LIKE '%disposal%'
-          OR LOWER(ac.subcategory) LIKE '%profit on%'
-          OR LOWER(ac.subcategory) LIKE '%loss on%'
-          /* Accumulated depreciation (contra-asset) */
-          OR LOWER(ac.type)        LIKE '%accumulated%'
+          LOWER(COALESCE(ac.subcategory, '')) LIKE '%depreciation%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%amortisation%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%amortization%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%provision%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%prior year%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%prior-year%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%disposal%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%profit on%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%loss on%'
+          OR LOWER(COALESCE(ac.description, '')) LIKE '%depreciat%'
+          OR LOWER(COALESCE(ac.description, '')) LIKE '%amortis%'
         )
+        /* P&L charges only — exclude BS contra (Accum. Dep) so add-backs are not cancelled */
+        AND LOWER(COALESCE(ac.description, '')) NOT LIKE '%accum%'
+        AND LOWER(COALESCE(ac.type, '')) NOT LIKE '%accumulat%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%accumulat%'
+        AND ac.account_nature IN ('EXPENSE', 'LIABILITY', 'EQUITY')
       GROUP BY ac.code, ac.description, ac.category, ac.type,
                ac.subcategory, ac.account_nature
       HAVING COALESCE(SUM(gl.dr), 0) > 0 OR COALESCE(SUM(gl.cr), 0) > 0
@@ -2504,9 +2510,6 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ════════════════════════════════════════════════════════════════════════
     // 3. WORKING CAPITAL CHANGES
-    //    Current Assets (excl. cash/bank) — Inventory, Receivables, Prepayments
-    //    Current Liabilities              — Payables, Accruals
-    //    We EXCLUDE accounts that are categorised as Cash / Bank.
     // ════════════════════════════════════════════════════════════════════════
     const workingCapitalQuery = `
       SELECT
@@ -2519,15 +2522,11 @@ exports.getCashFlowStatement = async (req, res) => {
         ac.parent_code,
         COALESCE(SUM(gl.dr), 0) AS debit,
         COALESCE(SUM(gl.cr), 0) AS credit,
-        /*
-          For Current Assets:  increase in asset = cash outflow  → dr - cr (negative effect)
-          For Current Liabilities: increase in liability = cash inflow → cr - dr (positive effect)
-        */
         CASE
           WHEN ac.account_nature = 'ASSET'
-               THEN COALESCE(SUM(gl.cr - gl.dr), 0)   -- increase in asset is negative
+               THEN COALESCE(SUM(gl.cr - gl.dr), 0)
           WHEN ac.account_nature = 'LIABILITY'
-               THEN COALESCE(SUM(gl.cr - gl.dr), 0)   -- increase in liability is positive
+               THEN COALESCE(SUM(gl.cr - gl.dr), 0)
           ELSE COALESCE(SUM(gl.cr - gl.dr), 0)
         END AS net_amount
       FROM account_category ac
@@ -2535,25 +2534,21 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND ac.display     = 1
         AND ac.account_nature IN ('ASSET', 'LIABILITY')
-        /* Only current items */
-        AND LOWER(ac.type) IN (
+        AND LOWER(COALESCE(ac.type, '')) IN (
           'current assets', 'current asset',
           'current liabilities', 'current liability'
         )
-        /* Exclude Cash & Bank accounts */
-        AND LOWER(ac.subcategory) NOT IN ('cash','bank','cash and bank','cash & bank')
-        AND LOWER(ac.type)        NOT IN ('cash','bank','cash and bank')
-        /* Exclude non-cash adjustment items already captured above */
-        AND LOWER(ac.subcategory) NOT LIKE '%depreciation%'
-        AND LOWER(ac.subcategory) NOT LIKE '%amortis%'
-        AND LOWER(ac.subcategory) NOT LIKE '%provision%'
-        AND LOWER(ac.subcategory) NOT LIKE '%prior year%'
-        AND LOWER(ac.subcategory) NOT LIKE '%disposal%'
+        AND NOT ${SQL_IS_CASH_OR_BANK}
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%depreciation%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%amortis%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%provision%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%prior year%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%disposal%'
+        AND LOWER(COALESCE(ac.description, '')) NOT LIKE '%accum.%'
+        AND LOWER(COALESCE(ac.description, '')) NOT LIKE '%accumulat%'
       GROUP BY ac.code, ac.description, ac.category, ac.type,
                ac.subcategory, ac.account_nature, ac.parent_code
       HAVING COALESCE(SUM(gl.dr), 0) > 0 OR COALESCE(SUM(gl.cr), 0) > 0
@@ -2562,7 +2557,6 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ════════════════════════════════════════════════════════════════════════
     // 4. TAX PAID
-    //    Any account tagged as tax-type under current liabilities
     // ════════════════════════════════════════════════════════════════════════
     const taxQuery = `
       SELECT
@@ -2579,14 +2573,12 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND ac.display     = 1
         AND (
-          LOWER(ac.subcategory) LIKE '%tax%'
-          OR LOWER(ac.type)     LIKE '%tax%'
-          OR LOWER(ac.category) LIKE '%tax%'
+          LOWER(COALESCE(ac.subcategory, '')) LIKE '%tax%'
+          OR LOWER(COALESCE(ac.type, ''))     LIKE '%tax%'
+          OR LOWER(COALESCE(ac.category, '')) LIKE '%tax%'
         )
       GROUP BY ac.code, ac.description, ac.category, ac.type, ac.subcategory
       HAVING COALESCE(SUM(gl.dr), 0) > 0 OR COALESCE(SUM(gl.cr), 0) > 0
@@ -2595,8 +2587,6 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ════════════════════════════════════════════════════════════════════════
     // 5. INVESTING ACTIVITIES
-    //    Fixed assets / Non-current assets: purchases (dr outflow) and
-    //    proceeds from disposals (cr inflow)
     // ════════════════════════════════════════════════════════════════════════
     const investingQuery = `
       SELECT
@@ -2608,33 +2598,26 @@ exports.getCashFlowStatement = async (req, res) => {
         ac.parent_code,
         COALESCE(SUM(gl.dr), 0) AS debit,
         COALESCE(SUM(gl.cr), 0) AS credit,
-        /*
-          Net cash for investing:
-            Purchases (debit)  = outflow → negative
-            Proceeds  (credit) = inflow  → positive
-          Formula: cr - dr gives the net cash effect correctly.
-        */
         COALESCE(SUM(gl.cr - gl.dr), 0) AS net_amount
       FROM account_category ac
       LEFT JOIN general_ledger gl
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.account_nature = 'ASSET'
         AND ac.is_active      = 1
-        AND ac.display        = 1
-        AND LOWER(ac.type) IN (
-          'fixed assets', 'fixed asset',
-          'non-current assets', 'non-current asset',
-          'noncurrent assets', 'noncurrent asset',
-          'long-term assets', 'long term assets',
+        AND LOWER(REPLACE(COALESCE(ac.type, ''), ' ', '')) IN (
+          'fixedassets', 'fixedasset',
+          'non-currentassets', 'non-currentasset',
+          'noncurrentassets', 'noncurrentasset',
+          'long-termassets', 'longtermassets',
           'investment', 'investments'
         )
-        /* Exclude accumulated depreciation (contra accounts) */
-        AND LOWER(ac.subcategory) NOT LIKE '%accumulated%'
-        AND LOWER(ac.type)        NOT LIKE '%accumulated%'
+        AND LOWER(COALESCE(ac.subcategory, '')) NOT LIKE '%accumulat%'
+        AND LOWER(COALESCE(ac.type, ''))        NOT LIKE '%accumulat%'
+        AND LOWER(COALESCE(ac.description, '')) NOT LIKE '%accum.%'
+        AND LOWER(COALESCE(ac.description, '')) NOT LIKE '%accumulat%'
       GROUP BY ac.code, ac.description, ac.category, ac.type,
                ac.subcategory, ac.parent_code
       HAVING COALESCE(SUM(gl.dr), 0) > 0 OR COALESCE(SUM(gl.cr), 0) > 0
@@ -2643,7 +2626,6 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ════════════════════════════════════════════════════════════════════════
     // 6. FINANCING ACTIVITIES
-    //    Equity movements, long-term liabilities, dividends paid
     // ════════════════════════════════════════════════════════════════════════
     const financingQuery = `
       SELECT
@@ -2656,27 +2638,19 @@ exports.getCashFlowStatement = async (req, res) => {
         ac.parent_code,
         COALESCE(SUM(gl.dr), 0) AS debit,
         COALESCE(SUM(gl.cr), 0) AS credit,
-        /*
-          Equity / Long-term Liability:
-            New share capital / borrowings received (cr) = inflow  → positive
-            Repayments / dividends paid (dr)             = outflow → negative
-          Formula: cr - dr
-        */
         COALESCE(SUM(gl.cr - gl.dr), 0) AS net_amount
       FROM account_category ac
       LEFT JOIN general_ledger gl
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date BETWEEN :startDate AND :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND ac.display     = 1
         AND (
           ac.account_nature = 'EQUITY'
           OR (
             ac.account_nature = 'LIABILITY'
-            AND LOWER(ac.type) IN (
+            AND LOWER(COALESCE(ac.type, '')) IN (
               'long-term liabilities','long term liabilities',
               'non-current liabilities','non-current liability',
               'noncurrent liabilities','long-term liability',
@@ -2684,8 +2658,7 @@ exports.getCashFlowStatement = async (req, res) => {
               'deferred', 'deferred liability'
             )
           )
-          /* Dividends declared / paid — typically an equity sub-account */
-          OR LOWER(ac.subcategory) LIKE '%dividend%'
+          OR LOWER(COALESCE(ac.subcategory, '')) LIKE '%dividend%'
         )
       GROUP BY ac.code, ac.description, ac.account_nature, ac.category,
                ac.type, ac.subcategory, ac.parent_code
@@ -2694,7 +2667,7 @@ exports.getCashFlowStatement = async (req, res) => {
     `;
 
     // ════════════════════════════════════════════════════════════════════════
-    // 7. OPENING CASH BALANCE (Cash & Bank accounts — balance at period start)
+    // 7. OPENING CASH BALANCE
     // ════════════════════════════════════════════════════════════════════════
     const openingCashQuery = `
       SELECT
@@ -2711,14 +2684,9 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date < :startDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND (
-          LOWER(ac.subcategory) IN ('cash','bank','cash and bank','cash & bank','petty cash')
-          OR LOWER(ac.type)     IN ('cash','bank','cash and bank','cash & bank')
-          OR LOWER(ac.category) IN ('cash','bank','cash and cash equivalents')
-        )
+        AND ${SQL_IS_CASH_OR_BANK}
       GROUP BY ac.code, ac.description, ac.category, ac.type, ac.subcategory
       ORDER BY ac.code
     `;
@@ -2741,14 +2709,9 @@ exports.getCashFlowStatement = async (req, res) => {
              ON ac.code = gl.account_code
             AND gl.facility_id    = :facilityId
             AND gl.transaction_date <= :endDate
-            AND gl.status IN ('paid','posted')
       WHERE ac.facility_id = :facilityId
         AND ac.is_active   = 1
-        AND (
-          LOWER(ac.subcategory) IN ('cash','bank','cash and bank','cash & bank','petty cash','overdraft','bank overdraft')
-          OR LOWER(ac.type)     IN ('cash','bank','cash and bank','cash & bank','overdraft')
-          OR LOWER(ac.category) IN ('cash','bank','cash and cash equivalents')
-        )
+        AND ${SQL_IS_CASH_OR_BANK}
       GROUP BY ac.code, ac.description, ac.category, ac.type, ac.subcategory
       ORDER BY ac.code
     `;
@@ -2843,17 +2806,16 @@ exports.getCashFlowStatement = async (req, res) => {
 
     // ── Closing cash balance ─────────────────────────────────────────────────
     //    Separate bank balances from overdraft accounts
-    const bankBalances = closingCash.filter(
-      (r) =>
-        !["overdraft", "bank overdraft"].includes(
-          (r.subcategory || "").toLowerCase()
-        )
-    );
-    const overdraftBalances = closingCash.filter((r) =>
-      ["overdraft", "bank overdraft"].includes(
-        (r.subcategory || "").toLowerCase()
-      )
-    );
+    const bankBalances = closingCash.filter((r) => {
+      const sub = (r.subcategory || "").toLowerCase();
+      const name = (r.account_name || "").toLowerCase();
+      return !sub.includes("overdraft") && !name.includes("overdraft");
+    });
+    const overdraftBalances = closingCash.filter((r) => {
+      const sub = (r.subcategory || "").toLowerCase();
+      const name = (r.account_name || "").toLowerCase();
+      return sub.includes("overdraft") || name.includes("overdraft");
+    });
 
     const totalBankBalance = bankBalances.reduce(
       (sum, r) => sum + parseFloat(r.net_amount),
@@ -3024,6 +2986,25 @@ const COLUMN_LABELS = {
   accumulated_other_comprehensive_income: "Other Comprehensive Income",
 };
 
+/** Infer SOCE column when CoA subcategory is null (common on Inventria charts). */
+function resolveEquitySubcategory(acc) {
+  const raw = String(acc.subcategory || "").trim();
+  if (raw) return raw;
+  const d = String(acc.description || "").toLowerCase();
+  if (d.includes("retained")) return "retained_earnings";
+  if (d.includes("share premium") || d.includes("share premium")) return "share_premium";
+  if (
+    d.includes("share capital") ||
+    d.includes("owner's capital") ||
+    d.includes("owners capital") ||
+    d.includes("opening balance equity")
+  ) {
+    return "share_capital";
+  }
+  if (d.includes("revaluation")) return "revaluation_reserve";
+  return "other_reserves";
+}
+
 // SOCE row definitions — order matches screenshot top to bottom
 const ROW_DEFINITIONS = [
   { key: "opening_balance",       label: "Balance As At 1 January {year}", isBold: false, isOpening: true  },
@@ -3031,7 +3012,7 @@ const ROW_DEFINITIONS = [
   { key: "prior_year_dividend",   label: "Prior year Dividend paid",        isBold: false                   },
   { key: "dividend_paid",         label: "Dividend paid",                   isBold: false                   },
   { key: "profit_for_year",       label: "Profit for the year",             isBold: false                   },
-  { key: "closing_balance",       label: "Balance as at 31 December {year}", isBold: true, isClosing: true },
+  { key: "closing_balance",       label: "Balance as at {yearEnd}", isBold: true, isClosing: true },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3100,7 +3081,7 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
     const accountMap = {};
     for (const acc of equityAccounts) {
       accountMap[acc.code] = {
-        subcategory: acc.subcategory || "other_reserves",
+        subcategory: resolveEquitySubcategory(acc),
         description: acc.description,
       };
     }
@@ -3109,7 +3090,7 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
     // ── 3. Fetch all GL movements on equity accounts ─────────────────────────
     // We fetch from priorYearStart so we can show prior year block too.
     // For current period, opening_balance entries on 2026-01-01 serve as the
-    // "Balance As At 1 January 2026" row.
+    // "Balance As At 1 January 2026" row. No status filter.
     const equityGL = equityCodes.length > 0
       ? await db.sequelize.query(
           `SELECT
@@ -3122,7 +3103,6 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
            FROM general_ledger
            WHERE facility_id  = :facilityId
              AND account_code IN (:codes)
-             AND status       IN ('paid', 'posted')
              AND transaction_date BETWEEN :from AND :to
            ORDER BY transaction_date ASC`,
           {
@@ -3150,7 +3130,6 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
            AND ac.facility_id = gl.facility_id
          WHERE gl.facility_id      = :facilityId
            AND ac.account_nature   IN ('REVENUE', 'EXPENSE')
-           AND gl.status           IN ('paid', 'posted')
            AND gl.type             != 'opening_balance'
            AND gl.transaction_date BETWEEN :from AND :to`,
         {
@@ -3163,7 +3142,7 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
 
     // Find the retained_earnings subcategory account codes
     const retainedEarningsCodes = equityAccounts
-      .filter((a) => a.subcategory === "retained_earnings")
+      .filter((a) => resolveEquitySubcategory(a) === "retained_earnings")
       .map((a) => a.code);
 
     const priorNetProfit   = await getNetProfit(priorYearStart, priorYearEnd);
@@ -3251,7 +3230,14 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
     }));
 
     // ── 8. Build period row arrays ───────────────────────────────────────────
-    function buildRows(grid, year) {
+    const formatYearEndLabel = (year, isCurrentPeriod) => {
+      if (isCurrentPeriod) {
+        return moment(endDate).format("D MMMM YYYY");
+      }
+      return `31 December ${year}`;
+    };
+
+    function buildRows(grid, year, isCurrentPeriod = false) {
       return ROW_DEFINITIONS
         .filter((def) => {
           // Always show opening and closing
@@ -3271,7 +3257,9 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
           }
           return {
             rowKey   : def.key,
-            label    : def.label.replace("{year}", String(year)),
+            label    : def.label
+              .replace("{year}", String(year))
+              .replace("{yearEnd}", formatYearEndLabel(year, isCurrentPeriod)),
             isBold   : def.isBold   || false,
             isOpening: def.isOpening || false,
             isClosing: def.isClosing || false,
@@ -3282,9 +3270,9 @@ exports.getStatementOfChangesInEquity = async (req, res) => {
     }
 
     // Prior year block (for comparative column as in screenshot)
-    const priorRows   = buildRows(priorGrid,   priorYear);
+    const priorRows   = buildRows(priorGrid,   priorYear, false);
     // Current year block
-    const currentRows = buildRows(currentGrid, currentYear);
+    const currentRows = buildRows(currentGrid, currentYear, true);
 
     // ── 9. Closing position grand total ─────────────────────────────────────
     const closingCols = currentGrid["closing_balance"];

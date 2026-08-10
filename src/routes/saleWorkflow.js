@@ -28,4 +28,8 @@ module.exports = (app) => {
     "/api/v1/sale-workflows/cashier-confirm",
     saleWorkflow.cashierConfirmPayment,
   );
+  app.post(
+    "/api/v1/sale-workflows/special-treatment",
+    saleWorkflow.applySpecialInvoiceTreatment,
+  );
 };

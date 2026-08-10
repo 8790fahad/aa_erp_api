@@ -77,11 +77,16 @@ function nextStageFor(current, paymentType) {
     paymentType === "transfer" ||
     paymentType === "split" ||
     paymentType === "bank";
+  const isWarehouse = paymentType === "warehouse";
 
   const map = {
     sales_order: "invoice_generated",
     invoice_generated: "submitted",
-    submitted: isPaid ? "awaiting_cashier_confirm" : "awaiting_credit_approval",
+    submitted: isPaid
+      ? "awaiting_cashier_confirm"
+      : isWarehouse
+        ? "invoice_separation"
+        : "awaiting_credit_approval",
     awaiting_payment: "awaiting_cashier_confirm",
     awaiting_cashier_confirm: "payment_confirmed",
     payment_confirmed: "invoice_separation",
@@ -104,9 +109,11 @@ function stagesForPaymentType(paymentType) {
     paymentType === "transfer" ||
     paymentType === "split" ||
     paymentType === "bank";
+  const isWarehouse = paymentType === "warehouse";
 
-  // Cash/transfer: Invoice → Cashier → Paid (separation) → Warehouse → Done
-  // Credit: Invoice → Paid (separation, skip cashier) → Warehouse → Done
+  // Cash/transfer: Invoice → Cashier → Separation → Warehouse → Done
+  // Warehouse: Invoice → Separation → Warehouse → Done (no cashier)
+  // Credit: Invoice → Credit approval → Separation → Warehouse → Done
   const core = [
     { id: "invoice_generated", label: "Invoice generated", phase: "order", color: "slate" },
   ];
@@ -116,6 +123,13 @@ function stagesForPaymentType(paymentType) {
       label: "Cashier",
       phase: "payment_cash",
       color: "amber",
+    });
+  } else if (!isWarehouse) {
+    core.push({
+      id: "awaiting_credit_approval",
+      label: "Credit approval",
+      phase: "payment_credit",
+      color: "rose",
     });
   }
   core.push(
@@ -180,6 +194,7 @@ module.exports = (sequelize, DataTypes) => {
           "transfer",
           "split",
           "bank",
+          "warehouse",
         ),
         allowNull: false,
         defaultValue: "credit",

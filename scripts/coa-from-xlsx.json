@@ -71,13 +71,13 @@
   },
   {
     "code": "112102",
-    "name": "Prepaid Expenses",
-    "type": ""
+    "name": "Advance To Suplier",
+    "type": "Current Asset"
   },
   {
     "code": "112103",
-    "name": "Input VAT Recoverable",
-    "type": ""
+    "name": "Goods in Transit",
+    "type": "Current Asset"
   },
   {
     "code": "112104",

@@ -17056,7 +17056,119 @@ exports.getReceivableLedger = async (req, res) => {
   }
 };
 
-// Get Debtors Report (customer receivable balances only: net debit / positive GL)
+/**
+ * Party balances for customers + suppliers from general_ledger.
+ * Balance = SUM(dr) - SUM(cr); matches receivable/payable ledgers (incl. ref suffixes).
+ * DR (balance > 0) → receivables/debtors; CR (balance < 0) → payables/creditors.
+ */
+async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
+  const parties = await db.sequelize.query(
+    `
+    SELECT
+      party_type,
+      party_id,
+      party_name,
+      address,
+      phone,
+      email,
+      balance
+    FROM (
+      SELECT
+        'customer' AS party_type,
+        c.customerNo AS party_id,
+        COALESCE(
+          NULLIF(TRIM(c.fullname), ''),
+          NULLIF(TRIM(c.company_name), ''),
+          NULLIF(TRIM(CONCAT(IFNULL(c.first_name, ''), ' ', IFNULL(c.last_name, ''))), ''),
+          c.customerNo
+        ) AS party_name,
+        c.address,
+        c.phone,
+        c.email,
+        COALESCE((
+          SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+          FROM general_ledger gl
+          WHERE gl.facility_id = :facilityId
+            AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+            AND (
+              gl.transaction_ref = c.customerNo
+              OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
+            )
+        ), 0) AS balance
+      FROM customers c
+      WHERE c.facilityId = :facilityId
+
+      UNION ALL
+
+      SELECT
+        'supplier' AS party_type,
+        s.supplier_number AS party_id,
+        s.supplier_name AS party_name,
+        s.address,
+        s.phone,
+        s.email,
+        COALESCE((
+          SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+          FROM general_ledger gl
+          WHERE gl.facility_id = :facilityId
+            AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+            AND (
+              gl.transaction_ref = s.supplier_number
+              OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')
+            )
+        ), 0) AS balance
+      FROM suppliersinfo s
+      WHERE s.facilityId = :facilityId
+    ) parties
+    WHERE ABS(COALESCE(balance, 0)) > 0.0001
+    ORDER BY party_name ASC
+    `,
+    {
+      replacements: { facilityId, asAtDate: asAtDate || null },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const mapDebtorRow = (row) => ({
+    party_type: row.party_type,
+    party_id: row.party_id,
+    party_name: row.party_name,
+    customerNo: row.party_id,
+    Name: row.party_name,
+    fullname: row.party_name,
+    address: row.address,
+    phone: row.phone,
+    email: row.email,
+    balance: parseFloat(row.balance || 0) || 0,
+  });
+
+  const mapCreditorRow = (row) => {
+    const balance = parseFloat(row.balance || 0) || 0;
+    return {
+      party_type: row.party_type,
+      party_id: row.party_id,
+      party_name: row.party_name,
+      supplier_number: row.party_id,
+      supplier_name: row.party_name,
+      address: row.address,
+      phone: row.phone,
+      email: row.email,
+      balance,
+      amount: Math.abs(balance),
+    };
+  };
+
+  const debtorRows = parties
+    .filter((row) => (parseFloat(row.balance || 0) || 0) > 0)
+    .map(mapDebtorRow);
+  const creditorRows = parties
+    .filter((row) => (parseFloat(row.balance || 0) || 0) < 0)
+    .map(mapCreditorRow);
+
+  return { parties, debtorRows, creditorRows };
+}
+
+// Get Debtors Report (customers + suppliers with net DR / receivable balances)
 exports.getDebtorsReport = async (req, res) => {
   try {
     const { facilityId, asAtDate } = req.body;
@@ -17068,39 +17180,12 @@ exports.getDebtorsReport = async (req, res) => {
       });
     }
 
-    const rows = await db.sequelize.query(
-      `
-      SELECT
-        c.customerNo,
-        c.fullname,
-        c.address,
-        c.phone,
-        c.email,
-        COALESCE(gl.balance, 0) AS balance
-      FROM customers c
-      LEFT JOIN (
-        SELECT
-          transaction_ref AS customerNo,
-          COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-        FROM general_ledger
-        WHERE facility_id = :facilityId
-          AND (:asAtDate IS NULL OR transaction_date <= :asAtDate)
-        GROUP BY transaction_ref
-      ) gl ON c.customerNo = gl.customerNo
-      WHERE c.facilityId = :facilityId
-        AND COALESCE(gl.balance, 0) > 0
-      ORDER BY c.fullname ASC
-      `,
-      {
-        replacements: {
-          facilityId,
-          asAtDate: asAtDate || null,
-        },
-        type: QueryTypes.SELECT,
-      },
+    const { debtorRows } = await fetchPartyBalancesByDrCr(
+      facilityId,
+      asAtDate || null,
     );
 
-    const totalBalance = rows.reduce(
+    const totalBalance = debtorRows.reduce(
       (sum, row) => sum + (parseFloat(row.balance || 0) || 0),
       0,
     );
@@ -17109,7 +17194,7 @@ exports.getDebtorsReport = async (req, res) => {
       success: true,
       data: {
         asAtDate: asAtDate || null,
-        rows,
+        rows: debtorRows,
         totalBalance,
       },
     });
@@ -17124,9 +17209,9 @@ exports.getDebtorsReport = async (req, res) => {
 };
 
 /**
- * Single API: customer balances (debtors / receivable) + supplier balances (creditors / payables).
- * Debtors: customers with net receivable (SUM(dr)-SUM(cr) > 0).
- * Creditors: suppliers with net payable (SUM(dr)-SUM(cr) < 0). Excludes prepayment / debit-only supplier nets.
+ * Single API: customers + suppliers split by ledger net.
+ * Debtors / Receivables: net DR (SUM(dr)-SUM(cr) > 0).
+ * Creditors / Payables: net CR (SUM(dr)-SUM(cr) < 0).
  */
 exports.getDebtorsCreditorsCombinedReport = async (req, res) => {
   try {
@@ -17140,66 +17225,10 @@ exports.getDebtorsCreditorsCombinedReport = async (req, res) => {
     }
 
     const asAt = asAtDate || null;
-
-    const debtorsQuery = `
-      SELECT
-        c.customerNo,
-        c.fullname,
-        c.address,
-        c.phone,
-        c.email,
-        COALESCE(gl.balance, 0) AS balance
-      FROM customers c
-      LEFT JOIN (
-        SELECT
-          transaction_ref AS customerNo,
-          COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-        FROM general_ledger
-        WHERE facility_id = :facilityId
-          AND (:asAtDate IS NULL OR transaction_date <= :asAtDate)
-        GROUP BY transaction_ref
-      ) gl ON c.customerNo = gl.customerNo
-      WHERE c.facilityId = :facilityId
-        AND COALESCE(gl.balance, 0) > 0
-      ORDER BY c.fullname ASC
-    `;
-
-    const creditorsQuery = `
-      SELECT
-        c.supplier_number,
-        c.supplier_name,
-        c.address,
-        c.phone,
-        c.email,
-        COALESCE(gl.balance, 0) AS balance,
-        ABS(COALESCE(gl.balance, 0)) AS amount
-      FROM suppliersinfo c
-      LEFT JOIN (
-        SELECT
-          transaction_ref AS supplierNo,
-          COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-        FROM general_ledger
-        WHERE facility_id = :facilityId
-          AND (:asAtDate IS NULL OR transaction_date <= :asAtDate)
-        GROUP BY transaction_ref
-      ) gl ON c.supplier_number = gl.supplierNo
-      WHERE c.facilityId = :facilityId
-        AND COALESCE(gl.balance, 0) < 0
-      ORDER BY c.supplier_name ASC
-    `;
-
-    const replacements = { facilityId, asAtDate: asAt };
-
-    const [debtorRows, creditorRows] = await Promise.all([
-      db.sequelize.query(debtorsQuery, {
-        replacements,
-        type: QueryTypes.SELECT,
-      }),
-      db.sequelize.query(creditorsQuery, {
-        replacements,
-        type: QueryTypes.SELECT,
-      }),
-    ]);
+    const { debtorRows, creditorRows } = await fetchPartyBalancesByDrCr(
+      facilityId,
+      asAt,
+    );
 
     const debtorsTotalBalance = debtorRows.reduce(
       (sum, row) => sum + (parseFloat(row.balance || 0) || 0),

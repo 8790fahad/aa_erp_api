@@ -380,6 +380,7 @@ require("./routes/stoctmangement")(app);
 require("./routes/sales")(app);
 require("./routes/saleWorkflow")(app);
 require("./routes/rebateLedger")(app);
+require("./routes/crm")(app);
 require("./routes/customer")(app);
 require("./routes/generalledger")(app);
 require("./routes/journalEntries")(app);
@@ -524,6 +525,28 @@ const startServer = () => {
       } catch (err) {
         console.error(
           `[Worker ${process.pid}] Failed to start invoice closing cron:`,
+          err.message,
+        );
+      }
+      try {
+        const {
+          startArApWeeklyDigestCron,
+        } = require("./jobs/arApWeeklyDigestCron");
+        startArApWeeklyDigestCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start AR/AP weekly digest cron:`,
+          err.message,
+        );
+      }
+      try {
+        const {
+          startCrmClassificationCron,
+        } = require("./jobs/crmClassificationCron");
+        startCrmClassificationCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start CRM classification cron:`,
           err.message,
         );
       }

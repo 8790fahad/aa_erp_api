@@ -1,8 +1,14 @@
 import { getAndUpdateNumber } from "../services/numberGen";
 
 const db = require("../models");
+const { Op } = require("sequelize");
 const { parseAmount } = require("../utils/parseAmount");
 const { validatePostingDate } = require("../utils/validatePostingDate");
+const {
+  normalizeNigerianPhone,
+  isValidNigerianPhone,
+  NIGERIAN_PHONE_HINT,
+} = require("../utils/nigerianPhone");
 const moment = require("moment");
 const { resolveDefaultBranchId } = require("../services/branchResolver");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
@@ -697,6 +703,56 @@ exports.CreateCustomer = async (req, res) => {
       });
     }
 
+    const rawPhone = phone || mobile || "";
+    if (!String(rawPhone).trim()) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "phone is required",
+      });
+    }
+    if (!isValidNigerianPhone(rawPhone)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: NIGERIAN_PHONE_HINT,
+      });
+    }
+    const normalizedPhone = normalizeNigerianPhone(rawPhone);
+    const normalizedMobile = mobile
+      ? isValidNigerianPhone(mobile)
+        ? normalizeNigerianPhone(mobile)
+        : null
+      : null;
+    if (mobile && String(mobile).trim() && !isValidNigerianPhone(mobile)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Mobile: ${NIGERIAN_PHONE_HINT}`,
+      });
+    }
+
+    const duplicateWhere = {
+      facilityId,
+      phone: normalizedPhone,
+      fullname: displayName,
+    };
+    if (query_type === "update" && customerNo) {
+      duplicateWhere.customerNo = { [Op.ne]: customerNo };
+    }
+    const duplicate = await db.Customer.findOne({
+      where: duplicateWhere,
+      transaction,
+    });
+    if (duplicate) {
+      await transaction.rollback();
+      return res.status(409).json({
+        success: false,
+        message:
+          "A customer with this phone number and name already exists for this facility",
+      });
+    }
+
     const profileFields = {
       entity_type:
         entity_type === "individual" ? "individual" : "business",
@@ -704,7 +760,7 @@ exports.CreateCustomer = async (req, res) => {
       salutation: salutation || null,
       first_name: first_name || null,
       last_name: last_name || null,
-      mobile: mobile || null,
+      mobile: normalizedMobile,
       language: language || "English",
       currency: currency || "NGN - Nigerian Naira",
       payment_terms: payment_terms || "Due on Receipt",
@@ -741,7 +797,7 @@ exports.CreateCustomer = async (req, res) => {
         {
           account_head: head || customer.account_head,
           address: addressLine || customer.address,
-          phone: phone || customer.phone,
+          phone: normalizedPhone,
           email: email || customer.email,
           fullname: displayName || customer.fullname,
           store_name: store_name || customer.store_name,
@@ -769,8 +825,8 @@ exports.CreateCustomer = async (req, res) => {
             first_name,
             last_name,
             email,
-            work_phone: phone,
-            mobile,
+            work_phone: normalizedPhone,
+            mobile: normalizedMobile,
           },
           contactPersons: contact_persons,
         },
@@ -810,7 +866,7 @@ exports.CreateCustomer = async (req, res) => {
         fullname: displayName,
         store_name: store_name || "",
         address: addressLine || "",
-        phone: phone || "",
+        phone: normalizedPhone,
         email: email || "",
         tin: tin || "",
         receivable_code,
@@ -836,8 +892,8 @@ exports.CreateCustomer = async (req, res) => {
           first_name,
           last_name,
           email,
-          work_phone: phone,
-          mobile,
+          work_phone: normalizedPhone,
+          mobile: normalizedMobile,
         },
         contactPersons: contact_persons,
       },
@@ -1046,6 +1102,16 @@ exports.CreateCustomer = async (req, res) => {
   } catch (error) {
     await transaction.rollback();
     console.error("CreateCustomer Error:", error);
+    if (
+      error?.name === "SequelizeUniqueConstraintError" ||
+      error?.original?.code === "ER_DUP_ENTRY"
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "A customer with this phone number and name already exists for this facility",
+      });
+    }
     return res.status(500).json({
       success: false,
       message: "Failed to create customer",
@@ -1117,6 +1183,32 @@ exports.CreateCustomerUpload = async (req, res) => {
         );
       }
 
+      if (!String(phone || "").trim()) {
+        throw new Error(
+          `Phone is required for customer "${fullname}".`,
+        );
+      }
+      if (!isValidNigerianPhone(phone)) {
+        throw new Error(
+          `Invalid phone for customer "${fullname}": ${NIGERIAN_PHONE_HINT}`,
+        );
+      }
+      const normalizedPhone = normalizeNigerianPhone(phone);
+
+      const duplicate = await db.Customer.findOne({
+        where: {
+          facilityId,
+          phone: normalizedPhone,
+          fullname,
+        },
+        transaction,
+      });
+      if (duplicate) {
+        throw new Error(
+          `A customer with phone ${normalizedPhone} and name "${fullname}" already exists.`,
+        );
+      }
+
       // === 1. Generate Customer Number ===
       const numberResult = await getAndUpdateNumber(
         "cus",
@@ -1134,7 +1226,7 @@ exports.CreateCustomerUpload = async (req, res) => {
           fullname,
           store_name: store_name || "",
           address: address || "",
-          phone: phone || "",
+          phone: normalizedPhone,
           email: email || "",
           receivable_code,
           receivable_accural_code: deposit_code,

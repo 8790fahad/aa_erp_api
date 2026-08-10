@@ -120,7 +120,9 @@ module.exports = (sequelize, DataTypes) => {
           "payment",
           "journal_entry",
           "charges",
-          "interest"
+          "interest",
+          "goods_in_transit",
+          "git"
         ),
         allowNull: false,
       },

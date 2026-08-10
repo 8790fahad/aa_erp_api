@@ -23,6 +23,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: "sales",
       },
+      target_type: {
+        type: DataTypes.ENUM("product", "supplier", "customer"),
+        allowNull: false,
+        defaultValue: "product",
+      },
       product_name: {
         type: DataTypes.STRING(255),
         allowNull: false,
@@ -30,6 +35,26 @@ module.exports = (sequelize, DataTypes) => {
       },
       product_sku: {
         type: DataTypes.STRING(100),
+        allowNull: true,
+        defaultValue: null,
+      },
+      supplier_no: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: null,
+      },
+      supplier_name: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+        defaultValue: null,
+      },
+      customer_no: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        defaultValue: null,
+      },
+      customer_name: {
+        type: DataTypes.STRING(255),
         allowNull: true,
         defaultValue: null,
       },

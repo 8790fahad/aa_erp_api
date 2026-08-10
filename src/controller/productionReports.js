@@ -2333,6 +2333,7 @@ exports.getSalesPerProductReport = async (req, res) => {
       toDate: rawTo,
       branchId,
       byLocation,
+      paymentType: rawPaymentType,
     } = req.body;
     if (!facilityId) {
       return res.status(400).json({
@@ -2349,6 +2350,12 @@ exports.getSalesPerProductReport = async (req, res) => {
       branchId !== undefined &&
       branchId !== "" &&
       branchId !== "all";
+    const paymentType = String(rawPaymentType || "")
+      .toLowerCase()
+      .trim();
+    const hasPaymentFilter = ["cash", "transfer", "warehouse"].includes(
+      paymentType,
+    );
 
     if (groupByLocation && !hasBranchFilter) {
       return res.status(400).json({
@@ -2381,6 +2388,26 @@ exports.getSalesPerProductReport = async (req, res) => {
       `
       : "";
     const locationGroupBy = groupByLocation ? ", COALESCE(se.branchId, 0)" : "";
+
+    let paymentJoin = "";
+    let paymentFilter = "";
+    if (hasPaymentFilter) {
+      paymentJoin = `
+        INNER JOIN sale_workflows sw
+          ON sw.facility_id = :facilityId
+          AND sw.sale_code COLLATE utf8mb4_unicode_ci
+            = se.reference_number COLLATE utf8mb4_unicode_ci
+      `;
+      if (paymentType === "cash") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('cash', 'split')";
+      } else if (paymentType === "transfer") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('transfer', 'bank', 'split')";
+      } else {
+        paymentFilter = "AND LOWER(TRIM(sw.payment_type)) = 'warehouse'";
+      }
+    }
 
     const query = `
       SELECT
@@ -2430,6 +2457,7 @@ exports.getSalesPerProductReport = async (req, res) => {
         ON inv.facility_id = :facilityId
         AND inv.type = 'sales'
         AND inv.invoice_ref = se.reference_number
+      ${paymentJoin}
       ${locationJoin}
       WHERE se.facilityId = :facilityId
         AND se.qty_out > 0
@@ -2440,6 +2468,7 @@ exports.getSalesPerProductReport = async (req, res) => {
         )
         AND ${entryDateSql} BETWEEN DATE(:fromDate) AND DATE(:toDate)
         ${branchFilter}
+        ${paymentFilter}
       GROUP BY
         p.id, p.sku, p.name, p.cost_price
         ${locationGroupBy}
@@ -2524,6 +2553,7 @@ exports.getSalesPerProductReport = async (req, res) => {
           fromDate,
           toDate,
           branchId: hasBranchFilter ? Number(branchId) || 0 : null,
+          paymentType: hasPaymentFilter ? paymentType : "all",
         },
         isDemoData: false,
       },
@@ -2533,6 +2563,158 @@ exports.getSalesPerProductReport = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error generating sales per product report",
+      error: error.message,
+    });
+  }
+};
+
+/** Sales aggregated by product supplier (source). */
+exports.getSalesBySupplierReport = async (req, res) => {
+  try {
+    const {
+      facilityId,
+      fromDate: rawFrom,
+      toDate: rawTo,
+      paymentType: rawPaymentType,
+    } = req.body;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required field: facilityId",
+      });
+    }
+
+    const fromDate = rawFrom || moment().startOf("month").format("YYYY-MM-DD");
+    const toDate = rawTo || moment().format("YYYY-MM-DD");
+    const paymentType = String(rawPaymentType || "")
+      .toLowerCase()
+      .trim();
+    const hasPaymentFilter = ["cash", "transfer", "warehouse"].includes(
+      paymentType,
+    );
+
+    let paymentJoin = "";
+    let paymentFilter = "";
+    if (hasPaymentFilter) {
+      paymentJoin = `
+        INNER JOIN sale_workflows sw
+          ON sw.facility_id = :facilityId
+          AND sw.sale_code COLLATE utf8mb4_unicode_ci
+            = se.reference_number COLLATE utf8mb4_unicode_ci
+      `;
+      if (paymentType === "cash") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('cash', 'split')";
+      } else if (paymentType === "transfer") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('transfer', 'bank', 'split')";
+      } else {
+        paymentFilter = "AND LOWER(TRIM(sw.payment_type)) = 'warehouse'";
+      }
+    }
+
+    const query = `
+      SELECT
+        COALESCE(NULLIF(TRIM(p.supplier_id), ''), 'UNASSIGNED') AS supplier_no,
+        COALESCE(
+          NULLIF(TRIM(MAX(s.supplier_name)), ''),
+          CASE
+            WHEN NULLIF(TRIM(p.supplier_id), '') IS NULL THEN 'Unassigned supplier'
+            ELSE CONCAT('Supplier ', TRIM(p.supplier_id))
+          END
+        ) AS supplier_name,
+        COUNT(DISTINCT p.id) AS product_count,
+        SUM(se.qty_out) AS quantity_sold,
+        SUM(se.qty_out * COALESCE(se.selling_price, 0)) AS gross_sales,
+        SUM(
+          se.qty_out * COALESCE(NULLIF(se.cost_price, 0), p.cost_price, 0)
+        ) AS cost_of_goods_sold
+      FROM store_entries se
+      INNER JOIN products p
+        ON p.facility_id = :facilityId
+        AND ${skuEq("se.product_id", "p.sku")}
+      LEFT JOIN suppliersinfo s
+        ON s.facilityId = :facilityId
+        AND s.supplier_number = p.supplier_id
+      ${paymentJoin}
+      WHERE se.facilityId = :facilityId
+        AND se.qty_out > 0
+        AND (
+          se.type IN (${salesTypesSqlList()})
+          OR se.destination = 'sold'
+          OR LOWER(TRIM(se.source)) = 'for sales'
+        )
+        AND DATE(se.createdAt) BETWEEN DATE(:fromDate) AND DATE(:toDate)
+        ${paymentFilter}
+      GROUP BY COALESCE(NULLIF(TRIM(p.supplier_id), ''), 'UNASSIGNED')
+      HAVING quantity_sold > 0
+      ORDER BY gross_sales DESC
+    `;
+
+    const rows = await db.sequelize.query(query, {
+      replacements: { facilityId, fromDate, toDate },
+      type: db.sequelize.QueryTypes.SELECT,
+    });
+
+    const mappedRows = rows.map((row) => {
+      const quantitySold = parseFloat(row.quantity_sold || 0);
+      const grossSales = parseFloat(row.gross_sales || 0);
+      const costOfGoodsSold = parseFloat(row.cost_of_goods_sold || 0);
+      const grossProfit = grossSales - costOfGoodsSold;
+      const grossMargin =
+        grossSales > 0 ? (grossProfit / grossSales) * 100 : 0;
+      return {
+        supplierNo: row.supplier_no,
+        supplierName: row.supplier_name,
+        productCount: Number(row.product_count || 0),
+        quantitySold,
+        grossSales,
+        costOfGoodsSold,
+        grossProfit,
+        grossMargin,
+      };
+    });
+
+    const summary = mappedRows.reduce(
+      (acc, row) => {
+        acc.supplierCount += 1;
+        acc.totalQuantity += row.quantitySold;
+        acc.totalGrossSales += row.grossSales;
+        acc.totalCogs += row.costOfGoodsSold;
+        acc.totalGrossProfit += row.grossProfit;
+        return acc;
+      },
+      {
+        supplierCount: 0,
+        totalQuantity: 0,
+        totalGrossSales: 0,
+        totalCogs: 0,
+        totalGrossProfit: 0,
+      },
+    );
+    summary.grossMargin =
+      summary.totalGrossSales > 0
+        ? (summary.totalGrossProfit / summary.totalGrossSales) * 100
+        : 0;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        rows: mappedRows,
+        summary,
+        reportPeriod: {
+          fromDate,
+          toDate,
+          paymentType: hasPaymentFilter ? paymentType : "all",
+        },
+        isDemoData: false,
+      },
+    });
+  } catch (error) {
+    console.error("Sales by supplier report error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error generating sales by supplier report",
       error: error.message,
     });
   }

@@ -4856,6 +4856,8 @@ exports.getAllTransactionsData = async (req, res) => {
       page,
       pageSize,
       branchId,
+      fromDate,
+      toDate,
     } = req.query;
     const { Op } = db.Sequelize;
 
@@ -4959,6 +4961,36 @@ exports.getAllTransactionsData = async (req, res) => {
       whereClause.invoice_ref = { [Op.regexp]: "^INV-[0-9]+$" };
     }
 
+    // Optional transaction_date range (YYYY-MM-DD) — compare by calendar date
+    const fromDateStr =
+      fromDate && String(fromDate).trim()
+        ? String(fromDate).trim().slice(0, 10)
+        : null;
+    const toDateStr =
+      toDate && String(toDate).trim()
+        ? String(toDate).trim().slice(0, 10)
+        : null;
+    if (fromDateStr || toDateStr) {
+      const dateParts = [];
+      if (fromDateStr) {
+        dateParts.push(
+          db.Sequelize.where(
+            db.Sequelize.fn("DATE", db.Sequelize.col("transaction_date")),
+            { [Op.gte]: fromDateStr },
+          ),
+        );
+      }
+      if (toDateStr) {
+        dateParts.push(
+          db.Sequelize.where(
+            db.Sequelize.fn("DATE", db.Sequelize.col("transaction_date")),
+            { [Op.lte]: toDateStr },
+          ),
+        );
+      }
+      whereClause[Op.and] = [...(whereClause[Op.and] || []), ...dateParts];
+    }
+
     // Optional text search across invoice_ref, description, ref_number (customer no)
     const finalWhere = search && String(search).trim()
       ? {
@@ -4984,6 +5016,8 @@ exports.getAllTransactionsData = async (req, res) => {
       typeFilter,
       search,
       branchId: hasBranchFilter ? branchIdList : null,
+      fromDate: fromDateStr,
+      toDate: toDateStr,
       page: pageNum,
       pageSize: limitNum,
     });
@@ -5136,6 +5170,7 @@ exports.getAllTransactionsData = async (req, res) => {
 
     // Join sale workflow stage (pay → separate → warehouse → …) for sales invoices
     let workflowBySaleCode = {};
+    let warehousesBySaleCode = {};
     const isSalesList =
       Array.isArray(typeFilter) &&
       typeFilter.some((t) => String(t).toLowerCase() === "sales");
@@ -5174,6 +5209,58 @@ exports.getAllTransactionsData = async (req, res) => {
               hold_overnight: Boolean(w.hold_overnight),
             };
           });
+
+          // Warehouse / branch packs for each sale (names for Warehouse stage UI)
+          if (db.SaleFulfillment) {
+            const packs = await db.SaleFulfillment.findAll({
+              where: {
+                facility_id: facilityId,
+                sale_code: { [Op.in]: saleCodes },
+              },
+              attributes: ["sale_code", "branch_id"],
+              raw: true,
+            });
+            const packBranchIds = [
+              ...new Set(
+                packs
+                  .map((p) => parseInt(p.branch_id, 10))
+                  .filter((id) => Number.isFinite(id) && id > 0),
+              ),
+            ];
+            const packBranchNameMap = { ...branchNameMap };
+            const missingBranchIds = packBranchIds.filter(
+              (id) => !packBranchNameMap[id],
+            );
+            if (missingBranchIds.length > 0 && db.Branch) {
+              try {
+                const extraBranches = await db.Branch.findAll({
+                  where: { id: { [Op.in]: missingBranchIds } },
+                  attributes: ["id", "branch_name"],
+                  raw: true,
+                });
+                extraBranches.forEach((b) => {
+                  packBranchNameMap[b.id] = b.branch_name;
+                });
+              } catch (err) {
+                console.error(
+                  "Error fetching fulfillment branch names:",
+                  err,
+                );
+              }
+            }
+            packs.forEach((p) => {
+              const name =
+                packBranchNameMap[p.branch_id] ||
+                (p.branch_id ? `Warehouse ${p.branch_id}` : null);
+              if (!name) return;
+              if (!warehousesBySaleCode[p.sale_code]) {
+                warehousesBySaleCode[p.sale_code] = [];
+              }
+              if (!warehousesBySaleCode[p.sale_code].includes(name)) {
+                warehousesBySaleCode[p.sale_code].push(name);
+              }
+            });
+          }
         }
       } catch (err) {
         console.error("Error fetching sale workflows for invoices:", err);
@@ -5183,6 +5270,8 @@ exports.getAllTransactionsData = async (req, res) => {
     // Transform data to match frontend expectations
     const formattedInvoices = invoices.map((invoice) => {
       const wf = workflowBySaleCode[invoice.invoice_ref] || null;
+      const warehouseNames =
+        warehousesBySaleCode[invoice.invoice_ref] || [];
       return {
         id: invoice.invoice_id,
         invoice_id: invoice.invoice_id,
@@ -5204,6 +5293,8 @@ exports.getAllTransactionsData = async (req, res) => {
         payment_method: invoice.payment_method,
         branchId: invoice.branchId || null,
         branch_name: branchNameMap[invoice.branchId] || null,
+        warehouse_names: warehouseNames,
+        warehouse_name: warehouseNames.join(", ") || null,
         created_by: invoice.created_by,
         created_at: invoice.created_at,
         workflow_status: wf?.workflow_status || null,

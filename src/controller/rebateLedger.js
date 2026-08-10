@@ -7,12 +7,24 @@ const creditNoteController = require("./creditNoteController");
 function mapRule(row) {
   if (!row) return null;
   const r = row.toJSON ? row.toJSON() : row;
+  const basis = r.basis === "purchase" ? "purchase" : "sales";
+  let targetType = String(r.target_type || "product").toLowerCase();
+  if (basis === "purchase" && targetType === "customer") targetType = "product";
+  if (basis === "sales" && targetType === "supplier") targetType = "product";
+  if (!["product", "supplier", "customer"].includes(targetType)) {
+    targetType = "product";
+  }
   return {
     id: r.id,
     name: r.name,
-    basis: r.basis === "purchase" ? "purchase" : "sales",
+    basis,
+    targetType,
     product: r.product_name,
     productSku: r.product_sku || "",
+    supplierNo: r.supplier_no || "",
+    supplierName: r.supplier_name || "",
+    customerNo: r.customer_no || "",
+    customerName: r.customer_name || "",
     period: r.period_label,
     fromDate: r.from_date,
     toDate: r.to_date,
@@ -64,8 +76,18 @@ exports.createRule = async (req, res) => {
       facilityId,
       name,
       basis,
+      targetType,
+      target_type,
       product,
       productSku,
+      supplierNo,
+      supplier_no,
+      supplierName,
+      supplier_name,
+      customerNo,
+      customer_no,
+      customerName,
+      customer_name,
       period,
       fromDate,
       toDate,
@@ -81,6 +103,16 @@ exports.createRule = async (req, res) => {
       });
     }
     const ruleBasis = basis === "purchase" ? "purchase" : "sales";
+    let ruleTarget = String(targetType || target_type || "product")
+      .toLowerCase()
+      .trim();
+    if (ruleBasis === "purchase" && !["product", "supplier"].includes(ruleTarget)) {
+      ruleTarget = "product";
+    }
+    if (ruleBasis === "sales" && !["product", "customer"].includes(ruleTarget)) {
+      ruleTarget = "product";
+    }
+
     const qty = parseFloat(minQty);
     const pct = parseFloat(rebatePercent);
     if (!Number.isFinite(qty) || qty < 0 || !Number.isFinite(pct) || pct < 0) {
@@ -90,12 +122,44 @@ exports.createRule = async (req, res) => {
       });
     }
 
+    const supplierNumber = String(supplierNo || supplier_no || "").trim();
+    const supplierLabel = String(supplierName || supplier_name || "").trim();
+    const customerNumber = String(customerNo || customer_no || "").trim();
+    const customerLabel = String(customerName || customer_name || "").trim();
+
+    if (ruleTarget === "supplier" && !supplierNumber && !supplierLabel) {
+      return res.status(400).json({
+        success: false,
+        message: "Select a supplier for this purchase rebate rule",
+      });
+    }
+    if (ruleTarget === "customer" && !customerNumber && !customerLabel) {
+      return res.status(400).json({
+        success: false,
+        message: "Select a customer for this sales rebate rule",
+      });
+    }
+
+    const productName =
+      ruleTarget === "product"
+        ? String(product || "All products").trim() || "All products"
+        : "All products";
+    const productSkuVal =
+      ruleTarget === "product" && productSku
+        ? String(productSku).trim()
+        : null;
+
     const row = await db.RebateRule.create({
       facility_id: String(facilityId),
       name: String(name).trim(),
       basis: ruleBasis,
-      product_name: String(product || "All products").trim() || "All products",
-      product_sku: productSku ? String(productSku).trim() : null,
+      target_type: ruleTarget,
+      product_name: productName,
+      product_sku: productSkuVal,
+      supplier_no: ruleTarget === "supplier" ? supplierNumber || null : null,
+      supplier_name: ruleTarget === "supplier" ? supplierLabel || null : null,
+      customer_no: ruleTarget === "customer" ? customerNumber || null : null,
+      customer_name: ruleTarget === "customer" ? customerLabel || null : null,
       period_label: String(period).trim(),
       from_date: fromDate,
       to_date: toDate,

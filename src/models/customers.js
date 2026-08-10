@@ -112,6 +112,13 @@ module.exports = (sequelize, DataTypes) => {
       timestamps: true,
       charset: "latin1",
       collate: "latin1_swedish_ci",
+      indexes: [
+        {
+          unique: true,
+          name: "customers_facility_phone_fullname_uq",
+          fields: ["facilityId", "phone", "fullname"],
+        },
+      ],
     },
   );
 

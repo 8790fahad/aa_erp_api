@@ -2,14 +2,14 @@ const moment = require("moment");
 const { QueryTypes } = require("sequelize");
 
 const EXPENSE_COLORS = [
-  "#059669",
+  "#CC4D3D",
+  "#F2A93B",
+  "#2563eb",
+  "#7c3aed",
   "#10b981",
-  "#34d399",
-  "#6ee7b7",
-  "#a7f3d0",
-  "#047857",
-  "#065f46",
-  "#064e3b",
+  "#d97706",
+  "#e11d48",
+  "#0d9488",
 ];
 
 function convertQueryDate(dateStr) {
@@ -108,8 +108,22 @@ function isExpenseSql() {
   )`;
 }
 
+function isCogsSql(alias = "ac") {
+  return `(
+    UPPER(${alias}.account_nature) = 'EXPENSE'
+    AND (
+      LOWER(IFNULL(${alias}.pl_line, '')) LIKE '%cost_of_sales%'
+      OR LOWER(IFNULL(${alias}.pl_line, '')) LIKE '%cogs%'
+      OR LOWER(IFNULL(${alias}.type, '')) LIKE '%cost%sale%'
+      OR LOWER(IFNULL(${alias}.subcategory, '')) LIKE '%cost%sale%'
+      OR LOWER(IFNULL(${alias}.description, '')) LIKE '%cost of sale%'
+      OR LEFT(TRIM(${alias}.code), 1) = '7'
+    )
+  )`;
+}
+
 async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
-  // Total Revenue / Total Expenses via account_nature (REVENUE / EXPENSE)
+  // Revenue − COGS = Gross Profit; Gross Profit − Operating = Net Profit
   const rows = await sequelize.query(
     `
       SELECT
@@ -124,7 +138,13 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
             WHEN ${isExpenseSql()} THEN gl.dr - gl.cr
             ELSE 0
           END
-        ), 0) AS total_expenses
+        ), 0) AS total_expenses,
+        COALESCE(SUM(
+          CASE
+            WHEN ${isCogsSql("ac")} THEN gl.dr - gl.cr
+            ELSE 0
+          END
+        ), 0) AS cogs
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId
@@ -139,11 +159,19 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
 
   const totalRevenue = parseFloat(rows[0]?.total_revenue || 0);
   const totalExpenses = parseFloat(rows[0]?.total_expenses || 0);
+  const cogs = parseFloat(rows[0]?.cogs || 0);
+  const operatingExpenses = Math.max(totalExpenses - cogs, 0);
+  const grossProfit = totalRevenue - cogs;
+  const netProfit = grossProfit - operatingExpenses;
+
   return {
     totalRevenue,
-    totalIncome: totalRevenue, // alias for older UI fields
+    totalIncome: totalRevenue,
     totalExpenses,
-    netProfit: totalRevenue - totalExpenses,
+    cogs,
+    grossProfit,
+    operatingExpenses,
+    netProfit,
   };
 }
 
@@ -219,7 +247,13 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
             WHEN ${isExpenseSql()} THEN gl.dr - gl.cr
             ELSE 0
           END
-        ), 0) AS expenses
+        ), 0) AS expenses,
+        COALESCE(SUM(
+          CASE
+            WHEN ${isCogsSql("ac")} THEN gl.dr - gl.cr
+            ELSE 0
+          END
+        ), 0) AS cogs
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId
@@ -238,6 +272,10 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
     rows.map((row) => {
       const revenue = parseFloat(row.revenue || 0);
       const expenses = parseFloat(row.expenses || 0);
+      const cogs = parseFloat(row.cogs || 0);
+      const operatingExpenses = Math.max(expenses - cogs, 0);
+      const grossProfit = revenue - cogs;
+      const netProfit = grossProfit - operatingExpenses;
       return [
         row.month_key,
         {
@@ -246,15 +284,26 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
           revenue,
           income: revenue,
           expenses,
+          cogs,
+          grossProfit,
+          operatingExpenses,
+          netProfit,
         },
       ];
     }),
   );
 
-  // Always return every month in the selected period so the chart has a continuous series
-  return buildMonthSeries(fromDate, toDate).map(
-    (slot) => byMonth.get(slot.monthKey) || slot,
-  );
+  return buildMonthSeries(fromDate, toDate).map((slot) => {
+    const found = byMonth.get(slot.monthKey);
+    if (found) return found;
+    return {
+      ...slot,
+      cogs: 0,
+      grossProfit: 0,
+      operatingExpenses: 0,
+      netProfit: 0,
+    };
+  });
 }
 
 /**
@@ -717,6 +766,307 @@ async function fetchTopCustomers(sequelize, facilityId, fromDate, toDate) {
   return { byPrice, byUnit };
 }
 
+function agingBucket(dueDate, asOf = new Date()) {
+  if (!dueDate) return "current";
+  const due = moment(dueDate).startOf("day");
+  const today = moment(asOf).startOf("day");
+  const days = today.diff(due, "days");
+  if (days <= 0) return "current";
+  if (days <= 30) return "1_30";
+  if (days <= 60) return "31_60";
+  if (days <= 90) return "61_90";
+  return "90_plus";
+}
+
+const EMPTY_AGING = () => ({
+  current: 0,
+  "1_30": 0,
+  "31_60": 0,
+  "61_90": 0,
+  "90_plus": 0,
+});
+
+async function fetchReceivablePayableSummary(sequelize, facilityId, asOfDate) {
+  const salesRows = await sequelize.query(
+    `
+      SELECT
+        i.amount,
+        COALESCE(payments.total_paid, 0) AS total_paid,
+        (i.amount - COALESCE(payments.total_paid, 0)) AS amount_due,
+        i.due_date
+      FROM invoices i
+      LEFT JOIN (
+        SELECT
+          reference_number AS transaction_ref,
+          facility_id,
+          SUM(
+            CASE
+              WHEN type = 'bank' THEN cr
+              WHEN type = 'payment' THEN dr
+              ELSE 0
+            END
+          ) AS total_paid
+        FROM general_ledger
+        WHERE type IN ('bank', 'payment')
+          AND facility_id = :facilityId
+          AND reference_number IS NOT NULL
+          AND reference_number != ''
+        GROUP BY reference_number, facility_id
+      ) payments
+        ON payments.transaction_ref = i.invoice_ref
+        AND payments.facility_id = i.facility_id
+      WHERE i.type = 'sales'
+        AND i.facility_id = :facilityId
+    `,
+    { replacements: { facilityId }, type: QueryTypes.SELECT },
+  );
+
+  const purchaseRows = await sequelize.query(
+    `
+      SELECT
+        i.amount,
+        COALESCE(payments.total_paid, 0) AS total_paid,
+        (i.amount - COALESCE(payments.total_paid, 0)) AS amount_due,
+        i.due_date
+      FROM invoices i
+      LEFT JOIN (
+        SELECT
+          reference_number AS transaction_ref,
+          facility_id,
+          SUM(
+            CASE
+              WHEN type = 'bank' THEN cr
+              WHEN type = 'payment' THEN dr
+              ELSE 0
+            END
+          ) AS total_paid
+        FROM general_ledger
+        WHERE type IN ('bank', 'payment')
+          AND facility_id = :facilityId
+          AND reference_number IS NOT NULL
+          AND reference_number != ''
+        GROUP BY reference_number, facility_id
+      ) payments
+        ON payments.transaction_ref = i.invoice_ref
+        AND payments.facility_id = i.facility_id
+      WHERE i.type = 'purchase'
+        AND i.facility_id = :facilityId
+    `,
+    { replacements: { facilityId }, type: QueryTypes.SELECT },
+  );
+
+  const receivableAging = EMPTY_AGING();
+  let totalReceivable = 0;
+  let receivableOpenCount = 0;
+  let receivableOverdue = 0;
+  for (const row of salesRows) {
+    const due = parseFloat(row.amount_due || 0);
+    if (due <= 0.005) continue;
+    totalReceivable += due;
+    receivableOpenCount += 1;
+    const bucket = agingBucket(row.due_date, asOfDate);
+    receivableAging[bucket] += due;
+    if (bucket !== "current") receivableOverdue += due;
+  }
+
+  const payableAging = EMPTY_AGING();
+  let totalPayable = 0;
+  let payableOpenCount = 0;
+  let payableOverdue = 0;
+  for (const row of purchaseRows) {
+    const due = parseFloat(row.amount_due || 0);
+    if (due <= 0.005) continue;
+    totalPayable += due;
+    payableOpenCount += 1;
+    const bucket = agingBucket(row.due_date, asOfDate);
+    payableAging[bucket] += due;
+    if (bucket !== "current") payableOverdue += due;
+  }
+
+  return {
+    totalReceivable,
+    totalPayable,
+    receivableAging,
+    payableAging,
+    receivableOpenCount,
+    payableOpenCount,
+    receivableOverdue,
+    payableOverdue,
+  };
+}
+
+async function fetchSalesByCategoryAndSupplier(
+  sequelize,
+  facilityId,
+  fromDate,
+  toDate,
+) {
+  const byCategory = await sequelize.query(
+    `
+      SELECT
+        COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized') AS name,
+        COALESCE(SUM(s.quantity), 0) AS units,
+        COALESCE(SUM(s.total), 0) AS revenue
+      FROM sales s
+      INNER JOIN products p ON p.id = s.productId
+      WHERE p.facility_id = :facilityId
+        AND s.status = 'completed'
+        AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
+      GROUP BY COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized')
+      HAVING revenue > 0.001
+      ORDER BY revenue DESC
+      LIMIT 12
+    `,
+    {
+      replacements: { facilityId, fromDate, toDate },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const bySupplier = await sequelize.query(
+    `
+      SELECT
+        COALESCE(
+          NULLIF(TRIM(si.supplier_name), ''),
+          NULLIF(TRIM(si.company_name), ''),
+          NULLIF(CONCAT('Supplier ', p.supplier_id), 'Supplier '),
+          'No Supplier'
+        ) AS name,
+        COALESCE(SUM(s.quantity), 0) AS units,
+        COALESCE(SUM(s.total), 0) AS revenue
+      FROM sales s
+      INNER JOIN products p ON p.id = s.productId
+      LEFT JOIN suppliersinfo si
+        ON CAST(si.supplier_number AS CHAR) = CAST(p.supplier_id AS CHAR)
+        AND si.facilityId = p.facility_id
+      WHERE p.facility_id = :facilityId
+        AND s.status = 'completed'
+        AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
+      GROUP BY COALESCE(
+          NULLIF(TRIM(si.supplier_name), ''),
+          NULLIF(TRIM(si.company_name), ''),
+          NULLIF(CONCAT('Supplier ', p.supplier_id), 'Supplier '),
+          'No Supplier'
+        )
+      HAVING revenue > 0.001
+      ORDER BY revenue DESC
+      LIMIT 12
+    `,
+    {
+      replacements: { facilityId, fromDate, toDate },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  return {
+    byCategory: byCategory.map((r) => ({
+      name: r.name,
+      units: parseInt(r.units || 0, 10),
+      revenue: parseFloat(r.revenue || 0),
+    })),
+    bySupplier: bySupplier.map((r) => ({
+      name: r.name,
+      units: parseInt(r.units || 0, 10),
+      revenue: parseFloat(r.revenue || 0),
+    })),
+  };
+}
+
+async function fetchOutstandingBills(sequelize, facilityId) {
+  const purchases = await sequelize.query(
+    `
+      SELECT
+        i.invoice_ref AS ref,
+        COALESCE(i.ref_number, i.invoice_ref) AS invoice_no,
+        COALESCE(si.supplier_name, i.customerNo, 'Supplier') AS party,
+        i.amount,
+        COALESCE(payments.total_paid, 0) AS total_paid,
+        (i.amount - COALESCE(payments.total_paid, 0)) AS amount_due,
+        i.due_date,
+        i.created_at AS bill_date
+      FROM invoices i
+      LEFT JOIN suppliersinfo si
+        ON si.supplier_number = i.customerNo
+        AND si.facilityId = i.facility_id
+      LEFT JOIN (
+        SELECT
+          reference_number AS transaction_ref,
+          facility_id,
+          SUM(
+            CASE
+              WHEN type = 'bank' THEN cr
+              WHEN type = 'payment' THEN dr
+              ELSE 0
+            END
+          ) AS total_paid
+        FROM general_ledger
+        WHERE type IN ('bank', 'payment')
+          AND facility_id = :facilityId
+          AND reference_number IS NOT NULL
+          AND reference_number != ''
+        GROUP BY reference_number, facility_id
+      ) payments
+        ON payments.transaction_ref = i.invoice_ref
+        AND payments.facility_id = i.facility_id
+      WHERE i.type = 'purchase'
+        AND i.facility_id = :facilityId
+      ORDER BY i.due_date ASC
+      LIMIT 50
+    `,
+    { replacements: { facilityId }, type: QueryTypes.SELECT },
+  );
+
+  const expenses = await sequelize.query(
+    `
+      SELECT
+        e.expense_id AS ref,
+        e.request_no AS invoice_no,
+        COALESCE(NULLIF(e.particulars, ''), e.type_of_expenses, 'Expense') AS party,
+        e.amount AS amount_due,
+        e.amount,
+        0 AS total_paid,
+        e.date AS due_date,
+        e.date AS bill_date,
+        e.status
+      FROM expense e
+      WHERE e.facilityId = :facilityId
+        AND LOWER(IFNULL(e.status, '')) NOT IN ('paid', 'completed', 'cancelled', 'rejected')
+        AND e.amount > 0.005
+      ORDER BY e.date ASC
+      LIMIT 20
+    `,
+    { replacements: { facilityId }, type: QueryTypes.SELECT },
+  );
+
+  const purchaseItems = purchases
+    .map((r) => ({
+      ref: r.ref,
+      invoiceNo: r.invoice_no,
+      party: r.party,
+      amountDue: parseFloat(r.amount_due || 0),
+      dueDate: r.due_date,
+      kind: "purchase",
+    }))
+    .filter((r) => r.amountDue > 0.005)
+    .slice(0, 20);
+  const expenseItems = expenses.map((r) => ({
+    ref: r.ref,
+    invoiceNo: r.invoice_no,
+    party: r.party,
+    amountDue: parseFloat(r.amount_due || 0),
+    dueDate: r.due_date,
+    kind: "expense",
+    status: r.status,
+  }));
+
+  return {
+    purchases: purchaseItems,
+    expenses: expenseItems,
+    purchasesTotal: purchaseItems.reduce((s, i) => s + i.amountDue, 0),
+    expensesTotal: expenseItems.reduce((s, i) => s + i.amountDue, 0),
+  };
+}
+
 async function buildFinancialDashboardOverview(sequelize, options) {
   const { facilityId, from, to } = options;
   const defaults = getDefaultPeriod();
@@ -736,6 +1086,9 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     bankAccounts,
     topProducts,
     topCustomers,
+    arAp,
+    salesBreakdown,
+    outstandingBills,
   ] = await Promise.all([
     fetchPeriodTotals(sequelize, facilityId, fromDate, toDate),
     fetchPeriodTotals(sequelize, facilityId, prior.fromDate, prior.toDate),
@@ -748,6 +1101,9 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     fetchBankAccountBalances(sequelize, facilityId, toDate),
     fetchTopProducts(sequelize, facilityId, fromDate, toDate),
     fetchTopCustomers(sequelize, facilityId, fromDate, toDate),
+    fetchReceivablePayableSummary(sequelize, facilityId, toDate),
+    fetchSalesByCategoryAndSupplier(sequelize, facilityId, fromDate, toDate),
+    fetchOutstandingBills(sequelize, facilityId),
   ]);
 
   const operatingExpenses = operatingExpenseResult.items || [];
@@ -769,6 +1125,12 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     priorTotals.netProfit,
   );
   const cashChange = pctChange(cashInBank, priorCashInBank);
+  const cogsChange = pctChange(currentTotals.cogs, priorTotals.cogs);
+  const gpChange = pctChange(currentTotals.grossProfit, priorTotals.grossProfit);
+  const opexChange = pctChange(
+    currentTotals.operatingExpenses,
+    priorTotals.operatingExpenses,
+  );
 
   return {
     period: { from: fromDate, to: toDate },
@@ -776,16 +1138,25 @@ async function buildFinancialDashboardOverview(sequelize, options) {
       totalRevenue: currentTotals.totalRevenue,
       totalIncome: currentTotals.totalRevenue,
       totalExpenses: currentTotals.totalExpenses,
+      cogs: currentTotals.cogs,
+      grossProfit: currentTotals.grossProfit,
+      operatingExpenses: currentTotals.operatingExpenses,
       netProfit: currentTotals.netProfit,
       cashInBank,
       incomeChange: incomeChange.value,
       revenueChange: incomeChange.value,
       expenseChange: expenseChange.value,
+      cogsChange: cogsChange.value,
+      grossProfitChange: gpChange.value,
+      operatingExpensesChange: opexChange.value,
       netProfitChange: netProfitChange.value,
       cashChange: cashChange.value,
       incomeChangeLabel: incomeChange.label,
       revenueChangeLabel: incomeChange.label,
       expenseChangeLabel: expenseChange.label,
+      cogsChangeLabel: cogsChange.label,
+      grossProfitChangeLabel: gpChange.label,
+      operatingExpensesChangeLabel: opexChange.label,
       netProfitChangeLabel: netProfitChange.label,
       cashChangeLabel: cashChange.label,
     },
@@ -798,6 +1169,10 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     bankAccounts,
     topProducts,
     topCustomers,
+    receivablesPayables: arAp,
+    salesByCategory: salesBreakdown.byCategory,
+    salesBySupplier: salesBreakdown.bySupplier,
+    outstandingBills,
   };
 }
 
@@ -805,4 +1180,5 @@ module.exports = {
   convertQueryDate,
   getDefaultPeriod,
   buildFinancialDashboardOverview,
+  fetchReceivablePayableSummary,
 };

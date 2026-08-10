@@ -11,8 +11,21 @@ const UNPAID_NON_CREDIT_STATUSES = [
 
 const NON_CREDIT_PAYMENT_TYPES = ["cash", "transfer", "bank", "split"];
 
+function normalizeHistory(history) {
+  if (Array.isArray(history)) return history;
+  if (typeof history === "string" && history.trim()) {
+    try {
+      const parsed = JSON.parse(history);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 function pushHistory(history, status, userId, note) {
-  const list = Array.isArray(history) ? [...history] : [];
+  const list = [...normalizeHistory(history)];
   list.push({
     status,
     at: new Date().toISOString(),

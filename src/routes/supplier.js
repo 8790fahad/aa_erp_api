@@ -105,4 +105,12 @@ module.exports = (app) => {
     "/api/v1/apply-supplier-advance",
     supplierAdvancePayment.applySupplierAdvanceToBills,
   );
+  app.post(
+    "/api/v1/move-supplier-deposit-to-git",
+    supplierAdvancePayment.moveSupplierDepositToGoodsInTransit,
+  );
+  app.post(
+    "/api/v1/write-off-supplier-git",
+    supplierAdvancePayment.writeOffSupplierGoodsInTransit,
+  );
 };

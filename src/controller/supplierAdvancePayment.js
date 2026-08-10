@@ -35,6 +35,142 @@ async function getAvailableSupplierAdvance(facilityId, supplierNo, transaction) 
   return Math.max(0, parseFloat(balRows[0]?.available_advance || 0));
 }
 
+/**
+ * Resolve Goods in Transit CoA account for a facility.
+ * Prefers description match, then known codes (112103 / 100022).
+ */
+async function resolveGoodsInTransitAccount(facilityId, transaction) {
+  const opts = transaction ? { transaction } : {};
+  const byDesc = await db.sequelize.query(
+    `SELECT code, parent_code, description, category, type, account_nature
+     FROM account_category
+     WHERE facility_id = :facilityId
+       AND is_active = 1
+       AND category = 'assets'
+       AND LOWER(TRIM(description)) IN (
+         'goods in transit',
+         'goods-in-transit',
+         'goods in-transit'
+       )
+     ORDER BY code
+     LIMIT 1`,
+    {
+      replacements: { facilityId },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...opts,
+    },
+  );
+  if (byDesc[0]) {
+    return byDesc[0];
+  }
+
+  for (const code of ["112103", "100022"]) {
+    const acc = await db.AccountCategory.findOne({
+      where: { code, facility_id: facilityId },
+      ...opts,
+    });
+    if (acc) return acc;
+  }
+  return null;
+}
+
+/**
+ * Expense head for writing off GIT.
+ * Prefers Goods in Transit Loss, then Inventory Write-off.
+ */
+async function resolveGitWriteOffExpenseAccount(
+  facilityId,
+  preferredCode,
+  transaction,
+) {
+  const opts = transaction ? { transaction } : {};
+  if (preferredCode) {
+    const preferred = await db.AccountCategory.findOne({
+      where: { code: String(preferredCode).trim(), facility_id: facilityId },
+      ...opts,
+    });
+    if (preferred) return preferred;
+  }
+
+  const byDesc = await db.sequelize.query(
+    `SELECT code, parent_code, description, category, type, account_nature
+     FROM account_category
+     WHERE facility_id = :facilityId
+       AND is_active = 1
+       AND category = 'expenses'
+       AND LOWER(TRIM(description)) IN (
+         'goods in transit loss',
+         'goods-in-transit loss',
+         'inventory write-off',
+         'inventory write off'
+       )
+     ORDER BY
+       CASE LOWER(TRIM(description))
+         WHEN 'goods in transit loss' THEN 1
+         WHEN 'goods-in-transit loss' THEN 2
+         WHEN 'inventory write-off' THEN 3
+         WHEN 'inventory write off' THEN 4
+         ELSE 9
+       END,
+       code
+     LIMIT 1`,
+    {
+      replacements: { facilityId },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...opts,
+    },
+  );
+  if (byDesc[0]) return byDesc[0];
+
+  for (const code of ["800904", "800901"]) {
+    const acc = await db.AccountCategory.findOne({
+      where: { code, facility_id: facilityId },
+      ...opts,
+    });
+    if (acc) return acc;
+  }
+  return null;
+}
+
+/** Available goods-in-transit pool (deposit reclassified as GIT CoA). */
+async function getAvailableSupplierGoodsInTransit(
+  facilityId,
+  supplierNo,
+  transaction,
+  gitAccountCode,
+) {
+  let accountCode = gitAccountCode;
+  if (!accountCode) {
+    const gitAcc = await resolveGoodsInTransitAccount(facilityId, transaction);
+    accountCode = gitAcc?.code || null;
+  }
+
+  const balRows = await db.sequelize.query(
+    accountCode
+      ? `SELECT COALESCE(SUM(dr) - SUM(cr), 0) AS available_git
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND transaction_ref = :supplierNo
+           AND account_code = :accountCode
+           AND LOWER(type) IN ('goods_in_transit', 'git', 'inventory', 'prepayment')`
+      : `SELECT COALESCE(SUM(dr) - SUM(cr), 0) AS available_git
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND transaction_ref = :supplierNo
+           AND LOWER(type) IN ('goods_in_transit', 'git')`,
+    {
+      replacements: {
+        facilityId,
+        supplierNo,
+        ...(accountCode ? { accountCode } : {}),
+      },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+  return Math.max(0, parseFloat(balRows[0]?.available_git || 0));
+}
+
 async function getBillAmountDue(facilityId, invoiceRef, transaction) {
   const rows = await db.sequelize.query(
     `SELECT
@@ -720,8 +856,13 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
     );
 
     let availableAdvance = 0;
+    let availableGit = 0;
     if (filterBySupplier) {
       availableAdvance = await getAvailableSupplierAdvance(
+        facilityId,
+        filterBySupplier,
+      );
+      availableGit = await getAvailableSupplierGoodsInTransit(
         facilityId,
         filterBySupplier,
       );
@@ -743,6 +884,8 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       count:             rows.length,
       available_advance: availableAdvance,
       available_deposit: availableAdvance,
+      available_goods_in_transit: availableGit,
+      available_git: availableGit,
     });
   } catch (error) {
     console.error("getSupplierAdvanceHistory:", error);
@@ -767,10 +910,20 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
     supplierNo,
     applications = [],
     narration = "",
+    source = "deposit",
   } = req.body;
 
   const supplierNumber = String(supplier_no || supplierNo || "").trim();
   const actor = userId || pickActor(req);
+  const applySource =
+    String(source || "deposit").toLowerCase() === "goods_in_transit" ||
+    String(source || "").toLowerCase() === "git"
+      ? "goods_in_transit"
+      : "deposit";
+  const consumeType =
+    applySource === "goods_in_transit" ? "goods_in_transit" : "accrued";
+  const sourceLabel =
+    applySource === "goods_in_transit" ? "goods in transit" : "deposit";
 
   if (!facilityId) {
     return res.status(400).json({ success: false, error: "facilityId is required" });
@@ -839,10 +992,28 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
       });
     }
 
-    const availableDeposit = await getAvailableSupplierAdvance(
-      facilityId,
-      supplierNumber,
-    );
+    let sourceAccount = advanceAccount;
+    if (applySource === "goods_in_transit") {
+      const gitAccount = await resolveGoodsInTransitAccount(facilityId);
+      if (!gitAccount) {
+        return res.status(404).json({
+          success: false,
+          error:
+            "Goods in Transit account not found in Chart of Accounts. Please add it under Current Assets.",
+        });
+      }
+      sourceAccount = gitAccount;
+    }
+
+    const availablePool =
+      applySource === "goods_in_transit"
+        ? await getAvailableSupplierGoodsInTransit(
+            facilityId,
+            supplierNumber,
+            null,
+            sourceAccount.code,
+          )
+        : await getAvailableSupplierAdvance(facilityId, supplierNumber);
 
     const cleaned = [];
     let totalApply = 0;
@@ -859,18 +1030,24 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
         error: "No valid application amounts provided",
       });
     }
-    if (availableDeposit <= 0) {
+    if (availablePool <= 0) {
       return res.status(400).json({
         success: false,
-        error: `No available deposit/advance for supplier ${supplierNumber}`,
-        available_deposit: 0,
+        error: `No available ${sourceLabel} for supplier ${supplierNumber}`,
+        available_deposit:
+          applySource === "deposit" ? 0 : undefined,
+        available_goods_in_transit:
+          applySource === "goods_in_transit" ? 0 : undefined,
       });
     }
-    if (totalApply > availableDeposit + 0.01) {
+    if (totalApply > availablePool + 0.01) {
       return res.status(400).json({
         success: false,
-        error: `Apply total (${totalApply}) exceeds available deposit (${availableDeposit})`,
-        available_deposit: availableDeposit,
+        error: `Apply total (${totalApply}) exceeds available ${sourceLabel} (${availablePool})`,
+        available_deposit:
+          applySource === "deposit" ? availablePool : undefined,
+        available_goods_in_transit:
+          applySource === "goods_in_transit" ? availablePool : undefined,
       });
     }
 
@@ -878,10 +1055,10 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
     const supplierName = supplier.supplier_name || supplierNumber;
     const descBase =
       String(narration || "").trim() ||
-      `Deposit applied to bills — ${supplierName}`;
+      `${sourceLabel === "deposit" ? "Deposit" : "Goods in transit"} applied to bills — ${supplierName}`;
 
     const applied = await db.sequelize.transaction(async (t) => {
-      let remainingPool = availableDeposit;
+      let remainingPool = availablePool;
       const settled = [];
 
       for (const { invoice_ref, amount } of cleaned) {
@@ -919,7 +1096,7 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
         const applyAmt = Math.min(amount, remainingPool, amountDue);
         if (applyAmt <= 0) break;
 
-        // Dr Payable (settle bill with deposit)
+        // Dr Payable (settle bill)
         await GeneralLedger.create(
           {
             transaction_date: transactionDate,
@@ -930,7 +1107,7 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
             account_description: payableAccount.description,
             transaction_description: `${descBase} — ${invoice_ref}`,
             reference_number: invoice_ref,
-            purpose_of_payment: `Apply supplier deposit — ${invoice_ref}`,
+            purpose_of_payment: `Apply supplier ${sourceLabel} — ${invoice_ref}`,
             payee: supplierName,
             created_by: actor,
             facility_id: facilityId,
@@ -941,23 +1118,23 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
           { transaction: t },
         );
 
-        // Cr Advance / prepaid (consume deposit)
+        // Cr Advance / GIT CoA (consume source)
         await GeneralLedger.create(
           {
             transaction_date: transactionDate,
-            account_code: advanceAccount.code,
-            account_subhead: advanceAccount.parent_code || 0,
+            account_code: sourceAccount.code,
+            account_subhead: sourceAccount.parent_code || 0,
             dr: 0,
             cr: applyAmt,
-            account_description: advanceAccount.description,
+            account_description: sourceAccount.description,
             transaction_description: `${descBase} — ${invoice_ref}`,
             reference_number: invoice_ref,
-            purpose_of_payment: `Apply supplier deposit — ${invoice_ref}`,
+            purpose_of_payment: `Apply supplier ${sourceLabel} — ${invoice_ref}`,
             payee: supplierName,
             created_by: actor,
             facility_id: facilityId,
             status: "paid",
-            type: "accrued",
+            type: consumeType,
             transaction_ref: supplierNumber,
           },
           { transaction: t },
@@ -966,12 +1143,13 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
         await SupplierEntry.create(
           {
             supplier_number: supplierNumber,
-            description: `Deposit applied — ${invoice_ref}`,
+            description: `${sourceLabel === "deposit" ? "Deposit" : "GIT"} applied - ${invoice_ref}`,
             qty_in: 0,
             qty_out: 1,
             cost: applyAmt,
             facilityId,
-            mode_of_payment: "ADVANCE",
+            mode_of_payment:
+              applySource === "goods_in_transit" ? "GIT" : "ADVANCE",
             receiptNo: referenceNumber,
             cheque_no: invoice_ref,
             type: "payment",
@@ -1001,6 +1179,7 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
       after: {
         reference_number: referenceNumber,
         supplier_no: supplierNumber,
+        source: applySource,
         applied_total: appliedTotal,
         applications: applied,
       },
@@ -1009,13 +1188,14 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: `Applied deposit of ${appliedTotal.toLocaleString()} to ${applied.length} bill(s)`,
+      message: `Applied ${sourceLabel} of ${appliedTotal.toLocaleString()} to ${applied.length} bill(s)`,
       data: {
         reference_number: referenceNumber,
         supplier_no: supplierNumber,
+        source: applySource,
         applied_total: appliedTotal,
-        available_before: availableDeposit,
-        available_after: Math.max(0, availableDeposit - appliedTotal),
+        available_before: availablePool,
+        available_after: Math.max(0, availablePool - appliedTotal),
         applications: applied,
       },
     });
@@ -1031,3 +1211,430 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
     });
   }
 };
+
+/**
+ * POST /api/v1/move-supplier-deposit-to-git
+ * Reclassify supplier deposit/advance into goods-in-transit pool.
+ * body: { facilityId, userId, supplier_no, amount, transaction_date?, narration? }
+ */
+exports.moveSupplierDepositToGoodsInTransit = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    supplier_no,
+    supplierNo,
+    amount,
+    narration = "",
+  } = req.body;
+
+  const supplierNumber = String(supplier_no || supplierNo || "").trim();
+  const actor = userId || pickActor(req);
+  const moveAmt = parseAmount(amount) ?? 0;
+
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!actor) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!supplierNumber) {
+    return res.status(400).json({ success: false, error: "supplier_no is required" });
+  }
+  if (moveAmt <= 0) {
+    return res.status(400).json({ success: false, error: "amount must be greater than 0" });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(
+      req.body.transaction_date || new Date(),
+      { field: "transaction_date" },
+    );
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+  const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+
+  try {
+    const supplier = await SuppliersInfo.findOne({
+      where: { supplier_number: supplierNumber, facilityId },
+    });
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: "Supplier not found" });
+    }
+
+    const accrualCode =
+      supplier.payable_accural_code || supplier.payable_accrual_code;
+    if (!accrualCode) {
+      return res.status(400).json({
+        success: false,
+        error: "Supplier missing payable_accural_code (advance account)",
+      });
+    }
+
+    const advanceAccount = await db.AccountCategory.findOne({
+      where: { code: accrualCode, facility_id: facilityId },
+    });
+    if (!advanceAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Advance account not found: ${accrualCode}`,
+      });
+    }
+
+    const gitAccount = await resolveGoodsInTransitAccount(facilityId);
+    if (!gitAccount) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "Goods in Transit account not found in Chart of Accounts. Please add it under Current Assets (e.g. 112103).",
+      });
+    }
+
+    const availableDeposit = await getAvailableSupplierAdvance(
+      facilityId,
+      supplierNumber,
+    );
+    if (moveAmt > availableDeposit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Amount (${moveAmt}) exceeds available deposit (${availableDeposit})`,
+        available_deposit: availableDeposit,
+      });
+    }
+
+    const referenceNumber = `GIT-${await getAndUpdateNumber("GIT", facilityId)}`;
+    const supplierName = supplier.supplier_name || supplierNumber;
+    const desc =
+      String(narration || "").trim() ||
+      `Move deposit to goods in transit — ${supplierName}`;
+
+    await db.sequelize.transaction(async (t) => {
+      // Reduce deposit pool (Cr advance / deposit CoA)
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: advanceAccount.code,
+          account_subhead: advanceAccount.parent_code || 0,
+          dr: 0,
+          cr: moveAmt,
+          account_description: advanceAccount.description,
+          transaction_description: desc,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Move supplier deposit to goods in transit",
+          payee: supplierName,
+          created_by: actor,
+          facility_id: facilityId,
+          status: "posted",
+          type: "accrued",
+          transaction_ref: supplierNumber,
+        },
+        { transaction: t },
+      );
+
+      // Increase GIT pool (Dr Goods in Transit CoA)
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: gitAccount.code,
+          account_subhead: gitAccount.parent_code || 0,
+          dr: moveAmt,
+          cr: 0,
+          account_description: gitAccount.description,
+          transaction_description: desc,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Move supplier deposit to goods in transit",
+          payee: supplierName,
+          created_by: actor,
+          facility_id: facilityId,
+          status: "posted",
+          type: "goods_in_transit",
+          transaction_ref: supplierNumber,
+        },
+        { transaction: t },
+      );
+
+      await SupplierEntry.create(
+        {
+          supplier_number: supplierNumber,
+          description: `Deposit -> Goods in transit (${formatAmount(moveAmt)})`,
+          qty_in: 0,
+          qty_out: 0,
+          cost: moveAmt,
+          facilityId,
+          mode_of_payment: "GIT",
+          receiptNo: referenceNumber,
+          type: "payment",
+          link_id: referenceNumber,
+          created_by: actor,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+    });
+
+    const [depositAfter, gitAfter] = await Promise.all([
+      getAvailableSupplierAdvance(facilityId, supplierNumber),
+      getAvailableSupplierGoodsInTransit(
+        facilityId,
+        supplierNumber,
+        null,
+        gitAccount.code,
+      ),
+    ]);
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "move",
+      entityType: "supplier_advance",
+      entityId: referenceNumber,
+      entityLabel: supplierName,
+      after: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        amount: moveAmt,
+        available_deposit: depositAfter,
+        available_goods_in_transit: gitAfter,
+      },
+      remark: desc,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Moved ${moveAmt.toLocaleString()} from deposit to goods in transit`,
+      data: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        amount: moveAmt,
+        available_deposit: depositAfter,
+        available_goods_in_transit: gitAfter,
+      },
+    });
+  } catch (error) {
+    console.error("moveSupplierDepositToGoodsInTransit:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to move deposit to goods in transit",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+};
+
+/**
+ * Write off goods-in-transit (lost/damaged/never received).
+ * Dr expense (Goods in Transit Loss / Inventory Write-off) | Cr GIT CoA.
+ * POST /api/v1/write-off-supplier-git
+ */
+exports.writeOffSupplierGoodsInTransit = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    supplier_no,
+    supplierNo,
+    amount,
+    narration = "",
+    expense_code,
+    expenseCode,
+    write_off_account,
+  } = req.body;
+
+  const supplierNumber = String(supplier_no || supplierNo || "").trim();
+  const actor = userId || pickActor(req);
+  const writeAmt = parseAmount(amount) ?? 0;
+  const preferredExpense =
+    expense_code || expenseCode || write_off_account || null;
+
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!actor) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!supplierNumber) {
+    return res.status(400).json({ success: false, error: "supplier_no is required" });
+  }
+  if (writeAmt <= 0) {
+    return res.status(400).json({ success: false, error: "amount must be greater than 0" });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(
+      req.body.transaction_date || new Date(),
+      { field: "transaction_date" },
+    );
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+  const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+
+  try {
+    const supplier = await SuppliersInfo.findOne({
+      where: { supplier_number: supplierNumber, facilityId },
+    });
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: "Supplier not found" });
+    }
+
+    const gitAccount = await resolveGoodsInTransitAccount(facilityId);
+    if (!gitAccount) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "Goods in Transit account not found in Chart of Accounts. Please add it under Current Assets.",
+      });
+    }
+
+    const expenseAccount = await resolveGitWriteOffExpenseAccount(
+      facilityId,
+      preferredExpense,
+    );
+    if (!expenseAccount) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "Write-off expense account not found. Add Goods in Transit Loss (800904) or Inventory Write-off (800901).",
+      });
+    }
+
+    const availableGit = await getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+      null,
+      gitAccount.code,
+    );
+    if (writeAmt > availableGit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Amount (${writeAmt}) exceeds available goods in transit (${availableGit})`,
+        available_goods_in_transit: availableGit,
+      });
+    }
+
+    const referenceNumber = `GWO-${await getAndUpdateNumber("GWO", facilityId)}`;
+    const supplierName = supplier.supplier_name || supplierNumber;
+    const desc =
+      String(narration || "").trim() ||
+      `Write-off goods in transit — ${supplierName}`;
+
+    await db.sequelize.transaction(async (t) => {
+      // Dr expense / loss
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: expenseAccount.code,
+          account_subhead: expenseAccount.parent_code || 0,
+          dr: writeAmt,
+          cr: 0,
+          account_description: expenseAccount.description,
+          transaction_description: desc,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Write-off supplier goods in transit",
+          payee: supplierName,
+          created_by: actor,
+          facility_id: facilityId,
+          status: "posted",
+          type: "expenses",
+          transaction_ref: supplierNumber,
+        },
+        { transaction: t },
+      );
+
+      // Cr GIT CoA (clear asset)
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: gitAccount.code,
+          account_subhead: gitAccount.parent_code || 0,
+          dr: 0,
+          cr: writeAmt,
+          account_description: gitAccount.description,
+          transaction_description: desc,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Write-off supplier goods in transit",
+          payee: supplierName,
+          created_by: actor,
+          facility_id: facilityId,
+          status: "posted",
+          type: "goods_in_transit",
+          transaction_ref: supplierNumber,
+        },
+        { transaction: t },
+      );
+
+      await SupplierEntry.create(
+        {
+          supplier_number: supplierNumber,
+          description: `GIT write-off (${formatAmount(writeAmt)}) - ${expenseAccount.description}`,
+          qty_in: 0,
+          qty_out: 1,
+          cost: writeAmt,
+          facilityId,
+          mode_of_payment: "WRITE_OFF",
+          receiptNo: referenceNumber,
+          type: "payment",
+          link_id: referenceNumber,
+          created_by: actor,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+    });
+
+    const gitAfter = await getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+      null,
+      gitAccount.code,
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "write_off",
+      entityType: "supplier_advance",
+      entityId: referenceNumber,
+      entityLabel: supplierName,
+      after: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        amount: writeAmt,
+        expense_code: expenseAccount.code,
+        git_account: gitAccount.code,
+        available_goods_in_transit: gitAfter,
+      },
+      remark: desc,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Wrote off ${writeAmt.toLocaleString()} goods in transit`,
+      data: {
+        reference_number: referenceNumber,
+        supplier_no: supplierNumber,
+        amount: writeAmt,
+        expense_code: expenseAccount.code,
+        expense_description: expenseAccount.description,
+        git_account: gitAccount.code,
+        available_goods_in_transit: gitAfter,
+      },
+    });
+  } catch (error) {
+    console.error("writeOffSupplierGoodsInTransit:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to write off goods in transit",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+};
+
+function formatAmount(n) {
+  return Number(n || 0).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
