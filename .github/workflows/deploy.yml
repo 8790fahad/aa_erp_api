@@ -125,13 +125,30 @@ jobs:
             pm2 restart flowbooks || pm2 start build/app.js --name=flowbooks
             pm2 save
 
-            # Ensure Apache publicly serves /flowbooks → Node (same idea as inventria_new).
-            # Without this, https://server.brainstorm.ng/flowbooks returns Apache 404.
+            echo "✅ App deploy finished (install / migrate / build / pm2)."
+
+            # Apache proxy is optional — sudo often needs a password on this VPS,
+            # and must not fail the deploy after a successful pm2 restart.
             APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
             APP_PORT="${APP_PORT:-42843}"
             CONF_DIR="/etc/apache2/conf-available"
             CONF_FILE="${CONF_DIR}/flowbooks-proxy.conf"
-            if [ -d "$CONF_DIR" ] && command -v sudo >/dev/null 2>&1; then
+
+            configure_apache_proxy() {
+              if [ ! -d "$CONF_DIR" ]; then
+                echo "::warning::Apache conf-available not found; skip /flowbooks proxy."
+                return 0
+              fi
+              if ! command -v sudo >/dev/null 2>&1; then
+                echo "::warning::sudo not available; skip /flowbooks proxy."
+                return 0
+              fi
+              # Non-interactive only — never prompt for a password in CI.
+              if ! sudo -n true 2>/dev/null; then
+                echo "::warning::Passwordless sudo not available; skip Apache /flowbooks proxy."
+                echo "On the VPS, either grant passwordless sudo for apache2, or create ${CONF_FILE} once manually."
+                return 0
+              fi
               printf '%s\n' \
                 '# Managed by aa_erp_api GitHub Actions deploy' \
                 'ProxyPreserveHost On' \
@@ -140,11 +157,14 @@ jobs:
                 "ProxyPassReverse /flowbooks http://127.0.0.1:${APP_PORT}/flowbooks" \
                 "ProxyPass /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
                 "ProxyPassReverse /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
-                | sudo tee "$CONF_FILE" >/dev/null
-              sudo a2enmod proxy proxy_http headers >/dev/null 2>&1 || true
-              sudo a2enconf flowbooks-proxy >/dev/null 2>&1 || true
-              sudo apache2ctl configtest && sudo systemctl reload apache2
-              echo "Apache /flowbooks proxy enabled → 127.0.0.1:${APP_PORT}"
-            else
-              echo "::warning::Could not write Apache proxy config (missing sudo or conf-available)."
-            fi
+                | sudo -n tee "$CONF_FILE" >/dev/null
+              sudo -n a2enmod proxy proxy_http headers >/dev/null 2>&1 || true
+              sudo -n a2enconf flowbooks-proxy >/dev/null 2>&1 || true
+              if sudo -n apache2ctl configtest && sudo -n systemctl reload apache2; then
+                echo "Apache /flowbooks proxy enabled → 127.0.0.1:${APP_PORT}"
+              else
+                echo "::warning::Apache configtest/reload failed; app is still running via pm2."
+              fi
+            }
+
+            configure_apache_proxy
