@@ -48,80 +48,118 @@ function stageMeta(statusId) {
 }
 
 /**
- * Build branch packs from store_entries for a sale (idempotent).
+ * Resolve a line branch id from store / customer fields.
+ */
+function resolveLineBranchId(...candidates) {
+  for (const raw of candidates) {
+    const bid = parseInt(raw, 10);
+    if (Number.isFinite(bid) && bid > 0) return bid;
+  }
+  return 0;
+}
+
+/**
+ * Build branch packs from store_entries (and customer_entries fallback).
+ * One pack per distinct store/branch involved in the sale.
  */
 async function ensureSaleFulfillments(
   { facilityId, saleCode, createdBy },
   transaction,
 ) {
-  if (!db.SaleFulfillment || !db.SaleFulfillmentLine || !db.StoreEntry) {
+  if (!db.SaleFulfillment || !db.SaleFulfillmentLine) {
     return [];
   }
 
-  const storeEntries = await db.StoreEntry.findAll({
-    where: {
-      facilityId,
-      reference_number: saleCode,
-      qty_out: { [Op.gt]: 0 },
-    },
-    transaction,
-  });
+  const customerLines =
+    db.CustomerEntry
+      ? await db.CustomerEntry.findAll({
+          where: {
+            facilityId,
+            receiptNo: saleCode,
+            type: { [Op.in]: ["sales", "service", "pro-bono"] },
+          },
+          transaction,
+        })
+      : [];
 
-  if (!storeEntries.length) {
-    // Fallback: customer_entries with branch_id
-    const customerLines = await db.CustomerEntry.findAll({
-      where: {
-        facilityId,
-        receiptNo: saleCode,
-        type: { [Op.in]: ["sales", "service", "pro-bono"] },
-      },
-      transaction,
-    });
-    if (!customerLines.length) return [];
-
-    const byBranch = new Map();
-    for (const line of customerLines) {
-      const bid = parseInt(line.branch_id, 10) || 0;
-      if (!byBranch.has(bid)) byBranch.set(bid, []);
-      byBranch.get(bid).push({
-        product_id: line.link_id,
-        item_name: line.description,
-        qty: Number(line.qty_out || 0),
-        store_entry_id: null,
-      });
+  const customerBranchBySku = new Map();
+  for (const line of customerLines) {
+    const sku = String(line.link_id || "").trim();
+    if (!sku) continue;
+    const bid = resolveLineBranchId(line.branch_id, line.branchId);
+    if (bid > 0 && !customerBranchBySku.has(sku)) {
+      customerBranchBySku.set(sku, bid);
     }
-    return createFulfillmentsFromGroups({
-      facilityId,
-      saleCode,
-      createdBy,
-      byBranch,
-      transaction,
-    });
   }
 
-  const productIds = [
-    ...new Set(storeEntries.map((e) => e.product_id).filter(Boolean)),
-  ];
-  const products = productIds.length
-    ? await db.Product.findAll({
-        where: { facility_id: facilityId, sku: productIds },
-        attributes: ["sku", "name"],
+  const storeEntries = db.StoreEntry
+    ? await db.StoreEntry.findAll({
+        where: {
+          facilityId,
+          reference_number: saleCode,
+          qty_out: { [Op.gt]: 0 },
+        },
         transaction,
       })
     : [];
-  const nameBySku = new Map(products.map((p) => [p.sku, p.name]));
 
   const byBranch = new Map();
-  for (const entry of storeEntries) {
-    const bid = parseInt(entry.branchId, 10) || 0;
-    if (!byBranch.has(bid)) byBranch.set(bid, []);
-    byBranch.get(bid).push({
-      product_id: entry.product_id,
-      item_name: nameBySku.get(entry.product_id) || entry.product_id,
-      qty: Number(entry.qty_out || 0),
-      store_entry_id: entry.id || null,
-    });
+
+  if (storeEntries.length) {
+    const productIds = [
+      ...new Set(storeEntries.map((e) => e.product_id).filter(Boolean)),
+    ];
+    const products = productIds.length
+      ? await db.Product.findAll({
+          where: { facility_id: facilityId, sku: productIds },
+          attributes: ["sku", "name"],
+          transaction,
+        })
+      : [];
+    const nameBySku = new Map(products.map((p) => [p.sku, p.name]));
+
+    for (const entry of storeEntries) {
+      const sku = String(entry.product_id || "").trim();
+      const bid = resolveLineBranchId(
+        entry.branchId,
+        entry.branch_id,
+        customerBranchBySku.get(sku),
+      );
+      if (!byBranch.has(bid)) byBranch.set(bid, []);
+      byBranch.get(bid).push({
+        product_id: entry.product_id,
+        item_name: nameBySku.get(entry.product_id) || entry.product_id,
+        qty: Number(entry.qty_out || 0),
+        store_entry_id: entry.id || null,
+      });
+    }
   }
+
+  // Prefer customer line branches when store stock collapsed everything to 0
+  const storeOnlyZero =
+    byBranch.size > 0 &&
+    [...byBranch.keys()].every((bid) => Number(bid) === 0);
+  const customerHasRealBranches = [...customerBranchBySku.values()].some(
+    (bid) => bid > 0,
+  );
+
+  if ((!byBranch.size || storeOnlyZero) && customerLines.length) {
+    if (!byBranch.size || customerHasRealBranches) {
+      byBranch.clear();
+      for (const line of customerLines) {
+        const bid = resolveLineBranchId(line.branch_id, line.branchId);
+        if (!byBranch.has(bid)) byBranch.set(bid, []);
+        byBranch.get(bid).push({
+          product_id: line.link_id,
+          item_name: line.description,
+          qty: Number(line.qty_out || 0),
+          store_entry_id: null,
+        });
+      }
+    }
+  }
+
+  if (!byBranch.size) return [];
 
   return createFulfillmentsFromGroups({
     facilityId,
@@ -139,9 +177,33 @@ async function createFulfillmentsFromGroups({
   byBranch,
   transaction,
 }) {
+  const realBranchIds = [...byBranch.keys()].filter((bid) => Number(bid) > 0);
+
+  // Drop obsolete unassigned (B0) pending packs when real store packs exist
+  if (realBranchIds.length && db.SaleFulfillment) {
+    const orphanZero = await db.SaleFulfillment.findAll({
+      where: {
+        facility_id: facilityId,
+        sale_code: saleCode,
+        branch_id: 0,
+        status: "pending",
+      },
+      transaction,
+    });
+    for (const pack of orphanZero) {
+      if (db.SaleFulfillmentLine) {
+        await db.SaleFulfillmentLine.destroy({
+          where: { fulfillment_id: pack.id },
+          transaction,
+        });
+      }
+      await pack.destroy({ transaction });
+    }
+  }
+
   const results = [];
   for (const [branchId, lines] of byBranch.entries()) {
-    const bid = branchId > 0 ? branchId : 0;
+    const bid = Number(branchId) > 0 ? Number(branchId) : 0;
     const packCode = `${saleCode}-B${bid || "0"}`;
     const [row, created] = await db.SaleFulfillment.findOrCreate({
       where: {
@@ -161,18 +223,34 @@ async function createFulfillmentsFromGroups({
       transaction,
     });
 
-    if (created) {
-      await db.SaleFulfillmentLine.bulkCreate(
-        lines.map((l) => ({
-          fulfillment_id: row.id,
-          product_id: l.product_id || null,
-          item_name: l.item_name || null,
-          qty: l.qty,
-          qty_collected: 0,
-          store_entry_id: l.store_entry_id || null,
-        })),
-        { transaction },
-      );
+    const existingLines = created
+      ? []
+      : await db.SaleFulfillmentLine.findAll({
+          where: { fulfillment_id: row.id },
+          transaction,
+        });
+
+    // Create lines on first insert, or backfill if a pending pack has none
+    if (created || (row.status === "pending" && !existingLines.length)) {
+      if (!created && existingLines.length === 0) {
+        await db.SaleFulfillmentLine.destroy({
+          where: { fulfillment_id: row.id },
+          transaction,
+        });
+      }
+      if (created || !existingLines.length) {
+        await db.SaleFulfillmentLine.bulkCreate(
+          lines.map((l) => ({
+            fulfillment_id: row.id,
+            product_id: l.product_id || null,
+            item_name: l.item_name || null,
+            qty: l.qty,
+            qty_collected: 0,
+            store_entry_id: l.store_entry_id || null,
+          })),
+          { transaction },
+        );
+      }
     }
 
     const withLines = await db.SaleFulfillment.findByPk(row.id, {
@@ -181,6 +259,11 @@ async function createFulfillmentsFromGroups({
     });
     results.push(withLines);
   }
+
+  // Return packs sorted by branch for stable Copy N of M display
+  results.sort(
+    (a, b) => Number(a.branch_id || 0) - Number(b.branch_id || 0),
+  );
   return results;
 }
 
@@ -796,6 +879,132 @@ exports.getCashierDashboard = async (req, res) => {
 };
 
 /**
+ * Invoice Separation queue + history of previously separated sales.
+ */
+exports.getSeparationDashboard = async (req, res) => {
+  try {
+    const { facilityId } = req.query;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+
+    const pendingStatuses = [
+      "payment_confirmed",
+      "invoice_separation",
+      "awaiting_credit_approval",
+      "credit_approved",
+      "final_invoice",
+    ];
+    const historyStatuses = [
+      "warehouse_picking",
+      "dual_signature",
+      "goods_released",
+      "completed",
+    ];
+
+    const mapWorkflow = (r) => {
+      const plain = r.toJSON ? r.toJSON() : r;
+      const meta = stageMeta(plain.status);
+      return {
+        ...plain,
+        history: normalizeHistory(plain.history),
+        status_label: meta?.label || plain.status,
+        status_color: meta?.color || "slate",
+        amount: Number(plain.amount) || 0,
+      };
+    };
+
+    const pending = await db.SaleWorkflow.findAll({
+      where: {
+        facility_id: facilityId,
+        status: { [Op.in]: pendingStatuses },
+      },
+      order: [["updated_at", "DESC"]],
+      limit: 200,
+    });
+
+    const historyRows = await db.SaleWorkflow.findAll({
+      where: {
+        facility_id: facilityId,
+        status: { [Op.in]: historyStatuses },
+      },
+      order: [["updated_at", "DESC"]],
+      limit: 150,
+    });
+
+    const historySaleCodes = historyRows.map((r) => r.sale_code).filter(Boolean);
+    let packsBySale = new Map();
+    if (historySaleCodes.length && db.SaleFulfillment) {
+      const packs = await db.SaleFulfillment.findAll({
+        where: {
+          facility_id: facilityId,
+          sale_code: { [Op.in]: historySaleCodes },
+        },
+        include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+        order: [["branch_id", "ASC"]],
+      });
+      const enriched = await enrichFulfillments(packs);
+      for (const pack of enriched) {
+        const key = pack.sale_code;
+        if (!packsBySale.has(key)) packsBySale.set(key, []);
+        packsBySale.get(key).push(pack);
+      }
+    }
+
+    const history = historyRows.map((r) => {
+      const mapped = mapWorkflow(r);
+      const packs = packsBySale.get(mapped.sale_code) || [];
+      const printedCount = packs.filter(
+        (p) => p.printed_at || ["printed", "collecting", "collected"].includes(p.status),
+      ).length;
+      return {
+        ...mapped,
+        pack_count: packs.length,
+        packs_printed: printedCount,
+        packs,
+        separated_at:
+          [...normalizeHistory(mapped.history)]
+            .reverse()
+            .find((h) =>
+              String(h.note || "")
+                .toLowerCase()
+                .includes("separat") ||
+              h.status === "warehouse_picking",
+            )?.at || mapped.updated_at || mapped.updatedAt,
+      };
+    });
+
+    return res.json({
+      success: true,
+      results: {
+        pending: pending.map(mapWorkflow),
+        history,
+        summary: {
+          pending_count: pending.length,
+          history_count: history.length,
+          packs_total: history.reduce((s, r) => s + (r.pack_count || 0), 0),
+        },
+      },
+    });
+  } catch (err) {
+    console.error("getSeparationDashboard:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to load separation dashboard",
+    });
+  }
+};
+
+/**
  * Cashier collects payment for an invoice awaiting confirmation.
  * Posts Dr Cash/Bank, Cr A/R and advances workflow to payment_confirmed.
  */
@@ -1147,19 +1356,38 @@ exports.listSaleFulfillments = async (req, res) => {
         : status;
     }
 
-    // When listing for a sale at separation, ensure packs exist
+    // When listing for a sale at separation, ensure packs exist (skip pre-credit)
     if (saleCode) {
-      await ensureSaleFulfillments({
-        facilityId,
-        saleCode,
-        createdBy: req.query.userId || null,
-      });
+      let allowEnsure = true;
+      if (db.SaleWorkflow) {
+        const workflow = await db.SaleWorkflow.findOne({
+          where: { facility_id: facilityId, sale_code: saleCode },
+          attributes: ["status", "payment_type"],
+        });
+        if (
+          workflow &&
+          workflow.status === "awaiting_credit_approval" &&
+          String(workflow.payment_type || "").toLowerCase() === "credit"
+        ) {
+          allowEnsure = false;
+        }
+      }
+      if (allowEnsure) {
+        await ensureSaleFulfillments({
+          facilityId,
+          saleCode,
+          createdBy: req.query.userId || null,
+        });
+      }
     }
 
     const rows = await db.SaleFulfillment.findAll({
       where,
       include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
-      order: [["updated_at", "DESC"]],
+      order: [
+        ["branch_id", "ASC"],
+        ["updated_at", "DESC"],
+      ],
       limit: 300,
     });
 

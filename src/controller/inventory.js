@@ -254,9 +254,8 @@ exports.getProductList = (req, res) => {
   } = req.body;
 
   // Cash account lookup is used by advance-payment drawers.
-  // Use account_category (chart-of-accounts source of truth).
+  // Payment Mode = Cash → only Cash on/in Hand (not equivalents / charges / banks).
   if (String(query_type).toLowerCase() === "cash") {
-    // Prefer real cash / bank / cash-equivalent accounts for Deposit To.
     return db.sequelize
       .query(
         `
@@ -269,19 +268,16 @@ exports.getProductList = (req, res) => {
         WHERE
           facility_id = :facilityId
           AND (
-            LOWER(COALESCE(description, '')) LIKE '%cash%'
-            OR LOWER(COALESCE(type, '')) LIKE '%cash%'
-            OR LOWER(COALESCE(type, '')) LIKE '%bank%'
-            OR code LIKE '101%'
-            OR parent_code IN ('101', '10101', '100003', '100004')
+            code = '112199'
+            OR LOWER(COALESCE(description, '')) LIKE '%cash on hand%'
+            OR LOWER(COALESCE(description, '')) LIKE '%cash in hand%'
           )
         ORDER BY
           CASE
-            WHEN LOWER(description) LIKE '%cash on hand%' THEN 0
-            WHEN LOWER(description) LIKE '%cash in hand%' THEN 1
-            WHEN LOWER(description) = 'cash' THEN 2
-            WHEN LOWER(description) LIKE '%petty cash%' THEN 3
-            ELSE 4
+            WHEN code = '112199' THEN 0
+            WHEN LOWER(description) LIKE '%cash on hand%' THEN 1
+            WHEN LOWER(description) LIKE '%cash in hand%' THEN 2
+            ELSE 3
           END,
           description ASC
         `,

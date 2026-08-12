@@ -4,6 +4,10 @@ module.exports = (app) => {
   app.get("/api/v1/sale-workflows/stages", saleWorkflow.getWorkflowStages);
   app.get("/api/v1/sale-workflows/cashier-dashboard", saleWorkflow.getCashierDashboard);
   app.get(
+    "/api/v1/sale-workflows/separation-dashboard",
+    saleWorkflow.getSeparationDashboard,
+  );
+  app.get(
     "/api/v1/sale-workflows/warehouse-requests",
     saleWorkflow.listWarehouseRequests,
   );

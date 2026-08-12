@@ -93,9 +93,17 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
       status: {
-        type: DataTypes.ENUM("paid", "unpaid", "saved", "pending", "partial"),
+        type: DataTypes.ENUM(
+          "paid",
+          "unpaid",
+          "saved",
+          "pending",
+          "partial",
+          "posted",
+          "reversed",
+        ),
         allowNull: false,
-        defaultValue: "saved",
+        defaultValue: "posted",
       },
       reconciled: {
         type: DataTypes.ENUM("unmatched", "matched", "retain"),
@@ -161,6 +169,14 @@ module.exports = (sequelize, DataTypes) => {
   };
 
   GeneralLedger.addHook("beforeValidate", (instance) => {
+    // Operational ledger lines are always posted.
+    // Journal drafts keep status "saved" until explicitly posted.
+    const type = String(instance.type || "").toLowerCase();
+    const isJournalDraft =
+      type === "journal_entry" && String(instance.status || "") === "saved";
+    if (!isJournalDraft && instance.status !== "reversed") {
+      instance.status = "posted";
+    }
     if (instance.transaction_date == null || instance.transaction_date === "") {
       return;
     }
@@ -168,6 +184,17 @@ module.exports = (sequelize, DataTypes) => {
     instance.transaction_date = validatePostingDate(instance.transaction_date, {
       field: "transaction_date",
     });
+  });
+
+  GeneralLedger.addHook("beforeBulkCreate", (instances) => {
+    for (const instance of instances) {
+      const type = String(instance.type || "").toLowerCase();
+      const isJournalDraft =
+        type === "journal_entry" && String(instance.status || "") === "saved";
+      if (!isJournalDraft && instance.status !== "reversed") {
+        instance.status = "posted";
+      }
+    }
   });
 
   return GeneralLedger;

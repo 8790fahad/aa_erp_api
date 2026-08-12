@@ -38,7 +38,8 @@ function fileFilter(req, file, cb) {
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
+    // Payment / supporting documents — allow larger scans & PDFs
+    fileSize: 25 * 1024 * 1024, // 25MB
   },
   fileFilter: fileFilter,
 });
