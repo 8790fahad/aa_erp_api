@@ -1,73 +1,85 @@
 # FlowBooks E-Invoicing API
 
-**Document Version:** 2.0
-**Last Updated:** July 2026
+**Document Version:** 2.1  
+**Last Updated:** August 2026  
 **Scope:** FIRS/NRS e-Invoicing — NRS/FIRS payload structure only
 
 **API documentation (single URL):**
 
-|                  | URL                                                           |
-| ---------------- | ------------------------------------------------------------- |
-| Documentation    | `/e-invoicing-api-docs` (Redoc — NRS e-invoicing only)        |
-| OpenAPI JSON     | `/e-invoicing-api-docs.json`                                  |
-| Try-it (Swagger) | `/e-invoicing-api-docs/try`                                   |
-| Production       | `https://server.brainstorm.ng/flowbooks/e-invoicing-api-docs` |
+| | URL |
+|--|-----|
+| Documentation | `/e-invoicing-api-docs` (Redoc — NRS e-invoicing only) |
+| OpenAPI JSON | `/e-invoicing-api-docs.json` |
+| Sample invoice (HTML) | `/e-invoicing-api-docs/sample-invoice` |
+| Try-it (Swagger) | `/e-invoicing-api-docs/try` |
+| Production | `https://server.brainstorm.ng/inventria_new/e-invoicing-api-docs` |
 
-Reference: [FIRS e-Invoicing API](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
+Reference: [NRS / FIRS e-Invoicing API](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
 
 ---
 
 ## Endpoints
 
-| Method | Path                             | Description                     |
-| ------ | -------------------------------- | ------------------------------- |
-| POST   | `/api/v1/invoice/create`         | Submit NRS invoice              |
-| POST   | `/api/v1/invoice/status`         | Lookup by `business_id` + `irn` |
-| POST   | `/api/v1/invoice/payment/notify` | Notify payment status           |
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/invoice/create` | Submit NRS invoice |
+| POST | `/api/v1/invoice/status` | Lookup by `business_id` + `irn` |
+| POST | `/api/v1/invoice/payment/notify` | Notify payment status |
 
-**Authentication:** OAuth 2.0 client credentials (system-to-system) — `POST /api/v1/invoice/oauth/token`.
+**Authentication:** OAuth 2.0 client credentials (system-to-system) — `POST /api/v1/invoice/oauth/token`.  
 Access tokens are short-lived Bearer JWTs (`expires_in` default 3600, `scope`: `e-invoicing`).
-See [FIRS e-Invoicing](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
 
 ---
 
-## NRS Create Invoice Sample (B2B)
+## NRS Create Invoice Sample (B2B sales invoice)
 
-Replace `YOUR_NRS_BUSINESS_ID`, `YOUR_SUPPLIER_TIN`, and `YOUR_CUSTOMER_TIN` with Brainstorm sandbox credentials.
+This sample is Brainstorm’s NRS sandbox tax invoice:
 
-**IRN format:** `InvoiceNo-ServiceId-YYYYMMDD` → `INV-2026-B2B-001-SVC001-20260709`
+| Field | Sandbox value |
+|-------|----------------|
+| `business_id` | `870c96de-c43c-430b-9fec-9f65648f4773` |
+| Service ID | `FFEAC43C` |
+| IRN | `FBTEST20260805174324-FFEAC43C-20260805` |
+| `invoice_type_code` | `381` (sales invoice). `380` = credit note, `384` = debit note |
+
+**IRN format:** `InvoiceNo-ServiceId-YYYYMMDD`
+
+Credit/debit notes must also include `billing_reference: [{ irn, issue_date }]` pointing at the original signed invoice. Do not send `billing_reference` on a type `381` sales invoice.
+
+HSN codes for goods must use dotted UN style (e.g. `8471.30`). Service lines use `isic_code` + `service_category`. Tax category ids are `STANDARD_VAT` / `ZERO_VAT`.
 
 ```json
 {
-  "business_id": "YOUR_NRS_BUSINESS_ID",
-  "irn": "INV-2026-B2B-001-SVC001-20260709",
+  "business_id": "870c96de-c43c-430b-9fec-9f65648f4773",
+  "irn": "FBTEST20260805174324-FFEAC43C-20260805",
   "invoice_kind": "B2B",
-  "issue_date": "2026-07-09",
-  "due_date": "2026-08-08",
-  "issue_time": "10:30:00",
+  "issue_date": "2026-08-05",
+  "due_date": "2026-09-04",
+  "issue_time": "17:43:24",
   "invoice_type_code": "381",
   "payment_status": "PENDING",
-  "tax_point_date": "2026-07-09",
+  "tax_point_date": "2026-08-05",
   "document_currency_code": "NGN",
   "tax_currency_code": "NGN",
   "accounting_supplier_party": {
     "party_name": "Brainstorm IT Solutions",
-    "tin": "YOUR_SUPPLIER_TIN",
+    "tin": "12345678-0001",
     "email": "hello@flowbooks.org",
     "telephone": "+2348067643479",
-    "business_description": "Software Development",
+    "business_description": "Information technology and software services",
     "postal_address": {
-      "street_name": "Plot 5, Brainstorm Close, Victoria Island",
+      "street_name": "Plot 5, Adeola Odeku Street, Victoria Island",
       "city_name": "Lagos",
       "postal_zone": "101241",
       "country": "NG"
     }
   },
   "accounting_customer_party": {
-    "party_name": "AA FOODS NIGERIA LIMITED",
-    "tin": "YOUR_CUSTOMER_TIN",
-    "email": "accounts@aafoods.ng",
+    "party_name": "Atlantic Foods Nigeria Limited",
+    "tin": "87654321-0001",
+    "email": "accounts@atlanticfoods.ng",
     "telephone": "+2348012345678",
+    "business_description": "Food manufacturing",
     "postal_address": {
       "street_name": "12 Industrial Avenue, Ikeja",
       "city_name": "Lagos",
@@ -77,21 +89,41 @@ Replace `YOUR_NRS_BUSINESS_ID`, `YOUR_SUPPLIER_TIN`, and `YOUR_CUSTOMER_TIN` wit
   },
   "invoice_line": [
     {
-      "discount_rate": 0,
-      "discount_amount": 0,
-      "fee_rate": 0,
-      "fee_amount": 0,
-      "invoiced_quantity": 50,
-      "line_extension_amount": 2250000,
-      "hsn_code": "7306",
-      "product_category": "Construction Materials",
+      "isic_code": "6201",
+      "service_category": "Computer programming activities",
+      "discount_rate": 0.0,
+      "discount_amount": 0.0,
+      "fee_rate": 0.0,
+      "fee_amount": 0.0,
+      "invoiced_quantity": 1.0,
+      "line_extension_amount": 1500000.0,
       "item": {
-        "name": "Industrial Steel Pipes 6inch",
-        "description": "Galvanized steel pipes, 6 inch diameter, 6m length",
-        "sellers_item_identification": "SKU-PIPE-6IN-001"
+        "name": "FlowBooks Cloud Accounting — Annual Licence",
+        "description": "12-month SaaS licence for FlowBooks accounting (GL, sales, purchases, inventory, VAT returns) for one legal entity.",
+        "sellers_item_identification": "6201"
       },
       "price": {
-        "price_amount": 45000,
+        "price_amount": 1500000.0,
+        "base_quantity": 1,
+        "price_unit": "EA"
+      }
+    },
+    {
+      "isic_code": "6202",
+      "service_category": "Computer consultancy and computer facilities management",
+      "discount_rate": 0.0,
+      "discount_amount": 0.0,
+      "fee_rate": 0.0,
+      "fee_amount": 0.0,
+      "invoiced_quantity": 5.0,
+      "line_extension_amount": 500000.0,
+      "item": {
+        "name": "Implementation, data migration and user training",
+        "description": "On-site / remote implementation: chart of accounts setup, opening balances, and training for up to 10 users (5 person-days).",
+        "sellers_item_identification": "6202"
+      },
+      "price": {
+        "price_amount": 100000.0,
         "base_quantity": 1,
         "price_unit": "EA"
       }
@@ -99,24 +131,26 @@ Replace `YOUR_NRS_BUSINESS_ID`, `YOUR_SUPPLIER_TIN`, and `YOUR_CUSTOMER_TIN` wit
   ],
   "tax_total": [
     {
-      "tax_amount": 168750,
+      "tax_amount": 150000.0,
       "tax_subtotal": [
         {
-          "taxable_amount": 2250000,
-          "tax_amount": 168750,
-          "tax_category": {
-            "id": "STANDARD_VAT",
-            "percent": 7.5
-          }
+          "taxable_amount": 1500000.0,
+          "tax_amount": 112500.0,
+          "tax_category": { "id": "STANDARD_VAT", "percent": 7.5 }
+        },
+        {
+          "taxable_amount": 500000.0,
+          "tax_amount": 37500.0,
+          "tax_category": { "id": "STANDARD_VAT", "percent": 7.5 }
         }
       ]
     }
   ],
   "legal_monetary_total": {
-    "line_extension_amount": 2250000,
-    "tax_exclusive_amount": 2250000,
-    "tax_inclusive_amount": 2418750,
-    "payable_amount": 2418750
+    "line_extension_amount": 2000000.0,
+    "tax_exclusive_amount": 2000000.0,
+    "tax_inclusive_amount": 2150000.0,
+    "payable_amount": 2150000.0
   }
 }
 ```

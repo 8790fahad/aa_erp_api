@@ -5509,6 +5509,8 @@ exports.getSalesLineReport = async (req, res) => {
          ) AS customer_no,
          COALESCE(p.name, se.product_id, '—') AS product_name,
          COALESCE(p.sku, se.product_id, '') AS product_sku,
+         COALESCE(p.category, '') AS product_category,
+         COALESCE(p.item_type, '') AS item_type,
          CASE
            WHEN LOWER(TRIM(COALESCE(se.type, ''))) IN ('pro-bono', 'pro_bono')
              THEN 'pro-bono'
@@ -5543,6 +5545,9 @@ exports.getSalesLineReport = async (req, res) => {
       customer_no: row.customer_no || "",
       product_name: row.product_name || "—",
       product_sku: row.product_sku || "",
+      product_category: row.product_category || "",
+      item_type: row.item_type || "",
+      category: row.product_category || row.item_type || "",
       line_type: row.line_type || "sales",
       basis: "sales",
       qty: parseFloat(row.qty || 0) || 0,
@@ -5732,6 +5737,8 @@ exports.getPurchaseLineReport = async (req, res) => {
          ) AS supplier_no,
          COALESCE(p.name, se.product_id, '—') AS product_name,
          COALESCE(p.sku, se.product_id, '') AS product_sku,
+         COALESCE(p.category, '') AS product_category,
+         COALESCE(p.item_type, '') AS item_type,
          'purchase' AS line_type,
          se.qty_in AS qty,
          COALESCE(NULLIF(se.cost_price, 0), se.selling_price, 0) AS unit_price,
@@ -5762,6 +5769,9 @@ exports.getPurchaseLineReport = async (req, res) => {
       supplier_no: row.supplier_no || "",
       product_name: row.product_name || "—",
       product_sku: row.product_sku || "",
+      product_category: row.product_category || "",
+      item_type: row.item_type || "",
+      category: row.product_category || row.item_type || "",
       line_type: "purchase",
       basis: "purchase",
       qty: parseFloat(row.qty || 0) || 0,

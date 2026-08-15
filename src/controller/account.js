@@ -36,6 +36,11 @@ const {
   buildFinancialDashboardOverview,
 } = require("../services/financialDashboard");
 const {
+  signedBalance,
+  signedMovement,
+  resolveAccountNature,
+} = require("../utils/accountBalance");
+const {
   recordActivity,
   pickActor,
 } = require("../services/activityAuditService");
@@ -16500,16 +16505,19 @@ exports.getHierarchicalGeneralLedger = async (req, res) => {
       );
     }
 
-    // Beginning Balance = sum of (dr - cr) for all transactions with transaction_date BEFORE fromDate
-    // (i.e. balance as of the day before the range; transactions on/after fromDate and after toDate excluded)
+    // Beginning Balance = nature-signed sum for transactions before fromDate
+    // Assets/Expenses: Dr − Cr | Liabilities/Equity/Revenue: Cr − Dr
     const openingBalances = {};
     openingBalanceTxns.forEach((t) => {
       const code = getAccountCodeFromTxn(t);
       if (code) {
+        const nature = resolveAccountNature(
+          accountMap[code]?.accountNature || accountMap[code]?.account_nature,
+          code,
+        );
         openingBalances[code] =
           (openingBalances[code] || 0) +
-          parseFloat(t.dr || 0) -
-          parseFloat(t.cr || 0);
+          signedMovement(nature, t.dr, t.cr);
       }
     });
 
@@ -16630,6 +16638,11 @@ exports.getHierarchicalGeneralLedger = async (req, res) => {
       // Get opening balance, defaulting to 0 if not found
       const beginningBalance = openingBalances[accountCode] || 0;
       let runningBalance = beginningBalance;
+      const nature = resolveAccountNature(
+        accountMap[accountCode]?.accountNature ||
+          accountMap[accountCode]?.account_nature,
+        accountCode,
+      );
 
       // Get period transactions and sort by transaction_date then transaction_id (chronological order for correct running balance)
       const transactions = [];
@@ -16650,12 +16663,11 @@ exports.getHierarchicalGeneralLedger = async (req, res) => {
           const debit = parseFloat(t.dr || 0);
           const credit = parseFloat(t.cr || 0);
 
-          // Update running balance: debit increases balance, credit decreases balance
-          // This works for all account types:
-          // - Assets/Expenses: positive balance (debit normal)
-          // - Liabilities/Equity/Revenue: negative balance (credit normal)
+          // Nature-based running balance (Assets/Expenses: Dr−Cr; L/E/R: Cr−Dr)
           runningBalance =
-            Math.round((runningBalance + debit - credit) * 100) / 100;
+            Math.round(
+              (runningBalance + signedMovement(nature, debit, credit)) * 100,
+            ) / 100;
 
           transactions.push({
             date: moment(t.transaction_date).format("YYYY-MM-DD"),
@@ -16680,6 +16692,7 @@ exports.getHierarchicalGeneralLedger = async (req, res) => {
         const accountData = {
           code: accountCode,
           name: getAccountName(accountCode),
+          account_nature: nature,
           beginningBalance, // Separate beginning balance
           transactions, // Only period transactions, sorted by date ASC
           finalBalance: runningBalance,
@@ -18488,19 +18501,26 @@ exports.getAccountLedgerReport = async (req, res) => {
     // Expand selected codes to include all descendants in AccountCategory.
     const allFacilityAccounts = await db.AccountCategory.findAll({
       where: { facilityId },
-      attributes: ["code", "parent_code", "description", "category"],
+      attributes: [
+        "code",
+        "parentCode",
+        "description",
+        "category",
+        "accountNature",
+      ],
       raw: true,
     });
     const accountMetaByCode = new Map();
     const childrenByParent = new Map();
     allFacilityAccounts.forEach((acc) => {
-      const parent = String(acc.parent_code || "").trim();
+      const parent = String(acc.parent_code || acc.parentCode || "").trim();
       const code = String(acc.code || "").trim();
       if (!code) return;
       accountMetaByCode.set(code, {
         code,
         parent_code: parent || null,
         description: acc.description || acc.category || code,
+        account_nature: acc.account_nature || acc.accountNature || null,
       });
       if (!parent) return;
       if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
@@ -18615,12 +18635,28 @@ exports.getAccountLedgerReport = async (req, res) => {
 
     const openingMap = {};
     openingBalances.forEach((ob) => {
-      openingMap[ob.account_code] =
-        parseFloat(ob.total_dr || 0) - parseFloat(ob.total_cr || 0);
+      const code = String(ob.account_code);
+      const nature = resolveAccountNature(
+        accountMetaByCode.get(code)?.account_nature ||
+          accounts.find((a) => String(a.code) === code)?.accountNature ||
+          accounts.find((a) => String(a.code) === code)?.account_nature,
+        code,
+      );
+      openingMap[code] = signedBalance(
+        nature,
+        ob.total_dr,
+        ob.total_cr,
+      );
     });
 
     const result = accounts.map((acc) => {
       const code = String(acc.code);
+      const nature = resolveAccountNature(
+        acc.accountNature ||
+          acc.account_nature ||
+          accountMetaByCode.get(code)?.account_nature,
+        code,
+      );
       const accTxns = transactions.filter(
         (t) => String(t.account_code) === code,
       );
@@ -18628,7 +18664,7 @@ exports.getAccountLedgerReport = async (req, res) => {
 
       let runningBalance = openingBalance;
       const rows = accTxns.map((t) => {
-        runningBalance += parseFloat(t.dr || 0) - parseFloat(t.cr || 0);
+        runningBalance += signedMovement(nature, t.dr, t.cr);
         return { ...t, running_balance: runningBalance };
       });
 
@@ -18638,9 +18674,13 @@ exports.getAccountLedgerReport = async (req, res) => {
       return {
         account_code: code,
         description: acc.description || acc.category || code,
-        account_nature: acc.accountNature || acc.account_type || null,
+        account_nature: nature,
         opening_balance: openingBalance,
-        closing_balance: openingBalance + totalDr - totalCr,
+        closing_balance: Number(
+          (openingBalance + signedMovement(nature, totalDr, totalCr)).toFixed(
+            4,
+          ),
+        ),
         total_debit: totalDr,
         total_credit: totalCr,
         transactions: rows,

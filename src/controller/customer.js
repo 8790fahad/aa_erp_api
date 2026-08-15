@@ -2862,7 +2862,26 @@ export const createCustomerAdvancePayment = async (req, res) => {
     receivable_code,
     invoices: invoicesFromBody,
     allocation_order,
+    pure_advance,
+    payment_splits: paymentSplitsFromBody,
+    source,
   } = req.body;
+
+  const pureAdvance =
+    pure_advance === true ||
+    pure_advance === "true" ||
+    String(source || "").toLowerCase() === "collection_points";
+
+  const paymentSplits = Array.isArray(paymentSplitsFromBody)
+    ? paymentSplitsFromBody
+        .map((s) => ({
+          mode: String(s?.mode || "").toLowerCase().trim(),
+          amount: parseAmount(s?.amount),
+          accountHead: s?.accountHead || null,
+          bankAccount: s?.bankAccount || null,
+        }))
+        .filter((s) => s.amount != null && s.amount > 0)
+    : [];
 
   let invoices = Array.isArray(invoicesFromBody) ? invoicesFromBody : [];
   invoices = invoices.filter(
@@ -2873,9 +2892,29 @@ export const createCustomerAdvancePayment = async (req, res) => {
 
   if (!customer_no)
     return res.status(400).json({ error: "customer_no is required" });
-  const amountPaidNum = parseAmount(amount_paid);
+
+  let amountPaidNum =
+    paymentSplits.length > 0
+      ? paymentSplits.reduce((s, x) => s + (x.amount || 0), 0)
+      : parseAmount(amount_paid);
   if (amountPaidNum == null || amountPaidNum <= 0)
     return res.status(400).json({ error: "Valid amount_paid is required" });
+  if (paymentSplits.length > 0) {
+    const hasCash = paymentSplits.some((s) => s.mode === "cash");
+    const hasBank = paymentSplits.some(
+      (s) =>
+        s.mode === "bank" ||
+        s.mode === "transfer" ||
+        s.mode === "bank transfer",
+    );
+    if (!hasCash || !hasBank) {
+      return res.status(400).json({
+        error:
+          "Cash + Transfer advance requires both a cash and a transfer amount",
+      });
+    }
+    mode_of_payment = "cash+transfer";
+  }
   if (!facilityId)
     return res.status(400).json({ error: "facilityId is required" });
   if (!userId) return res.status(400).json({ error: "userId is required" });
@@ -2909,7 +2948,7 @@ export const createCustomerAdvancePayment = async (req, res) => {
       outstandingRows.map((r) => [r.invoice_ref, r.amount_due]),
     );
 
-    if (invoices.length === 0) {
+    if (invoices.length === 0 && !pureAdvance) {
       const { invoices: fifoInv, allocation } = buildFifoInvoiceAllocations(
         outstandingRows,
         amountPaidNum,
@@ -2917,6 +2956,9 @@ export const createCustomerAdvancePayment = async (req, res) => {
       );
       invoices = fifoInv;
       allocationMeta = allocation;
+    } else if (pureAdvance) {
+      invoices = [];
+      allocationMeta = { mode: "pure_advance", source: source || null };
     } else {
       const check = validateAdvanceLinesAgainstOutstanding(invoices, dueByRef);
       if (check.error) return res.status(400).json({ error: check.error });
@@ -2958,7 +3000,197 @@ export const createCustomerAdvancePayment = async (req, res) => {
       sum_applied_to_invoices: sumAlloc,
       remainder_to_advance: remainderToAdvance,
       fifo_or_client_lines: allocationMeta ? "server_fifo" : "client_lines",
+      payment_splits: paymentSplits.length,
+      pure_advance: pureAdvance,
     });
+
+    const receivableCodeToUse = receivable_code || customer.receivable_code;
+    const depositCodeToUse =
+      receivable_deposit_code || customer.receivable_accural_code;
+
+    let receivableAccount = null;
+    let depositAccount = null;
+
+    if (receivableCodeToUse) {
+      receivableAccount = await db.AccountCategory.findOne({
+        where: { code: receivableCodeToUse, facility_id: facilityId },
+      });
+      if (!receivableAccount)
+        return res.status(404).json({
+          error: `Receivable account not found: ${receivableCodeToUse}`,
+        });
+    }
+
+    if (depositCodeToUse) {
+      depositAccount = await db.AccountCategory.findOne({
+        where: { code: depositCodeToUse, facility_id: facilityId },
+      });
+      if (!depositAccount)
+        return res.status(404).json({
+          error: `Deposit/Accrual account not found: ${depositCodeToUse}`,
+        });
+    }
+
+    // Collection Points: Cash + Transfer pure advance (one AD- receipt, two funding legs)
+    if (paymentSplits.length > 0 && pureAdvance) {
+      if (!depositAccount) {
+        return res.status(400).json({
+          error: "Deposit account code required for advance payments",
+        });
+      }
+
+      const resolvedSplits = [];
+      for (const split of paymentSplits) {
+        const isCash = split.mode === "cash";
+        let headCode = null;
+        let bankId = null;
+        let accountDesc = "";
+        if (isCash) {
+          headCode = split.accountHead?.head || accountHead?.head;
+          accountDesc = split.accountHead?.description || accountHead?.description || "";
+          if (!headCode) {
+            return res.status(400).json({
+              error: "Account head is required for the cash portion",
+            });
+          }
+        } else {
+          const bankIdRaw = split.bankAccount?.id || bankAccount?.id;
+          if (!bankIdRaw) {
+            return res.status(400).json({
+              error: "Bank account is required for the transfer portion",
+            });
+          }
+          const ba = await db.bank_account.findOne({
+            where: { id: bankIdRaw, facilityId, status: "active" },
+          });
+          if (!ba) {
+            return res
+              .status(404)
+              .json({ error: "Bank account not found or inactive" });
+          }
+          headCode = ba.head;
+          bankId = ba.id;
+          accountDesc = ba.account_name || ba.bank_name || "";
+        }
+        const acct = await db.AccountCategory.findOne({
+          where: { code: headCode, facility_id: facilityId },
+        });
+        if (!acct) {
+          return res
+            .status(404)
+            .json({ error: `Cash/Bank account not found: ${headCode}` });
+        }
+        resolvedSplits.push({
+          mode: isCash ? "cash" : "bank transfer",
+          amount: split.amount,
+          account: acct,
+          bankId,
+          accountDesc,
+        });
+      }
+
+      const splitResult = await db.sequelize.transaction(async (t) => {
+        const narrationText =
+          narration ||
+          `Collection Points advance (Cash + Transfer) from ${customerName}`;
+
+        for (const split of resolvedSplits) {
+          await GeneralLedger.create(
+            {
+              transaction_date: transactionDate,
+              account_code: split.account.code,
+              account_subhead: split.account.parent_code || 0,
+              dr: split.amount,
+              cr: 0,
+              account_description:
+                split.accountDesc || split.account.description,
+              transaction_description: `${narrationText} (${split.mode})`,
+              reference_number: referenceNumber,
+              purpose_of_payment: narrationText,
+              payee: customerName,
+              bank_account_id: split.bankId || null,
+              cheque_no: cheque_number || null,
+              mode_of_payment: split.mode,
+              created_by: userId,
+              facility_id: facilityId,
+              status: "posted",
+              type: "bank",
+              transaction_ref: "",
+            },
+            { transaction: t },
+          );
+
+          await CustomerEntry.create(
+            {
+              customerNo: customer_no,
+              description: narrationText,
+              qty_in: 0,
+              qty_out: 0,
+              cost: split.amount,
+              amount_paid: split.amount,
+              facilityId,
+              link_id: null,
+              mode_of_payment: split.mode,
+              type: "deposit",
+              receiptNo: referenceNumber,
+              bank_account_id: split.bankId || split.account.code,
+              created_by: userId,
+              created_at: new Date(),
+            },
+            { transaction: t },
+          );
+        }
+
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: depositCodeToUse,
+            account_subhead:
+              depositAccount.subhead ||
+              depositAccount.parent_code ||
+              depositCodeToUse.substring(0, 6) ||
+              0,
+            dr: 0,
+            cr: amountPaidNum,
+            account_description: depositAccount.description,
+            transaction_description: `Customer advance deposit - ${customerName}`,
+            reference_number: referenceNumber,
+            purpose_of_payment: narrationText,
+            payee: customerName,
+            bank_account_id: null,
+            cheque_no: cheque_number || null,
+            mode_of_payment: "cash+transfer",
+            created_by: userId,
+            facility_id: facilityId,
+            status: "posted",
+            type: "deposit",
+            transaction_ref: customer_no,
+          },
+          { transaction: t },
+        );
+
+        return {
+          reference_number: referenceNumber,
+          transaction_ref: referenceNumber,
+          amount_paid: amountPaidNum,
+          appliedToReceivable: 0,
+          advanceAmount: amountPaidNum,
+          invoicesSettled: 0,
+          payment_mode: "cash+transfer",
+          splits: resolvedSplits.map((s) => ({
+            mode: s.mode,
+            amount: s.amount,
+          })),
+        };
+      });
+
+      return res.status(201).json({
+        success: true,
+        data: splitResult,
+        allocation: allocationMeta,
+        message: "Customer advance payment recorded successfully",
+      });
+    }
 
     let getBankAccount = null;
     let codeData = null;
@@ -2993,33 +3225,6 @@ export const createCustomerAdvancePayment = async (req, res) => {
       return res
         .status(404)
         .json({ error: `Cash/Bank account not found: ${codeData.head}` });
-
-    const receivableCodeToUse = receivable_code || customer.receivable_code;
-    const depositCodeToUse =
-      receivable_deposit_code || customer.receivable_accural_code;
-
-    let receivableAccount = null;
-    let depositAccount = null;
-
-    if (receivableCodeToUse) {
-      receivableAccount = await db.AccountCategory.findOne({
-        where: { code: receivableCodeToUse, facility_id: facilityId },
-      });
-      if (!receivableAccount)
-        return res.status(404).json({
-          error: `Receivable account not found: ${receivableCodeToUse}`,
-        });
-    }
-
-    if (depositCodeToUse) {
-      depositAccount = await db.AccountCategory.findOne({
-        where: { code: depositCodeToUse, facility_id: facilityId },
-      });
-      if (!depositAccount)
-        return res.status(404).json({
-          error: `Deposit/Accrual account not found: ${depositCodeToUse}`,
-        });
-    }
 
     const ledgerEntries = [];
     let amountAppliedToReceivable = 0;
@@ -3103,7 +3308,7 @@ export const createCustomerAdvancePayment = async (req, res) => {
             if (remainingAmount <= 0) break;
           }
         }
-      } else {
+      } else if (!pureAdvance) {
         const receivableBalanceDue = Math.max(0, previousBalance);
         amountAppliedToReceivable = Math.min(
           remainingAmount,
@@ -3167,6 +3372,8 @@ export const createCustomerAdvancePayment = async (req, res) => {
             { transaction: t },
           );
         }
+      } else {
+        // pure_advance from Collection Points: leave remainingAmount as full deposit
       }
 
       if (remainingAmount > 0) {

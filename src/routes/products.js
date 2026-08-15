@@ -1,6 +1,12 @@
 module.exports = (app) => {
   const products = require("../controller/products");
 
+  // Static paths must be registered before /api/products/:id
+  app.get("/api/products/categories", products.getCategories);
+  app.get("/api/products/suppliers", products.getSuppliers);
+  app.get("/api/products/accounts", products.getAccounts);
+  app.get("/api/products/warehouses", products.getWarehouses);
+
   // Product CRUD operations
   app.post("/api/products", products.createProduct);
   app.get("/api/products", products.getProducts);
@@ -15,12 +21,6 @@ module.exports = (app) => {
   app.put("/api/products/:id/images", products.updateProductImages);
   app.put("/api/products/:id/description", products.updateProductDescription);
   app.delete("/api/products/:id", products.deleteProduct);
-
-  // Product categories and suppliers
-  app.get("/api/products/categories", products.getCategories);
-  app.get("/api/products/suppliers", products.getSuppliers);
-  app.get("/api/products/accounts", products.getAccounts);
-  app.get("/api/products/warehouses", products.getWarehouses);
 
   // Bulk operations
   app.post("/api/products/bulk-import", products.bulkImport);

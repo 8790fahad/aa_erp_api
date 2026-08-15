@@ -1,6 +1,10 @@
 const db = require("../models");
 const moment = require("moment");
 const { QueryTypes, Op } = require("sequelize");
+const {
+  signedBalance,
+  resolveAccountNature,
+} = require("../utils/accountBalance");
 
 /** SOFP: treat Assets = Liabilities + Equity as balanced if |difference| ≤ this (₦). Warn only above. */
 const SOFP_BALANCE_TOLERANCE_NAIRA = 10;
@@ -97,6 +101,7 @@ function applyLiabilityClassification(rows) {
 
 /**
  * Core balance sheet data from general_ledger + account_category (single as-of date).
+ * Balancing rules: ASSET = Dr−Cr; LIABILITY/EQUITY = Cr−Dr. (Revenue = Cr−Dr on P&L.)
  * BS sections use account_nature (ASSET / LIABILITY / EQUITY) so Inventria CoAs that put
  * liabilities under 9xxxx (not 2xxxx) still balance. No GL status filter — all postings count.
  * Current / non-current uses parent_code + segment head (balanceSheetHead3).
@@ -3348,7 +3353,6 @@ exports.getGeneralLedgerSummary = async (req, res) => {
         a.account_category,
         COALESCE(SUM(gl.dr), 0) as total_debit,
         COALESCE(SUM(gl.cr), 0) as total_credit,
-        COALESCE(SUM(gl.dr - gl.cr), 0) as net_balance,
         COUNT(gl.transaction_id) as transaction_count,
         MIN(gl.transaction_date) as first_transaction,
         MAX(gl.transaction_date) as last_transaction,
@@ -3374,6 +3378,34 @@ exports.getGeneralLedgerSummary = async (req, res) => {
     const results = await db.sequelize.query(query, {
       replacements: { facilityId, asOfDate },
       type: QueryTypes.SELECT,
+    });
+
+    // Apply nature balancing rules for net_balance display
+    const natureByCode = {};
+    try {
+      const cats = await db.AccountCategory.findAll({
+        where: { facilityId },
+        attributes: ["code", "accountNature"],
+        raw: true,
+      });
+      cats.forEach((c) => {
+        natureByCode[String(c.code)] = c.account_nature || c.accountNature;
+      });
+    } catch (_) {
+      /* legacy CoA may not have account_category */
+    }
+
+    results.forEach((row) => {
+      const nature = resolveAccountNature(
+        natureByCode[String(row.account_code)] || row.account_type,
+        row.account_code,
+      );
+      row.account_nature = nature;
+      row.net_balance = signedBalance(
+        nature,
+        row.total_debit,
+        row.total_credit,
+      );
     });
 
     // Group by age category

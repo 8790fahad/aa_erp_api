@@ -127,27 +127,28 @@ exports.createRule = async (req, res) => {
     const customerNumber = String(customerNo || customer_no || "").trim();
     const customerLabel = String(customerName || customer_name || "").trim();
 
-    if (ruleTarget === "supplier" && !supplierNumber && !supplierLabel) {
+    const productName = String(product || "All products").trim() || "All products";
+    const productSkuVal = productSku ? String(productSku).trim() : null;
+
+    // Infer target when party is provided even if client sends product
+    if (ruleBasis === "sales" && (customerNumber || customerLabel)) {
+      ruleTarget = "customer";
+    } else if (ruleBasis === "purchase" && (supplierNumber || supplierLabel)) {
+      ruleTarget = "supplier";
+    }
+
+    if (ruleBasis === "purchase" && !supplierNumber && !supplierLabel) {
       return res.status(400).json({
         success: false,
         message: "Select a supplier for this purchase rebate rule",
       });
     }
-    if (ruleTarget === "customer" && !customerNumber && !customerLabel) {
+    if (ruleBasis === "sales" && !customerNumber && !customerLabel) {
       return res.status(400).json({
         success: false,
         message: "Select a customer for this sales rebate rule",
       });
     }
-
-    const productName =
-      ruleTarget === "product"
-        ? String(product || "All products").trim() || "All products"
-        : "All products";
-    const productSkuVal =
-      ruleTarget === "product" && productSku
-        ? String(productSku).trim()
-        : null;
 
     const row = await db.RebateRule.create({
       facility_id: String(facilityId),
@@ -156,10 +157,13 @@ exports.createRule = async (req, res) => {
       target_type: ruleTarget,
       product_name: productName,
       product_sku: productSkuVal,
-      supplier_no: ruleTarget === "supplier" ? supplierNumber || null : null,
-      supplier_name: ruleTarget === "supplier" ? supplierLabel || null : null,
-      customer_no: ruleTarget === "customer" ? customerNumber || null : null,
-      customer_name: ruleTarget === "customer" ? customerLabel || null : null,
+      // Always persist party + product filters when provided (sales/purchase rules)
+      supplier_no:
+        ruleBasis === "purchase" ? supplierNumber || null : null,
+      supplier_name:
+        ruleBasis === "purchase" ? supplierLabel || null : null,
+      customer_no: ruleBasis === "sales" ? customerNumber || null : null,
+      customer_name: ruleBasis === "sales" ? customerLabel || null : null,
       period_label: String(period).trim(),
       from_date: fromDate,
       to_date: toDate,

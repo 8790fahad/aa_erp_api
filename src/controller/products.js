@@ -734,20 +734,65 @@ exports.getCategories = async (req, res) => {
   try {
     const { facilityId } = req.query;
 
-    const categories = await db.Product.findAll({
-      where: { facility_id: facilityId },
-      attributes: [
-        "item_type",
-        [db.sequelize.fn("COUNT", db.sequelize.col("id")), "count"],
-      ],
-      group: ["item_type"],
-      raw: true,
-    });
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
 
-    const formattedCategories = categories.map((cat) => ({
-      category: cat.item_type,
-      count: parseInt(cat.count),
-    }));
+    const [byCategory, byItemType] = await Promise.all([
+      db.Product.findAll({
+        where: {
+          facility_id: facilityId,
+          category: {
+            [db.Sequelize.Op.and]: [
+              { [db.Sequelize.Op.ne]: null },
+              { [db.Sequelize.Op.ne]: "" },
+            ],
+          },
+        },
+        attributes: [
+          "category",
+          [db.sequelize.fn("COUNT", db.sequelize.col("id")), "count"],
+        ],
+        group: ["category"],
+        raw: true,
+      }),
+      db.Product.findAll({
+        where: { facility_id: facilityId },
+        attributes: [
+          "item_type",
+          [db.sequelize.fn("COUNT", db.sequelize.col("id")), "count"],
+        ],
+        group: ["item_type"],
+        raw: true,
+      }),
+    ]);
+
+    const fromCategory = (byCategory || [])
+      .filter((c) => c.category)
+      .map((c) => ({
+        category: c.category,
+        count: parseInt(c.count, 10) || 0,
+        source: "category",
+      }));
+
+    // Fall back to item_type groups when products have no category labels
+    const fromType =
+      fromCategory.length > 0
+        ? []
+        : (byItemType || [])
+            .filter((c) => c.item_type)
+            .map((c) => ({
+              category: c.item_type,
+              count: parseInt(c.count, 10) || 0,
+              source: "item_type",
+            }));
+
+    const formattedCategories = [...fromCategory, ...fromType].sort((a, b) =>
+      String(a.category).localeCompare(String(b.category)),
+    );
 
     res.json({
       success: true,

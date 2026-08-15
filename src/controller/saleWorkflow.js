@@ -8,11 +8,43 @@ const {
 
 function normalizePaymentType(modeOfPayment, isCashSale) {
   if (!isCashSale) return "credit";
-  const m = String(modeOfPayment || "").toLowerCase();
-  if (m === "split") return "split";
+  const m = String(modeOfPayment || "").toLowerCase().trim();
+  if (
+    m === "split" ||
+    m === "both" ||
+    m === "cash+transfer" ||
+    m === "cash_transfer" ||
+    m === "cash + transfer"
+  ) {
+    return "split";
+  }
   if (m === "bank" || m === "transfer") return "transfer";
   if (m === "cash") return "cash";
   return "cash";
+}
+
+function isSplitPaymentType(paymentType) {
+  const t = String(paymentType || "").toLowerCase().trim();
+  return (
+    t === "split" ||
+    t === "both" ||
+    t === "cash+transfer" ||
+    t === "cash_transfer" ||
+    t === "cash + transfer"
+  );
+}
+
+function inferCollectionSideFromSplits(splits) {
+  const modes = (Array.isArray(splits) ? splits : []).map((s) =>
+    String(s?.mode || "").toLowerCase().trim(),
+  );
+  const hasCash = modes.some((m) => m === "cash" || m === "c");
+  const hasBank = modes.some((m) =>
+    ["bank", "transfer", "bank transfer"].includes(m),
+  );
+  if (hasCash && !hasBank) return "cash";
+  if (hasBank && !hasCash) return "transfer";
+  return "";
 }
 
 function normalizeHistory(history) {
@@ -54,22 +86,32 @@ function getSplitCollectionProgress(history) {
   let transfer = 0;
   let cash_by = null;
   let transfer_by = null;
+  let cash_by_name = null;
+  let transfer_by_name = null;
   let cash_at = null;
   let transfer_at = null;
   for (const h of list) {
     const side = String(h?.collection?.side || "").toLowerCase();
     const amt = Number(h?.collection?.amount) || 0;
     if (!amt) continue;
+    const byName =
+      h?.collection?.by_name ||
+      h?.by_name ||
+      null;
     if (side === "cash") {
       cash += amt;
       cash_by = h.by || cash_by;
+      // Prefer latest collector name on this side
+      if (byName) cash_by_name = byName;
       cash_at = h.at || cash_at;
     } else if (side === "transfer" || side === "bank") {
       transfer += amt;
       transfer_by = h.by || transfer_by;
+      if (byName) transfer_by_name = byName;
       transfer_at = h.at || transfer_at;
     }
   }
+  const collected_total = Number((cash + transfer).toFixed(2));
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
@@ -77,10 +119,21 @@ function getSplitCollectionProgress(history) {
     transfer_done: transfer > 0.05,
     cash_by,
     transfer_by,
+    cash_by_name,
+    transfer_by_name,
     cash_at,
     transfer_at,
-    collected_total: Number((cash + transfer).toFixed(2)),
+    collected_total,
   };
+}
+
+/** Persist workflow history JSON (Sequelize may miss nested mutations). */
+function setWorkflowHistory(row, nextHistory) {
+  const value = normalizeHistory(nextHistory);
+  row.set("history", value);
+  if (typeof row.changed === "function") {
+    row.changed("history", true);
+  }
 }
 
 function stageMeta(statusId) {
@@ -829,8 +882,7 @@ exports.getCashierDashboard = async (req, res) => {
     const pendingRows = pending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
-      const split_progress =
-        String(plain.payment_type || "").toLowerCase() === "split"
+      const split_progress = isSplitPaymentType(plain.payment_type)
           ? getSplitCollectionProgress(plain.history)
           : null;
       return {
@@ -842,6 +894,42 @@ exports.getCashierDashboard = async (req, res) => {
         split_progress,
       };
     });
+
+    // Resolve collector display names for split progress (when only user id stored)
+    const collectorIds = new Set();
+    pendingRows.forEach((r) => {
+      if (r.split_progress?.cash_by) collectorIds.add(String(r.split_progress.cash_by));
+      if (r.split_progress?.transfer_by)
+        collectorIds.add(String(r.split_progress.transfer_by));
+    });
+    if (collectorIds.size && db.users) {
+      try {
+        const users = await db.users.findAll({
+          where: { id: [...collectorIds] },
+          attributes: ["id", "firstname", "lastname", "username"],
+        });
+        const nameById = {};
+        users.forEach((u) => {
+          nameById[String(u.id)] =
+            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
+            u.username ||
+            String(u.id);
+        });
+        pendingRows.forEach((r) => {
+          if (!r.split_progress) return;
+          if (!r.split_progress.cash_by_name && r.split_progress.cash_by) {
+            r.split_progress.cash_by_name =
+              nameById[String(r.split_progress.cash_by)] || null;
+          }
+          if (!r.split_progress.transfer_by_name && r.split_progress.transfer_by) {
+            r.split_progress.transfer_by_name =
+              nameById[String(r.split_progress.transfer_by)] || null;
+          }
+        });
+      } catch (_) {
+        /* ignore name lookup failures */
+      }
+    }
 
     // Credit sales awaiting approval (Collection Points → Credit tab)
     const creditWhere = {
@@ -897,7 +985,7 @@ exports.getCashierDashboard = async (req, res) => {
       summary.pending_count = creditRows.length;
     }
 
-    // Today's confirmed payments from customer_entries (invoice deposits)
+    // Today's confirmed payments from customer_entries (invoice collections + advances)
     const todayReplacements = { facilityId };
     let branchClause = "";
     if (branchId && branchId !== "all") {
@@ -921,6 +1009,10 @@ exports.getCashierDashboard = async (req, res) => {
            ce.description LIKE 'Sale payment%'
            OR ce.link_id LIKE 'INV-%'
            OR ce.receiptNo LIKE 'INV-%'
+           OR ce.receiptNo LIKE 'AD-%'
+           OR ce.description LIKE '%advance%'
+           OR ce.description LIKE '%Advance%'
+           OR ce.description LIKE '%Collection Points advance%'
          )
          ${branchClause}
        GROUP BY LOWER(TRIM(ce.mode_of_payment))`,
@@ -936,8 +1028,92 @@ exports.getCashierDashboard = async (req, res) => {
       const mode = String(row.mode_of_payment || "").toLowerCase();
       const total = Number(row.total) || 0;
       if (mode === "cash") collected_cash += total;
-      else if (mode === "bank" || mode === "transfer") collected_transfer += total;
+      else if (
+        mode === "bank" ||
+        mode === "transfer" ||
+        mode === "bank transfer" ||
+        mode === "cheque"
+      ) {
+        collected_transfer += total;
+      } else if (
+        mode === "split" ||
+        mode === "cash+transfer" ||
+        mode === "cash + transfer"
+      ) {
+        // Split advances are stored as separate cash/bank rows; ignore aggregate if any
+      }
     }
+
+    // Recent customer advances for Collection Points history (Cash / Transfer tabs)
+    const advanceRows = await db.sequelize.query(
+      `SELECT
+         ce.entry_id,
+         ce.receiptNo AS sale_code,
+         ce.customerNo AS customer_no,
+         COALESCE(c.fullname, ce.customerNo) AS customer_name,
+         ce.mode_of_payment AS payment_type,
+         ce.cost AS amount,
+         ce.description,
+         ce.created_at AS updated_at,
+         ce.created_at AS createdAt
+       FROM customer_entries ce
+       LEFT JOIN customers c
+         ON c.customerNo = ce.customerNo
+        AND c.facilityId = ce.facilityId
+       WHERE ce.facilityId = :facilityId
+         AND ce.type = 'deposit'
+         AND ce.cost > 0
+         AND (
+           ce.receiptNo LIKE 'AD-%'
+           OR LOWER(ce.description) LIKE '%advance%'
+           OR LOWER(ce.description) LIKE '%collection points advance%'
+         )
+         AND (
+           ce.description NOT LIKE 'Sale payment%'
+         )
+         ${branchClause}
+       ORDER BY ce.created_at DESC
+       LIMIT 80`,
+      {
+        replacements: todayReplacements,
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const advance_history = (advanceRows || []).map((r) => {
+      const mode = String(r.payment_type || "").toLowerCase();
+      let payment_type = "cash";
+      if (
+        mode === "bank" ||
+        mode === "transfer" ||
+        mode === "bank transfer" ||
+        mode === "cheque"
+      ) {
+        payment_type = "transfer";
+      } else if (
+        mode === "split" ||
+        mode === "cash+transfer" ||
+        mode === "cash + transfer"
+      ) {
+        payment_type = "split";
+      } else if (mode === "cash") {
+        payment_type = "cash";
+      }
+      return {
+        id: `adv-${r.entry_id}`,
+        sale_code: r.sale_code || `AD-${r.entry_id}`,
+        customer_no: r.customer_no || "",
+        customer_name: r.customer_name || "",
+        payment_type,
+        amount: Number(r.amount) || 0,
+        status: "customer_advance",
+        status_label: "Customer Deposit",
+        kind: "customer_advance",
+        description: r.description || "",
+        updated_at: r.updated_at,
+        createdAt: r.createdAt,
+      };
+    });
 
     // Confirmed workflow history (recent)
     const historyWhere = {
@@ -970,22 +1146,33 @@ exports.getCashierDashboard = async (req, res) => {
       limit: 100,
     });
 
+    const workflowHistory = history.map((r) => {
+      const plain = r.toJSON();
+      return {
+        ...plain,
+        kind: "invoice",
+        history: normalizeHistory(plain.history),
+        status_label:
+          SALE_WORKFLOW_STAGES.find((s) => s.id === plain.status)?.label ||
+          plain.status,
+        amount: Number(plain.amount) || 0,
+      };
+    });
+
+    // Merge advances into history (newest first)
+    const mergedHistory = [...workflowHistory, ...advance_history].sort(
+      (a, b) =>
+        new Date(b.updated_at || b.createdAt || 0) -
+        new Date(a.updated_at || a.createdAt || 0),
+    );
+
     return res.json({
       success: true,
       results: {
         pending: pendingRows,
         credit_pending: creditRows,
-        history: history.map((r) => {
-          const plain = r.toJSON();
-          return {
-            ...plain,
-            history: normalizeHistory(plain.history),
-            status_label:
-              SALE_WORKFLOW_STAGES.find((s) => s.id === plain.status)?.label ||
-              plain.status,
-            amount: Number(plain.amount) || 0,
-          };
-        }),
+        history: mergedHistory.slice(0, 120),
+        advance_history,
         summary: {
           ...summary,
           collected_cash_today: collected_cash,
@@ -1152,6 +1339,26 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
 
+    let collectorName =
+      String(req.body.collector_name || req.body.updated_by_name || "").trim() ||
+      null;
+    if (!collectorName && updated_by && db.users) {
+      try {
+        const u = await db.users.findByPk(updated_by, {
+          attributes: ["firstname", "lastname", "username"],
+          transaction,
+        });
+        if (u) {
+          collectorName =
+            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
+            u.username ||
+            null;
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
     const row = await db.SaleWorkflow.findOne({
       where: { facility_id: facilityId, sale_code: saleCode },
       transaction,
@@ -1186,7 +1393,11 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
     const ct = String(cashier_type || "").toLowerCase();
-    if (ct === "cash" && paymentType !== "cash" && paymentType !== "split") {
+    if (
+      ct === "cash" &&
+      paymentType !== "cash" &&
+      !isSplitPaymentType(paymentType)
+    ) {
       await transaction.rollback();
       return res.status(403).json({
         success: false,
@@ -1197,7 +1408,7 @@ exports.cashierConfirmPayment = async (req, res) => {
       ct === "transfer" &&
       paymentType !== "transfer" &&
       paymentType !== "bank" &&
-      paymentType !== "split"
+      !isSplitPaymentType(paymentType)
     ) {
       await transaction.rollback();
       return res.status(403).json({
@@ -1220,7 +1431,7 @@ exports.cashierConfirmPayment = async (req, res) => {
     )
       .toLowerCase()
       .trim();
-    const isSplit = paymentType === "split";
+    const isSplit = isSplitPaymentType(paymentType);
     const progress = isSplit
       ? getSplitCollectionProgress(row.history)
       : {
@@ -1242,52 +1453,10 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
 
-    // Cash + Transfer: each collection point only posts its own side
-    if (isSplit && (collectionSide === "cash" || collectionSide === "transfer")) {
-      const sideModes =
-        collectionSide === "cash"
-          ? ["cash", "c"]
-          : ["bank", "transfer", "bank transfer"];
-      rawSplits = rawSplits.filter((s) =>
-        sideModes.includes(String(s.mode || "").toLowerCase().trim()),
-      );
-      if (!rawSplits.length) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message:
-            collectionSide === "cash"
-              ? "Cash collection point must submit a cash amount"
-              : "Transfer collection point must submit a transfer amount",
-        });
-      }
-      if (collectionSide === "cash" && progress.cash_done) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: "Cash portion already collected for this invoice",
-        });
-      }
-      if (collectionSide === "transfer" && progress.transfer_done) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: "Transfer portion already collected for this invoice",
-        });
-      }
-    } else {
-      // Full settlement in one step (admin / both sides together)
-      const splitTotal = rawSplits.reduce(
-        (sum, s) => sum + (Number(s.amount) || 0),
-        0,
-      );
-      if (Math.abs(splitTotal - amountDue) > 0.05) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Payment total (${splitTotal}) must equal amount due (${amountDue})`,
-        });
-      }
+    // Prefer explicit side, else infer from submitted modes (cash-only → cash, etc.)
+    let resolvedSide = collectionSide;
+    if (resolvedSide !== "cash" && resolvedSide !== "transfer") {
+      resolvedSide = inferCollectionSideFromSplits(rawSplits);
     }
 
     const portionTotal = rawSplits.reduce(
@@ -1302,34 +1471,57 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
 
-    if (isSplit && (collectionSide === "cash" || collectionSide === "transfer")) {
+    if (isSplit) {
+      // Cash + Transfer: part payment from either point is always allowed
+      // (amount may be less than invoice total; advance when cash+transfer = due).
+      if (resolvedSide === "cash" || resolvedSide === "transfer") {
+        const sideModes =
+          resolvedSide === "cash"
+            ? ["cash", "c"]
+            : ["bank", "transfer", "bank transfer"];
+        rawSplits = rawSplits.filter((s) =>
+          sideModes.includes(String(s.mode || "").toLowerCase().trim()),
+        );
+        if (!rawSplits.length) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              resolvedSide === "cash"
+                ? "Cash collection point must submit a cash amount"
+                : "Transfer collection point must submit a transfer amount",
+          });
+        }
+      }
+
       const remaining = Number(
         (amountDue - (progress.collected_total || 0)).toFixed(2),
       );
-      if (portionTotal - remaining > 0.05) {
+      if (remaining <= 0.05) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "This invoice is already fully collected",
+        });
+      }
+      const paidNow = rawSplits.reduce(
+        (sum, s) => sum + (Number(s.amount) || 0),
+        0,
+      );
+      if (paidNow - remaining > 0.05) {
         await transaction.rollback();
         return res.status(400).json({
           success: false,
           message: `Amount exceeds remaining balance (₦${remaining.toFixed(2)})`,
         });
       }
-      const otherDone =
-        collectionSide === "cash"
-          ? progress.transfer_done
-          : progress.cash_done;
-      if (!otherDone && portionTotal >= amountDue - 0.05) {
+    } else {
+      // Cash-only / transfer-only: full settlement in one step
+      if (Math.abs(portionTotal - amountDue) > 0.05) {
         await transaction.rollback();
         return res.status(400).json({
           success: false,
-          message:
-            "Enter only your portion — leave the remainder for the other collection point (Cash or Transfer)",
-        });
-      }
-      if (otherDone && Math.abs(portionTotal - remaining) > 0.05) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Second portion must equal remaining ₦${remaining.toFixed(2)}`,
+          message: `Payment total (${portionTotal}) must equal amount due (${amountDue})`,
         });
       }
     }
@@ -1499,14 +1691,46 @@ exports.cashierConfirmPayment = async (req, res) => {
         { transaction },
       );
 
-      if (isSplit && (collectionSide === "cash" || collectionSide === "transfer")) {
-        const side = collectionSide === "cash" ? "cash" : "transfer";
-        row.history = pushHistory(
-          row.history,
-          "awaiting_cashier_confirm",
-          updated_by,
-          `${side === "cash" ? "Cash" : "Transfer"} portion collected ₦${payAmt.toFixed(2)}`,
-          { collection: { side, amount: payAmt } },
+      if (isSplit && (resolvedSide === "cash" || resolvedSide === "transfer")) {
+        const side = resolvedSide === "cash" ? "cash" : "transfer";
+        setWorkflowHistory(
+          row,
+          pushHistory(
+            row.history,
+            "awaiting_cashier_confirm",
+            updated_by,
+            `${side === "cash" ? "Cash" : "Transfer"} portion collected ₦${payAmt.toFixed(2)}${
+              collectorName ? ` by ${collectorName}` : ""
+            }`,
+            {
+              collection: {
+                side,
+                amount: payAmt,
+                by_name: collectorName,
+              },
+            },
+          ),
+        );
+      } else if (isSplit) {
+        // Both modes in one submit — record each
+        const side = mode === "cash" ? "cash" : "transfer";
+        setWorkflowHistory(
+          row,
+          pushHistory(
+            row.history,
+            "awaiting_cashier_confirm",
+            updated_by,
+            `${side === "cash" ? "Cash" : "Transfer"} portion collected ₦${payAmt.toFixed(2)}${
+              collectorName ? ` by ${collectorName}` : ""
+            }`,
+            {
+              collection: {
+                side,
+                amount: payAmt,
+                by_name: collectorName,
+              },
+            },
+          ),
         );
       }
     }
@@ -1516,36 +1740,38 @@ exports.cashierConfirmPayment = async (req, res) => {
     const updatedProgress = isSplit
       ? getSplitCollectionProgress(row.history)
       : null;
-    const fullyPaid =
-      !isSplit ||
-      !(collectionSide === "cash" || collectionSide === "transfer")
-        ? true
-        : !!(
-            updatedProgress &&
-            updatedProgress.cash_done &&
-            updatedProgress.transfer_done &&
-            Math.abs(updatedProgress.collected_total - amountDue) <= 0.05
-          );
+    const fullyPaid = isSplit
+      ? !!(
+          updatedProgress &&
+          Math.abs(updatedProgress.collected_total - amountDue) <= 0.05
+        )
+      : true;
 
     if (fullyPaid) {
       row.status = "invoice_separation";
       row.hold_overnight = false;
-      row.history = pushHistory(
-        row.history,
-        "payment_confirmed",
-        updated_by,
-        note ||
-          (isSplit
-            ? "Cash + Transfer fully collected — ready for separation"
-            : `Payment collected by cashier (${rawSplits
-                .map((s) => `${s.mode}:${s.amount}`)
-                .join(", ")})`),
+      setWorkflowHistory(
+        row,
+        pushHistory(
+          row.history,
+          "payment_confirmed",
+          updated_by,
+          note ||
+            (isSplit
+              ? "Cash + Transfer fully collected — ready for separation"
+              : `Payment collected by cashier (${rawSplits
+                  .map((s) => `${s.mode}:${s.amount}`)
+                  .join(", ")})`),
+        ),
       );
-      row.history = pushHistory(
-        row.history,
-        "invoice_separation",
-        updated_by,
-        "Ready for invoice separation by branch",
+      setWorkflowHistory(
+        row,
+        pushHistory(
+          row.history,
+          "invoice_separation",
+          updated_by,
+          "Ready for invoice separation by branch",
+        ),
       );
       row.updated_by = updated_by || row.updated_by;
       await row.save({ transaction });
@@ -1576,24 +1802,30 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
 
-    // Partial split — stay at collection points for the other side
+    // Partial split — stay at collection points until cash + transfer cover amount due
     row.updated_by = updated_by || row.updated_by;
     await row.save({ transaction });
     await transaction.commit();
 
-    const waitingFor = updatedProgress?.cash_done ? "transfer" : "cash";
+    const rem = Number(
+      (amountDue - (updatedProgress?.collected_total || 0)).toFixed(2),
+    );
+    const sideLabel =
+      resolvedSide === "transfer"
+        ? "Transfer"
+        : resolvedSide === "cash"
+          ? "Cash"
+          : "Payment";
     return res.json({
       success: true,
-      message: `${
-        collectionSide === "cash" ? "Cash" : "Transfer"
-      } portion recorded for ${saleRef}. Waiting for ${waitingFor} collection.`,
+      message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${rem.toFixed(2)} — collect from Cash and/or Transfer.`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
         split_progress: updatedProgress,
         partial: true,
-        waiting_for: waitingFor,
+        remaining: rem,
       },
     });
   } catch (err) {
