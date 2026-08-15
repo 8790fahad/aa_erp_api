@@ -188,7 +188,8 @@ exports.createAsset = async (req, res) => {
     let journalRef = null;
     let ledgerWarning = null;
 
-    // Already booked in purchase (or explicit postToLedger=false) — skip capitalization JE.
+    // Register-only by default: no capitalization JE unless postToLedger is
+    // explicitly true. Account treatment for dep is posted by Run Depreciation.
     const alreadyInPurchase =
       recordedInPurchase === true ||
       recordedInPurchase === 'true' ||
@@ -197,11 +198,7 @@ exports.createAsset = async (req, res) => {
       asset.recorded_in_purchase === true;
     const shouldPostLedger =
       !alreadyInPurchase &&
-      (postToLedger === true ||
-        postToLedger === 'true' ||
-        (postToLedger !== false &&
-          postToLedger !== 'false' &&
-          !invoiceRef));
+      (postToLedger === true || postToLedger === 'true' || postToLedger === 1 || postToLedger === '1');
 
     if (shouldPostLedger) {
       try {
