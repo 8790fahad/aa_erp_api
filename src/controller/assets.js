@@ -1514,6 +1514,26 @@ exports.createAssetMaintenance = async (req, res) => {
 
     await syncAssetMaintenanceStatus(id, createdBy);
 
+    const maintCost = parseFloat(cost || 0);
+    if (maintCost > 0 && AssetTransaction) {
+      try {
+        await AssetTransaction.create({
+          id: uuidv4(),
+          assetId: id,
+          transactionType: 'Maintenance',
+          transactionDate: actualDate || scheduledDate || new Date().toISOString().slice(0, 10),
+          amount: maintCost,
+          description: description || `Maintenance - ${asset.asset_name || asset.description}`,
+          facilityId: facilityId || asset.facility_id,
+          createdBy,
+          status: 'Approved',
+          journalEntryId: null,
+        });
+      } catch (txErr) {
+        console.warn('Maintenance asset transaction skipped:', txErr.message);
+      }
+    }
+
     res.status(201).json({
       success: true,
       message: 'Maintenance record created successfully',
@@ -1783,5 +1803,102 @@ exports.getMaintenanceCostsReport = async (req, res) => {
   } catch (error) {
     console.error('Error generating maintenance-costs report:', error);
     res.status(500).json({ success: false, message: 'Error generating maintenance-costs report', error: error.message });
+  }
+};
+
+/**
+ * GET /api/assets/account-entries?facilityId=&status=
+ * Account / asset-transaction entries scoped to a register status route.
+ * status: All | Active | Under Maintenance | Disposed | Written Off
+ */
+exports.getAccountEntries = async (req, res) => {
+  try {
+    const { facilityId, status } = req.query;
+    if (!facilityId) {
+      return res.status(400).json({ success: false, message: 'facilityId is required' });
+    }
+    if (!AssetTransaction) {
+      return res.json({ success: true, data: { entries: [], count: 0 } });
+    }
+
+    const statusFilter = status && status !== 'All' ? status : null;
+    const assetWhere = { facility_id: facilityId };
+    if (statusFilter) assetWhere.status = statusFilter;
+
+    const assets = await Asset.findAll({
+      where: assetWhere,
+      attributes: [
+        'id',
+        'asset_code',
+        'asset_name',
+        'description',
+        'category',
+        'status',
+        'acquisition_cost',
+        'accumulated_depreciation',
+        'net_book_value',
+      ],
+    });
+    const assetIds = assets.map((a) => a.id);
+    if (assetIds.length === 0) {
+      return res.json({ success: true, data: { entries: [], count: 0, status: statusFilter || 'All' } });
+    }
+
+    const typeByStatus = {
+      Active: ['Acquisition', 'Depreciation'],
+      'Under Maintenance': ['Maintenance'],
+      Disposed: ['Disposal'],
+      'Written Off': ['Disposal'],
+    };
+    const txWhere = {
+      facilityId,
+      assetId: { [Op.in]: assetIds },
+    };
+    if (statusFilter && typeByStatus[statusFilter]) {
+      txWhere.transactionType = { [Op.in]: typeByStatus[statusFilter] };
+    }
+
+    const transactions = await AssetTransaction.findAll({
+      where: txWhere,
+      order: [['transactionDate', 'DESC'], ['createdAt', 'DESC']],
+      limit: 500,
+    });
+
+    const byId = new Map(assets.map((a) => [a.id, a]));
+    const entries = transactions.map((t) => {
+      const row = t.toJSON ? t.toJSON() : t;
+      const asset = byId.get(row.assetId);
+      return {
+        id: row.id,
+        assetId: row.assetId,
+        assetCode: asset?.asset_code || '',
+        assetName: asset?.asset_name || asset?.description || '',
+        assetStatus: asset?.status || '',
+        category: asset?.category || '',
+        transactionType: row.transactionType,
+        transactionDate: row.transactionDate,
+        amount: parseFloat(row.amount || 0),
+        description: row.description || '',
+        journalRef: row.journalEntryId || null,
+        disposalProceeds:
+          row.disposalProceeds != null ? parseFloat(row.disposalProceeds) : null,
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        status: statusFilter || 'All',
+        count: entries.length,
+        entries,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching asset account entries:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching asset account entries',
+      error: error.message,
+    });
   }
 };

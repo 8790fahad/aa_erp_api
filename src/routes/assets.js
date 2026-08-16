@@ -47,6 +47,13 @@ module.exports = (app) => {
     assets.getMaintenanceCostsReport
   );
 
+  // Account entries by asset status (static — before /:id)
+  app.get(
+    "/api/assets/account-entries",
+    authenticate,
+    assets.getAccountEntries
+  );
+
   // Maintenance update by maintenance id (static-ish path before /:id CRUD)
   app.put(
     "/api/assets/maintenance/:maintenanceId",

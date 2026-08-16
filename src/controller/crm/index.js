@@ -168,8 +168,26 @@ exports.listCustomers = async (req, res) => {
       replacements.crm_status = crm_status;
     }
     if (segment_key) {
-      where.push(`meta.segment_key = :segment_key`);
-      replacements.segment_key = segment_key;
+      // Built-in segments store filters.crm_status; resolve those by status.
+      // Custom segments (no status filter) match assigned meta.segment_key.
+      const seg = await db.CrmSegment.findOne({
+        where: { facility_id: facilityId, segment_key },
+      });
+      let filters = seg?.filters;
+      if (typeof filters === "string") {
+        try {
+          filters = JSON.parse(filters);
+        } catch (_) {
+          filters = null;
+        }
+      }
+      if (filters?.crm_status) {
+        where.push(`COALESCE(meta.crm_status, 'New') = :crm_status_from_seg`);
+        replacements.crm_status_from_seg = filters.crm_status;
+      } else {
+        where.push(`meta.segment_key = :segment_key`);
+        replacements.segment_key = segment_key;
+      }
     }
     if (assigned_user_id) {
       where.push(`meta.assigned_user_id = :assigned_user_id`);

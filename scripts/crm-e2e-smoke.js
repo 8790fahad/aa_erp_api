@@ -2,9 +2,12 @@
 
 const FACILITY = "094c6e1e-dd07-48c4-a344-6e9d58cd7861";
 const BASE = "http://127.0.0.1:42844";
+const EMAIL = process.env.CRM_E2E_EMAIL || "admin@gmail.com";
+const PASSWORD = process.env.CRM_E2E_PASSWORD || "Ashiru@2026";
 
 let pass = 0;
 let fail = 0;
+let AUTH = "";
 
 function ok(name, detail = "") {
   pass += 1;
@@ -16,9 +19,11 @@ function bad(name, detail = "") {
 }
 
 async function req(method, path, body) {
+  const headers = { "Content-Type": "application/json" };
+  if (AUTH) headers.authorization = AUTH;
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -53,6 +58,37 @@ async function expectOk(name, method, path, body, assertFn) {
 
 (async () => {
   console.log(`===== CRM API E2E (${FACILITY}) =====`);
+
+  const login = await fetch(`${BASE}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  const loginJson = await login.json().catch(() => ({}));
+  if (!login.ok || !loginJson.success || !loginJson.token) {
+    bad("login", loginJson.message || loginJson.error || `HTTP ${login.status}`);
+    console.log(`\n===== RESULT: ${pass} passed, ${fail} failed =====`);
+    process.exit(1);
+  }
+  AUTH = loginJson.token.startsWith("Bearer ")
+    ? loginJson.token
+    : `Bearer ${loginJson.token}`;
+  ok("login");
+
+  // Unauthenticated CRM must fail
+  const unauth = await fetch(
+    `${BASE}/api/v1/crm/dashboard?facilityId=${FACILITY}`,
+  );
+  if (unauth.status === 401) ok("crm rejects unauthenticated");
+  else bad("crm rejects unauthenticated", `HTTP ${unauth.status}`);
+
+  // Cross-facility must fail (random UUID)
+  const cross = await req(
+    "GET",
+    `/api/v1/crm/dashboard?facilityId=00000000-0000-0000-0000-000000000099`,
+  );
+  if (cross.status === 403) ok("crm rejects foreign facility");
+  else bad("crm rejects foreign facility", `HTTP ${cross.status} ${cross.json.error || ""}`);
 
   await expectOk(
     "dashboard",
@@ -309,8 +345,20 @@ async function expectOk(name, method, path, body, assertFn) {
     `/api/v1/crm/customers?facilityId=${FACILITY}&crm_status=VIP`,
   );
 
+  await expectOk(
+    "builtin vip segment resolves by status",
+    "GET",
+    `/api/v1/crm/customers?facilityId=${FACILITY}&segment_key=vip`,
+    null,
+    (j) => {
+      // Should not error; results may be empty but filter path must work
+      if (!Array.isArray(j.results)) throw new Error("bad results");
+    },
+  );
+
   const rb = await fetch(
     `${BASE}/api/v1/rebate-ledger/rules?facilityId=${FACILITY}`,
+    { headers: AUTH ? { authorization: AUTH } : {} },
   );
   if (rb.status === 200) ok("rebate ledger still 200");
   else bad("rebate ledger", `HTTP ${rb.status}`);

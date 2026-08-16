@@ -3,9 +3,11 @@
 const db = require("../../models");
 const smsApi = require("../../services/smsApi");
 const { CUSTOMER_NAME_SQL } = require("./classification");
+const { CRM_MAX_RECIPIENTS } = require("../../middleware/crmAuth");
 
 function facilityFrom(req) {
   return (
+    req.crmFacilityId ||
     req.query.facilityId ||
     req.body.facilityId ||
     req.headers["x-facility-id"] ||
@@ -36,8 +38,13 @@ exports.listTemplates = async (req, res) => {
     if (!facilityId) {
       return res.status(400).json({ success: false, error: "facilityId required" });
     }
+    const where = { facility_id: facilityId };
+    const channel = req.query.channel;
+    if (channel === "sms" || channel === "email") {
+      where.channel = channel;
+    }
     const rows = await db.CrmSmsTemplate.findAll({
-      where: { facility_id: facilityId },
+      where,
       order: [["updated_at", "DESC"]],
     });
     return res.json({ success: true, results: rows });
@@ -50,15 +57,31 @@ exports.listTemplates = async (req, res) => {
 exports.createTemplate = async (req, res) => {
   try {
     const facilityId = facilityFrom(req);
-    const { name, body, variables, is_active = true, created_by } = req.body;
+    const {
+      name,
+      body,
+      subject,
+      channel = "sms",
+      variables,
+      is_active = true,
+      created_by,
+    } = req.body;
     if (!facilityId || !name || !body) {
       return res
         .status(400)
         .json({ success: false, error: "facilityId, name, body required" });
     }
+    const ch = channel === "email" ? "email" : "sms";
+    if (ch === "email" && !String(subject || "").trim()) {
+      return res
+        .status(400)
+        .json({ success: false, error: "subject required for email templates" });
+    }
     const row = await db.CrmSmsTemplate.create({
       facility_id: facilityId,
       name,
+      channel: ch,
+      subject: ch === "email" ? subject : null,
       body,
       variables: variables || ["customer_name", "customer_no"],
       is_active: !!is_active,
@@ -82,8 +105,11 @@ exports.updateTemplate = async (req, res) => {
       return res.status(404).json({ success: false, error: "Not found" });
     }
     const patch = {};
-    for (const k of ["name", "body", "variables", "is_active"]) {
+    for (const k of ["name", "body", "subject", "variables", "is_active"]) {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
+    }
+    if (req.body.channel === "sms" || req.body.channel === "email") {
+      patch.channel = req.body.channel;
     }
     await row.update(patch);
     return res.json({ success: true, results: row });
@@ -200,9 +226,14 @@ exports.sendBulkSms = async (req, res) => {
       );
     }
 
-    // de-dupe by phone
+    // de-dupe by normalized phone
     const seen = new Set();
-    dest = dest.filter((r) => {
+    dest = dest
+      .map((r) => {
+        const phone = smsApi.normalizeBulkSmsPhone(r.phone) || String(r.phone || "").trim();
+        return { ...r, phone };
+      })
+      .filter((r) => {
       const phone = String(r.phone || "").trim();
       if (!phone) return false;
       if (seen.has(phone)) return false;
@@ -214,6 +245,13 @@ exports.sendBulkSms = async (req, res) => {
       return res
         .status(400)
         .json({ success: false, error: "No valid recipients with phone numbers" });
+    }
+
+    if (dest.length > CRM_MAX_RECIPIENTS) {
+      return res.status(400).json({
+        success: false,
+        error: `Too many recipients (${dest.length}). Max ${CRM_MAX_RECIPIENTS} per send.`,
+      });
     }
 
     if (dry_run) {

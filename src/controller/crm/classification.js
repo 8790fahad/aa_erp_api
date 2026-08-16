@@ -42,7 +42,31 @@ const BUILTIN_SEGMENTS = [
     description: "Recently purchasing customers",
     filters: { crm_status: "Active" },
   },
+  {
+    segment_key: "regular",
+    name: "Regular",
+    description: "Steady purchasing customers",
+    filters: { crm_status: "Regular" },
+  },
+  {
+    segment_key: "lost",
+    name: "Lost",
+    description: "Long-lost customers",
+    filters: { crm_status: "Lost" },
+  },
 ];
+
+const STATUS_TO_BUILTIN_SEGMENT = {
+  VIP: "vip",
+  Dormant: "dormant",
+  Inactive: "inactive",
+  New: "new",
+  Active: "active",
+  Regular: "regular",
+  Lost: "lost",
+};
+
+const BUILTIN_SEGMENT_KEYS = new Set(BUILTIN_SEGMENTS.map((s) => s.segment_key));
 
 /** Customer display name — column is `fullname` (legacy DBs may still have `Name`). */
 const CUSTOMER_NAME_SQL = `COALESCE(NULLIF(TRIM(c.fullname), ''), NULLIF(TRIM(c.company_name), ''), NULLIF(TRIM(CONCAT_WS(' ', c.first_name, c.last_name)), ''), c.customerNo)`;
@@ -254,16 +278,23 @@ async function classifyFacility(facilityId) {
         facility_id: facilityId,
         customer_no: row.customer_no,
         crm_status: status,
+        segment_key: STATUS_TO_BUILTIN_SEGMENT[status] || null,
       },
     });
 
-    if (!created && meta.crm_status !== status) {
-      await meta.update({ crm_status: status });
+    const builtinKey = STATUS_TO_BUILTIN_SEGMENT[status] || null;
+    const canSyncSegment =
+      !meta.segment_key || BUILTIN_SEGMENT_KEYS.has(meta.segment_key);
+    const patch = {};
+    if (meta.crm_status !== status) patch.crm_status = status;
+    if (canSyncSegment && builtinKey && meta.segment_key !== builtinKey) {
+      patch.segment_key = builtinKey;
+    }
+
+    if (Object.keys(patch).length) {
+      await meta.update(patch);
       updated += 1;
     } else if (created) {
-      updated += 1;
-    } else if (meta.crm_status !== status) {
-      await meta.update({ crm_status: status });
       updated += 1;
     }
   }
@@ -274,6 +305,8 @@ async function classifyFacility(facilityId) {
 module.exports = {
   DEFAULT_SETTINGS,
   BUILTIN_SEGMENTS,
+  STATUS_TO_BUILTIN_SEGMENT,
+  BUILTIN_SEGMENT_KEYS,
   CUSTOMER_NAME_SQL,
   SALES_METRICS_SUBQUERY,
   OUTSTANDING_SUBQUERY,

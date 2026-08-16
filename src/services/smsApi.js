@@ -196,6 +196,18 @@ exports.sendOtp = (phone, message, callback = (f) => f, err = (f) => f) => {
     .catch((e) => err(e));
 };
 
+exports.toE164Nigeria = toE164Nigeria;
+
+/**
+ * Digits for BulkSMS Nigeria (234xxxxxxxxxx). Falls back to stripped digits.
+ */
+exports.normalizeBulkSmsPhone = function normalizeBulkSmsPhone(phone) {
+  const e164 = toE164Nigeria(phone);
+  if (e164) return e164.replace(/^\+/, "");
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits || null;
+};
+
 /** Legacy Twilio helper kept for older call sites. */
 exports.sendSMS = (recipient, content) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM) {

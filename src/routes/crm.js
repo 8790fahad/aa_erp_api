@@ -1,38 +1,93 @@
 module.exports = (app) => {
+  const multer = require("multer");
   const crm = require("../controller/crm");
   const sms = require("../controller/crm/sms");
+  const email = require("../controller/crm/email");
+  const { requireCrmAuth } = require("../middleware/crmAuth");
 
-  app.get("/api/v1/crm/dashboard", crm.getDashboard);
+  const emailUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10MB per file
+      files: 5,
+    },
+  });
 
-  app.get("/api/v1/crm/customers", crm.listCustomers);
-  app.get("/api/v1/crm/customers/:customerNo", crm.getCustomer360);
-  app.get("/api/v1/crm/customers/:customerNo/timeline", crm.getCustomerTimeline);
-  app.put("/api/v1/crm/customers/:customerNo/meta", crm.updateCustomerMeta);
-  app.post("/api/v1/crm/customers/bulk-meta", crm.bulkUpdateMeta);
+  app.get("/api/v1/crm/dashboard", requireCrmAuth, crm.getDashboard);
 
-  app.get("/api/v1/crm/activities", crm.listActivities);
-  app.post("/api/v1/crm/activities", crm.createActivity);
-  app.put("/api/v1/crm/activities/:id", crm.updateActivity);
-  app.delete("/api/v1/crm/activities/:id", crm.deleteActivity);
+  app.get("/api/v1/crm/customers", requireCrmAuth, crm.listCustomers);
+  app.get(
+    "/api/v1/crm/customers/:customerNo",
+    requireCrmAuth,
+    crm.getCustomer360,
+  );
+  app.get(
+    "/api/v1/crm/customers/:customerNo/timeline",
+    requireCrmAuth,
+    crm.getCustomerTimeline,
+  );
+  app.put(
+    "/api/v1/crm/customers/:customerNo/meta",
+    requireCrmAuth,
+    crm.updateCustomerMeta,
+  );
+  app.post(
+    "/api/v1/crm/customers/bulk-meta",
+    requireCrmAuth,
+    crm.bulkUpdateMeta,
+  );
 
-  app.get("/api/v1/crm/followups", crm.listFollowups);
-  app.post("/api/v1/crm/followups", crm.createFollowup);
-  app.put("/api/v1/crm/followups/:id", crm.updateFollowup);
-  app.delete("/api/v1/crm/followups/:id", crm.deleteFollowup);
+  app.get("/api/v1/crm/activities", requireCrmAuth, crm.listActivities);
+  app.post("/api/v1/crm/activities", requireCrmAuth, crm.createActivity);
+  app.put("/api/v1/crm/activities/:id", requireCrmAuth, crm.updateActivity);
+  app.delete(
+    "/api/v1/crm/activities/:id",
+    requireCrmAuth,
+    crm.deleteActivity,
+  );
 
-  app.get("/api/v1/crm/segments", crm.listSegments);
-  app.post("/api/v1/crm/segments", crm.createSegment);
-  app.put("/api/v1/crm/segments/:id", crm.updateSegment);
-  app.delete("/api/v1/crm/segments/:id", crm.deleteSegment);
+  app.get("/api/v1/crm/followups", requireCrmAuth, crm.listFollowups);
+  app.post("/api/v1/crm/followups", requireCrmAuth, crm.createFollowup);
+  app.put("/api/v1/crm/followups/:id", requireCrmAuth, crm.updateFollowup);
+  app.delete(
+    "/api/v1/crm/followups/:id",
+    requireCrmAuth,
+    crm.deleteFollowup,
+  );
 
-  app.get("/api/v1/crm/settings", crm.getSettings);
-  app.put("/api/v1/crm/settings", crm.updateSettings);
-  app.post("/api/v1/crm/classify", crm.classify);
+  app.get("/api/v1/crm/segments", requireCrmAuth, crm.listSegments);
+  app.post("/api/v1/crm/segments", requireCrmAuth, crm.createSegment);
+  app.put("/api/v1/crm/segments/:id", requireCrmAuth, crm.updateSegment);
+  app.delete(
+    "/api/v1/crm/segments/:id",
+    requireCrmAuth,
+    crm.deleteSegment,
+  );
 
-  app.get("/api/v1/crm/sms/templates", sms.listTemplates);
-  app.post("/api/v1/crm/sms/templates", sms.createTemplate);
-  app.put("/api/v1/crm/sms/templates/:id", sms.updateTemplate);
-  app.delete("/api/v1/crm/sms/templates/:id", sms.deleteTemplate);
-  app.get("/api/v1/crm/sms/logs", sms.listSmsLogs);
-  app.post("/api/v1/crm/sms/send", sms.sendBulkSms);
+  app.get("/api/v1/crm/settings", requireCrmAuth, crm.getSettings);
+  app.put("/api/v1/crm/settings", requireCrmAuth, crm.updateSettings);
+  app.post("/api/v1/crm/classify", requireCrmAuth, crm.classify);
+
+  app.get("/api/v1/crm/sms/templates", requireCrmAuth, sms.listTemplates);
+  app.post("/api/v1/crm/sms/templates", requireCrmAuth, sms.createTemplate);
+  app.put(
+    "/api/v1/crm/sms/templates/:id",
+    requireCrmAuth,
+    sms.updateTemplate,
+  );
+  app.delete(
+    "/api/v1/crm/sms/templates/:id",
+    requireCrmAuth,
+    sms.deleteTemplate,
+  );
+  app.get("/api/v1/crm/sms/logs", requireCrmAuth, sms.listSmsLogs);
+  app.post("/api/v1/crm/sms/send", requireCrmAuth, sms.sendBulkSms);
+
+  app.get("/api/v1/crm/email/logs", requireCrmAuth, email.listEmailLogs);
+  app.post(
+    "/api/v1/crm/email/send",
+    requireCrmAuth,
+    emailUpload.array("attachments", 5),
+    email.sendBulkEmail,
+  );
 };

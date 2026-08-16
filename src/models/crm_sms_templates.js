@@ -9,6 +9,12 @@ module.exports = (sequelize, DataTypes) => {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
       facility_id: { type: DataTypes.STRING(50), allowNull: false },
       name: { type: DataTypes.STRING(150), allowNull: false },
+      channel: {
+        type: DataTypes.ENUM("sms", "email"),
+        allowNull: false,
+        defaultValue: "sms",
+      },
+      subject: { type: DataTypes.STRING(255), allowNull: true },
       body: { type: DataTypes.TEXT, allowNull: false },
       variables: { type: DataTypes.JSON, allowNull: true },
       is_active: {
