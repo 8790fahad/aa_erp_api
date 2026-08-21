@@ -13,6 +13,12 @@ const SALE_WORKFLOW_STAGES = [
     color: "amber",
   },
   {
+    id: "awaiting_discount_approval",
+    label: "Review & Approve Discount",
+    phase: "payment_cash",
+    color: "orange",
+  },
+  {
     id: "awaiting_cashier_confirm",
     label: "Cashier Confirms Payment",
     phase: "payment_cash",
@@ -87,6 +93,9 @@ function nextStageFor(current, paymentType) {
       : isWarehouse
         ? "invoice_separation"
         : "awaiting_credit_approval",
+    awaiting_discount_approval: isPaid
+      ? "awaiting_cashier_confirm"
+      : "awaiting_credit_approval",
     awaiting_payment: "awaiting_cashier_confirm",
     awaiting_cashier_confirm: "payment_confirmed",
     payment_confirmed: "invoice_separation",

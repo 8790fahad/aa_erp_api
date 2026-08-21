@@ -729,7 +729,17 @@ exports.deleteProduct = async (req, res) => {
   }
 };
 
-// Get product categories
+/** CoA brand label: "BUA PRODUCTS" → "BUA" */
+function brandLabelFromCoaDescription(description) {
+  const raw = String(description || "").trim();
+  if (!raw) return "";
+  if (/ products$/i.test(raw)) {
+    return raw.replace(/\s+products$/i, "").trim();
+  }
+  return raw;
+}
+
+// Get product categories (product.category + CoA brand groups e.g. BUA, Dangote)
 exports.getCategories = async (req, res) => {
   try {
     const { facilityId } = req.query;
@@ -741,7 +751,7 @@ exports.getCategories = async (req, res) => {
       });
     }
 
-    const [byCategory, byItemType] = await Promise.all([
+    const [byCategory, byItemType, coaBrandRows] = await Promise.all([
       db.Product.findAll({
         where: {
           facility_id: facilityId,
@@ -768,29 +778,88 @@ exports.getCategories = async (req, res) => {
         group: ["item_type"],
         raw: true,
       }),
+      // Inventory / revenue brand heads under CoA (… PRODUCTS)
+      db.sequelize.query(
+        `
+          SELECT
+            ac.code,
+            ac.description,
+            ac.category AS coa_category,
+            (
+              SELECT COUNT(*)
+              FROM products p
+              WHERE p.facility_id = ac.facility_id
+                AND (
+                  LOWER(TRIM(IFNULL(p.category, ''))) = LOWER(TRIM(
+                    CASE
+                      WHEN UPPER(TRIM(ac.description)) LIKE '% PRODUCTS'
+                      THEN TRIM(SUBSTRING(TRIM(ac.description), 1, CHAR_LENGTH(TRIM(ac.description)) - 9))
+                      ELSE TRIM(ac.description)
+                    END
+                  ))
+                  OR CAST(p.revenue_account AS CHAR) IN (
+                    SELECT CAST(c.code AS CHAR)
+                    FROM account_category c
+                    WHERE c.facility_id = ac.facility_id
+                      AND CAST(c.parent_code AS CHAR) = CAST(ac.code AS CHAR)
+                  )
+                  OR CAST(p.cogs_head AS CHAR) IN (
+                    SELECT CAST(c2.code AS CHAR)
+                    FROM account_category c2
+                    WHERE c2.facility_id = ac.facility_id
+                      AND CAST(c2.parent_code AS CHAR) = CAST(ac.code AS CHAR)
+                  )
+                )
+            ) AS product_count
+          FROM account_category ac
+          WHERE ac.facility_id = :facilityId
+            AND ac.is_active = 1
+            AND UPPER(TRIM(ac.description)) LIKE '% PRODUCTS'
+            AND LOWER(IFNULL(ac.category, '')) IN ('assets', 'revenue')
+          ORDER BY ac.description ASC
+        `,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      ),
     ]);
 
-    const fromCategory = (byCategory || [])
+    const map = new Map();
+
+    const upsert = (name, count, source) => {
+      const key = String(name || "").trim();
+      if (!key) return;
+      const prev = map.get(key.toLowerCase());
+      if (prev) {
+        prev.count = Math.max(prev.count, parseInt(count, 10) || 0);
+        if (source === "category" || source === "coa") prev.source = source;
+        return;
+      }
+      map.set(key.toLowerCase(), {
+        category: key,
+        count: parseInt(count, 10) || 0,
+        source,
+      });
+    };
+
+    (byCategory || [])
       .filter((c) => c.category)
-      .map((c) => ({
-        category: c.category,
-        count: parseInt(c.count, 10) || 0,
-        source: "category",
-      }));
+      .forEach((c) => upsert(c.category, c.count, "category"));
 
-    // Fall back to item_type groups when products have no category labels
-    const fromType =
-      fromCategory.length > 0
-        ? []
-        : (byItemType || [])
-            .filter((c) => c.item_type)
-            .map((c) => ({
-              category: c.item_type,
-              count: parseInt(c.count, 10) || 0,
-              source: "item_type",
-            }));
+    (coaBrandRows || []).forEach((row) => {
+      const label = brandLabelFromCoaDescription(row.description);
+      upsert(label, row.product_count, "coa");
+    });
 
-    const formattedCategories = [...fromCategory, ...fromType].sort((a, b) =>
+    // Fall back to item_type only when nothing else exists
+    if (map.size === 0) {
+      (byItemType || [])
+        .filter((c) => c.item_type)
+        .forEach((c) => upsert(c.item_type, c.count, "item_type"));
+    }
+
+    const formattedCategories = [...map.values()].sort((a, b) =>
       String(a.category).localeCompare(String(b.category)),
     );
 

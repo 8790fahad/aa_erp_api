@@ -460,6 +460,7 @@ async function maybeAdvanceAfterAllCollected({
 
 /**
  * Create workflow after invoice/sale is posted.
+ * Discounted sales → awaiting discount approval (before cashier/credit).
  * Paid sales → awaiting cashier confirm; credit → awaiting credit approval.
  */
 async function createSaleWorkflowRecord(
@@ -473,33 +474,37 @@ async function createSaleWorkflowRecord(
     branchId,
     createdBy,
     holdOvernight = false,
+    discountAmount = 0,
   },
   transaction,
 ) {
   if (!db.SaleWorkflow || !facilityId || !saleCode) return null;
 
-    const isPaid = paymentType !== "credit" && paymentType !== "warehouse";
-  // Cash/transfer → cashier. Warehouse → separation. Credit → credit approval.
-  const initialStatus = isPaid
-    ? "awaiting_cashier_confirm"
-    : paymentType === "warehouse"
-      ? "invoice_separation"
-      : "awaiting_credit_approval";
+  const isPaid = paymentType !== "credit" && paymentType !== "warehouse";
+  const hasDiscount = Number(discountAmount) > 0;
+
+  // Discounted invoices must be approved before Collection Points / credit path
+  let initialStatus;
+  let statusNote;
+  if (hasDiscount) {
+    initialStatus = "awaiting_discount_approval";
+    statusNote = "Awaiting discount approval before collection";
+  } else if (isPaid) {
+    initialStatus = "awaiting_cashier_confirm";
+    statusNote = "Awaiting cashier payment confirmation";
+  } else if (paymentType === "warehouse") {
+    initialStatus = "invoice_separation";
+    statusNote = "Warehouse invoice treatment — ready for separation";
+  } else {
+    initialStatus = "awaiting_credit_approval";
+    statusNote = "Awaiting credit approval";
+  }
 
   let history = [];
   history = pushHistory(history, "sales_order", createdBy, "Order created");
   history = pushHistory(history, "invoice_generated", createdBy, "Invoice generated");
   history = pushHistory(history, "submitted", createdBy, "Submitted for processing");
-  history = pushHistory(
-    history,
-    initialStatus,
-    createdBy,
-    isPaid
-      ? "Awaiting cashier payment confirmation"
-      : paymentType === "warehouse"
-        ? "Warehouse invoice treatment — ready for separation"
-        : "Awaiting credit approval",
-  );
+  history = pushHistory(history, initialStatus, createdBy, statusNote);
 
   const [row] = await db.SaleWorkflow.findOrCreate({
     where: { facility_id: facilityId, sale_code: saleCode },
@@ -748,6 +753,20 @@ exports.advanceSaleWorkflow = async (req, res) => {
       advanceNote = "Ready for invoice separation by branch";
     }
 
+    // Discount approval → release to cashier (or credit approval for credit sales)
+    if (
+      (!action || action === "advance") &&
+      row.status === "awaiting_discount_approval"
+    ) {
+      next = nextStageFor("awaiting_discount_approval", row.payment_type);
+      advanceNote =
+        next === "awaiting_credit_approval"
+          ? advanceNote ||
+            "Discount approved — awaiting credit approval"
+          : advanceNote ||
+            "Discount approved — ready for Collection Points";
+    }
+
     if (!next) {
       await transaction.rollback();
       return res.status(400).json({
@@ -942,7 +961,7 @@ exports.getCashierDashboard = async (req, res) => {
       if (Number.isFinite(bid) && bid > 0) creditWhere.branch_id = bid;
     }
     const creditPending =
-      ct === "cash" || ct === "transfer" || ct === "split"
+      ct === "cash" || ct === "transfer" || ct === "split" || ct === "discount"
         ? []
         : await db.SaleWorkflow.findAll({
             where: creditWhere,
@@ -960,11 +979,40 @@ exports.getCashierDashboard = async (req, res) => {
       };
     });
 
+    // Discounted invoices awaiting approval before Collection Points
+    const discountWhere = {
+      facility_id: facilityId,
+      status: "awaiting_discount_approval",
+    };
+    if (branchId && branchId !== "all") {
+      const bid = parseInt(branchId, 10);
+      if (Number.isFinite(bid) && bid > 0) discountWhere.branch_id = bid;
+    }
+    const discountPending =
+      ct === "cash" || ct === "transfer" || ct === "split" || ct === "credit"
+        ? []
+        : await db.SaleWorkflow.findAll({
+            where: discountWhere,
+            order: [["created_at", "DESC"]],
+            limit: 200,
+          });
+    const discountRows = discountPending.map((r) => {
+      const plain = r.toJSON();
+      const meta = stageMeta(plain.status);
+      return {
+        ...plain,
+        status_label: meta?.label || plain.status,
+        status_color: meta?.color || "orange",
+        amount: Number(plain.amount) || 0,
+      };
+    });
+
     const summary = {
       pending_cash: 0,
       pending_transfer: 0,
       pending_split: 0,
       pending_credit: 0,
+      pending_discount: 0,
       pending_count: pendingRows.length,
       pending_total: 0,
     };
@@ -981,8 +1029,15 @@ exports.getCashierDashboard = async (req, res) => {
       summary.pending_credit += amt;
       if (ct === "credit" || !ct) summary.pending_total += amt;
     }
+    for (const row of discountRows) {
+      const amt = Number(row.amount) || 0;
+      summary.pending_discount += amt;
+      if (ct === "discount" || !ct) summary.pending_total += amt;
+    }
     if (ct === "credit") {
       summary.pending_count = creditRows.length;
+    } else if (ct === "discount") {
+      summary.pending_count = discountRows.length;
     }
 
     // Today's confirmed payments from customer_entries (invoice collections + advances)
@@ -1171,6 +1226,7 @@ exports.getCashierDashboard = async (req, res) => {
       results: {
         pending: pendingRows,
         credit_pending: creditRows,
+        discount_pending: discountRows,
         history: mergedHistory.slice(0, 120),
         advance_history,
         summary: {

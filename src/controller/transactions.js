@@ -4370,6 +4370,7 @@ exports.createSale = async (req, res) => {
         amount: netAmount,
         branchId: saleBranchId,
         createdBy: created_by,
+        discountAmount,
       });
     } catch (wfErr) {
       console.error("Sale workflow create skipped:", wfErr.message);
@@ -5323,7 +5324,7 @@ exports.getAllTransactionsData = async (req, res) => {
 
 /**
  * Flat sales line report — one row per store_entries sale line (qty_out).
- * GET /api/v1/transactions/sales-line-report?facilityId=&userId=&fromDate=&toDate=&branchId=&search=
+ * GET /api/v1/transactions/sales-line-report?facilityId=&userId=&fromDate=&toDate=&branchId=&search=&category=
  */
 exports.getSalesLineReport = async (req, res) => {
   try {
@@ -5334,6 +5335,7 @@ exports.getSalesLineReport = async (req, res) => {
       toDate,
       branchId,
       search = "",
+      category = "",
       page,
       pageSize,
     } = req.query;
@@ -5426,11 +5428,31 @@ exports.getSalesLineReport = async (req, res) => {
         OR COALESCE(c_inv.fullname, c_ce.fullname, c_gl.fullname, '') LIKE :search
         OR COALESCE(c_inv.customerNo, ce_sales.customerNo, gl_recv.customer_no, '') LIKE :search
         OR COALESCE(p.name, se.product_id, '') LIKE :search
+        OR COALESCE(p.category, '') LIKE :search
       )`);
       replacements.search = `%${searchTerm}%`;
     }
 
+    const categoryTerm = String(category || "").trim();
+    if (categoryTerm) {
+      if (
+        categoryTerm.toLowerCase() === "uncategorized" ||
+        categoryTerm === "-"
+      ) {
+        whereParts.push(
+          "(p.category IS NULL OR TRIM(p.category) = '')",
+        );
+      } else {
+        whereParts.push(
+          "LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:category))",
+        );
+        replacements.category = categoryTerm;
+      }
+    }
+
     const whereSql = whereParts.join(" AND ");
+
+    const lineAmountSql = `se.qty_out * COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0)`;
 
     const fromSql = `
       FROM store_entries se
@@ -5473,6 +5495,34 @@ exports.getSalesLineReport = async (req, res) => {
        AND p.sku = se.product_id
       LEFT JOIN branches b
         ON b.id = COALESCE(NULLIF(se.branchId, 0), NULLIF(i.branchId, 0))
+      LEFT JOIN users u_sp
+        ON CAST(u_sp.id AS CHAR) = CAST(COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), '')) AS CHAR)
+      LEFT JOIN (
+        SELECT
+          ce.receiptNo,
+          ce.facilityId,
+          COALESCE(SUM(ce.cost), 0) AS vat_amount
+        FROM customer_entries ce
+        WHERE LOWER(TRIM(ce.type)) = 'tax'
+        GROUP BY ce.receiptNo, ce.facilityId
+      ) inv_vat
+        ON inv_vat.receiptNo = se.reference_number
+       AND inv_vat.facilityId = se.facilityId
+      LEFT JOIN (
+        SELECT
+          se2.reference_number,
+          se2.facilityId,
+          COALESCE(SUM(
+            se2.qty_out * COALESCE(NULLIF(se2.selling_price, 0), se2.cost_price, 0)
+          ), 0) AS goods_total
+        FROM store_entries se2
+        WHERE se2.qty_out > 0
+          AND se2.reference_number IS NOT NULL
+          AND TRIM(se2.reference_number) != ''
+        GROUP BY se2.reference_number, se2.facilityId
+      ) inv_goods
+        ON inv_goods.reference_number = se.reference_number
+       AND inv_goods.facilityId = se.facilityId
     `;
 
     const countRows = await db.sequelize.query(
@@ -5521,9 +5571,21 @@ exports.getSalesLineReport = async (req, res) => {
          END AS line_type,
          se.qty_out AS qty,
          COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0) AS unit_price,
-         se.qty_out * COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0) AS line_total,
+         ${lineAmountSql} AS line_total,
+         CASE
+           WHEN COALESCE(inv_goods.goods_total, 0) > 0.0001
+           THEN COALESCE(inv_vat.vat_amount, 0) * ((${lineAmountSql}) / inv_goods.goods_total)
+           ELSE 0
+         END AS vat_amount,
          COALESCE(NULLIF(se.branchId, 0), i.branchId) AS branch_id,
          COALESCE(b.branch_name, se.branch_name, '') AS branch_name,
+         COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), ''), '') AS salesperson_id,
+         COALESCE(
+           NULLIF(TRIM(CONCAT(IFNULL(u_sp.firstname, ''), ' ', IFNULL(u_sp.lastname, ''))), ''),
+           NULLIF(TRIM(u_sp.username), ''),
+           NULLIF(TRIM(se.inserted_by), ''),
+           '—'
+         ) AS salesperson_name,
          se.id AS store_entry_id
        ${fromSql}
        WHERE ${whereSql}
@@ -5538,27 +5600,37 @@ exports.getSalesLineReport = async (req, res) => {
       },
     );
 
-    const results = rows.map((row) => ({
-      invoice_no: row.invoice_no,
-      invoice_date: row.invoice_date,
-      customer_name: row.customer_name || "",
-      customer_no: row.customer_no || "",
-      product_name: row.product_name || "—",
-      product_sku: row.product_sku || "",
-      product_category: row.product_category || "",
-      item_type: row.item_type || "",
-      category: row.product_category || row.item_type || "",
-      line_type: row.line_type || "sales",
-      basis: "sales",
-      qty: parseFloat(row.qty || 0) || 0,
-      unit_price: parseFloat(row.unit_price || 0) || 0,
-      line_total: parseFloat(row.line_total || 0) || 0,
-      branch_id: row.branch_id,
-      branch_name: row.branch_name || "",
-      store_entry_id: row.store_entry_id,
-    }));
+    const results = rows.map((row) => {
+      const lineTotal = parseFloat(row.line_total || 0) || 0;
+      const vatAmount = parseFloat(row.vat_amount || 0) || 0;
+      return {
+        invoice_no: row.invoice_no,
+        invoice_date: row.invoice_date,
+        customer_name: row.customer_name || "",
+        customer_no: row.customer_no || "",
+        product_name: row.product_name || "—",
+        product_sku: row.product_sku || "",
+        product_category: row.product_category || "",
+        item_type: row.item_type || "",
+        category: row.product_category || row.item_type || "",
+        line_type: row.line_type || "sales",
+        basis: "sales",
+        qty: parseFloat(row.qty || 0) || 0,
+        unit_price: parseFloat(row.unit_price || 0) || 0,
+        line_total: lineTotal,
+        vat_amount: vatAmount,
+        vat: vatAmount,
+        total_incl_vat: lineTotal + vatAmount,
+        branch_id: row.branch_id,
+        branch_name: row.branch_name || "",
+        salesperson_id: row.salesperson_id || "",
+        salesperson_name: row.salesperson_name || "—",
+        store_entry_id: row.store_entry_id,
+      };
+    });
 
     const lineTotalSum = results.reduce((s, r) => s + r.line_total, 0);
+    const vatTotalSum = results.reduce((s, r) => s + r.vat_amount, 0);
 
     return res.json({
       success: true,
@@ -5568,7 +5640,11 @@ exports.getSalesLineReport = async (req, res) => {
       page: pageNum,
       pageSize: limitNum,
       totalPages: Math.ceil(totalCount / limitNum) || 0,
-      summary: { line_total: lineTotalSum },
+      summary: {
+        line_total: lineTotalSum,
+        vat_total: vatTotalSum,
+        total_incl_vat: lineTotalSum + vatTotalSum,
+      },
       userId: String(userId),
       source: "store_entries",
     });

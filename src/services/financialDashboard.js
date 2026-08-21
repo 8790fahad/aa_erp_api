@@ -680,17 +680,19 @@ async function fetchTopProducts(sequelize, facilityId, fromDate, toDate) {
         s.productId AS id,
         p.sku AS product_sku,
         COALESCE(p.name, s.description, 'Unnamed Product') AS product_name,
+        COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized') AS category,
         COALESCE(SUM(s.quantity), 0) AS units,
-        COALESCE(SUM(s.total), 0) AS revenue
+        COALESCE(SUM(s.total), 0) AS revenue,
+        COALESCE(SUM(s.quantity * COALESCE(p.cost_price, 0)), 0) AS cogs
       FROM sales s
       INNER JOIN products p ON p.id = s.productId
       WHERE p.facility_id = :facilityId
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
-      GROUP BY s.productId, product_name, product_sku
-      HAVING units > 0 OR revenue > 0.001
+      GROUP BY s.productId, product_name, product_sku, category
+      HAVING units > 0 OR revenue > 0.001 OR cogs > 0.001
       ORDER BY revenue DESC
-      LIMIT 50
+      LIMIT 100
     `,
     {
       replacements: { facilityId, fromDate, toDate },
@@ -702,14 +704,16 @@ async function fetchTopProducts(sequelize, facilityId, fromDate, toDate) {
     id: row.id,
     sku: row.product_sku || null,
     name: row.product_name,
+    category: row.category || "Uncategorized",
     units: parseInt(row.units || 0, 10),
     revenue: parseFloat(row.revenue || 0),
+    cogs: parseFloat(row.cogs || 0),
   }));
 
   const byPrice = [...items].sort((a, b) => b.revenue - a.revenue).slice(0, 5);
   const byUnit = [...items].sort((a, b) => b.units - a.units).slice(0, 5);
 
-  return { byPrice, byUnit };
+  return { byPrice, byUnit, all: items };
 }
 
 /**
@@ -895,6 +899,143 @@ async function fetchReceivablePayableSummary(sequelize, facilityId, asOfDate) {
   };
 }
 
+/**
+ * Facility-wide customer deposit (advance) and supplier advance balances.
+ * Customer deposit: GL type = deposit, credit-heavy (SUM(cr)-SUM(dr)).
+ * Supplier advance: GL type in (accrued, advance), debit-heavy (SUM(dr)-SUM(cr)).
+ */
+async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
+  const customerRows = await sequelize.query(
+    `
+      SELECT
+        gl.transaction_ref AS party_no,
+        COALESCE(
+          NULLIF(TRIM(c.fullname), ''),
+          NULLIF(TRIM(c.store_name), ''),
+          NULLIF(TRIM(c.company_name), ''),
+          gl.transaction_ref
+        ) AS party_name,
+        GREATEST(COALESCE(SUM(gl.cr) - SUM(gl.dr), 0), 0) AS balance
+      FROM general_ledger gl
+      LEFT JOIN customers c
+        ON c.customerNo = gl.transaction_ref
+        AND c.facilityId = gl.facility_id
+      WHERE gl.facility_id = :facilityId
+        AND LOWER(gl.type) = 'deposit'
+        AND gl.transaction_ref IS NOT NULL
+        AND TRIM(gl.transaction_ref) != ''
+      GROUP BY
+        gl.transaction_ref,
+        c.fullname,
+        c.store_name,
+        c.company_name
+      HAVING GREATEST(COALESCE(SUM(gl.cr) - SUM(gl.dr), 0), 0) > 0.005
+      ORDER BY balance DESC
+      LIMIT :rowLimit
+    `,
+    {
+      replacements: { facilityId, rowLimit: limit },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const customerTotalRows = await sequelize.query(
+    `
+      SELECT COALESCE(SUM(party_balance), 0) AS total_balance,
+             COUNT(*) AS party_count
+      FROM (
+        SELECT
+          GREATEST(COALESCE(SUM(cr) - SUM(dr), 0), 0) AS party_balance
+        FROM general_ledger
+        WHERE facility_id = :facilityId
+          AND LOWER(type) = 'deposit'
+          AND transaction_ref IS NOT NULL
+          AND TRIM(transaction_ref) != ''
+        GROUP BY transaction_ref
+        HAVING GREATEST(COALESCE(SUM(cr) - SUM(dr), 0), 0) > 0.005
+      ) t
+    `,
+    {
+      replacements: { facilityId },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const supplierRows = await sequelize.query(
+    `
+      SELECT
+        gl.transaction_ref AS party_no,
+        COALESCE(
+          NULLIF(TRIM(si.supplier_name), ''),
+          NULLIF(TRIM(si.company_name), ''),
+          gl.transaction_ref
+        ) AS party_name,
+        GREATEST(COALESCE(SUM(gl.dr) - SUM(gl.cr), 0), 0) AS balance
+      FROM general_ledger gl
+      LEFT JOIN suppliersinfo si
+        ON CAST(si.supplier_number AS CHAR) = CAST(gl.transaction_ref AS CHAR)
+        AND si.facilityId = gl.facility_id
+      WHERE gl.facility_id = :facilityId
+        AND LOWER(gl.type) IN ('accrued', 'advance')
+        AND gl.transaction_ref IS NOT NULL
+        AND TRIM(gl.transaction_ref) != ''
+      GROUP BY
+        gl.transaction_ref,
+        si.supplier_name,
+        si.company_name
+      HAVING GREATEST(COALESCE(SUM(gl.dr) - SUM(gl.cr), 0), 0) > 0.005
+      ORDER BY balance DESC
+      LIMIT :rowLimit
+    `,
+    {
+      replacements: { facilityId, rowLimit: limit },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const supplierTotalRows = await sequelize.query(
+    `
+      SELECT COALESCE(SUM(party_balance), 0) AS total_balance,
+             COUNT(*) AS party_count
+      FROM (
+        SELECT
+          GREATEST(COALESCE(SUM(dr) - SUM(cr), 0), 0) AS party_balance
+        FROM general_ledger
+        WHERE facility_id = :facilityId
+          AND LOWER(type) IN ('accrued', 'advance')
+          AND transaction_ref IS NOT NULL
+          AND TRIM(transaction_ref) != ''
+        GROUP BY transaction_ref
+        HAVING GREATEST(COALESCE(SUM(dr) - SUM(cr), 0), 0) > 0.005
+      ) t
+    `,
+    {
+      replacements: { facilityId },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const mapParties = (rows) =>
+    (rows || []).map((row) => ({
+      partyNo: row.party_no,
+      partyName: row.party_name || row.party_no,
+      balance: parseFloat(row.balance || 0),
+    }));
+
+  return {
+    customerDeposits: {
+      total: parseFloat(customerTotalRows[0]?.total_balance || 0),
+      count: parseInt(customerTotalRows[0]?.party_count || 0, 10),
+      parties: mapParties(customerRows),
+    },
+    supplierAdvances: {
+      total: parseFloat(supplierTotalRows[0]?.total_balance || 0),
+      count: parseInt(supplierTotalRows[0]?.party_count || 0, 10),
+      parties: mapParties(supplierRows),
+    },
+  };
+}
+
 async function fetchSalesByCategoryAndSupplier(
   sequelize,
   facilityId,
@@ -906,16 +1047,17 @@ async function fetchSalesByCategoryAndSupplier(
       SELECT
         COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized') AS name,
         COALESCE(SUM(s.quantity), 0) AS units,
-        COALESCE(SUM(s.total), 0) AS revenue
+        COALESCE(SUM(s.total), 0) AS revenue,
+        COALESCE(SUM(s.quantity * COALESCE(p.cost_price, 0)), 0) AS cogs
       FROM sales s
       INNER JOIN products p ON p.id = s.productId
       WHERE p.facility_id = :facilityId
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
       GROUP BY COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized')
-      HAVING revenue > 0.001
+      HAVING revenue > 0.001 OR cogs > 0.001
       ORDER BY revenue DESC
-      LIMIT 12
+      LIMIT 50
     `,
     {
       replacements: { facilityId, fromDate, toDate },
@@ -963,6 +1105,7 @@ async function fetchSalesByCategoryAndSupplier(
       name: r.name,
       units: parseInt(r.units || 0, 10),
       revenue: parseFloat(r.revenue || 0),
+      cogs: parseFloat(r.cogs || 0),
     })),
     bySupplier: bySupplier.map((r) => ({
       name: r.name,
@@ -1089,6 +1232,7 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     arAp,
     salesBreakdown,
     outstandingBills,
+    advanceDepositBalances,
   ] = await Promise.all([
     fetchPeriodTotals(sequelize, facilityId, fromDate, toDate),
     fetchPeriodTotals(sequelize, facilityId, prior.fromDate, prior.toDate),
@@ -1104,6 +1248,7 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     fetchReceivablePayableSummary(sequelize, facilityId, toDate),
     fetchSalesByCategoryAndSupplier(sequelize, facilityId, fromDate, toDate),
     fetchOutstandingBills(sequelize, facilityId),
+    fetchAdvanceDepositBalances(sequelize, facilityId, 8),
   ]);
 
   const operatingExpenses = operatingExpenseResult.items || [];
@@ -1173,6 +1318,7 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     salesByCategory: salesBreakdown.byCategory,
     salesBySupplier: salesBreakdown.bySupplier,
     outstandingBills,
+    advanceDepositBalances,
   };
 }
 
@@ -1181,4 +1327,5 @@ module.exports = {
   getDefaultPeriod,
   buildFinancialDashboardOverview,
   fetchReceivablePayableSummary,
+  fetchAdvanceDepositBalances,
 };

@@ -547,7 +547,7 @@ exports.getProductByItemType = async (req, res) => {
   }
 };
 
-// Get product categories
+// Get product categories (aligned with /api/products/categories CoA brands)
 exports.getProductCategories = async (req, res) => {
   try {
     const { facilityId } = req.params;
@@ -559,20 +559,66 @@ exports.getProductCategories = async (req, res) => {
       });
     }
 
-    const categories = await db.Product.findAll({
-      where: {
-        facility_id: facilityId,
-        category: { [db.Sequelize.Op.ne]: null },
-      },
-      attributes: [
-        [db.Sequelize.fn("DISTINCT", db.Sequelize.col("category")), "category"],
-      ],
-      order: [["category", "ASC"]],
+    const brandLabel = (description) => {
+      const raw = String(description || "").trim();
+      if (!raw) return "";
+      return / products$/i.test(raw)
+        ? raw.replace(/\s+products$/i, "").trim()
+        : raw;
+    };
+
+    const [byCategory, coaBrandRows] = await Promise.all([
+      db.Product.findAll({
+        where: {
+          facility_id: facilityId,
+          category: {
+            [db.Sequelize.Op.and]: [
+              { [db.Sequelize.Op.ne]: null },
+              { [db.Sequelize.Op.ne]: "" },
+            ],
+          },
+        },
+        attributes: [
+          "category",
+          [db.sequelize.fn("COUNT", db.sequelize.col("id")), "count"],
+        ],
+        group: ["category"],
+        raw: true,
+      }),
+      db.sequelize.query(
+        `
+          SELECT DISTINCT ac.description
+          FROM account_category ac
+          WHERE ac.facility_id = :facilityId
+            AND ac.is_active = 1
+            AND UPPER(TRIM(ac.description)) LIKE '% PRODUCTS'
+            AND LOWER(IFNULL(ac.category, '')) IN ('assets', 'revenue')
+          ORDER BY ac.description ASC
+        `,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      ),
+    ]);
+
+    const map = new Map();
+    (byCategory || []).forEach((c) => {
+      const key = String(c.category || "").trim();
+      if (key) map.set(key.toLowerCase(), key);
     });
+    (coaBrandRows || []).forEach((row) => {
+      const label = brandLabel(row.description);
+      if (label) map.set(label.toLowerCase(), label);
+    });
+
+    const categories = [...map.values()].sort((a, b) =>
+      a.localeCompare(b),
+    );
 
     res.status(200).json({
       success: true,
-      data: categories.map((cat) => cat.category).filter(Boolean),
+      data: categories,
     });
   } catch (error) {
     console.error("Error fetching product categories:", error);
