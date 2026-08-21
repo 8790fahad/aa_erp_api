@@ -35,6 +35,11 @@ const sendMail = require("../services/emailApi").sendMail;
 const constants = require("../services/constants").constants;
 require("dotenv").config();
 
+const JWT_SECRET =
+  process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret";
+/** Workday-length session; refresh via /auth/verify-token keeps active users signed in */
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "12h";
+
 // load input validation
 const validateRegisterForm = require("../validation/register");
 const validateLoginForm = require("../validation/login");
@@ -2446,9 +2451,9 @@ exports.login = (req, res) => {
             const payload = { id, username, email, facilityId }; //jwt payload
             jwt.sign(
               payload,
-              process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret",
+              JWT_SECRET,
               {
-                expiresIn: 3600,
+                expiresIn: JWT_EXPIRES_IN,
               },
               async (err, token) => {
                 // let accessTo = [],
@@ -2589,9 +2594,9 @@ exports.loginWithUsername = (req, res) => {
 
             jwt.sign(
               payload,
-              process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret",
+              JWT_SECRET,
               {
-                expiresIn: 3600,
+                expiresIn: JWT_EXPIRES_IN,
               },
               (err, token) => {
                 // let accessTo = [],
@@ -2668,7 +2673,7 @@ exports.verifyUserToken = (req, res) => {
     });
   }
 
-  jwt.verify(token, "secret", (err, decoded) => {
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) {
       const expired = err.name === "TokenExpiredError";
       if (expired) {
@@ -2688,13 +2693,13 @@ exports.verifyUserToken = (req, res) => {
         code: err.name,
       });
     }
-    const { id, email, facilityId } = decoded;
+    const { id, email, facilityId, username } = decoded;
     User.findAll({
       where: { id, email, facilityId },
     })
       .then((user) => {
         if (!user.length) {
-          return res.json({ msg: "user not found" });
+          return res.json({ success: false, msg: "user not found" });
         }
 
         userApi.getBusinessProfile(
@@ -2709,9 +2714,21 @@ exports.verifyUserToken = (req, res) => {
             const primaryBranch =
               branches.find((b) => b.is_primary) || branches[0];
 
+            // Issue a fresh token on each successful verify (sliding session)
+            const freshToken = jwt.sign(
+              {
+                id: userId,
+                username: user[0].dataValues.username || username,
+                email: user[0].dataValues.email || email,
+                facilityId: user[0].dataValues.facilityId || facilityId,
+              },
+              JWT_SECRET,
+              { expiresIn: JWT_EXPIRES_IN },
+            );
+
             res.json({
               success: true,
-              token: token,
+              token: "Bearer " + freshToken,
               user: {
                 id: userId,
                 username: user[0].dataValues.username,
@@ -2727,6 +2744,7 @@ exports.verifyUserToken = (req, res) => {
                 cashier_type: user[0].dataValues.cashier_type || null,
                 designation: designation,
                 facilityId: user[0].dataValues.facilityId,
+                facilityID: user[0].dataValues.facilityId,
                 branchId:
                   user[0].dataValues.branchId || primaryBranch?.id || null,
                 branchIds,
@@ -2753,12 +2771,21 @@ exports.verifyUserToken = (req, res) => {
                       .filter((item) => item.trim())
                   : [],
               },
-              business: business,
-              businessesList: businessesList,
-              businessCount: businessesList.length,
+              business: business || [],
+              businessesList: businessesList || [],
+              businessCount: (businessesList || []).length,
             });
           },
-          () => {},
+          (profileErr) => {
+            console.error(
+              "[verifyUserToken] business profile failed:",
+              profileErr,
+            );
+            return res.status(500).json({
+              success: false,
+              msg: "Unable to restore session profile.",
+            });
+          },
           user[0].dataValues.email,
         );
       })
