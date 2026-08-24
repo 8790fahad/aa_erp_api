@@ -2652,7 +2652,14 @@ exports.createSale = async (req, res) => {
         const rawMode = String(modeOfPayment || "")
           .toLowerCase()
           .trim();
-        if (rawMode === "split" || rawMode === "both") {
+        if (
+          rawMode === "credit_split" ||
+          rawMode === "credit+cash+transfer" ||
+          rawMode === "credit + cash + transfer" ||
+          rawMode === "credit_cash_transfer"
+        ) {
+          cashModeOfPayment = "credit_split";
+        } else if (rawMode === "split" || rawMode === "both") {
           cashModeOfPayment = "split";
         } else if (
           rawMode === "bank" ||
@@ -3602,12 +3609,13 @@ exports.createSale = async (req, res) => {
             "daily_sales_limit",
             "weekly_sales_limit",
             "monthly_sales_limit",
+            "sales_stopped",
           ],
         });
         if (!product) throw new Error(`Product not found: ${sku}`);
         productBySku.set(sku, product);
 
-        // Sales target / limit — block even when stock remains (aggregated qty)
+        // Sales target / limit / stop — block even when stock remains (aggregated qty)
         await assertProductSalesLimits({
           product,
           sku,
@@ -4587,10 +4595,17 @@ exports.createSale = async (req, res) => {
         customerNo: customer_id,
         customerName: customer.fullname,
         paymentType: normalizePaymentType(
-          isCashSale ? cashModeOfPayment : "CREDIT",
+          isCashSale
+            ? cashModeOfPayment
+            : String(modeOfPayment || "").toLowerCase().includes("deposit")
+              ? "deposit"
+              : "CREDIT",
           isCashSale,
         ),
-        amount: netAmount,
+        amount:
+          String(modeOfPayment || "").toLowerCase().includes("deposit")
+            ? amountToAR
+            : netAmount,
         branchId: saleBranchId,
         createdBy: created_by,
         discountAmount,

@@ -238,11 +238,11 @@ exports.postJournalEntry = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Journal entry posted successfully",
+      message: "Journal entry approved and posted to the ledger",
       data: journalEntry,
     });
   } catch (error) {
-    console.error("Error posting journal entry:", error);
+    console.error("Error approving journal entry:", error);
 
     if (error.message === "Journal entry not found") {
       return res.status(404).json({
@@ -253,7 +253,7 @@ exports.postJournalEntry = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to post journal entry",
+      message: error.message || "Failed to approve journal entry",
       error: error.message,
     });
   }

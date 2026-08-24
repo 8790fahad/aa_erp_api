@@ -121,6 +121,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         defaultValue: null,
       },
+      // When true, product cannot be sold on sales invoices
+      sales_stopped: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
       // Purchase info
       purchase_description: {
         type: DataTypes.TEXT,

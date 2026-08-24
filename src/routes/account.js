@@ -320,7 +320,20 @@ module.exports = (app) => {
   app.post("/products/add-product-name", account.productName);
   app.post("/products/add-product-data", account.addProductionData);
   app.post("/account/get-purchase-requisition", account.getRequisition);
-  app.post("/account/purchase-requisition", account.insertRequisition);
+  app.post(
+    "/account/purchase-requisition",
+    upload.fields([{ name: "po_documents", maxCount: 5 }]),
+    account.insertRequisition,
+  );
+  app.get(
+    "/account/purchase-order-documents",
+    account.getPurchaseOrderDocuments,
+  );
+  app.post(
+    "/account/purchase-order-documents",
+    upload.fields([{ name: "po_documents", maxCount: 5 }]),
+    account.uploadPurchaseOrderDocuments,
+  );
   app.post("/account/update-purchase-requisition", account.updateRequisition);
 
   app.post(

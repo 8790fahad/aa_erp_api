@@ -170,6 +170,10 @@ async function getProductSalesLimitSnapshot({
   return tightest;
 }
 
+function isSalesStopped(value) {
+  return value === true || value === 1 || value === "1";
+}
+
 /**
  * Attach sales_limit_* fields + remaining onto sellable rows (by product_id/sku).
  * Mutates and returns the same array.
@@ -190,33 +194,51 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
         daily_sales_limit: row.daily_sales_limit,
         weekly_sales_limit: row.weekly_sales_limit,
         monthly_sales_limit: row.monthly_sales_limit,
+        sales_stopped: row.sales_stopped,
       });
     }
   }
 
-  // Prefer product master if limits were not joined onto the row
+  // Prefer product master if limits / stop flag were not joined onto the row
   const missing = [...bySku.entries()].filter(
     ([, p]) =>
+      p.sales_stopped == null &&
       parseLimit(p.daily_sales_limit) == null &&
       parseLimit(p.weekly_sales_limit) == null &&
       parseLimit(p.monthly_sales_limit) == null,
   );
-  if (missing.length && db.Product) {
+  const needsStopFlag = [...bySku.entries()].filter(
+    ([, p]) => p.sales_stopped == null,
+  );
+  const skusToFetch = [
+    ...new Set([
+      ...missing.map(([sku]) => sku),
+      ...needsStopFlag.map(([sku]) => sku),
+    ]),
+  ];
+  if (skusToFetch.length && db.Product) {
     const products = await db.Product.findAll({
       where: {
         facility_id: facilityId,
-        sku: missing.map(([sku]) => sku),
+        sku: skusToFetch,
       },
       attributes: [
         "sku",
         "daily_sales_limit",
         "weekly_sales_limit",
         "monthly_sales_limit",
+        "sales_stopped",
       ],
       raw: true,
     });
     for (const p of products || []) {
-      bySku.set(String(p.sku), p);
+      const prev = bySku.get(String(p.sku)) || {};
+      bySku.set(String(p.sku), {
+        daily_sales_limit: p.daily_sales_limit ?? prev.daily_sales_limit,
+        weekly_sales_limit: p.weekly_sales_limit ?? prev.weekly_sales_limit,
+        monthly_sales_limit: p.monthly_sales_limit ?? prev.monthly_sales_limit,
+        sales_stopped: p.sales_stopped,
+      });
     }
   }
 
@@ -280,6 +302,9 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
       product.weekly_sales_limit ?? row.weekly_sales_limit ?? null;
     row.monthly_sales_limit =
       product.monthly_sales_limit ?? row.monthly_sales_limit ?? null;
+    row.sales_stopped = isSalesStopped(
+      product.sales_stopped ?? row.sales_stopped,
+    );
     const snap = snapBySku.get(sku) || null;
     row.sales_limit_period = snap?.period || null;
     row.sales_limit = snap?.limit ?? null;
@@ -303,10 +328,16 @@ async function assertProductSalesLimits({
   saleDate,
   transaction,
 }) {
+  const label = (product?.name || sku || "product").trim();
+
+  if (isSalesStopped(product?.sales_stopped)) {
+    throw new Error(
+      `Sales are stopped for ${label}. This product cannot be sold on invoices.`,
+    );
+  }
+
   const checks = limitChecksForProduct(product, saleDate);
   if (!checks.length) return;
-
-  const label = (product.name || sku || "product").trim();
 
   for (const check of checks) {
     const sold = await getSoldQtyInRange({
@@ -328,6 +359,7 @@ async function assertProductSalesLimits({
 
 module.exports = {
   parseLimit,
+  isSalesStopped,
   getSoldQtyInRange,
   getSoldQtyInRangeBatch,
   getProductSalesLimitSnapshot,

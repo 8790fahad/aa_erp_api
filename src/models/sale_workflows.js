@@ -19,6 +19,12 @@ const SALE_WORKFLOW_STAGES = [
     color: "orange",
   },
   {
+    id: "awaiting_payment_mode_approval",
+    label: "Review & Approve Payment Mode Switch",
+    phase: "payment_cash",
+    color: "indigo",
+  },
+  {
     id: "awaiting_cashier_confirm",
     label: "Cashier Confirms Payment",
     phase: "payment_cash",
@@ -82,20 +88,24 @@ function nextStageFor(current, paymentType) {
     paymentType === "cash" ||
     paymentType === "transfer" ||
     paymentType === "split" ||
+    paymentType === "credit_split" ||
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
+  const isDeposit = paymentType === "deposit";
 
   const map = {
     sales_order: "invoice_generated",
     invoice_generated: "submitted",
     submitted: isPaid
       ? "awaiting_cashier_confirm"
-      : isWarehouse
+      : isWarehouse || isDeposit
         ? "invoice_separation"
         : "awaiting_credit_approval",
     awaiting_discount_approval: isPaid
       ? "awaiting_cashier_confirm"
-      : "awaiting_credit_approval",
+      : isDeposit
+        ? "invoice_separation"
+        : "awaiting_credit_approval",
     awaiting_payment: "awaiting_cashier_confirm",
     awaiting_cashier_confirm: "payment_confirmed",
     payment_confirmed: "invoice_separation",
@@ -117,26 +127,36 @@ function stagesForPaymentType(paymentType) {
     paymentType === "cash" ||
     paymentType === "transfer" ||
     paymentType === "split" ||
+    paymentType === "credit_split" ||
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
+  const isDeposit = paymentType === "deposit";
 
   // Cash/transfer: Invoice → Cashier → Separation → Warehouse → Done
   // Warehouse: Invoice → Separation → Warehouse → Done (no cashier)
   // Credit: Invoice → Credit approval → Separation → Warehouse → Done
+  // Deposit: Invoice → Separation (or credit approval if remainder) → Warehouse → Done
   const core = [
     { id: "invoice_generated", label: "Invoice generated", phase: "order", color: "slate" },
   ];
   if (isPaid) {
     core.push({
       id: "awaiting_cashier_confirm",
-      label: "Cashier",
+      label: paymentType === "credit_split" ? "Cash + Transfer (+ Credit)" : "Cashier",
       phase: "payment_cash",
       color: "amber",
     });
-  } else if (!isWarehouse) {
+  } else if (!isWarehouse && !isDeposit) {
     core.push({
       id: "awaiting_credit_approval",
       label: "Credit approval",
+      phase: "payment_credit",
+      color: "rose",
+    });
+  } else if (isDeposit) {
+    core.push({
+      id: "awaiting_credit_approval",
+      label: "Deposit / credit",
       phase: "payment_credit",
       color: "rose",
     });
@@ -204,6 +224,8 @@ module.exports = (sequelize, DataTypes) => {
           "split",
           "bank",
           "warehouse",
+          "credit_split",
+          "deposit",
         ),
         allowNull: false,
         defaultValue: "credit",

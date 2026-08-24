@@ -254,7 +254,7 @@ function assert(cond, name, detail) {
         facilityId: FACILITY,
         saleCode: cashSaleCode,
         updated_by: userId,
-        cashier_type: "cash",
+        
         payment_splits: [
           { mode: "cash", amount: Number(wf.amount) || lineTotal, accountHead: { head: cashHead } },
         ],

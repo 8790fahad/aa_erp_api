@@ -2684,6 +2684,7 @@ exports.inventoryWriteOff = async (req, res) => {
       facilityId,
       product_id,
       branch_name,
+      branchId,
       quantity,
       notes = "",
       account_head_code,
@@ -2705,20 +2706,30 @@ exports.inventoryWriteOff = async (req, res) => {
       return res.status(400).json({ success: false, message: "quantity must be greater than zero" });
     }
 
+    const parsedBranchId = parseInt(branchId, 10);
+    const hasBranchId = Number.isInteger(parsedBranchId) && parsedBranchId > 0;
+    const zoneName = branch_name || "for sales";
+
     // ── Check available stock ──────────────────────────────────────────────
-    const branchCondition = branch_name ? "AND branch_name = :branch_name" : "";
-    const [stockRow] = await db.sequelize.query(
-      `SELECT SUM(qty_in) - SUM(qty_out) AS balance
+    let stockSql = `SELECT SUM(qty_in) - SUM(qty_out) AS balance
        FROM store_entries
        WHERE product_id = :product_id
-         AND facilityId = :facilityId
-         ${branchCondition}`,
-      {
-        replacements: { product_id, facilityId, ...(branch_name ? { branch_name } : {}) },
-        type: db.sequelize.QueryTypes.SELECT,
-        transaction,
-      },
-    );
+         AND facilityId = :facilityId`;
+    const stockReplacements = { product_id, facilityId };
+    if (hasBranchId) {
+      stockSql += ` AND branchId = :branchId
+         AND LOWER(TRIM(branch_name)) IN ('for sales', 'for sale')`;
+      stockReplacements.branchId = parsedBranchId;
+    } else if (branch_name) {
+      stockSql += ` AND branch_name = :branch_name`;
+      stockReplacements.branch_name = branch_name;
+    }
+
+    const [stockRow] = await db.sequelize.query(stockSql, {
+      replacements: stockReplacements,
+      type: db.sequelize.QueryTypes.SELECT,
+      transaction,
+    });
 
     const available = Number(stockRow?.balance || 0);
     if (qty > available) {
@@ -2759,17 +2770,22 @@ exports.inventoryWriteOff = async (req, res) => {
 
     // Fallback: avg from store_entries with cost > 0
     if (unitCost === 0) {
-      const branchFilter = branch_name ? "AND branch_name = :branch_name" : "";
-      const [avgRow] = await db.sequelize.query(
-        `SELECT SUM(qty_in * cost_price) / NULLIF(SUM(CASE WHEN qty_in > 0 AND cost_price > 0 THEN qty_in ELSE 0 END), 0) AS avg_cost
+      let avgSql = `SELECT SUM(qty_in * cost_price) / NULLIF(SUM(CASE WHEN qty_in > 0 AND cost_price > 0 THEN qty_in ELSE 0 END), 0) AS avg_cost
          FROM store_entries
-         WHERE product_id = :product_id AND facilityId = :facilityId AND cost_price > 0 ${branchFilter}`,
-        {
-          replacements: { product_id, facilityId, ...(branch_name ? { branch_name } : {}) },
-          type: db.sequelize.QueryTypes.SELECT,
-          transaction,
-        },
-      );
+         WHERE product_id = :product_id AND facilityId = :facilityId AND cost_price > 0`;
+      const avgReplacements = { product_id, facilityId };
+      if (hasBranchId) {
+        avgSql += ` AND branchId = :branchId`;
+        avgReplacements.branchId = parsedBranchId;
+      } else if (branch_name) {
+        avgSql += ` AND branch_name = :branch_name`;
+        avgReplacements.branch_name = branch_name;
+      }
+      const [avgRow] = await db.sequelize.query(avgSql, {
+        replacements: avgReplacements,
+        type: db.sequelize.QueryTypes.SELECT,
+        transaction,
+      });
       unitCost = parseFloat(avgRow?.avg_cost || 0) || 0;
     }
 
@@ -2789,7 +2805,7 @@ exports.inventoryWriteOff = async (req, res) => {
     const sequenceNo  = await getAndUpdateNumber("invwo", facilityId);
     const refBase     = `INVWO/${moment().format("YY")}/${String(sequenceNo).padStart(4, "0")}`;
     const narration   = `Inventory Write-off (Scrap/Loss) — ${product?.name || product_id} | Ref: ${refBase}`;
-    const srcBranch   = branch_name || "Inventory";
+    const srcBranch   = zoneName;
 
     // Helper
     const lookupAcct = async (code) => {
@@ -2833,6 +2849,7 @@ exports.inventoryWriteOff = async (req, res) => {
       mark_up:          0,
       markup_mode:      "percentage",
       branch_name:      srcBranch,
+      branchId:         hasBranchId ? parsedBranchId : null,
       source:           srcBranch,
       destination:      `Scrap/Loss${account_head_name ? ` (${account_head_name})` : ""}`,
       status:           "Active",
@@ -2866,6 +2883,7 @@ exports.inventoryWriteOff = async (req, res) => {
       facility_id:             facilityId,
       type:                    "expenses",
       transaction_ref:         `${refBase}-DR`,
+      ...(hasBranchId ? { branch_id: parsedBranchId } : {}),
     }, { transaction });
 
     // CR: Inventory account
@@ -2884,6 +2902,7 @@ exports.inventoryWriteOff = async (req, res) => {
         facility_id:             facilityId,
         type:                    "inventory",
         transaction_ref:         `${refBase}-CR`,
+        ...(hasBranchId ? { branch_id: parsedBranchId } : {}),
       }, { transaction });
     }
 

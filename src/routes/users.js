@@ -17,6 +17,7 @@ module.exports = (app) => {
   );
   //adding a new user
   app.post("/api/auth/add-new-staff", users.createNewUser);
+  app.post("/api/auth/bulk-staff", users.bulkCreateStaff);
   app.post(
     "/api/auth/create-staff",
     // passport.authenticate('jwt', { session: false }),

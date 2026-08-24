@@ -5,10 +5,15 @@ const {
   calculateBaseAmounts,
   JournalValidationError,
 } = require("../utils/journalValidation");
+const {
+  ensureDraftTables,
+  mapDraftToApi,
+} = require("./journalDraftStore");
 
 /**
- * Service layer for Journal Entry business logic
- * Uses GeneralLedger table directly
+ * Service layer for Journal Entry business logic.
+ * Pending journals are stored in aa_journal_drafts / aa_journal_draft_lines.
+ * General ledger rows are created ONLY on approval.
  */
 
 class JournalEntryService {
@@ -131,21 +136,96 @@ class JournalEntryService {
     }
   }
 
+
   /**
-   * Create a new journal entry
+   * Create AR/AP side entries — only called when approving into the ledger.
+   */
+  static async createPartyEntries(linesWithBaseAmounts, data, transactionRef, facilityId, userId, transaction) {
+    for (const line of linesWithBaseAmounts) {
+      if (!line.account_code || !line.number_id) continue;
+
+      const accountCheck = await this.isARorAPAccount(
+        line.account_code,
+        facilityId
+      );
+
+      const supplierCustomerType = (
+        line.supplier_customer_type ||
+        line.type ||
+        ""
+      ).toLowerCase();
+
+      const amount = parseFloat(line.debit) || parseFloat(line.credit) || 0;
+      if (amount <= 0) continue;
+
+      if (accountCheck.isAR && supplierCustomerType === "customer") {
+        const customer = await db.Customer.findOne({
+          where: {
+            customerNo: line.number_id.toString(),
+            facilityId: facilityId.toString(),
+          },
+          transaction,
+        });
+        if (!customer) continue;
+
+        await db.CustomerEntry.create(
+          {
+            customerNo: line.number_id.toString(),
+            description: data.notes || data.description || "Journal Entry",
+            cost: amount,
+            facilityId: facilityId.toString(),
+            mode_of_payment: "Journal Entry",
+            receiptNo: data.reference_number,
+            link_id: transactionRef,
+            type: line.debit > 0 ? "deposit" : "purchase",
+            created_by: userId.toString(),
+          },
+          { transaction }
+        );
+      }
+
+      if (accountCheck.isAP && supplierCustomerType === "supplier") {
+        const supplier = await db.SuppliersInfo.findOne({
+          where: {
+            supplier_number: line.number_id.toString(),
+            facilityId: facilityId.toString(),
+          },
+          transaction,
+        });
+        if (!supplier) continue;
+
+        await db.SupplierEntry.create(
+          {
+            supplier_number: line.number_id.toString(),
+            description: data.notes || data.description || "Journal Entry",
+            cost: amount,
+            facilityId: facilityId.toString(),
+            mode_of_payment: "Journal Entry",
+            cheque_no: data.reference_number,
+            link_id: transactionRef,
+            type: line.credit > 0 ? "payment" : "purchase",
+            created_by: userId.toString(),
+          },
+          { transaction }
+        );
+      }
+    }
+  }
+
+  /**
+   * Create a pending journal (draft tables only — no general_ledger yet).
    */
   static async createJournalEntry(data, facilityId, userId) {
+    await ensureDraftTables();
     const transaction = await db.sequelize.transaction();
     const notes = data.notes || data.description || "Journal Entry";
     try {
-      // Reference number must be provided from frontend (generated via number generator)
       if (!data.reference_number) {
         throw new Error(
           "Reference number is required. Please use the number generator."
         );
       }
 
-      // Validate the journal entry
       const validation = await validateJournalEntry(data, facilityId, userId);
       if (!validation.valid) {
         throw new JournalValidationError(
@@ -154,46 +234,12 @@ class JournalEntryService {
         );
       }
 
-      // Calculate base amounts for lines
       const linesWithBaseAmounts = calculateBaseAmounts(
         data.lines,
         data.currency || "NGN"
       );
-
-      // Generate unique transaction reference for grouping
       const transactionRef = this.generateTransactionRef();
 
-      // Create general ledger entries (one for each line)
-      // If a line is linked to a customer/supplier (number_id), store that ID in transaction_ref
-      // so balance reports can use it. Otherwise, use the journal-wide transactionRef.
-      const ledgerEntries = linesWithBaseAmounts.map((line, index) => ({
-        transaction_date: line.line_date || data.entry_date,
-        account_code: line.account_code,
-        account_subhead:0 ,
-        dr: line.debit || 0,
-        cr: line.credit || 0,
-        transaction_description:
-          line.line_description ||
-          line.description ||
-          data.description ||
-          line.account_name ||
-          "",
-        account_description: line.account_name || "",
-        reference_number: data.reference_number,
-        purpose_of_payment: notes || "Journal Entry",
-        payee: data.payee || null,
-        created_by: userId,
-        facility_id: facilityId,
-        status: "saved", // Draft status
-        type: "journal_entry", // Use valid ENUM value - inventory for general journal entries
-        transaction_ref: line.number_id || transactionRef,
-      }));
-
-      console.log("Creating journal entry lines:", ledgerEntries);
-
-      await db.GeneralLedger.bulkCreate(ledgerEntries, { transaction });
-
-      // Calculate totals for summary
       let totalDebit = 0;
       let totalCredit = 0;
       linesWithBaseAmounts.forEach((line) => {
@@ -201,168 +247,69 @@ class JournalEntryService {
         totalCredit += parseFloat(line.credit) || 0;
       });
 
-      // Create summary entry in journal_entries table (optional - table may not exist)
-      // Using raw query to avoid model definition issues
-      try {
-        await db.sequelize.query(
-          `INSERT INTO journal_entries
-           (reference_number, transaction_ref, entry_date, currency, description, total_debit, total_credit, status, created_by, facility_id, created_at, updated_at)
-           VALUES (:reference_number, :transaction_ref, :entry_date, :currency, :description, :total_debit, :total_credit, :status, :created_by, :facility_id, NOW(), NOW())`,
-          {
-            replacements: {
-              reference_number: data.reference_number,
-              transaction_ref: transactionRef,
-              entry_date: data.entry_date,
-              currency: data.currency || "NGN",
-              description: data.notes || data.description || "Journal Entry",
-              total_debit: totalDebit,
-              total_credit: totalCredit,
-              status: "draft",
-              created_by: userId,
-              facility_id: facilityId,
-            },
-            type: db.sequelize.QueryTypes.INSERT,
-            transaction,
-          }
-        );
-        console.log("Created journal entry summary:", transactionRef);
-      } catch (journalError) {
-        // Journal entry summary table may not exist or have different structure
-        // Continue without it - the main entry is in general_ledger
-        console.warn("Could not create journal entry summary:", journalError.message);
-      }
-
-      // Check for A/R and A/P accounts and create entries in customer_entries or supplier_entries
-      for (const line of linesWithBaseAmounts) {
-        if (!line.account_code || !line.number_id) continue;
-
-        const accountCheck = await this.isARorAPAccount(
-          line.account_code,
-          facilityId
-        );
-
-        // Get the supplier/customer type from the line data
-        const supplierCustomerType = (
-          line.supplier_customer_type ||
-          line.type ||
-          ""
-        ).toLowerCase();
-
-        const amount = parseFloat(line.debit) || parseFloat(line.credit) || 0;
-        if (amount <= 0) continue;
-
-        // For A/R accounts: Create customer entry if type is "Customer"
-        if (accountCheck.isAR && supplierCustomerType === "customer") {
-          // Verify customer exists
-          const customer = await db.Customer.findOne({
-            where: {
-              customerNo: line.number_id.toString(),
-              facilityId: facilityId.toString(),
-            },
-            transaction,
-          });
-
-          if (!customer) {
-            console.warn(
-              `Customer ${line.number_id} not found, skipping customer entry`
-            );
-            continue;
-          }
-
-          await db.CustomerEntry.create(
-            {
-              customerNo: line.number_id.toString(),
-              description: data.notes || data.description || "Journal Entry",
-              cost: amount,
-              facilityId: facilityId.toString(),
-              mode_of_payment: "Journal Entry",
-              receiptNo: data.reference_number,
-              link_id: transactionRef,
-              type: line.debit > 0 ? "deposit" : "purchase", // Debit = deposit, Credit = purchase
-              created_by: userId.toString(),
-            },
-            { transaction }
-          );
-          console.log(
-            `Created customer entry for A/R account: ${line.account_code}, Customer: ${line.number_id}`
-          );
-        }
-
-        // For A/P accounts: Create supplier entry if type is "Supplier"
-        if (accountCheck.isAP && supplierCustomerType === "supplier") {
-          // Verify supplier exists
-          const supplier = await db.SuppliersInfo.findOne({
-            where: {
-              supplier_number: line.number_id.toString(),
-              facilityId: facilityId.toString(),
-            },
-            transaction,
-          });
-
-          if (!supplier) {
-            console.warn(
-              `Supplier ${line.number_id} not found, skipping supplier entry`
-            );
-            continue;
-          }
-
-          await db.SupplierEntry.create(
-            {
-              supplier_number: line.number_id.toString(),
-              description: data.notes || data.description || "Journal Entry",
-              cost: amount,
-              facilityId: facilityId.toString(),
-              mode_of_payment: "Journal Entry",
-              cheque_no: data.reference_number,
-              link_id: transactionRef,
-              type: line.credit > 0 ? "payment" : "purchase", // Credit = payment, Debit = purchase
-              created_by: userId.toString(),
-            },
-            { transaction }
-          );
-          console.log(
-            `Created supplier entry for A/P account: ${line.account_code}, Supplier: ${line.number_id}`
-          );
-        }
-      }
-
-      await transaction.commit();
-
-      console.log(
-        `✓ Journal entry created with transaction_ref: ${transactionRef}`
-      );
-
-      // Fetch and return the created entry (after commit, so errors won't rollback)
-      try {
-        return await this.getJournalEntryByRef(transactionRef, facilityId);
-      } catch (fetchError) {
-        // If fetch fails, we still return success since the entry was created
-        console.warn("Could not fetch created journal entry:", fetchError.message);
-        // Return minimal data
-        return {
+      await db.JournalDraft.create(
+        {
           transaction_ref: transactionRef,
           reference_number: data.reference_number,
           entry_date: data.entry_date,
-          description: data.notes || data.description || "Journal Entry",
+          currency: data.currency || "NGN",
+          exchange_rate: data.exchange_rate || 1,
+          description: data.description || notes,
+          notes,
+          total_debit: totalDebit,
+          total_credit: totalCredit,
           status: "draft",
-          total_debit: totalDebit.toFixed(2),
-          total_credit: totalCredit.toFixed(2),
-          facility_id: facilityId,
-          created_by: userId,
-          lines: linesWithBaseAmounts.map((line, index) => ({
-            id: index + 1,
-            line_number: index + 1,
-            account_code: line.account_code,
-            account_name: line.account_name || "",
-            description: line.description || "",
-            debit: parseFloat(line.debit || 0).toFixed(2),
-            credit: parseFloat(line.credit || 0).toFixed(2),
-            number_id: line.number_id || null,
-          })),
-        };
-      }
+          facility_id: String(facilityId),
+          created_by: String(userId),
+        },
+        { transaction }
+      );
+
+      const draftLines = linesWithBaseAmounts.map((line, index) => ({
+        transaction_ref: transactionRef,
+        facility_id: String(facilityId),
+        line_number: index + 1,
+        account_code: line.account_code,
+        account_name: line.account_name || "",
+        line_date: line.line_date || data.entry_date,
+        line_description:
+          line.line_description || line.description || data.description || "",
+        debit: line.debit || 0,
+        credit: line.credit || 0,
+        number_id: line.number_id || null,
+        supplier_customer_id: line.supplier_customer_id || line.number_id || null,
+        supplier_customer_name: line.supplier_customer_name || "",
+        supplier_customer_type: line.supplier_customer_type || line.type || "",
+      }));
+
+      await db.JournalDraftLine.bulkCreate(draftLines, { transaction });
+      await transaction.commit();
+
+      const createdByName = await this.resolveUserDisplayName(
+        userId,
+        facilityId
+      );
+      return mapDraftToApi(
+        {
+          transaction_ref: transactionRef,
+          reference_number: data.reference_number,
+          entry_date: data.entry_date,
+          currency: data.currency || "NGN",
+          exchange_rate: data.exchange_rate || 1,
+          description: data.description || notes,
+          notes,
+          total_debit: totalDebit,
+          total_credit: totalCredit,
+          status: "draft",
+          facility_id: String(facilityId),
+          created_by: String(userId),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+        draftLines,
+        createdByName
+      );
     } catch (error) {
-      // Only rollback if transaction is still active
       if (transaction && !transaction.finished) {
         await transaction.rollback();
       }
@@ -371,34 +318,48 @@ class JournalEntryService {
   }
 
   /**
-   * Update an existing journal entry (only drafts can be updated)
+   * Update a pending journal (draft tables only).
    */
   static async updateJournalEntry(transactionRef, data, facilityId, userId) {
+    await ensureDraftTables();
     const transaction = await db.sequelize.transaction();
-
     try {
-      // Find existing entry lines
-      const existingLines = await db.GeneralLedger.findAll({
+      const draft = await db.JournalDraft.findOne({
         where: {
           transaction_ref: transactionRef,
-          facility_id: facilityId,
+          facility_id: String(facilityId),
         },
+        transaction,
       });
 
-      if (existingLines.length === 0) {
-        throw new Error("Journal entry not found");
+      if (!draft) {
+        // Legacy: draft was wrongly saved into GL as status=saved
+        const existingLines = await db.GeneralLedger.findAll({
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: facilityId,
+            type: { [Op.in]: ["journal_entry", "inventory"] },
+          },
+          transaction,
+        });
+        if (existingLines.length === 0) {
+          throw new Error("Journal entry not found");
+        }
+        if (existingLines[0].status === "posted") {
+          throw new Error("Posted journal entries cannot be modified");
+        }
+        if (existingLines[0].status === "reversed") {
+          throw new Error("Reversed journal entries cannot be modified");
+        }
+        // Move legacy GL draft into draft tables, then continue as normal update
+        await db.GeneralLedger.destroy({
+          where: { transaction_ref: transactionRef, facility_id: facilityId },
+          transaction,
+        });
+      } else if (draft.status !== "draft") {
+        throw new Error("Only pending journal entries can be modified");
       }
 
-      // Validate that entry is not posted
-      if (existingLines[0].status === "posted") {
-        throw new Error("Posted journal entries cannot be modified");
-      }
-
-      if (existingLines[0].status === "reversed") {
-        throw new Error("Reversed journal entries cannot be modified");
-      }
-
-      // Validate the updated journal entry
       const validation = await validateJournalEntry(
         data,
         facilityId,
@@ -413,42 +374,12 @@ class JournalEntryService {
         );
       }
 
-      // Calculate base amounts for lines
       const linesWithBaseAmounts = calculateBaseAmounts(
         data.lines,
         data.currency || "NGN"
       );
+      const notes = data.notes || data.description || "Journal Entry";
 
-      // Delete existing lines
-      await db.GeneralLedger.destroy({
-        where: { transaction_ref: transactionRef },
-        transaction,
-      });
-
-      // Create new lines
-      const ledgerEntries = linesWithBaseAmounts.map((line) => ({
-        transaction_date: line.line_date || data.entry_date,
-        account_code: line.account_code,
-        account_subhead: line.account_name || "",
-        dr: line.debit || 0,
-        cr: line.credit || 0,
-        account_description: line.account_name || "",
-        transaction_description:
-          line.line_description || line.description || data.description || "",
-        reference_number: data.reference_number,
-        purpose_of_payment: data.description || "Journal Entry",
-        payee: data.payee || null,
-        created_by: userId,
-        updated_by: userId,
-        facility_id: facilityId,
-        status: "saved",
-        type: "inventory", // Use valid ENUM value
-        transaction_ref: line.number_id || transactionRef,
-      }));
-
-      await db.GeneralLedger.bulkCreate(ledgerEntries, { transaction });
-
-      // Calculate totals for summary
       let totalDebit = 0;
       let totalCredit = 0;
       linesWithBaseAmounts.forEach((line) => {
@@ -456,166 +387,71 @@ class JournalEntryService {
         totalCredit += parseFloat(line.credit) || 0;
       });
 
-      // Update or create summary entry in journal_entries table
-      const existingSummary = await db.JournalEntry.findOne({
-        where: {
-          transaction_ref: transactionRef,
-          facility_id: facilityId,
-        },
-        transaction,
-      });
-
-      if (existingSummary) {
-        await db.JournalEntry.update(
+      if (draft) {
+        await draft.update(
           {
             reference_number: data.reference_number,
             entry_date: data.entry_date,
             currency: data.currency || "NGN",
-            description: data.notes || data.description || "Journal Entry",
+            exchange_rate: data.exchange_rate || 1,
+            description: data.description || notes,
+            notes,
             total_debit: totalDebit,
             total_credit: totalCredit,
-            updated_by: userId,
+            updated_by: String(userId),
           },
-          {
-            where: { transaction_ref: transactionRef },
-            transaction,
-          }
+          { transaction }
         );
       } else {
-        await db.JournalEntry.create(
+        await db.JournalDraft.create(
           {
-            reference_number: data.reference_number,
             transaction_ref: transactionRef,
+            reference_number: data.reference_number,
             entry_date: data.entry_date,
             currency: data.currency || "NGN",
-            description: data.notes || data.description || "Journal Entry",
+            exchange_rate: data.exchange_rate || 1,
+            description: data.description || notes,
+            notes,
             total_debit: totalDebit,
             total_credit: totalCredit,
             status: "draft",
-            created_by: userId,
-            facility_id: facilityId,
+            facility_id: String(facilityId),
+            created_by: String(userId),
+            updated_by: String(userId),
           },
           { transaction }
         );
       }
 
-      // Delete existing customer/supplier entries for this transaction
-      await db.CustomerEntry.destroy({
-        where: { link_id: transactionRef },
+      await db.JournalDraftLine.destroy({
+        where: {
+          transaction_ref: transactionRef,
+          facility_id: String(facilityId),
+        },
         transaction,
       });
-      await db.SupplierEntry.destroy({
-        where: { link_id: transactionRef },
-        transaction,
-      });
 
-      // Recreate A/R and A/P entries
-      for (const line of linesWithBaseAmounts) {
-        if (!line.account_code || !line.number_id) continue;
-
-        const accountCheck = await this.isARorAPAccount(
-          line.account_code,
-          facilityId
-        );
-
-        // Get the supplier/customer type from the line data
-        const supplierCustomerType = (
-          line.supplier_customer_type ||
-          line.type ||
-          ""
-        ).toLowerCase();
-
-        const amount = parseFloat(line.debit) || parseFloat(line.credit) || 0;
-        if (amount <= 0) continue;
-
-        // For A/R accounts: Create customer entry if type is "Customer"
-        if (accountCheck.isAR && supplierCustomerType === "customer") {
-          // Verify customer exists
-          const customer = await db.Customer.findOne({
-            where: {
-              customerNo: line.number_id.toString(),
-              facilityId: facilityId.toString(),
-            },
-            transaction,
-          });
-
-          if (!customer) {
-            console.warn(
-              `Customer ${line.number_id} not found, skipping customer entry`
-            );
-            continue;
-          }
-
-          await db.CustomerEntry.create(
-            {
-              customerNo: line.number_id.toString(),
-              description: data.notes || data.description || "Journal Entry",
-              cost: amount,
-              facilityId: facilityId.toString(),
-              mode_of_payment: "Journal Entry",
-              receiptNo: data.reference_number,
-              link_id: transactionRef,
-              type: line.debit > 0 ? "deposit" : "purchase",
-              created_by: userId.toString(),
-            },
-            { transaction }
-          );
-        }
-
-        // For A/P accounts: Create supplier entry if type is "Supplier"
-        if (accountCheck.isAP && supplierCustomerType === "supplier") {
-          // Verify supplier exists
-          const supplier = await db.SuppliersInfo.findOne({
-            where: {
-              supplier_number: line.number_id.toString(),
-              facilityId: facilityId.toString(),
-            },
-            transaction,
-          });
-
-          if (!supplier) {
-            console.warn(
-              `Supplier ${line.number_id} not found, skipping supplier entry`
-            );
-            continue;
-          }
-
-          await db.SupplierEntry.create(
-            {
-              supplier_number: line.number_id.toString(),
-              description: data.notes || data.description || "Journal Entry",
-              cost: amount,
-              facilityId: facilityId.toString(),
-              mode_of_payment: "Journal Entry",
-              cheque_no: data.reference_number,
-              link_id: transactionRef,
-              type: line.credit > 0 ? "payment" : "purchase",
-              created_by: userId.toString(),
-            },
-            { transaction }
-          );
-        }
-      }
-
+      const draftLines = linesWithBaseAmounts.map((line, index) => ({
+        transaction_ref: transactionRef,
+        facility_id: String(facilityId),
+        line_number: index + 1,
+        account_code: line.account_code,
+        account_name: line.account_name || "",
+        line_date: line.line_date || data.entry_date,
+        line_description:
+          line.line_description || line.description || data.description || "",
+        debit: line.debit || 0,
+        credit: line.credit || 0,
+        number_id: line.number_id || null,
+        supplier_customer_id: line.supplier_customer_id || line.number_id || null,
+        supplier_customer_name: line.supplier_customer_name || "",
+        supplier_customer_type: line.supplier_customer_type || line.type || "",
+      }));
+      await db.JournalDraftLine.bulkCreate(draftLines, { transaction });
       await transaction.commit();
 
-      // Fetch updated entry (after commit, so errors won't rollback)
-      try {
-        return await this.getJournalEntryByRef(transactionRef, facilityId);
-      } catch (fetchError) {
-        console.warn("Could not fetch updated journal entry:", fetchError.message);
-        // Return success anyway since the update was committed
-        return {
-          transaction_ref: transactionRef,
-          reference_number: data.reference_number,
-          entry_date: data.entry_date,
-          description: data.notes || data.description || "Journal Entry",
-          status: "draft",
-          message: "Journal entry updated successfully",
-        };
-      }
+      return await this.getJournalEntryByRef(transactionRef, facilityId);
     } catch (error) {
-      // Only rollback if transaction is still active
       if (transaction && !transaction.finished) {
         await transaction.rollback();
       }
@@ -624,17 +460,106 @@ class JournalEntryService {
   }
 
   /**
-   * Post (approve) a journal entry
+   * Approve pending journal → write general_ledger (posted) + party entries.
    */
   static async postJournalEntry(transactionRef, facilityId, userId) {
+    await ensureDraftTables();
     const transaction = await db.sequelize.transaction();
 
     try {
+      const draft = await db.JournalDraft.findOne({
+        where: {
+          transaction_ref: transactionRef,
+          facility_id: String(facilityId),
+        },
+        transaction,
+      });
+
+      if (draft) {
+        if (draft.status !== "draft") {
+          throw new Error("Only pending (draft) entries can be approved");
+        }
+
+        const draftLines = await db.JournalDraftLine.findAll({
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: String(facilityId),
+          },
+          order: [["line_number", "ASC"]],
+          transaction,
+        });
+
+        if (!draftLines.length) {
+          throw new Error("Journal entry has no lines");
+        }
+
+        const notes = draft.notes || draft.description || "Journal Entry";
+        const ledgerEntries = draftLines.map((line) => ({
+          transaction_date: line.line_date || draft.entry_date,
+          account_code: line.account_code,
+          account_subhead: line.account_name || "",
+          dr: line.debit || 0,
+          cr: line.credit || 0,
+          transaction_description:
+            line.line_description || line.account_name || "",
+          account_description: line.account_name || "",
+          reference_number: draft.reference_number,
+          purpose_of_payment: notes,
+          created_by: userId,
+          updated_by: userId,
+          facility_id: facilityId,
+          status: "posted",
+          type: "journal_entry",
+          // Keep one shared ref for the whole journal (do not split by number_id)
+          transaction_ref: transactionRef,
+        }));
+
+        await db.GeneralLedger.bulkCreate(ledgerEntries, { transaction });
+
+        const linesForParty = draftLines.map((line) => ({
+          account_code: line.account_code,
+          account_name: line.account_name,
+          debit: parseFloat(line.debit || 0),
+          credit: parseFloat(line.credit || 0),
+          number_id: line.number_id,
+          supplier_customer_type: line.supplier_customer_type,
+          type: line.supplier_customer_type,
+        }));
+
+        await this.createPartyEntries(
+          linesForParty,
+          {
+            reference_number: draft.reference_number,
+            notes: draft.notes,
+            description: draft.description,
+          },
+          transactionRef,
+          facilityId,
+          userId,
+          transaction
+        );
+
+        await draft.update(
+          {
+            status: "approved",
+            approved_by: String(userId),
+            approved_at: new Date(),
+            updated_by: String(userId),
+          },
+          { transaction }
+        );
+
+        await transaction.commit();
+        return await this.getJournalEntryByRef(transactionRef, facilityId);
+      }
+
+      // Legacy path: pending rows already sitting in GL as status=saved
       const lines = await db.GeneralLedger.findAll({
         where: {
           transaction_ref: transactionRef,
           facility_id: facilityId,
         },
+        transaction,
       });
 
       if (lines.length === 0) {
@@ -642,49 +567,26 @@ class JournalEntryService {
       }
 
       if (lines[0].status !== "saved") {
-        throw new Error("Only draft entries can be posted");
+        throw new Error("Only pending (draft) entries can be approved");
       }
 
-      // Update all lines to posted status
       await db.GeneralLedger.update(
         {
           status: "posted",
           updated_by: userId,
         },
         {
-          where: { transaction_ref: transactionRef },
-          transaction,
-        }
-      );
-
-      // Update summary entry status
-      await db.JournalEntry.update(
-        {
-          status: "posted",
-          updated_by: userId,
-        },
-        {
-          where: { transaction_ref: transactionRef },
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: facilityId,
+          },
           transaction,
         }
       );
 
       await transaction.commit();
-
-      // Fetch posted entry (after commit, so errors won't rollback)
-      try {
-        return await this.getJournalEntryByRef(transactionRef, facilityId);
-      } catch (fetchError) {
-        console.warn("Could not fetch posted journal entry:", fetchError.message);
-        // Return success anyway since the post was committed
-        return {
-          transaction_ref: transactionRef,
-          status: "posted",
-          message: "Journal entry posted successfully",
-        };
-      }
+      return await this.getJournalEntryByRef(transactionRef, facilityId);
     } catch (error) {
-      // Only rollback if transaction is still active
       if (transaction && !transaction.finished) {
         await transaction.rollback();
       }
@@ -693,7 +595,7 @@ class JournalEntryService {
   }
 
   /**
-   * Reverse a posted journal entry
+   * Reverse a posted journal entry (GL only)
    */
   static async reverseJournalEntry(
     transactionRef,
@@ -708,140 +610,64 @@ class JournalEntryService {
         where: {
           transaction_ref: transactionRef,
           facility_id: facilityId,
+          status: "posted",
         },
       });
 
       if (originalLines.length === 0) {
-        throw new Error("Journal entry not found");
+        throw new Error("Posted journal entry not found");
       }
 
-      if (originalLines[0].status !== "posted") {
-        throw new Error("Only posted entries can be reversed");
-      }
-
-      // Check if already reversed
       const existingReversal = await db.GeneralLedger.findOne({
         where: {
-          facility_id: facilityId,
-          type: "inventory",
-          reference_number: {
-            [Op.like]: `REV-${originalLines[0].reference_number}%`,
+          purpose_of_payment: {
+            [Op.like]: `%Reversal of ${originalLines[0].reference_number}%`,
           },
+          facility_id: facilityId,
         },
       });
-
       if (existingReversal) {
-        throw new Error("This entry has already been reversed");
+        throw new Error("This journal entry has already been reversed");
       }
 
-      // Get original summary entry for currency
-      const originalSummary = await db.JournalEntry.findOne({
-        where: {
-          transaction_ref: transactionRef,
-          facility_id: facilityId,
-        },
-        transaction,
-      });
+      const reversalRef = this.generateTransactionRef();
+      const reversalNumber = `REV-${originalLines[0].reference_number}`;
+      const date = reversalDate || new Date().toISOString().slice(0, 10);
 
-      // Create reversal entry with mirrored lines
-      // Use REV prefix + original reference number
-      const reversalRefNumber = `REV-${originalLines[0].reference_number}`;
-      const reversalTransactionRef = this.generateTransactionRef();
-
-      const reversalEntries = originalLines.map((line) => ({
-        transaction_date: reversalDate || new Date(),
+      const reversalLines = originalLines.map((line) => ({
+        transaction_date: date,
         account_code: line.account_code,
         account_subhead: line.account_subhead,
-        dr: line.cr, // Swap debit and credit
-        cr: line.dr,
+        dr: line.cr || 0,
+        cr: line.dr || 0,
+        transaction_description: `Reversal: ${line.transaction_description || ""}`,
         account_description: line.account_description,
-        transaction_description: `Reversal: ${line.transaction_description}`,
-        reference_number: reversalRefNumber,
-        purpose_of_payment: `Reversal of ${originalLines[0].reference_number}: ${originalLines[0].purpose_of_payment}`,
-        payee: line.payee,
+        reference_number: reversalNumber,
+        purpose_of_payment: `Reversal of ${line.reference_number}`,
         created_by: userId,
+        updated_by: userId,
         facility_id: facilityId,
         status: "posted",
-        type: "inventory", // Use valid ENUM value
-        transaction_ref: reversalTransactionRef,
+        type: "journal_entry",
+        transaction_ref: reversalRef,
       }));
 
-      await db.GeneralLedger.bulkCreate(reversalEntries, { transaction });
+      await db.GeneralLedger.bulkCreate(reversalLines, { transaction });
 
-      // Update original entry status to reversed
       await db.GeneralLedger.update(
+        { status: "reversed", updated_by: userId },
         {
-          status: "reversed",
-          updated_by: userId,
-        },
-        {
-          where: { transaction_ref: transactionRef },
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: facilityId,
+          },
           transaction,
         }
       );
 
-      // Update original summary entry status to reversed
-      if (originalSummary) {
-        await db.JournalEntry.update(
-          {
-            status: "reversed",
-            updated_by: userId,
-          },
-          {
-            where: { transaction_ref: transactionRef },
-            transaction,
-          }
-        );
-      }
-
-      // Create reversal summary entry
-      const reversalTotalDebit = originalLines.reduce(
-        (sum, line) => sum + (parseFloat(line.cr) || 0),
-        0
-      );
-      const reversalTotalCredit = originalLines.reduce(
-        (sum, line) => sum + (parseFloat(line.dr) || 0),
-        0
-      );
-
-      await db.JournalEntry.create(
-        {
-          reference_number: reversalRefNumber,
-          transaction_ref: reversalTransactionRef,
-          entry_date: reversalDate || new Date(),
-          currency: originalSummary?.currency || "NGN",
-          description: `Reversal: ${
-            originalSummary?.description || originalLines[0].purpose_of_payment
-          }`,
-          total_debit: reversalTotalDebit,
-          total_credit: reversalTotalCredit,
-          status: "posted",
-          created_by: userId,
-          facility_id: facilityId,
-        },
-        { transaction }
-      );
-
       await transaction.commit();
-
-      // Fetch reversal entry (after commit, so errors won't rollback)
-      try {
-        return await this.getJournalEntryByRef(
-          reversalTransactionRef,
-          facilityId
-        );
-      } catch (fetchError) {
-        console.warn("Could not fetch reversal journal entry:", fetchError.message);
-        // Return success anyway since the reversal was committed
-        return {
-          transaction_ref: reversalTransactionRef,
-          reference_number: reversalRefNumber,
-          status: "posted",
-          message: "Journal entry reversed successfully",
-        };
-      }
+      return await this.getJournalEntryByRef(reversalRef, facilityId);
     } catch (error) {
-      // Only rollback if transaction is still active
       if (transaction && !transaction.finished) {
         await transaction.rollback();
       }
@@ -850,12 +676,38 @@ class JournalEntryService {
   }
 
   /**
-   * Delete a journal entry (only drafts)
+   * Delete a pending journal (draft only)
    */
   static async deleteJournalEntry(transactionRef, facilityId) {
+    await ensureDraftTables();
     const transaction = await db.sequelize.transaction();
 
     try {
+      const draft = await db.JournalDraft.findOne({
+        where: {
+          transaction_ref: transactionRef,
+          facility_id: String(facilityId),
+        },
+        transaction,
+      });
+
+      if (draft) {
+        if (draft.status !== "draft") {
+          throw new Error("Only pending journal entries can be deleted");
+        }
+        await db.JournalDraftLine.destroy({
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: String(facilityId),
+          },
+          transaction,
+        });
+        await draft.destroy({ transaction });
+        await transaction.commit();
+        return { message: "Journal entry deleted successfully" };
+      }
+
+      // Legacy GL saved drafts
       const lines = await db.GeneralLedger.findAll({
         where: {
           transaction_ref: transactionRef,
@@ -867,41 +719,26 @@ class JournalEntryService {
       if (lines.length === 0) {
         throw new Error("Journal entry not found");
       }
-
       if (lines[0].status !== "saved") {
         throw new Error("Only draft entries can be deleted");
       }
 
-      // Delete general ledger entries
       await db.GeneralLedger.destroy({
-        where: { transaction_ref: transactionRef },
+        where: { transaction_ref: transactionRef, facility_id: facilityId },
         transaction,
       });
-
-      // Delete summary entry
-      await db.JournalEntry.destroy({
-        where: {
-          transaction_ref: transactionRef,
-          facility_id: facilityId,
-        },
-        transaction,
-      });
-
-      // Delete customer/supplier entries
       await db.CustomerEntry.destroy({
         where: { link_id: transactionRef },
         transaction,
-      });
+      }).catch(() => {});
       await db.SupplierEntry.destroy({
         where: { link_id: transactionRef },
         transaction,
-      });
+      }).catch(() => {});
 
       await transaction.commit();
-
       return { message: "Journal entry deleted successfully" };
     } catch (error) {
-      // Only rollback if transaction is still active
       if (transaction && !transaction.finished) {
         await transaction.rollback();
       }
@@ -910,24 +747,34 @@ class JournalEntryService {
   }
 
   /**
-   * Get journal entry by transaction reference
+   * Get journal entry by transaction reference (draft or posted GL)
    */
   static async getJournalEntryByRef(transactionRef, facilityId) {
-    // First try to get from journal_entries summary table (optional - may not exist)
-    let summary = null;
-    try {
-      summary = await db.JournalEntry.findOne({
+    await ensureDraftTables();
+
+    const draft = await db.JournalDraft.findOne({
+      where: {
+        transaction_ref: transactionRef,
+        facility_id: String(facilityId),
+      },
+    });
+
+    if (draft && draft.status === "draft") {
+      const lines = await db.JournalDraftLine.findAll({
         where: {
           transaction_ref: transactionRef,
-          facility_id: facilityId,
+          facility_id: String(facilityId),
         },
+        order: [["line_number", "ASC"]],
       });
-    } catch (summaryError) {
-      // Journal entry summary table may not exist or have issues
-      console.warn("Could not fetch journal entry summary:", summaryError.message);
-      summary = null;
+      const createdByName = await this.resolveUserDisplayName(
+        draft.created_by,
+        facilityId
+      );
+      return mapDraftToApi(draft, lines, createdByName);
     }
 
+    // Approved draft or pure GL entry
     const lines = await db.GeneralLedger.findAll({
       where: {
         transaction_ref: transactionRef,
@@ -936,68 +783,61 @@ class JournalEntryService {
       order: [["transaction_id", "ASC"]],
     });
 
-    if (lines.length === 0 && !summary) {
+    if (lines.length === 0) {
+      if (draft) {
+        const draftLines = await db.JournalDraftLine.findAll({
+          where: {
+            transaction_ref: transactionRef,
+            facility_id: String(facilityId),
+          },
+          order: [["line_number", "ASC"]],
+        });
+        const createdByName = await this.resolveUserDisplayName(
+          draft.created_by,
+          facilityId
+        );
+        return mapDraftToApi(draft, draftLines, createdByName);
+      }
       throw new Error("Journal entry not found");
     }
 
-    // Use summary data if available, otherwise calculate from lines
     let totalDebit = 0;
     let totalCredit = 0;
-    let status = "draft";
-    let reference_number = "";
-    let entry_date = "";
-    let description = "";
-    let created_by = null;
-    let updated_by = null;
-    let created_at = null;
-    let updated_at = null;
+    lines.forEach((line) => {
+      totalDebit += parseFloat(line.dr || 0);
+      totalCredit += parseFloat(line.cr || 0);
+    });
 
-    if (summary) {
-      totalDebit = parseFloat(summary.total_debit) || 0;
-      totalCredit = parseFloat(summary.total_credit) || 0;
-      status = summary.status;
-      reference_number = summary.reference_number;
-      entry_date = summary.entry_date;
-      description = summary.description;
-      created_by = summary.created_by;
-      updated_by = summary.updated_by;
-      created_at = summary.created_at;
-      updated_at = summary.updated_at;
-    } else {
-      // Fallback to calculating from lines
-      lines.forEach((line) => {
-        totalDebit += parseFloat(line.dr) || 0;
-        totalCredit += parseFloat(line.cr) || 0;
-      });
-      if (lines.length > 0) {
-        reference_number = lines[0].reference_number;
-        entry_date = lines[0].transaction_date;
-        description = lines[0].purpose_of_payment;
-        status = lines[0].status;
-        created_by = lines[0].created_by;
-        updated_by = lines[0].updated_by;
-        created_at = lines[0].created_at;
-        updated_at = lines[0].updated_at;
-      }
-    }
+    const status =
+      lines[0].status === "saved"
+        ? "draft"
+        : lines[0].status === "posted"
+          ? "posted"
+          : lines[0].status;
 
-    const createdByName = await this.resolveUserDisplayName(created_by, facilityId);
-    const updatedByName = await this.resolveUserDisplayName(updated_by, facilityId);
+    const createdByName = await this.resolveUserDisplayName(
+      lines[0].created_by,
+      facilityId
+    );
+    const updatedByName = lines[0].updated_by
+      ? await this.resolveUserDisplayName(lines[0].updated_by, facilityId)
+      : null;
 
-    // Format as journal entry
     return {
       transaction_ref: transactionRef,
-      reference_number: reference_number,
-      entry_date: entry_date,
-      description: description,
-      status: status === "saved" ? "draft" : status,
+      reference_number: lines[0].reference_number,
+      entry_date: lines[0].transaction_date,
+      description: lines[0].purpose_of_payment,
+      notes: lines[0].purpose_of_payment,
+      status,
       total_debit: totalDebit.toFixed(2),
       total_credit: totalCredit.toFixed(2),
       facility_id: facilityId,
-      created_by: createdByName || created_by,
-      updated_by: updatedByName || updated_by,
-      created_at: created_at,
-      updated_at: updated_at,
+      created_by: createdByName || lines[0].created_by,
+      updated_by: updatedByName || lines[0].updated_by,
+      created_at: lines[0].created_at,
+      updated_at: lines[0].updated_at,
+      currency: "NGN",
       lines: lines.map((line, index) => ({
         id: line.transaction_id,
         line_number: index + 1,
@@ -1005,7 +845,7 @@ class JournalEntryService {
         account_name: line.account_subhead,
         line_date: line.transaction_date,
         line_description: line.transaction_description,
-        description: line.transaction_description, // backward compatibility
+        description: line.transaction_description,
         debit: parseFloat(line.dr).toFixed(2),
         credit: parseFloat(line.cr).toFixed(2),
         number_id: line.number_id || null,
@@ -1014,129 +854,231 @@ class JournalEntryService {
   }
 
   /**
-   * Get list of journal entries with filters
+   * List journals: pending drafts + posted/reversed from GL
    */
   static async getJournalEntries(facilityId, filters = {}) {
+    await ensureDraftTables();
     const {
       status,
       startDate,
       endDate,
-      accountCode,
       referenceNumber,
       page = 1,
       limit = 50,
-      sortBy = "transaction_date",
       sortOrder = "DESC",
     } = filters;
 
-    const whereClause = {
-      facility_id: facilityId,
-      // Support legacy rows (inventory) and current rows (journal_entry).
-      type: { [Op.in]: ["journal_entry", "inventory"] },
-      [Op.or]: [
-        { reference_number: { [Op.like]: "JE%" } }, // Journal entries (flexible - with or without dash)
-        { reference_number: { [Op.like]: "REV%" } }, // Reversal entries
-      ],
-    };
+    const wantDraft =
+      !status || status === "draft" || status === "saved" || status === "pending";
+    const wantPosted =
+      !status || status === "posted" || status === "approved";
+    const wantReversed = !status || status === "reversed";
 
-    // Add search filter if provided
-    if (referenceNumber) {
-      whereClause.reference_number = {
-        [Op.like]: `%${referenceNumber}%`,
+    const mapped = [];
+
+    if (wantDraft) {
+      const draftWhere = {
+        facility_id: String(facilityId),
+        status: "draft",
       };
-      delete whereClause[Op.or]; // Remove OR condition when searching
+      if (startDate || endDate) {
+        draftWhere.entry_date = {};
+        if (startDate) draftWhere.entry_date[Op.gte] = startDate;
+        if (endDate) draftWhere.entry_date[Op.lte] = endDate;
+      }
+      if (referenceNumber) {
+        draftWhere.reference_number = { [Op.like]: `%${referenceNumber}%` };
+      }
+
+      const drafts = await db.JournalDraft.findAll({
+        where: draftWhere,
+        order: [["entry_date", sortOrder]],
+        raw: true,
+      });
+
+      for (const d of drafts) {
+        mapped.push({
+          transaction_ref: d.transaction_ref,
+          reference_number: d.reference_number,
+          entry_date: d.entry_date,
+          description: d.notes || d.description,
+          status: "draft",
+          total_debit: parseFloat(d.total_debit || 0).toFixed(2),
+          total_credit: parseFloat(d.total_credit || 0).toFixed(2),
+          created_by:
+            (await this.resolveUserDisplayName(d.created_by, facilityId)) ||
+            d.created_by,
+          created_at: d.created_at,
+        });
+      }
+
+      // Legacy pending still in GL as saved
+      const legacyWhere = {
+        facility_id: facilityId,
+        type: { [Op.in]: ["journal_entry", "inventory"] },
+        status: "saved",
+        [Op.or]: [
+          { reference_number: { [Op.like]: "JE%" } },
+          { reference_number: { [Op.like]: "REV%" } },
+        ],
+      };
+      if (referenceNumber) {
+        legacyWhere.reference_number = { [Op.like]: `%${referenceNumber}%` };
+        delete legacyWhere[Op.or];
+      }
+      if (startDate || endDate) {
+        legacyWhere.transaction_date = {};
+        if (startDate)
+          legacyWhere.transaction_date[Op.gte] = `${startDate} 00:00:00`;
+        if (endDate)
+          legacyWhere.transaction_date[Op.lte] = `${endDate} 23:59:59`;
+      }
+
+      const legacy = await db.GeneralLedger.findAll({
+        attributes: [
+          "transaction_ref",
+          "reference_number",
+          "status",
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("transaction_date")),
+            "transaction_date",
+          ],
+          [
+            db.sequelize.fn("MAX", db.sequelize.col("purpose_of_payment")),
+            "purpose_of_payment",
+          ],
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("created_by")),
+            "created_by",
+          ],
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("created_at")),
+            "created_at",
+          ],
+          [db.sequelize.fn("SUM", db.sequelize.col("dr")), "total_debit"],
+          [db.sequelize.fn("SUM", db.sequelize.col("cr")), "total_credit"],
+        ],
+        where: legacyWhere,
+        group: ["transaction_ref", "reference_number", "status"],
+        raw: true,
+      });
+
+      const draftRefs = new Set(mapped.map((m) => m.transaction_ref));
+      for (const entry of legacy) {
+        if (draftRefs.has(entry.transaction_ref)) continue;
+        mapped.push({
+          transaction_ref: entry.transaction_ref,
+          reference_number: entry.reference_number,
+          entry_date: entry.transaction_date,
+          description: entry.purpose_of_payment,
+          status: "draft",
+          total_debit: parseFloat(entry.total_debit || 0).toFixed(2),
+          total_credit: parseFloat(entry.total_credit || 0).toFixed(2),
+          created_by:
+            (await this.resolveUserDisplayName(
+              entry.created_by,
+              facilityId
+            )) || entry.created_by,
+          created_at: entry.created_at,
+        });
+      }
     }
 
-    // Apply filters
-    if (status) {
-      whereClause.status = status === "draft" ? "saved" : status;
+    if (wantPosted || wantReversed) {
+      const statuses = [];
+      if (wantPosted) statuses.push("posted");
+      if (wantReversed) statuses.push("reversed");
+
+      const glWhere = {
+        facility_id: facilityId,
+        type: { [Op.in]: ["journal_entry", "inventory"] },
+        status: { [Op.in]: statuses },
+        [Op.or]: [
+          { reference_number: { [Op.like]: "JE%" } },
+          { reference_number: { [Op.like]: "REV%" } },
+        ],
+      };
+      if (referenceNumber) {
+        glWhere.reference_number = { [Op.like]: `%${referenceNumber}%` };
+        delete glWhere[Op.or];
+      }
+      if (startDate || endDate) {
+        glWhere.transaction_date = {};
+        if (startDate) glWhere.transaction_date[Op.gte] = `${startDate} 00:00:00`;
+        if (endDate) glWhere.transaction_date[Op.lte] = `${endDate} 23:59:59`;
+      }
+
+      const entries = await db.GeneralLedger.findAll({
+        attributes: [
+          "transaction_ref",
+          "reference_number",
+          "status",
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("transaction_date")),
+            "transaction_date",
+          ],
+          [
+            db.sequelize.fn("MAX", db.sequelize.col("purpose_of_payment")),
+            "purpose_of_payment",
+          ],
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("created_by")),
+            "created_by",
+          ],
+          [
+            db.sequelize.fn("MIN", db.sequelize.col("created_at")),
+            "created_at",
+          ],
+          [db.sequelize.fn("SUM", db.sequelize.col("dr")), "total_debit"],
+          [db.sequelize.fn("SUM", db.sequelize.col("cr")), "total_credit"],
+        ],
+        where: glWhere,
+        group: ["transaction_ref", "reference_number", "status"],
+        raw: true,
+      });
+
+      for (const entry of entries) {
+        mapped.push({
+          transaction_ref: entry.transaction_ref,
+          reference_number: entry.reference_number,
+          entry_date: entry.transaction_date,
+          description: entry.purpose_of_payment,
+          status: entry.status,
+          total_debit: parseFloat(entry.total_debit || 0).toFixed(2),
+          total_credit: parseFloat(entry.total_credit || 0).toFixed(2),
+          created_by:
+            (await this.resolveUserDisplayName(
+              entry.created_by,
+              facilityId
+            )) || entry.created_by,
+          created_at: entry.created_at,
+        });
+      }
     }
 
-    if (startDate || endDate) {
-      whereClause.transaction_date = {};
-      // Use full-day boundaries so DATETIME rows on endDate are included.
-      if (startDate) whereClause.transaction_date[Op.gte] = `${startDate} 00:00:00`;
-      if (endDate) whereClause.transaction_date[Op.lte] = `${endDate} 23:59:59`;
-    }
-
-    if (accountCode) {
-      whereClause.account_code = accountCode;
-    }
-
-    console.log("Fetching journal entries with whereClause:", whereClause);
-
-    // Get unique transaction refs
-    const entries = await db.GeneralLedger.findAll({
-      attributes: [
-        "transaction_ref",
-        "reference_number",
-        "transaction_date",
-        "purpose_of_payment",
-        "status",
-        "created_by",
-        "created_at",
-        [db.sequelize.fn("SUM", db.sequelize.col("dr")), "total_debit"],
-        [db.sequelize.fn("SUM", db.sequelize.col("cr")), "total_credit"],
-      ],
-      where: whereClause,
-      group: [
-        "transaction_ref",
-        "reference_number",
-        "transaction_date",
-        "purpose_of_payment",
-        "status",
-        "created_by",
-        "created_at",
-      ],
-      order: [
-        [sortBy === "entry_date" ? "transaction_date" : sortBy, sortOrder],
-      ],
-      limit: parseInt(limit),
-      offset: (page - 1) * limit,
-      raw: true,
+    mapped.sort((a, b) => {
+      const da = new Date(a.entry_date).getTime();
+      const db_ = new Date(b.entry_date).getTime();
+      return sortOrder === "ASC" ? da - db_ : db_ - da;
     });
 
-    console.log(`Found ${entries.length} journal entries`);
-
-    // Get count for pagination
-    const countResult = await db.GeneralLedger.findAll({
-      attributes: ["transaction_ref"],
-      where: whereClause,
-      group: ["transaction_ref"],
-      raw: true,
-    });
-
-    const total = countResult.length;
-    console.log(`Total unique journal entries: ${total}`);
-
-    const mappedEntries = await Promise.all(
-      entries.map(async (entry) => ({
-        transaction_ref: entry.transaction_ref,
-        reference_number: entry.reference_number,
-        entry_date: entry.transaction_date,
-        description: entry.purpose_of_payment,
-        status: entry.status === "saved" ? "draft" : entry.status,
-        total_debit: parseFloat(entry.total_debit || 0).toFixed(2),
-        total_credit: parseFloat(entry.total_credit || 0).toFixed(2),
-        created_by:
-          (await this.resolveUserDisplayName(entry.created_by, facilityId)) ||
-          entry.created_by,
-        created_at: entry.created_at,
-      }))
-    );
-
-    console.log("Returning journal entries:", mappedEntries);
+    const total = mapped.length;
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = parseInt(limit, 10) || 50;
+    const start = (pageNum - 1) * limitNum;
+    const pageRows = mapped.slice(start, start + limitNum);
 
     return {
-      entries: mappedEntries,
+      entries: pageRows,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        totalPages: Math.ceil(total / limit),
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum) || 1,
       },
     };
   }
+
 }
 
 module.exports = JournalEntryService;

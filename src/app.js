@@ -281,6 +281,17 @@ app.get("/", (req, res) => {
 app.get("/welcome", (req, res) => {
   res.json(welcomePayload);
 });
+// Lightweight liveness probe for clients on unreliable networks (no auth).
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "aa_erp_api",
+    ts: Date.now(),
+  });
+});
+app.head("/health", (req, res) => {
+  res.status(200).end();
+});
 
 app.use(
   "/public/uploads",

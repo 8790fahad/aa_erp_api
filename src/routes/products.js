@@ -18,6 +18,8 @@ module.exports = (app) => {
   // Toggle product online availability
   app.put("/api/products/:id/online", products.updateProductOnlineStatus);
   app.put("/api/products/:id/price", products.updateProductSellingPrice);
+  app.put("/api/products/:id/sales-target", products.updateProductSalesTarget);
+  app.put("/api/products/:id/stop-sales", products.updateProductStopSales);
   app.put("/api/products/:id/images", products.updateProductImages);
   app.put("/api/products/:id/description", products.updateProductDescription);
   app.delete("/api/products/:id", products.deleteProduct);

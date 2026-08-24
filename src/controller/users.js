@@ -425,25 +425,6 @@ exports.createNewUser = async (req, res) => {
             .status(400)
             .json({ success: false, message: "Id is require to update" });
         }
-        const roleLower = String(role || "").toLowerCase();
-        const isCashierRole =
-          roleLower.includes("cashier") || roleLower.includes("casheir");
-        const resolvedCashierType =
-          isCashierRole &&
-          (cashier_type === "cash" || cashier_type === "transfer")
-            ? cashier_type
-            : null;
-
-        if (
-          isCashierRole &&
-          cashier_type !== "cash" &&
-          cashier_type !== "transfer"
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "Cashier role requires payment type: cash or transfer",
-          });
-        }
 
         const updateUser = {
           email,
@@ -452,7 +433,7 @@ exports.createNewUser = async (req, res) => {
           lastname,
           role,
           status,
-          cashier_type: resolvedCashierType,
+          cashier_type: null,
           // Single departmentId is still supported for legacy HR forms.
           departmentId:
             departmentId != null && departmentId !== ""
@@ -625,17 +606,6 @@ exports.createNewUser = async (req, res) => {
         return Number.isFinite(n) ? n : null;
       })();
 
-      const roleLowerCreate = String(role || "").toLowerCase();
-      const isCashierCreate =
-        roleLowerCreate.includes("cashier") ||
-        roleLowerCreate.includes("casheir");
-      if (isCashierCreate && cashier_type !== "cash" && cashier_type !== "transfer") {
-        return res.status(400).json({
-          success: false,
-          message: "Cashier role requires payment type: cash or transfer",
-        });
-      }
-
       const user = await User.create(
         {
           id: entry_id_in,
@@ -647,11 +617,7 @@ exports.createNewUser = async (req, res) => {
           status,
           facilityId,
           branchId: parsedPrimaryBranchId,
-          cashier_type:
-            isCashierCreate &&
-            (cashier_type === "cash" || cashier_type === "transfer")
-              ? cashier_type
-              : null,
+          cashier_type: null,
         },
         { transaction },
       );
@@ -701,22 +667,338 @@ exports.createNewUser = async (req, res) => {
   }
 };
 
-//for creating user
-// //for creating user
-// // controllers/userController.js
-// const bcrypt = require("bcrypt");
-// const crypto = require("crypto");
-// const moment = require("moment");
-// const nodemailer = require("nodemailer");
-// const { MailtrapTransport } = require("mailtrap"); // Adjust if using different transporter
-// const { v4: UUIDV4 } = require("uuid");
+/**
+ * Bulk create staff from Excel upload (Manage Users).
+ * Body: { users: [...], facilityId }
+ * Each row: firstname, lastname, email, phone, role, branch (name), status?
+ */
+exports.bulkCreateStaff = async (req, res) => {
+  const { users: staffRows, facilityId } = req.body;
 
-// // Assume these are imported correctly in your project
-// const User = require("../models/User");
-// const db = require("../config/database"); // Sequelize instance
-// const userApi = require("../api/userApi"); // Your business creation API
-// const createBranchAPI = require("../api/branchApi"); // Your branch creation function
-// const getAndUpdateNumber = require("../utils/numberGenerator"); // Your number generator helper
+  if (!facilityId) {
+    return res
+      .status(400)
+      .json({ success: false, message: "facilityId is required" });
+  }
+  if (!Array.isArray(staffRows) || staffRows.length === 0) {
+    return res
+      .status(400)
+      .json({ success: false, message: "users array is required" });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const errors = [];
+  let created = 0;
+  let rolesCreated = 0;
+
+  try {
+    const Branch = db.branches || db.Branch;
+    const branchRows = Branch
+      ? await Branch.findAll({
+          where: { facilityId },
+          attributes: ["id", "branch_name", "branch_id"],
+        })
+      : [];
+
+    const branchByName = new Map(
+      branchRows.map((b) => [
+        String(b.branch_name || "")
+          .trim()
+          .toLowerCase(),
+        b,
+      ]),
+    );
+    const branchByCode = new Map(
+      branchRows.map((b) => [
+        String(b.branch_id || "")
+          .trim()
+          .toLowerCase(),
+        b,
+      ]),
+    );
+
+    // Cache facility roles by lowercase name → canonical Role record
+    const roleByName = new Map();
+    if (db.Role) {
+      const existingRoles = await db.Role.findAll({
+        where: { facilityId },
+        attributes: ["id", "name", "status"],
+      });
+      existingRoles.forEach((r) => {
+        roleByName.set(String(r.name || "").trim().toLowerCase(), r);
+      });
+    }
+
+    /**
+     * Find role by name (case-insensitive). If missing, create it and connect
+     * subsequent staff to the same canonical name.
+     */
+    const resolveOrCreateRole = async (roleName, transaction) => {
+      const key = String(roleName || "")
+        .trim()
+        .toLowerCase();
+      if (!key) {
+        throw new Error("Role name is required");
+      }
+
+      const cached = roleByName.get(key);
+      if (cached) {
+        return {
+          id: cached.id,
+          name: cached.name,
+          created: false,
+        };
+      }
+
+      if (!db.Role) {
+        // No roles table — fall back to free-text role string
+        return { id: null, name: roleName.trim(), created: false };
+      }
+
+      // Race-safe: another concurrent create may exist
+      let role = await db.Role.findOne({
+        where: {
+          facilityId,
+          name: roleName.trim(),
+        },
+        transaction,
+      });
+
+      if (!role) {
+        // Case-insensitive match in case DB collation differs
+        const allForFacility = await db.Role.findAll({
+          where: { facilityId },
+          attributes: ["id", "name", "status"],
+          transaction,
+        });
+        role =
+          allForFacility.find(
+            (r) =>
+              String(r.name || "")
+                .trim()
+                .toLowerCase() === key,
+          ) || null;
+      }
+
+      if (!role) {
+        role = await db.Role.create(
+          {
+            facilityId,
+            name: roleName.trim(),
+            description: `Role created automatically during staff bulk upload`,
+            status: "active",
+          },
+          { transaction },
+        );
+        rolesCreated += 1;
+      }
+
+      roleByName.set(key, role);
+      return { id: role.id, name: role.name, created: true };
+    };
+
+    const seenEmails = new Set();
+    const seenPhones = new Set();
+
+    for (let i = 0; i < staffRows.length; i++) {
+      const row = staffRows[i] || {};
+      const rowNum = i + 2;
+
+      const firstname = String(row.firstname || row.firstName || "").trim();
+      const lastname = String(row.lastname || row.lastName || "").trim();
+      const email = String(row.email || "")
+        .trim()
+        .toLowerCase();
+      const phone = String(row.phone || "").trim();
+      const roleInput = String(row.role || "").trim();
+      const branchLabel = String(
+        row.branch || row.branch_name || row.warehouse || "",
+      ).trim();
+      const status = String(row.status || "verified")
+        .trim()
+        .toLowerCase() || "verified";
+
+      if (
+        !firstname ||
+        !lastname ||
+        !email ||
+        !phone ||
+        !roleInput ||
+        !branchLabel
+      ) {
+        errors.push({
+          row: rowNum,
+          message:
+            "First name, last name, email, phone, role, and branch are required",
+        });
+        continue;
+      }
+
+      if (!emailRegex.test(email)) {
+        errors.push({ row: rowNum, message: `Invalid email: ${email}` });
+        continue;
+      }
+
+      if (seenEmails.has(email)) {
+        errors.push({
+          row: rowNum,
+          message: `Duplicate email in file: ${email}`,
+        });
+        continue;
+      }
+      if (seenPhones.has(phone)) {
+        errors.push({
+          row: rowNum,
+          message: `Duplicate phone in file: ${phone}`,
+        });
+        continue;
+      }
+      seenEmails.add(email);
+      seenPhones.add(phone);
+
+      const existingEmail = await User.findOne({ where: { email } });
+      if (existingEmail) {
+        errors.push({ row: rowNum, message: `Email already exists: ${email}` });
+        continue;
+      }
+
+      const existingPhone = await User.findOne({ where: { phone } });
+      if (existingPhone) {
+        errors.push({
+          row: rowNum,
+          message: `Phone already exists: ${phone}`,
+        });
+        continue;
+      }
+
+      const branchKey = branchLabel.toLowerCase();
+      const branch =
+        branchByName.get(branchKey) || branchByCode.get(branchKey) || null;
+      if (!branch) {
+        errors.push({
+          row: rowNum,
+          message: `Branch/warehouse not found: ${branchLabel}`,
+        });
+        continue;
+      }
+
+      const allowedStatus = ["verified", "pending", "suspended"];
+      const resolvedStatus = allowedStatus.includes(status)
+        ? status
+        : "verified";
+
+      const transaction = await db.sequelize.transaction();
+      try {
+        const resolvedRole = await resolveOrCreateRole(roleInput, transaction);
+        const role = resolvedRole.name;
+
+        const [genResult] = await db.sequelize.query(
+          `CALL nurmber_generator1(:in_query_type,:facilityId)`,
+          {
+            replacements: { in_query_type: "user", facilityId },
+            transaction,
+          },
+        );
+
+        const entryInCode = extractNurmberCode(genResult, "user");
+        if (entryInCode == null || entryInCode === "") {
+          throw new Error(
+            "Failed to generate user code — check number_generator prefix `user` for this facility.",
+          );
+        }
+
+        await db.sequelize.query(
+          `CALL update_number_generator(:query_type, :in_number,:facilityId)`,
+          {
+            replacements: {
+              query_type: "user",
+              in_number: entryInCode,
+              facilityId,
+            },
+            transaction,
+          },
+        );
+
+        const entry_id_in = `USER-${entryInCode}`;
+        const branchId = parseInt(branch.id, 10);
+
+        const user = await User.create(
+          {
+            id: entry_id_in,
+            firstname,
+            lastname,
+            email,
+            phone,
+            role,
+            status: resolvedStatus,
+            facilityId,
+            branchId,
+            cashier_type: null,
+          },
+          { transaction },
+        );
+
+        await db.sequelize.query(
+          `INSERT INTO membership(business_id, user_id, access_to,role,functionalities,email,branch_id)
+          VALUES (:business_id,:in_id, :accessTo,:role, :functionalities,:email,:branch_id )`,
+          {
+            replacements: {
+              business_id: facilityId,
+              in_id: user.id,
+              role,
+              email,
+              branch_id: branchId,
+              accessTo: "",
+              functionalities: "",
+            },
+            transaction,
+          },
+        );
+
+        await syncUserBranches(
+          user.id,
+          facilityId,
+          [branchId],
+          transaction,
+          email,
+        );
+
+        await transaction.commit();
+        created += 1;
+      } catch (rowErr) {
+        await transaction.rollback();
+        errors.push({
+          row: rowNum,
+          message: rowErr.message || "Failed to create staff row",
+        });
+      }
+    }
+
+    const failed = errors.length;
+    const success = created > 0;
+    return res.status(success ? 200 : 400).json({
+      success,
+      message: success
+        ? `Bulk import complete: ${created} staff created${
+            rolesCreated ? `, ${rolesCreated} role(s) created` : ""
+          }${failed ? `, ${failed} failed` : ""}`
+        : "Upload failed — no records were imported",
+      data: {
+        created,
+        roles_created: rolesCreated,
+        failed,
+        errors,
+      },
+    });
+  } catch (error) {
+    console.error("Error bulk creating staff:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error bulk creating staff",
+      error: error.message,
+    });
+  }
+};
 
 exports.create = async (req, res) => {
   let {

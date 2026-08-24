@@ -164,6 +164,10 @@ exports.getProducts = async (req, res) => {
         "revenue_account",
         "cogs_head",
         "inventory_account",
+        "daily_sales_limit",
+        "weekly_sales_limit",
+        "monthly_sales_limit",
+        "sales_stopped",
         "created_at",
         "updated_at",
       ],
@@ -564,6 +568,132 @@ exports.updateProductSellingPrice = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error updating product selling price",
+      error: error.message,
+    });
+  }
+};
+
+// Set / clear sales target (daily | weekly | monthly) from product list
+exports.updateProductSalesTarget = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { facilityId, period, quantity } = req.body;
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const allowed = ["none", "daily", "weekly", "monthly"];
+    const periodNorm = String(period || "none").toLowerCase();
+    if (!allowed.includes(periodNorm)) {
+      return res.status(400).json({
+        success: false,
+        message: "period must be none, daily, weekly, or monthly",
+      });
+    }
+
+    let qty = null;
+    if (periodNorm !== "none") {
+      qty = parseInt(String(quantity).replace(/,/g, ""), 10);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "quantity must be a positive whole number",
+        });
+      }
+    }
+
+    const product = await db.Product.findOne({
+      where: { id, facility_id: facilityId },
+    });
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    const payload = {
+      daily_sales_limit: null,
+      weekly_sales_limit: null,
+      monthly_sales_limit: null,
+    };
+    if (periodNorm === "daily") payload.daily_sales_limit = qty;
+    if (periodNorm === "weekly") payload.weekly_sales_limit = qty;
+    if (periodNorm === "monthly") payload.monthly_sales_limit = qty;
+
+    await product.update(payload);
+
+    res.json({
+      success: true,
+      data: {
+        productId: id,
+        ...payload,
+        message: "Sales target updated successfully",
+      },
+    });
+  } catch (error) {
+    console.error("Error updating product sales target:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating product sales target",
+      error: error.message,
+    });
+  }
+};
+
+// Toggle stop-sales flag from product list
+exports.updateProductStopSales = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { facilityId, sales_stopped } = req.body;
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    if (typeof sales_stopped !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "sales_stopped must be a boolean",
+      });
+    }
+
+    const product = await db.Product.findOne({
+      where: { id, facility_id: facilityId },
+    });
+
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    await product.update({ sales_stopped });
+
+    res.json({
+      success: true,
+      data: {
+        productId: id,
+        sales_stopped,
+        message: sales_stopped
+          ? "Sales stopped for this product"
+          : "Sales resumed for this product",
+      },
+    });
+  } catch (error) {
+    console.error("Error updating product stop sales:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating product stop sales",
       error: error.message,
     });
   }

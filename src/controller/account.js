@@ -8555,6 +8555,7 @@ exports.getReadyForSalesItems = async (req, res) => {
         p.\`daily_sales_limit\`,
         p.\`weekly_sales_limit\`,
         p.\`monthly_sales_limit\`,
+        p.\`sales_stopped\`,
         b.\`branch_name\` AS \`location_name\`,
         CONCAT(
           sd.\`product_id\`, '-',
@@ -8573,6 +8574,7 @@ exports.getReadyForSalesItems = async (req, res) => {
       ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
+        AND (p.\`sales_stopped\` IS NULL OR p.\`sales_stopped\` = 0)
       ORDER BY
         COALESCE(b.\`branch_name\`, ''),
         sd.\`item_name\`,
@@ -8634,6 +8636,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
         p.\`daily_sales_limit\`,
         p.\`weekly_sales_limit\`,
         p.\`monthly_sales_limit\`,
+        p.\`sales_stopped\`,
         b.\`branch_name\` AS \`location_name\`,
         CONCAT(
           sd.\`product_id\`, '-',
@@ -8652,6 +8655,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
       ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
+        AND (p.\`sales_stopped\` IS NULL OR p.\`sales_stopped\` = 0)
     `;
 
     const replacements = { facilityId };
@@ -8699,6 +8703,7 @@ exports.getServiceProducts = async (req, res) => {
     p.daily_sales_limit,
     p.weekly_sales_limit,
     p.monthly_sales_limit,
+    p.sales_stopped,
     p.created_at,
     p.updated_at,
     'available' AS balance,
@@ -8708,6 +8713,7 @@ FROM products p
 WHERE p.facility_id = :facilityId
     AND p.item_type = 'Service'
     AND p.status = 'Active'
+    AND (p.sales_stopped IS NULL OR p.sales_stopped = 0)
 ORDER BY p.name ASC;`,
       {
         replacements: { facilityId },
@@ -12063,6 +12069,28 @@ exports.getRequisition = async (req, res) => {
 };
 
 exports.insertRequisition = async (req, res) => {
+  // Support JSON body (legacy) and multipart FormData (with po_documents).
+  let body = req.body || {};
+  if (typeof body.po_data === "string" && body.po_data.trim()) {
+    try {
+      body = { ...body, ...JSON.parse(body.po_data) };
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid purchase order data format",
+      });
+    }
+  }
+
+  let expenses = body.expenses || [];
+  if (typeof expenses === "string") {
+    try {
+      expenses = JSON.parse(expenses);
+    } catch (_) {
+      expenses = [];
+    }
+  }
+
   const {
     branch = "",
     branch_id = "",
@@ -12076,11 +12104,12 @@ exports.insertRequisition = async (req, res) => {
     query_type = "insert",
     total = null,
     pr_no = "",
-    expenses = [],
     po_no = "",
     account_code = "",
-  } = req.body;
+  } = body;
 
+  const po_documents = req?.files?.po_documents || [];
+  const document_names = body.document_names;
   const transaction = await db.sequelize.transaction();
 
   try {
@@ -12133,6 +12162,59 @@ exports.insertRequisition = async (req, res) => {
       }
     }
 
+    if (po_documents.length > 0) {
+      await db.sequelize.query(
+        `CREATE TABLE IF NOT EXISTS purchase_order_documents (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          pr_no VARCHAR(100) NOT NULL,
+          po_no VARCHAR(100) NULL,
+          facilityId VARCHAR(50) NOT NULL,
+          document_name VARCHAR(255) NOT NULL,
+          file_path VARCHAR(500) NOT NULL,
+          original_name VARCHAR(255) NULL,
+          file_size INT NULL,
+          mime_type VARCHAR(100) NULL,
+          doc_type VARCHAR(50) NULL DEFAULT 'delivery',
+          uploaded_by VARCHAR(100) NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_po_docs_pr (pr_no, facilityId),
+          INDEX idx_po_docs_po (po_no, facilityId)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        { transaction },
+      );
+
+      for (let i = 0; i < po_documents.length; i++) {
+        const file = po_documents[i];
+        const customName = Array.isArray(document_names)
+          ? document_names[i]
+          : typeof document_names === "string"
+            ? document_names
+            : null;
+
+        await db.sequelize.query(
+          `INSERT INTO purchase_order_documents
+            (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
+           VALUES
+            (:pr_no, :po_no, :facilityId, :document_name, :file_path, :original_name, :file_size, :mime_type, :doc_type, :uploaded_by)`,
+          {
+            replacements: {
+              pr_no: newCode,
+              po_no: po_no || null,
+              facilityId,
+              document_name: customName || file.originalname,
+              file_path: file.filename,
+              original_name: file.originalname,
+              file_size: file.size,
+              mime_type: file.mimetype,
+              doc_type: "delivery",
+              uploaded_by: user_id || requisitor || null,
+            },
+            transaction,
+          },
+        );
+      }
+    }
+
     await transaction.commit();
 
     await recordActivity({
@@ -12148,6 +12230,7 @@ exports.insertRequisition = async (req, res) => {
         total,
         reason,
         line_count: expenses?.length || 0,
+        document_count: po_documents.length,
       },
       remark: reason || "Purchase requisition created",
     });
@@ -12157,6 +12240,7 @@ exports.insertRequisition = async (req, res) => {
       results: requisitionResult,
       pr_no: newCode,
       message: "Requisition created successfully",
+      documents_saved: po_documents.length,
     });
   } catch (error) {
     await transaction.rollback();
@@ -12165,6 +12249,148 @@ exports.insertRequisition = async (req, res) => {
       success: false,
       error: error.message,
       message: "Error while trying to create requisition",
+    });
+  }
+};
+
+exports.getPurchaseOrderDocuments = async (req, res) => {
+  try {
+    const { pr_no, po_no, facilityId } = req.query;
+    if (!facilityId || (!pr_no && !po_no)) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and pr_no (or po_no) are required",
+      });
+    }
+
+    await db.sequelize.query(
+      `CREATE TABLE IF NOT EXISTS purchase_order_documents (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        pr_no VARCHAR(100) NOT NULL,
+        po_no VARCHAR(100) NULL,
+        facilityId VARCHAR(50) NOT NULL,
+        document_name VARCHAR(255) NOT NULL,
+        file_path VARCHAR(500) NOT NULL,
+        original_name VARCHAR(255) NULL,
+        file_size INT NULL,
+        mime_type VARCHAR(100) NULL,
+        doc_type VARCHAR(50) NULL DEFAULT 'delivery',
+        uploaded_by VARCHAR(100) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_po_docs_pr (pr_no, facilityId),
+        INDEX idx_po_docs_po (po_no, facilityId)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    );
+
+    const where = ["facilityId = :facilityId"];
+    const replacements = { facilityId };
+    if (pr_no) {
+      where.push("pr_no = :pr_no");
+      replacements.pr_no = pr_no;
+    }
+    if (po_no) {
+      where.push("po_no = :po_no");
+      replacements.po_no = po_no;
+    }
+
+    const [rows] = await db.sequelize.query(
+      `SELECT id, pr_no, po_no, document_name, file_path, original_name,
+              file_size, mime_type, doc_type, uploaded_by, created_at
+       FROM purchase_order_documents
+       WHERE ${where.join(" AND ")}
+       ORDER BY created_at DESC`,
+      { replacements },
+    );
+
+    return res.json({ success: true, results: rows || [] });
+  } catch (error) {
+    console.error("Error fetching PO documents:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load purchase order documents",
+      error: error.message,
+    });
+  }
+};
+
+exports.uploadPurchaseOrderDocuments = async (req, res) => {
+  try {
+    const body = req.body || {};
+    const { pr_no, po_no, facilityId, uploaded_by, doc_type = "delivery" } =
+      body;
+    const po_documents = req?.files?.po_documents || [];
+
+    if (!facilityId || !pr_no) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and pr_no are required",
+      });
+    }
+    if (!po_documents.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No documents uploaded",
+      });
+    }
+
+    await db.sequelize.query(
+      `CREATE TABLE IF NOT EXISTS purchase_order_documents (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        pr_no VARCHAR(100) NOT NULL,
+        po_no VARCHAR(100) NULL,
+        facilityId VARCHAR(50) NOT NULL,
+        document_name VARCHAR(255) NOT NULL,
+        file_path VARCHAR(500) NOT NULL,
+        original_name VARCHAR(255) NULL,
+        file_size INT NULL,
+        mime_type VARCHAR(100) NULL,
+        doc_type VARCHAR(50) NULL DEFAULT 'delivery',
+        uploaded_by VARCHAR(100) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_po_docs_pr (pr_no, facilityId),
+        INDEX idx_po_docs_po (po_no, facilityId)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    );
+
+    const saved = [];
+    for (const file of po_documents) {
+      await db.sequelize.query(
+        `INSERT INTO purchase_order_documents
+          (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
+         VALUES
+          (:pr_no, :po_no, :facilityId, :document_name, :file_path, :original_name, :file_size, :mime_type, :doc_type, :uploaded_by)`,
+        {
+          replacements: {
+            pr_no,
+            po_no: po_no || null,
+            facilityId,
+            document_name: file.originalname,
+            file_path: file.filename,
+            original_name: file.originalname,
+            file_size: file.size,
+            mime_type: file.mimetype,
+            doc_type: doc_type || "delivery",
+            uploaded_by: uploaded_by || null,
+          },
+        },
+      );
+      saved.push({
+        document_name: file.originalname,
+        file_path: file.filename,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `${saved.length} document(s) uploaded`,
+      results: saved,
+    });
+  } catch (error) {
+    console.error("Error uploading PO documents:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to upload purchase order documents",
+      error: error.message,
     });
   }
 };
