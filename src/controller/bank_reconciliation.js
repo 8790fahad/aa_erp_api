@@ -503,6 +503,36 @@ exports.createBankAccount = async (req, res) => {
       });
     }
 
+    const openingBalanceCheck = parseFloat(opening_balance) || 0;
+    if (openingBalanceCheck !== 0) {
+      const obDate = String(opening_balance_date || "").trim();
+      if (!obDate) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "Opening Balance Date is required when an Opening Balance amount is entered",
+        });
+      }
+      if (!moment(obDate, "YYYY-MM-DD", true).isValid()) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Opening Balance Date must be a valid date (YYYY-MM-DD)",
+        });
+      }
+      // Future dates are allowed
+    } else if (
+      opening_balance_date &&
+      !moment(String(opening_balance_date).trim(), "YYYY-MM-DD", true).isValid()
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Opening Balance Date must be a valid date (YYYY-MM-DD)",
+      });
+    }
+
     // Prevent duplicate active account
     const existing = await db.bank_account.findOne({
       where: { account_number, facilityId, status: "active" },

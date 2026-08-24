@@ -9562,6 +9562,9 @@ exports.updatePayableCode = async (req, res) => {
       case "Scrap Inventory":
         updateFields.scrap_inventory_account = head;
         break;
+      case "VAT Account":
+        updateFields.vat_account_code = head;
+        break;
       default:
         return res.status(400).json({
           success: false,
@@ -9608,6 +9611,8 @@ exports.updatePayableCode = async (req, res) => {
         "sale_revenue_code",
         "abnormal_loss_account",
         "scrap_inventory_account",
+        "vat_policy",
+        "vat_account_code",
       ],
     });
 
@@ -10875,16 +10880,16 @@ exports.generateMarketplaceTinyLink = async (req, res) => {
   }
 };
 
-/** Set default receipt type for sales: pdf (standard) or terminal (80mm thermal). */
+/** Set default receipt type for sales: pdf (A4), a5 (A5), or terminal (80mm thermal). */
 exports.updateDefaultReceiptType = async (req, res) => {
   try {
     const { receiptType, facilityId, user_id } = req.params;
     const normalized = String(receiptType || "").toLowerCase();
 
-    if (!["pdf", "terminal"].includes(normalized)) {
+    if (!["pdf", "terminal", "a5"].includes(normalized)) {
       return res.status(400).json({
         success: false,
-        message: "receiptType must be 'pdf' or 'terminal'",
+        message: "receiptType must be 'pdf', 'a5', or 'terminal'",
       });
     }
 
@@ -10912,6 +10917,148 @@ exports.updateDefaultReceiptType = async (req, res) => {
   } catch (err) {
     console.error("Error updating default receipt type:", err);
     res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.message : "Server error",
+    });
+  }
+};
+
+/** Toggle printing Delivery Order with sales invoice preview/print. */
+exports.updatePrintDeliveryOrder = async (req, res) => {
+  try {
+    const { enabled, facilityId } = req.params;
+    const enableFlag = parseEnableFlag(enabled);
+
+    const [updatedRowsCount] = await db.business.update(
+      { print_delivery_order: enableFlag },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Delivery Order printing ${
+        enableFlag ? "enabled" : "disabled"
+      } successfully`,
+    });
+  } catch (err) {
+    console.error("Error updating print_delivery_order:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.message : "Server error",
+    });
+  }
+};
+
+/** Set Delivery Order layout: match (with invoice) or thermal (80mm). */
+exports.updateDeliveryOrderFormat = async (req, res) => {
+  try {
+    const { format, facilityId } = req.params;
+    const normalized = String(format || "").toLowerCase();
+
+    if (!["match", "thermal"].includes(normalized)) {
+      return res.status(400).json({
+        success: false,
+        message: "format must be 'match' or 'thermal'",
+      });
+    }
+
+    const [updatedRowsCount] = await db.business.update(
+      {
+        delivery_order_format: normalized,
+        // Selecting a format implies Delivery Order is enabled
+        print_delivery_order: true,
+      },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Delivery Order format set to ${normalized}`,
+    });
+  } catch (err) {
+    console.error("Error updating delivery_order_format:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.message : "Server error",
+    });
+  }
+};
+
+/** Set secondary slip type: delivery_order or goods_issue_note. */
+exports.updateDeliveryDocumentType = async (req, res) => {
+  try {
+    const { docType, facilityId } = req.params;
+    const normalized = String(docType || "")
+      .toLowerCase()
+      .replace(/-/g, "_");
+
+    if (!["delivery_order", "goods_issue_note"].includes(normalized)) {
+      return res.status(400).json({
+        success: false,
+        message: "docType must be 'delivery_order' or 'goods_issue_note'",
+      });
+    }
+
+    const [updatedRowsCount] = await db.business.update(
+      {
+        delivery_document_type: normalized,
+        print_delivery_order: true,
+      },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness,
+      message:
+        normalized === "goods_issue_note"
+          ? "Document type set to Goods Issue Note"
+          : "Document type set to Delivery Order",
+    });
+  } catch (err) {
+    console.error("Error updating delivery_document_type:", err);
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
       error:

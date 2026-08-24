@@ -377,6 +377,18 @@ module.exports = (app) => {
     account.updateDefaultReceiptType,
   );
   app.post(
+    "/account/update-print-delivery-order/:enabled/:facilityId/:user_id",
+    account.updatePrintDeliveryOrder,
+  );
+  app.post(
+    "/account/update-delivery-order-format/:format/:facilityId/:user_id",
+    account.updateDeliveryOrderFormat,
+  );
+  app.post(
+    "/account/update-delivery-document-type/:docType/:facilityId/:user_id",
+    account.updateDeliveryDocumentType,
+  );
+  app.post(
     "/account/update-price-setup-resalable-purchase/:enabled/:facilityId/:user_id",
     account.updatePriceSetupResalableOnPurchase,
   );

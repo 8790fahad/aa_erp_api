@@ -732,6 +732,37 @@ exports.CreateCustomer = async (req, res) => {
       });
     }
 
+    const normalizedEmail = String(email || "")
+      .trim()
+      .toLowerCase();
+    if (normalizedEmail) {
+      const emailDupWhere = {
+        facilityId,
+        [Op.and]: [
+          db.sequelize.where(
+            db.sequelize.fn("LOWER", db.sequelize.fn("TRIM", db.sequelize.col("email"))),
+            normalizedEmail,
+          ),
+        ],
+      };
+      if (query_type === "update" && customerNo) {
+        emailDupWhere.customerNo = { [Op.ne]: customerNo };
+      }
+      const emailDuplicate = await db.Customer.findOne({
+        where: emailDupWhere,
+        transaction,
+      });
+      if (emailDuplicate) {
+        await transaction.rollback();
+        return res.status(409).json({
+          success: false,
+          field: "email",
+          message:
+            "This email is already registered for another customer. Please use a different email.",
+        });
+      }
+    }
+
     const duplicateWhere = {
       facilityId,
       phone: normalizedPhone,
@@ -748,6 +779,7 @@ exports.CreateCustomer = async (req, res) => {
       await transaction.rollback();
       return res.status(409).json({
         success: false,
+        field: "work_phone",
         message:
           "A customer with this phone number and name already exists for this facility",
       });
@@ -1106,8 +1138,20 @@ exports.CreateCustomer = async (req, res) => {
       error?.name === "SequelizeUniqueConstraintError" ||
       error?.original?.code === "ER_DUP_ENTRY"
     ) {
+      const dupMsg = String(
+        error?.original?.sqlMessage || error?.message || "",
+      ).toLowerCase();
+      if (dupMsg.includes("email")) {
+        return res.status(409).json({
+          success: false,
+          field: "email",
+          message:
+            "This email is already registered for another customer. Please use a different email.",
+        });
+      }
       return res.status(409).json({
         success: false,
+        field: "work_phone",
         message:
           "A customer with this phone number and name already exists for this facility",
       });

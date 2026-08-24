@@ -83,6 +83,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         defaultValue: "all",
       },
+      vat_account_code: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        comment: "Default VAT account head (Output VAT / VAT payable)",
+      },
       business_name: {
         type: DataTypes.STRING(100),
         allowNull: false,
@@ -334,11 +339,32 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
       default_receipt_type: {
-        type: DataTypes.ENUM("pdf", "terminal"),
+        type: DataTypes.ENUM("pdf", "terminal", "a5"),
         allowNull: false,
         defaultValue: "pdf",
         comment:
-          "Default receipt format for sales — pdf (standard A4/A5) or terminal (80mm thermal printer)",
+          "Default receipt format for sales — pdf (A4), a5 (A5), or terminal (80mm thermal)",
+      },
+      print_delivery_order: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment:
+          "When true, invoice preview/print includes the Delivery Order section",
+      },
+      delivery_order_format: {
+        type: DataTypes.ENUM("match", "thermal"),
+        allowNull: false,
+        defaultValue: "match",
+        comment:
+          "Delivery Order layout: match invoice paper, or thermal 80mm",
+      },
+      delivery_document_type: {
+        type: DataTypes.ENUM("delivery_order", "goods_issue_note"),
+        allowNull: false,
+        defaultValue: "delivery_order",
+        comment:
+          "Secondary slip: Delivery Order (vehicle/driver) or Goods Issue Note",
       },
       customer_notes: {
         type: DataTypes.TEXT,
@@ -348,7 +374,8 @@ module.exports = (sequelize, DataTypes) => {
       terms_conditions: {
         type: DataTypes.TEXT,
         allowNull: true,
-        comment: "Default terms & conditions shown on sales invoices",
+        comment:
+          "Important note printed on sales invoice / delivery order (and terms)",
       },
     },
     {

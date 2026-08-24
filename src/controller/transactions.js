@@ -1267,7 +1267,7 @@ exports.getSaleByCode = async (req, res) => {
         .map((item) => mapEntryToSaleItem(item)),
     );
 
-    const deliveryItems = (
+    let deliveryItems = (
       await Promise.all(
         productEntries
           .filter((item) => {
@@ -1312,12 +1312,6 @@ exports.getSaleByCode = async (req, res) => {
         )
         .sort((a, b) => a - b)[0] || new Date();
 
-    const transaction = {
-      id: saleCode,
-      reference: saleCode,
-      mode_of_payment: baseEntry?.mode_of_payment || "CREDIT",
-      created_by: baseEntry?.created_by,
-    };
     const user = await db.users.findOne({
       where: {
         id: items[0]?.created_by || baseEntry?.created_by,
@@ -1393,6 +1387,205 @@ exports.getSaleByCode = async (req, res) => {
       console.warn("getSaleByCode branch enrich:", enrichErr.message);
     }
 
+    // Resolve warehouse / branch names for line items
+    let warehouseNames = [];
+    let warehouseLabel = "";
+    try {
+      const branchIds = [
+        ...new Set(
+          enrichedItems
+            .map((it) => Number(it.branch_id ?? it.branchId))
+            .filter((id) => Number.isFinite(id) && id > 0),
+        ),
+      ];
+      if (branchIds.length && db.Branch) {
+        const branchRows = await db.Branch.findAll({
+          where: { id: { [Op.in]: branchIds } },
+          attributes: ["id", "branch_name"],
+          raw: true,
+        });
+        const nameById = {};
+        branchRows.forEach((b) => {
+          nameById[b.id] = b.branch_name;
+        });
+        enrichedItems = enrichedItems.map((it) => {
+          const bid = Number(it.branch_id ?? it.branchId);
+          const warehouse =
+            Number.isFinite(bid) && nameById[bid] ? nameById[bid] : null;
+          return { ...it, warehouse, warehouse_name: warehouse };
+        });
+        warehouseNames = branchIds
+          .map((id) => nameById[id])
+          .filter(Boolean);
+        warehouseLabel = warehouseNames.join(", ");
+
+        // Also tag delivery lines with warehouse names
+        deliveryItems = deliveryItems.map((it) => {
+          const bid = Number(it.branch_id ?? it.branchId);
+          const warehouse =
+            Number.isFinite(bid) && nameById[bid] ? nameById[bid] : null;
+          return { ...it, warehouse, warehouse_name: warehouse };
+        });
+      }
+    } catch (whErr) {
+      console.warn("getSaleByCode warehouse resolve:", whErr.message);
+    }
+
+    // Mode of payment + amount paid (deposit / sale payment lines + workflow)
+    const paymentEntries = entries.filter((item) => {
+      const t = String(item.type || "").toLowerCase();
+      const desc = String(item.description || "").toLowerCase();
+      return (
+        t === "deposit" ||
+        t.includes("payment") ||
+        desc.includes("sale payment")
+      );
+    });
+    const amountPaidFromEntries = paymentEntries.reduce(
+      (sum, item) => sum + Number(item.cost || item.amount_paid || 0),
+      0,
+    );
+
+    // Resolve bank names for transfer/bank payment lines
+    const bankIds = [
+      ...new Set(
+        paymentEntries
+          .map((p) => String(p.bank_account_id || "").trim())
+          .filter((id) => id && /^\d+$/.test(id)),
+      ),
+    ];
+    const bankNameById = {};
+    if (bankIds.length && db.bank_account) {
+      try {
+        const banks = await db.bank_account.findAll({
+          where: { id: { [Op.in]: bankIds.map((id) => Number(id)) } },
+          attributes: ["id", "account_name", "bank_code", "account_number", "head"],
+          raw: true,
+        });
+        banks.forEach((b) => {
+          bankNameById[String(b.id)] =
+            b.account_name || b.bank_code || b.account_number || `Bank #${b.id}`;
+        });
+      } catch (bankErr) {
+        console.warn("getSaleByCode bank resolve:", bankErr.message);
+      }
+    }
+
+    const paymentBreakdown = paymentEntries
+      .map((p) => {
+        const modeRaw = String(p.mode_of_payment || "").toLowerCase();
+        const desc = String(p.description || "").toLowerCase();
+        let mode = "other";
+        if (
+          modeRaw === "cash" ||
+          desc.includes("(cash)") ||
+          desc.includes("payment (cash)")
+        ) {
+          mode = "cash";
+        } else if (
+          modeRaw === "bank" ||
+          modeRaw === "transfer" ||
+          modeRaw.includes("bank") ||
+          desc.includes("(bank)") ||
+          desc.includes("payment (bank)") ||
+          desc.includes("transfer")
+        ) {
+          mode = "transfer";
+        } else if (modeRaw === "cheque" || desc.includes("cheque")) {
+          mode = "cheque";
+        } else if (modeRaw && modeRaw !== "credit") {
+          mode = modeRaw;
+        }
+        const bankId = String(p.bank_account_id || "").trim();
+        const bankName =
+          mode === "transfer" || mode === "bank" || mode === "cheque"
+            ? bankNameById[bankId] || null
+            : null;
+        return {
+          mode,
+          amount: Number(p.cost || p.amount_paid || 0),
+          bank_account_id: bankId || null,
+          bank_name: bankName,
+          description: p.description || null,
+        };
+      })
+      .filter((p) => p.amount > 0);
+
+    const cashPaid = paymentBreakdown
+      .filter((p) => p.mode === "cash")
+      .reduce((s, p) => s + p.amount, 0);
+    const transferPaid = paymentBreakdown
+      .filter((p) => p.mode === "transfer" || p.mode === "bank")
+      .reduce((s, p) => s + p.amount, 0);
+    const transferBanks = [
+      ...new Set(
+        paymentBreakdown
+          .filter((p) => (p.mode === "transfer" || p.mode === "bank") && p.bank_name)
+          .map((p) => p.bank_name),
+      ),
+    ];
+
+    let workflowPaymentType = null;
+    let workflowAmount = null;
+    try {
+      if (db.SaleWorkflow) {
+        const wf = await db.SaleWorkflow.findOne({
+          where: { facility_id: facilityId, sale_code: saleCode },
+          attributes: ["payment_type", "amount", "status"],
+          raw: true,
+        });
+        if (wf) {
+          workflowPaymentType = wf.payment_type || null;
+          workflowAmount =
+            wf.amount != null ? Number(wf.amount) : null;
+        }
+      }
+    } catch (wfErr) {
+      console.warn("getSaleByCode workflow:", wfErr.message);
+    }
+
+    const salesMode =
+      enrichedItems.find((it) => it.mode_of_payment)?.mode_of_payment ||
+      paymentEntries.find((it) => it.mode_of_payment)?.mode_of_payment ||
+      null;
+
+    let modeOfPayment =
+      workflowPaymentType ||
+      salesMode ||
+      baseEntry?.mode_of_payment ||
+      "CREDIT";
+
+    // Prefer derived label when we have concrete payment lines
+    if (cashPaid > 0 && transferPaid > 0) {
+      modeOfPayment = "split";
+    } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length) {
+      modeOfPayment = "cash";
+    } else if (transferPaid > 0 && cashPaid <= 0) {
+      modeOfPayment = "transfer";
+    }
+
+    const amountPaid =
+      amountPaidFromEntries > 0
+        ? amountPaidFromEntries
+        : String(modeOfPayment).toUpperCase() === "CREDIT"
+          ? 0
+          : workflowAmount != null && Number.isFinite(workflowAmount)
+            ? workflowAmount
+            : 0;
+
+    const transaction = {
+      id: saleCode,
+      reference: saleCode,
+      mode_of_payment: modeOfPayment,
+      amount_paid: amountPaid,
+      payment_type: modeOfPayment,
+      cash_paid: cashPaid,
+      transfer_paid: transferPaid,
+      transfer_banks: transferBanks,
+      payment_breakdown: paymentBreakdown,
+      created_by: baseEntry?.created_by,
+    };
+
     return res.json({
       success: true,
       data: {
@@ -1412,6 +1605,15 @@ exports.getSaleByCode = async (req, res) => {
         totalTax,
         totalAmount,
         discountAmount: totalDiscount,
+        warehouse: warehouseLabel || null,
+        warehouse_name: warehouseLabel || null,
+        warehouses: warehouseNames,
+        mode_of_payment: modeOfPayment,
+        amount_paid: amountPaid,
+        cash_paid: cashPaid,
+        transfer_paid: transferPaid,
+        transfer_banks: transferBanks,
+        payment_breakdown: paymentBreakdown,
         transaction,
         date: createdAt,
         customer: customer
@@ -1433,6 +1635,14 @@ exports.getSaleByCode = async (req, res) => {
           description: business.description,
           business_email: business.business_email,
           rc: business.rc,
+          default_receipt_type: business.default_receipt_type,
+          print_delivery_order: business.print_delivery_order,
+          delivery_order_format: business.delivery_order_format,
+          delivery_document_type: business.delivery_document_type,
+          document_header_style: business.document_header_style,
+          business_logo: business.business_logo,
+          customer_notes: business.customer_notes,
+          terms_conditions: business.terms_conditions,
         },
         customPricing: false,
         customPrices: {},
@@ -2619,7 +2829,12 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     const business = await db.business.findOne({
       where: { id: facilityId },
-      attributes: ["inv_ev_m", "vat_policy", "allow_sales_without_stock"],
+      attributes: [
+        "inv_ev_m",
+        "vat_policy",
+        "allow_sales_without_stock",
+        "vat_account_code",
+      ],
       raw: true,
     });
 
@@ -2717,12 +2932,14 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     const taxAccounts = [];
     if (taxes && taxes.length > 0) {
+      const defaultVatHead = String(business?.vat_account_code || "").trim();
       for (const tax of taxes) {
         const taxHead =
           tax.account_head ||
           tax.account_sub_head ||
           tax.head ||
-          tax.tax_account_head;
+          tax.tax_account_head ||
+          defaultVatHead;
 
         if (!taxHead) {
           console.warn(
@@ -4034,7 +4251,13 @@ exports.createSale = async (req, res) => {
         );
 
         if (!taxAccountInfo) {
-          const taxCode = tax.account_head || tax.account_sub_head || tax.head || tax.tax_account_head || "N/A";
+          const taxCode =
+            tax.account_head ||
+            tax.account_sub_head ||
+            tax.head ||
+            tax.tax_account_head ||
+            String(business?.vat_account_code || "").trim() ||
+            "N/A";
           const errMsg = `Tax code "${taxCode}" does not exist in Chart of Accounts for tax "${tax.name || tax.description}". Please create the account or update the tax configuration.`;
           console.error(errMsg);
           throw new Error(errMsg);
