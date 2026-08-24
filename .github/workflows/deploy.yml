@@ -117,11 +117,35 @@ jobs:
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
+            # nvm refuses to switch when ~/.npmrc has prefix/globalconfig.
+            # Strip those keys (keep a backup) so deploy can use the nvm Node.
+            if [ -f "$HOME/.npmrc" ]; then
+              cp "$HOME/.npmrc" "$HOME/.npmrc.bak-flowbooks-deploy" 2>/dev/null || true
+              grep -vE '^(prefix|globalconfig)[[:space:]]*=' "$HOME/.npmrc" > "$HOME/.npmrc.tmp" \
+                && mv "$HOME/.npmrc.tmp" "$HOME/.npmrc" \
+                || rm -f "$HOME/.npmrc.tmp"
+            fi
+            # Also clear runtime npm config that can reintroduce the conflict.
+            npm config delete prefix >/dev/null 2>&1 || true
+            npm config delete globalconfig >/dev/null 2>&1 || true
+            unset npm_config_prefix npm_config_globalconfig NPM_CONFIG_PREFIX NPM_CONFIG_GLOBALCONFIG || true
 
-            # VPS ~/.npmrc often has prefix/globalconfig which breaks plain `nvm use`.
-            # --delete-prefix clears that conflict for this shell (nvm's recommended fix).
             nvm install 22 >/dev/null 2>&1 || true
-            nvm use --delete-prefix 22 --silent
+            NODE_VER="$(nvm version 22 2>/dev/null || true)"
+            if [ -z "$NODE_VER" ] || [ "$NODE_VER" = "N/A" ]; then
+              NODE_VER="$(ls -1d "$NVM_DIR"/versions/node/v22.* 2>/dev/null | sed 's|.*/||' | sort -V | tail -1 || true)"
+            fi
+            if [ -n "$NODE_VER" ] && [ "$NODE_VER" != "N/A" ]; then
+              nvm use --delete-prefix "$NODE_VER" --silent || nvm use "$NODE_VER"
+            else
+              nvm use 22
+            fi
+
+            # Hard fallback: put nvm's node bin first on PATH
+            if ! command -v node >/dev/null 2>&1; then
+              NODE_BIN="$(ls -1d "$NVM_DIR"/versions/node/v22.*/bin 2>/dev/null | sort -V | tail -1)"
+              [ -n "$NODE_BIN" ] && export PATH="$NODE_BIN:$PATH"
+            fi
 
             node -v
             npm -v
