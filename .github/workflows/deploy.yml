@@ -117,7 +117,13 @@ jobs:
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
-            nvm use 22
+            # VPS ~/.npmrc often has prefix/globalconfig which breaks plain `nvm use`.
+            # --delete-prefix clears that conflict for this shell (nvm's recommended fix).
+            nvm install 22 >/dev/null 2>&1 || true
+            nvm use --delete-prefix 22 --silent
+
+            node -v
+            npm -v
 
             npm install --legacy-peer-deps
             npm run migrate
