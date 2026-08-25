@@ -23,18 +23,19 @@ function renderTemplate(body, vars = {}) {
 }
 
 function getMailtrapTransport({ forLiveSend = false } = {}) {
-  // Prefer Mailtrap API token (sending domain / production).
-  if (process.env.MAILTRAP_TOKEN) {
-    return {
-      transport: nodemailer.createTransport(
-        MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
-      ),
-      mode: "api",
-    };
-  }
-  // Sandbox SMTP — capture only, does not deliver to real inboxes.
+  // Prefer sandbox SMTP when configured — avoids Mailtrap Sending API "Unauthorized"
+  // when MAILTRAP_TOKEN is an Email Testing / inbox token rather than a Sending domain token.
   if (process.env.MAILTRAP_USER && process.env.MAILTRAP_PASS) {
     if (forLiveSend && process.env.MAILTRAP_ALLOW_SANDBOX !== "true") {
+      // Live customer email needs Sending API token unless sandbox is explicitly allowed.
+      if (process.env.MAILTRAP_TOKEN) {
+        return {
+          transport: nodemailer.createTransport(
+            MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
+          ),
+          mode: "api",
+        };
+      }
       throw new Error(
         "Mailtrap sandbox SMTP cannot deliver live customer email. Set MAILTRAP_TOKEN (sending domain) or MAILTRAP_ALLOW_SANDBOX=true for intentional sandbox tests.",
       );
@@ -50,6 +51,14 @@ function getMailtrapTransport({ forLiveSend = false } = {}) {
         },
       }),
       mode: "sandbox",
+    };
+  }
+  if (process.env.MAILTRAP_TOKEN) {
+    return {
+      transport: nodemailer.createTransport(
+        MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
+      ),
+      mode: "api",
     };
   }
   throw new Error(
