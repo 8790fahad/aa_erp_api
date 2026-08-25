@@ -33,6 +33,10 @@ module.exports = (app) => {
     saleWorkflow.cashierConfirmPayment,
   );
   app.post(
+    "/api/v1/sale-workflows/send-credit-remainder",
+    saleWorkflow.sendCreditRemainder,
+  );
+  app.post(
     "/api/v1/sale-workflows/special-treatment",
     saleWorkflow.applySpecialInvoiceTreatment,
   );

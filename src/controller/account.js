@@ -13525,6 +13525,22 @@ exports.directPurchaseConsumables = async (req, res) => {
         }
       }
 
+      // Persist per-item VAT on the purchase line
+      await db.SupplierEntry.update(
+        {
+          vat_amount: parseFloat(Number(itemTotalTax || 0).toFixed(2)),
+        },
+        {
+          where: {
+            receiptNo: pvCode,
+            facilityId,
+            link_id: String(processedItem.sku),
+            type: "purchase",
+          },
+          transaction,
+        },
+      );
+
       // Calculate total for this item (item amount + tax) based on VAT policy
       // For vat_inclusive: itemTotal already includes tax, so payable = itemTotal
       // For vat_exclusive: itemTotal is base price, so payable = itemTotal + itemTotalTax
@@ -13955,6 +13971,7 @@ exports.getExpenseBill = async (req, res) => {
         unit_measure: item.product_unit_of_measure || "pcs",
         item_type: item.product_item_type || "N/A",
         taxable: item.product_taxable || "Not Taxable",
+        vat_amount: parseFloat(item.vat_amount || 0) || 0,
         product: item.product_id
           ? {
               id: item.product_id,
@@ -13972,11 +13989,14 @@ exports.getExpenseBill = async (req, res) => {
       taxes: taxEntries.map((entry) => {
         const inclusiveType =
           entry.tax_inclusive_type || entry.inclusive_type || "exclusive";
+        const taxName =
+          entry.tax_description || entry.description || "Input VAT";
+        // Prefer supplier_entries.description (includes "on purchase of …") for per-item matching
+        const lineDescription = entry.description || taxName;
         return {
           id: entry.tax_id || entry.link_id,
-          name: entry.tax_description || entry.description || "Input VAT",
-          description:
-            entry.tax_description || entry.description || "Input VAT",
+          name: taxName,
+          description: lineDescription,
           rate: entry.tax_rate || entry.rate || "0",
           amount: parseFloat(entry.cost || 0),
           cost: parseFloat(entry.cost || 0),
@@ -14423,6 +14443,30 @@ exports.directPurchaseExpenses = async (req, res) => {
               { transaction },
             );
           }
+        }
+
+        // Persist per-item VAT on the expense purchase line
+        const itemVat = taxAccountMap.size
+          ? [...taxAccountMap.values()].reduce(
+              (sum, taxInfo) =>
+                sum + (itemTotal / totalTaxableAmount) * taxInfo.amount,
+              0,
+            )
+          : 0;
+        const linkId = item.sku || item.item_code || item.head || item.account_head;
+        if (linkId) {
+          await db.SupplierEntry.update(
+            { vat_amount: parseFloat(Number(itemVat || 0).toFixed(2)) },
+            {
+              where: {
+                receiptNo: pvCode,
+                facilityId,
+                link_id: String(linkId),
+                type: "purchase",
+              },
+              transaction,
+            },
+          );
         }
       }
     }

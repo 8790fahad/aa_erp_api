@@ -14,6 +14,7 @@ module.exports = (sequelize, DataTypes) => {
       qty_in: { type: DataTypes.FLOAT, defaultValue: 0 },
       qty_out: { type: DataTypes.FLOAT, defaultValue: 0 },
       cost: { type: DataTypes.FLOAT, defaultValue: 0 },
+      vat_amount: { type: DataTypes.DECIMAL(18, 2), allowNull: false, defaultValue: 0 },
       bank_account_id: { type: DataTypes.STRING },
       transaction_date: { type: DataTypes.DATE },
       facilityId: {

@@ -1176,7 +1176,7 @@ exports.getCashierDashboard = async (req, res) => {
       if (Number.isFinite(bid) && bid > 0) where.branch_id = bid;
     }
 
-    // Cashiers only see invoices assigned to their user id
+    // Cashiers see invoices assigned to them, or unassigned (open pool)
     const roleNorm = String(role || "")
       .toLowerCase()
       .trim();
@@ -1188,7 +1188,11 @@ exports.getCashierDashboard = async (req, res) => {
     const cashierUserId =
       userId != null && String(userId).trim() ? String(userId).trim() : "";
     if (isCashierRole && cashierUserId) {
-      where.assigned_cashier_id = cashierUserId;
+      where[db.Sequelize.Op.or] = [
+        { assigned_cashier_id: cashierUserId },
+        { assigned_cashier_id: null },
+        { assigned_cashier_id: "" },
+      ];
     }
 
     const ct = String(cashierType || "").toLowerCase();
@@ -2198,7 +2202,9 @@ exports.cashierConfirmPayment = async (req, res) => {
           updated_by,
           note ||
             (isSplit
-              ? "Cash + Transfer fully collected — ready for separation"
+              ? paymentType === "credit_split"
+                ? "Cash + Transfer + Credit fully settled — ready for separation"
+                : "Cash + Transfer fully collected — ready for separation"
               : `Payment collected by cashier (${rawSplits
                   .map((s) => `${s.mode}:${s.amount}`)
                   .join(", ")})`),
@@ -2258,7 +2264,11 @@ exports.cashierConfirmPayment = async (req, res) => {
           : "Payment";
     return res.json({
       success: true,
-      message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${rem.toFixed(2)} — collect from Cash and/or Transfer.`,
+      message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${rem.toFixed(2)} — collect from Cash and/or Transfer${
+        paymentType === "credit_split"
+          ? ", or send the remainder to Credit Approval"
+          : ""
+      }.`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
@@ -2278,6 +2288,123 @@ exports.cashierConfirmPayment = async (req, res) => {
   }
 };
 
+/**
+ * Credit + Cash + Transfer: after (optional) partial cash/transfer collection,
+ * send the unpaid remainder to Credit Approval.
+ */
+exports.sendCreditRemainder = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      saleCode,
+      updated_by,
+      note,
+    } = req.body || {};
+
+    if (!facilityId || !saleCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and saleCode are required",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      await transaction.rollback();
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+
+    const row = await db.SaleWorkflow.findOne({
+      where: { facility_id: facilityId, sale_code: saleCode },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (!row) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Invoice workflow not found",
+      });
+    }
+
+    const paymentType = String(row.payment_type || "").toLowerCase();
+    if (paymentType !== "credit_split") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Only Credit + Cash + Transfer invoices can send a remainder to credit",
+      });
+    }
+    if (row.status !== "awaiting_cashier_confirm") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Invoice is not awaiting collection (status: ${row.status})`,
+      });
+    }
+
+    const amountDue = Number(row.amount) || 0;
+    const progress = getSplitCollectionProgress(row.history);
+    const remaining = Number(
+      (amountDue - (progress.collected_total || 0)).toFixed(2),
+    );
+    if (remaining <= 0.05) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Nothing left on credit — cash/transfer already covers the invoice",
+      });
+    }
+
+    row.amount = remaining;
+    row.payment_type = "credit";
+    row.status = "awaiting_credit_approval";
+    row.updated_by = updated_by || row.updated_by;
+    setWorkflowHistory(
+      row,
+      pushHistory(
+        row.history,
+        "awaiting_credit_approval",
+        updated_by,
+        note ||
+          `Cash/transfer collected ₦${Number(progress.collected_total || 0).toFixed(2)}; remainder ₦${remaining.toFixed(2)} sent to Credit Approval`,
+        {
+          credit_remainder: {
+            from: "credit_split",
+            cash_collected: progress.cash || 0,
+            transfer_collected: progress.transfer || 0,
+            remainder: remaining,
+          },
+        },
+      ),
+    );
+    await row.save({ transaction });
+    await transaction.commit();
+
+    return res.json({
+      success: true,
+      message: `Remainder ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
+      results: {
+        ...row.toJSON(),
+        status_color: stageMeta(row.status)?.color || "amber",
+        next_status: nextStageFor(row.status, row.payment_type),
+        split_progress: progress,
+      },
+    });
+  } catch (err) {
+    await transaction.rollback();
+    console.error("sendCreditRemainder:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to send credit remainder",
+    });
+  }
+};
 
 exports.listSaleFulfillments = async (req, res) => {
   try {

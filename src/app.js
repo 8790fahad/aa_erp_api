@@ -390,6 +390,7 @@ require("./routes/activityAudit")(app);
 require("./routes/stoctmangement")(app);
 require("./routes/sales")(app);
 require("./routes/saleWorkflow")(app);
+require("./routes/collectionReconciliation")(app);
 require("./routes/globalSearch")(app);
 require("./routes/rebateLedger")(app);
 require("./routes/crm")(app);

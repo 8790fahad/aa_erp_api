@@ -4597,7 +4597,11 @@ exports.createSale = async (req, res) => {
         facilityId,
         saleCode: saleRef,
         customerNo: customer_id,
-        customerName: customer.fullname,
+        customerName:
+          customer?.fullname ||
+          customer?.company_name ||
+          [customer?.first_name, customer?.last_name].filter(Boolean).join(" ") ||
+          null,
         paymentType: normalizePaymentType(
           isCashSale
             ? cashModeOfPayment
@@ -4612,12 +4616,12 @@ exports.createSale = async (req, res) => {
             : netAmount,
         branchId: saleBranchId,
         createdBy: created_by,
-        discountAmount,
+        discountAmount: discount_amount,
         assignedCashierId: assigned_cashier_id || cashier_user_id || null,
         assignedCashierName: assigned_cashier_name || cashier_name || null,
       });
     } catch (wfErr) {
-      console.error("Sale workflow create skipped:", wfErr.message);
+      console.error("Sale workflow create skipped:", wfErr?.message || wfErr, wfErr?.stack || "");
     }
 
     // ===================================================================
