@@ -1,10 +1,10 @@
 const env = {
-  database: 'db_inventria',
+  database: 'db_aa_erp',
   username: 'root',
   password: '',
   host: 'localhost',
   // dialect: 'mysql',
-  dialect: 'db_inventria',
+  dialect: 'db_aa_erp',
   pool: {
     max: 5,
     min: 0,

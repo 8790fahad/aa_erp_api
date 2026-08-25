@@ -1,4 +1,4 @@
-# FlowBooks — Pre-VAPT Security Assessment V2
+# AA ERP — Pre-VAPT Security Assessment V2
 
 **Date:** 16 July 2026  
 **Version:** 2.1 (fresh re-assessment after hardening + final app fixes)  
@@ -64,7 +64,7 @@
 | N8 | Low | Docs sample names/addresses look real | **Fixed** — docs samples now use neutral `example.com` / sample company data by default. |
 | N9 | Info | Dashboard credential rotate trust model differs from KYC | **Fixed** — invoice credential rotation now requires admin/superadmin/owner role. |
 
-**Ops fix applied locally:** `EINVOICING_DOCS_SHOW_SANDBOX_CREDS=false`, `EINVOICING_ALLOW_GLOBAL_CLIENT=false` in `flowbooks_api/.env`.
+**Ops fix applied locally:** `EINVOICING_DOCS_SHOW_SANDBOX_CREDS=false`, `EINVOICING_ALLOW_GLOBAL_CLIENT=false` in `aa_erp_api/.env`.
 
 ---
 

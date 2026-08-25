@@ -36,11 +36,11 @@ const getStaticPublicBasePath = () => {
   if (process.env.PUBLIC_STATIC_BASE_PATH) {
     const configured = String(process.env.PUBLIC_STATIC_BASE_PATH).trim();
     const withSlash = configured.startsWith("/") ? configured : `/${configured}`;
-    return withSlash.replace(/\/$/, "") || "/flowbooks";
+    return withSlash.replace(/\/$/, "") || "/aa_erp";
   }
 
-  const basePath = String(process.env.BASE_PATH || "/flowbooks").replace(/\/$/, "");
-  return basePath || "/flowbooks";
+  const basePath = String(process.env.BASE_PATH || "/aa_erp").replace(/\/$/, "");
+  return basePath || "/aa_erp";
 };
 
 const getStaticPublicOrigin = (req) => {

@@ -23,6 +23,16 @@ function countWorkingDaysInMonth(year, month) {
   return count;
 }
 
+/** True when payroll period is on/after the loan's applies-from month. */
+function loanAppliesInPeriod(loan, month, year) {
+  if (!loan?.startDate) return true;
+  const start = new Date(loan.startDate);
+  if (Number.isNaN(start.getTime())) return true;
+  const startYm = start.getFullYear() * 12 + start.getMonth();
+  const periodYm = parseInt(year, 10) * 12 + (parseInt(month, 10) - 1);
+  return periodYm >= startYm;
+}
+
 // ─── runPayroll ───────────────────────────────────────────────────────────────
 exports.runPayroll = async (req, res) => {
   try {
@@ -310,6 +320,7 @@ exports.runPayroll = async (req, res) => {
       });
 
       for (const loan of activeLoans) {
+        if (!loanAppliesInPeriod(loan, month, year)) continue;
         const remainingBalance = parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
         if (remainingBalance > 0) {
           const deduction = Math.min(parseFloat(loan.monthlyDeductionAmount || 0), remainingBalance);
@@ -850,6 +861,7 @@ exports.updatePayrollStatus = async (req, res) => {
         let remainingToApply = deduction;
         for (const loan of activeLoans) {
           if (remainingToApply <= 0) break;
+          if (!loanAppliesInPeriod(loan, payroll.month, payroll.year)) continue;
           const already = await db.loan_repayments.findOne({
             where: { loanId: loan.id, facilityId, reference: periodRef },
           });
@@ -943,6 +955,7 @@ exports.batchUpdateStatus = async (req, res) => {
         let remainingToApply = deduction;
         for (const loan of activeLoans) {
           if (remainingToApply <= 0) break;
+          if (!loanAppliesInPeriod(loan, row.month, row.year)) continue;
           const already = await db.loan_repayments.findOne({
             where: {
               loanId: loan.id,

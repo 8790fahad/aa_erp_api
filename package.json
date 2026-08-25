@@ -15,7 +15,7 @@
     "migrate:undo": "node run-migrations.js --undo",
     "migrate:single": "node scripts/run-single-migration.js",
     "test:firs": "node scripts/test-firs-einvoicing.js",
-    "test:firs:remote": "FIRS_TEST_BASE_URL=https://server.brainstorm.ng/flowbooks FIRS_TEST_SHOW_SECRET=1 node scripts/test-firs-einvoicing.js"
+    "test:firs:remote": "FIRS_TEST_BASE_URL=https://server.brainstorm.ng/aa_erp FIRS_TEST_SHOW_SECRET=1 node scripts/test-firs-einvoicing.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

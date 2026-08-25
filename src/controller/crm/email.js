@@ -58,11 +58,11 @@ function getMailtrapTransport({ forLiveSend = false } = {}) {
 }
 
 function fromAddress() {
-  const name = process.env.COMPANY_NAME || "FlowBooks";
+  const name = process.env.COMPANY_NAME || "AA ERP";
   const email =
     process.env.COMPANY_EMAIL ||
     process.env.MAIL_FROM ||
-    "no-reply@flowbooks.org";
+    "no-reply@aa_erp.org";
   return `"${name}" <${email}>`;
 }
 

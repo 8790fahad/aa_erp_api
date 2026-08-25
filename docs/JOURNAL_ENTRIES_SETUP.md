@@ -2,7 +2,7 @@
 
 ## Overview
 
-This guide walks you through setting up the Journal Entries module in your Inventria installation.
+This guide walks you through setting up the Journal Entries module in your AaErp installation.
 
 ---
 
@@ -10,7 +10,7 @@ This guide walks you through setting up the Journal Entries module in your Inven
 
 - Node.js >= 14.x
 - MySQL/MariaDB database
-- Existing Inventria installation
+- Existing AaErp installation
 - npm or yarn package manager
 
 ---
@@ -23,7 +23,7 @@ Run the migration to create journal entry tables:
 
 ```bash
 # Navigate to your project directory
-cd flowbooks_api
+cd aa_erp_api
 
 # Run migration
 npx sequelize-cli db:migrate --migrations-path src/migrations --name 20240101000000-create-journal-entries.js
@@ -345,8 +345,8 @@ Before going live:
 
 - **API Documentation**: See `JOURNAL_ENTRIES_API.md`
 - **Issue Tracker**: GitHub Issues
-- **Community**: Inventria Discord/Slack
-- **Email Support**: support@inventria.com
+- **Community**: AaErp Discord/Slack
+- **Email Support**: support@aa_erp.com
 
 ---
 

@@ -1,6 +1,6 @@
 "use strict";
 
-/** Short slug for marketplace tiny link (e.g. flowbooks.org/ma). */
+/** Short slug for marketplace tiny link (e.g. aa_erp.org/ma). */
 module.exports = {
   up: async (queryInterface, Sequelize) => {
     await queryInterface.addColumn("business", "marketplace_slug", {

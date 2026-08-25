@@ -1,5 +1,5 @@
 # VULNERABILITY ASSESSMENT & PENETRATION TESTING (VAPT) REPORT  
-## FlowBooks Invoice API
+## AA ERP Invoice API
 
 ---
 
@@ -7,7 +7,7 @@
 **Classification:** Confidential  
 **Date of Assessment:** Week of 17 February 2026  
 **Assessment Type:** Vulnerability Assessment & Penetration Testing  
-**Scope:** FlowBooks / FIRS Invoice API (Create, Lookup Status, Payment Notify)
+**Scope:** AA ERP / FIRS Invoice API (Create, Lookup Status, Payment Notify)
 
 **Purpose:** This assessment was conducted in support of compliance with the Federal Inland Revenue Service (FIRS) e-Invoicing mandate and related System Integrator / Access Point Provider requirements. This report may be submitted to FIRS as evidence of security assessment of the invoice API used for e-Invoicing.
 
@@ -15,13 +15,13 @@
 
 ## 1. EXECUTIVE SUMMARY
 
-This report presents the findings of a Vulnerability Assessment and Penetration Testing (VAPT) engagement performed on the **FlowBooks Invoice API**, which provides FIRS e-Invoicing compliance through Create Invoice, Lookup Invoice Status, and Payment Notification endpoints.
+This report presents the findings of a Vulnerability Assessment and Penetration Testing (VAPT) engagement performed on the **AA ERP Invoice API**, which provides FIRS e-Invoicing compliance through Create Invoice, Lookup Invoice Status, and Payment Notification endpoints.
 
 **In-scope components:**
 - `POST /api/v1/invoice/create`
 - `POST /api/v1/invoice/status`
 - `POST /api/v1/invoice/payment/notify`
-- Related controller, environment configuration, and API documentation (e.g. `/flowbooks-api-docs`)
+- Related controller, environment configuration, and API documentation (e.g. `/aa_erp-api-docs`)
 
 **Summary of findings:**
 
@@ -33,21 +33,21 @@ This report presents the findings of a Vulnerability Assessment and Penetration 
 | Low      | 2 | - |
 | Informational | 2 | - |
 
-**Overall risk:** **Low–Medium**. The High finding (VAPT-INV-001 – Missing Authentication & Authorization) has been **remediated** and the platform has been updated: JWT authentication (Passport) and facility-scoped authorization are now enforced on all FlowBooks Invoice API endpoints. Remaining Medium and Low findings should be addressed as per recommendations.
+**Overall risk:** **Low–Medium**. The High finding (VAPT-INV-001 – Missing Authentication & Authorization) has been **remediated** and the platform has been updated: JWT authentication (Passport) and facility-scoped authorization are now enforced on all AA ERP Invoice API endpoints. Remaining Medium and Low findings should be addressed as per recommendations.
 
 ---
 
 ## 2. SCOPE & OBJECTIVES
 
 ### 2.1 In Scope
-- FlowBooks Invoice API routes and controller logic
+- AA ERP Invoice API routes and controller logic
 - Request/response handling and input validation
-- Use of secrets (e.g. `FLOWBOOKS_SECRET_KEY`) and proxy behaviour
+- Use of secrets (e.g. `AA_ERP_SECRET_KEY`) and proxy behaviour
 - Error handling and information disclosure
 - API documentation exposure
 
 ### 2.2 Out of Scope
-- Third-party FlowBooks Connect Gateway backend (external gateway)
+- Third-party AA ERP Connect Gateway backend (external gateway)
 - Frontend application security
 - Infrastructure and network security
 - Social engineering or physical security
@@ -73,9 +73,9 @@ This report presents the findings of a Vulnerability Assessment and Penetration 
 |------|--------|
 | API base | `/api/v1/invoice/*` |
 | Backend | Node.js / Express |
-| Proxy | Requests forwarded to FlowBooks Connect Gateway |
-| Secrets | `FLOWBOOKS_SECRET_KEY`, `FLOWBOOKS_BASE_URL` (env) |
-| Documentation | Swagger UI at `/flowbooks-api-docs` |
+| Proxy | Requests forwarded to AA ERP Connect Gateway |
+| Secrets | `AA_ERP_SECRET_KEY`, `AA_ERP_BASE_URL` (env) |
+| Documentation | Swagger UI at `/aa_erp-api-docs` |
 
 ---
 
@@ -87,7 +87,7 @@ This report presents the findings of a Vulnerability Assessment and Penetration 
 **CVSS v3 (approx.):** 8.1 (High)
 
 **Description:**  
-The FlowBooks Invoice API endpoints (`/api/v1/invoice/create`, `/api/v1/invoice/status`, `POST /api/v1/invoice/payment/notify`) did not enforce authentication or authorization. Any party that could reach the API could call these endpoints. The server used `FLOWBOOKS_SECRET_KEY` only when proxying to the external gateway and did not validate the identity or permissions of the caller.
+The AA ERP Invoice API endpoints (`/api/v1/invoice/create`, `/api/v1/invoice/status`, `POST /api/v1/invoice/payment/notify`) did not enforce authentication or authorization. Any party that could reach the API could call these endpoints. The server used `AA_ERP_SECRET_KEY` only when proxying to the external gateway and did not validate the identity or permissions of the caller.
 
 **Impact (prior to remediation):**  
 - Unauthenticated users could create invoices, query status, and send payment notifications.
@@ -98,13 +98,13 @@ The FlowBooks Invoice API endpoints (`/api/v1/invoice/create`, `/api/v1/invoice/
 - Implement authorization so only allowed facilities/roles can create or query invoices (e.g. bind to `facilityId` and validate against authenticated identity).
 
 **Remediation:**  
-Authentication and authorization have been implemented on all FlowBooks Invoice API endpoints. Only authenticated and authorized users/facilities can access `/api/v1/invoice/create`, `/api/v1/invoice/status`, and `/api/v1/invoice/payment/notify`. Identity and permissions are validated before requests are proxied to the FlowBooks gateway.
+Authentication and authorization have been implemented on all AA ERP Invoice API endpoints. Only authenticated and authorized users/facilities can access `/api/v1/invoice/create`, `/api/v1/invoice/status`, and `/api/v1/invoice/payment/notify`. Identity and permissions are validated before requests are proxied to the AA ERP gateway.
 
 **Implementation (platform update):**
 - **Authentication:** All three invoice endpoints now use Passport JWT strategy (`passport.authenticate("jwt", { session: false })`). Requests must include a valid JWT in the `Authorization` header; otherwise the API returns 401 Unauthorized.
 - **Authorization:** A facility-scoped check ensures that the `facilityId` in the request body matches the authenticated user’s `facilityId`. Users can only create, lookup, or notify for their own facility. If the facility does not match, the API returns 403 Forbidden with the message: "Forbidden: you may only act on your own facility."
 - **Exception:** Users with role `superAdmin` may act on any facility.
-- **Code changes:** Routes in `src/routes/firsInvoice.js` were updated to apply the authentication middleware; the controller in `src/controller/firsInvoice.js` was updated with an `ensureFacilityAccess(req, facilityId)` helper and authorization checks in each handler before proxying to the FlowBooks gateway.
+- **Code changes:** Routes in `src/routes/firsInvoice.js` were updated to apply the authentication middleware; the controller in `src/controller/firsInvoice.js` was updated with an `ensureFacilityAccess(req, facilityId)` helper and authorization checks in each handler before proxying to the AA ERP gateway.
 
 **Remediation status:** **Remediated** (implemented in platform; no open High or Critical findings at time of submission.)
 
@@ -116,7 +116,7 @@ Authentication and authorization have been implemented on all FlowBooks Invoice 
 **CVSS v3 (approx.):** 5.3 (Medium)
 
 **Description:**  
-When `FLOWBOOKS_SECRET_KEY` is not set, the API returns a clear-text message indicating that the “FlowBooks secret key” is not configured and that `FLOWBOOKS_SECRET_KEY` should be set in the environment. Similar dependency on environment may be reflected in other error paths.
+When `AA_ERP_SECRET_KEY` is not set, the API returns a clear-text message indicating that the “AA ERP secret key” is not configured and that `AA_ERP_SECRET_KEY` should be set in the environment. Similar dependency on environment may be reflected in other error paths.
 
 **Impact:**  
 - Attackers can confirm the use of a specific secret key and where it is configured.
@@ -126,7 +126,7 @@ When `FLOWBOOKS_SECRET_KEY` is not set, the API returns a clear-text message ind
 ```json
 {
   "success": false,
-  "message": "FlowBooks secret key not configured. Set FLOWBOOKS_SECRET_KEY in environment."
+  "message": "AA ERP secret key not configured. Set AA_ERP_SECRET_KEY in environment."
 }
 ```
 
@@ -174,7 +174,7 @@ No rate limiting or throttling was observed on the invoice API. An attacker or m
 
 **Impact:**  
 - DoS through resource exhaustion (CPU, memory, or downstream gateway limits).
-- Abuse of the external FlowBooks service and possible account or contractual issues.
+- Abuse of the external AA ERP service and possible account or contractual issues.
 - Brute-force or enumeration of `facilityId` / `invoiceRef` if combined with weak auth.
 
 **Recommendation:**  
@@ -191,14 +191,14 @@ No rate limiting or throttling was observed on the invoice API. An attacker or m
 **CVSS v3 (approx.):** 3.7 (Low)
 
 **Description:**  
-Swagger UI for the FlowBooks Invoice API is exposed at `/flowbooks-api-docs` (and under `BASE_PATH`). The documentation describes request/response schemas, parameters, and examples, and may be reachable without authentication.
+Swagger UI for the AA ERP Invoice API is exposed at `/aa_erp-api-docs` (and under `BASE_PATH`). The documentation describes request/response schemas, parameters, and examples, and may be reachable without authentication.
 
 **Impact:**  
 - Easier reconnaissance: attackers can see exact endpoints, parameters, and example payloads.
 - Risk increases if authentication is not enforced on the docs or the API itself.
 
 **Recommendation:**  
-- Restrict access to `/flowbooks-api-docs` (e.g. authentication, IP allowlist, or only in non-production).
+- Restrict access to `/aa_erp-api-docs` (e.g. authentication, IP allowlist, or only in non-production).
 - Ensure production API requires authentication regardless of documentation exposure.
 
 **Remediation status:** Open
@@ -230,7 +230,7 @@ On upstream errors, the controller may return the upstream response (or part of 
 **Finding ID:** VAPT-INV-007  
 
 **Description:**  
-The controller uses the deprecated `request` npm package for outbound HTTP calls to the FlowBooks gateway.
+The controller uses the deprecated `request` npm package for outbound HTTP calls to the AA ERP gateway.
 
 **Impact:**  
 - No direct vulnerability cited, but deprecated dependencies may stop receiving security updates.
@@ -275,16 +275,16 @@ The application uses CORS and Helmet. CORS is configured with an allowlist of or
 
 ## 7. RECOMMENDATIONS SUMMARY
 
-1. **Completed:** Authentication and authorization are now enforced on all FlowBooks Invoice API endpoints (VAPT-INV-001 remediated).
-2. **High priority:** Add request validation (schema + length/enum checks) and generic error messages; avoid exposing `FLOWBOOKS_SECRET_KEY` or env details in responses.
-3. **Medium priority:** Deploy rate limiting and restrict or protect access to `/flowbooks-api-docs`.
+1. **Completed:** Authentication and authorization are now enforced on all AA ERP Invoice API endpoints (VAPT-INV-001 remediated).
+2. **High priority:** Add request validation (schema + length/enum checks) and generic error messages; avoid exposing `AA_ERP_SECRET_KEY` or env details in responses.
+3. **Medium priority:** Deploy rate limiting and restrict or protect access to `/aa_erp-api-docs`.
 4. **Ongoing:** Replace deprecated HTTP client, keep dependencies updated, and re-scan after changes.
 
 ---
 
 ## 8. CONCLUSION
 
-The FlowBooks Invoice API provides necessary integration points for FIRS e-Invoicing. The **High finding (VAPT-INV-001 – Missing Authentication & Authorization) has been remediated** and the **platform has been updated**: JWT authentication and facility-scoped authorization are enforced on all invoice endpoints (see Section 5.1 for implementation details). Overall risk is **Low–Medium**. Addressing the remaining Medium and Low findings (input validation, rate limiting, error message hardening, documentation access) will further improve security and compliance posture. Re-assessment after full remediation is recommended.
+The AA ERP Invoice API provides necessary integration points for FIRS e-Invoicing. The **High finding (VAPT-INV-001 – Missing Authentication & Authorization) has been remediated** and the **platform has been updated**: JWT authentication and facility-scoped authorization are enforced on all invoice endpoints (see Section 5.1 for implementation details). Overall risk is **Low–Medium**. Addressing the remaining Medium and Low findings (input validation, rate limiting, error message hardening, documentation access) will further improve security and compliance posture. Re-assessment after full remediation is recommended.
 
 ---
 

@@ -168,7 +168,7 @@
 Run these migrations to fix the database schema:
 
 ```bash
-cd /Users/mac/Documents/project/inventria workstation/flowbooks_api
+cd /Users/mac/Documents/project/aa_erp workstation/aa_erp_api
 npx sequelize-cli db:migrate
 ```
 

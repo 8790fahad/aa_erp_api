@@ -46,7 +46,7 @@ function signedMovement(nature, debit, credit) {
 }
 
 /**
- * Infer nature from first digit of Inventria CoA when account_nature is missing.
+ * Infer nature from first digit of AaErp CoA when account_nature is missing.
  * 1 = ASSET, 2/9 = LIABILITY, 3 = EQUITY, 4–6 = REVENUE, 7–8 = EXPENSE
  */
 function inferNatureFromCode(accountCode) {

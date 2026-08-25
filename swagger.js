@@ -9,7 +9,7 @@ const {
 } = require("./swagger/routeScanner");
 
 const PORT = process.env.PORT || 3000;
-const BASE_PATH = process.env.BASE_PATH || "/flowbooks";
+const BASE_PATH = process.env.BASE_PATH || "/aa_erp";
 const API_BASE_URL = (
   process.env.API_BASE_URL ||
   process.env.APP_URL ||
@@ -81,10 +81,10 @@ const options = {
   definition: {
     openapi: "3.0.0",
     info: {
-      title: "FlowBooks API",
+      title: "AA ERP API",
       version: "2.0.0",
       description: [
-        "FlowBooks ERP / accounting API documentation.",
+        "AA ERP ERP / accounting API documentation.",
         "",
         "**Auth:** `POST /api/auth/login` → use the returned JWT with **Authorize**.",
         "",
@@ -94,9 +94,9 @@ const options = {
         "Invoice endpoints include full request/response schemas.",
       ].join("\n"),
       contact: {
-        name: "FlowBooks",
-        url: "https://flowbooks.org",
-        email: "hello@flowbooks.org",
+        name: "AA ERP",
+        url: "https://aa_erp.org",
+        email: "hello@aa_erp.org",
       },
     },
     servers: buildServers(),

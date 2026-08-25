@@ -1,6 +1,6 @@
 module.exports = (app) => {
   const catalogController = require("../controller/catalogController");
-  const BASE_PATH = process.env.BASE_PATH || "/flowbooks";
+  const BASE_PATH = process.env.BASE_PATH || "/aa_erp";
 
   // Keep legacy routes and add BASE_PATH routes for production/live access.
   app.get("/api/catalog/business", catalogController.getCatalogBusiness);

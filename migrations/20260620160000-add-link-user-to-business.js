@@ -1,6 +1,6 @@
 "use strict";
 
-/** Custom username for marketplace link (e.g. flowbooks.org/i/myshop). */
+/** Custom username for marketplace link (e.g. aa_erp.org/i/myshop). */
 module.exports = {
   up: async (queryInterface, Sequelize) => {
     await queryInterface.addColumn("business", "link_user", {

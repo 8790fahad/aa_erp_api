@@ -3,7 +3,7 @@
 /**
  * Ensure each facility has a Goods in Transit asset account in CoA.
  * YAMMUSA-style CoA: 112103 under Current Assets (112000).
- * Default inventria CoA: 100022 under Inventory (100004).
+ * Default aa_erp CoA: 100022 under Inventory (100004).
  */
 module.exports = {
   up: async (queryInterface) => {

@@ -1,8 +1,8 @@
-# FlowBooks Invoice Upload System — Implementation Timeline and Milestones
+# AA ERP Invoice Upload System — Implementation Timeline and Milestones
 
 **Document:** Upload / E-Invoicing System Implementation Timeline
-**Product:** FlowBooks FIRS / NRS E-Invoicing API
-**API base:** `https://server.brainstorm.ng/flowbooks`
+**Product:** AA ERP FIRS / NRS E-Invoicing API
+**API base:** `https://server.brainstorm.ng/aa_erp`
 **Docs:** `/e-invoicing-api-docs`
 **Last updated:** July 2026
 
@@ -10,7 +10,7 @@
 
 ## 1. Overview
 
-FlowBooks implements an **invoice upload system** that allows System Integrator (SI) / Access Point clients to:
+AA ERP implements an **invoice upload system** that allows System Integrator (SI) / Access Point clients to:
 
 1. Authenticate via OAuth 2.0 Client Credentials
 2. **Upload / create** invoices (`POST /api/v1/invoice/create`)
@@ -25,7 +25,7 @@ The implementation follows a phased approach aligned with FIRS e-Invoicing requi
 
 ```mermaid
 gantt
-    title FlowBooks Invoice Upload System Timeline
+    title AA ERP Invoice Upload System Timeline
     dateFormat  YYYY-MM
     section Phase 1 — Foundation
     Discovery & NRS/FIRS alignment           :done, p1a, 2025-09, 2025-11
@@ -150,4 +150,4 @@ gantt
 
 ---
 
-_This document may be submitted as part of the FlowBooks SI/APP / VAPT evidence pack for the FIRS e-Invoicing invoice upload capability._
+_This document may be submitted as part of the AA ERP SI/APP / VAPT evidence pack for the FIRS e-Invoicing invoice upload capability._

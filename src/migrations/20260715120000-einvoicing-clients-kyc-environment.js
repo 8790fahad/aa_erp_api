@@ -4,7 +4,7 @@
  * Extend einvoicing_clients for KYC lifecycle credentials:
  * - environment: testing | production
  * - kyc_user_id: link to KYC client (nullable for legacy business-only rows)
- * - business_id: nullable for KYC signup before a FlowBooks business exists
+ * - business_id: nullable for KYC signup before a AA ERP business exists
  * - unique per (kyc_user_id, environment) and (business_id, environment)
  *
  * Also adds kyc_users.status value "approved" (KYC complete ≠ email verified).
@@ -36,7 +36,7 @@ module.exports = {
       await queryInterface.changeColumn("einvoicing_clients", "business_id", {
         type: Sequelize.STRING(50),
         allowNull: true,
-        comment: "FlowBooks business/facility id (optional until linked)",
+        comment: "AA ERP business/facility id (optional until linked)",
       });
     }
 

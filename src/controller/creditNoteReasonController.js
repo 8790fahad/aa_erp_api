@@ -1,10 +1,10 @@
 /**
  * Credit / Debit note reason definitions and metadata.
- * Single source of truth for labels, inventory flags, and API consumers (Flowbooks UI).
+ * Single source of truth for labels, inventory flags, and API consumers (AA ERP UI).
  */
 
 /**
- * Scenario key for UI behaviour (Flowbooks credit / debit note form).
+ * Scenario key for UI behaviour (AA ERP credit / debit note form).
  * RETURN | OVERCHARGE | PRICING_ERROR | DAMAGED | DISCOUNT
  */
 const CREDIT_NOTE_REASONS = [

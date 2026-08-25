@@ -3,10 +3,10 @@
 /**
  * Run one migration file (useful when the full chain fails).
  *
- * Uses flowbooks_api/.env (DB_*) — same as `npm run migrate` — so it hits the
+ * Uses aa_erp_api/.env (DB_*) — same as `npm run migrate` — so it hits the
  * same database. Falls back to config/config.json only if DB_NAME is unset.
  *
- * Usage (from flowbooks_api):
+ * Usage (from aa_erp_api):
  *   node scripts/run-single-migration.js 20260412120000-generate-account-code-nature-six-digit.js
  */
 

@@ -22,14 +22,14 @@ function getParentCodeFromRow(row) {
 }
 
 /**
- * Inventria CoA (account_category): digits 1–9, then 01–99 per level (101 → 10101 → 1010102).
+ * AaErp CoA (account_category): digits 1–9, then 01–99 per level (101 → 10101 → 1010102).
  * Parent links come from account_category.parent_code (e.g. 10101→101, 101→1); 10107 may attach
  * directly under 101 per CoA, not only via segment chop.
  */
 
 /**
  * Resolve the 3-digit head for BS classification: walk account_category.parent_code when the row
- * exists; otherwise Inventria segment (strip two digits). Does not require the parent row to be
+ * exists; otherwise AaErp segment (strip two digits). Does not require the parent row to be
  * present in rowsByCode (missing heads still resolve via parent_code on the child row).
  */
 function balanceSheetHead3(accountCode, rowsByCode) {
@@ -102,11 +102,11 @@ function applyLiabilityClassification(rows) {
 /**
  * Core balance sheet data from general_ledger + account_category (single as-of date).
  * Balancing rules: ASSET = Dr−Cr; LIABILITY/EQUITY = Cr−Dr. (Revenue = Cr−Dr on P&L.)
- * BS sections use account_nature (ASSET / LIABILITY / EQUITY) so Inventria CoAs that put
+ * BS sections use account_nature (ASSET / LIABILITY / EQUITY) so AaErp CoAs that put
  * liabilities under 9xxxx (not 2xxxx) still balance. No GL status filter — all postings count.
  * Current / non-current uses parent_code + segment head (balanceSheetHead3).
  * @param {{ includeZeroHeadAccounts?: boolean }} [options] — When true (SOFP only), include chart
- *   codes with zero balance when they are valid Inventria heads (odd length: 1,3,5,7…) so parents
+ *   codes with zero balance when they are valid AaErp heads (odd length: 1,3,5,7…) so parents
  *   like 10101 appear under 101 (10101 → 1010101 chain). Non-zero detection uses ABS(net) so
  *   asset accounts with credit/overdraft balances (e.g. cash 10107) are not dropped.
  */
@@ -331,7 +331,7 @@ function toSofpFlatLineRows(mergedRows) {
 }
 
 /**
- * Inventria chart numbering: level 1 = one digit 1–9; each deeper level adds two digits (01–99).
+ * AaErp chart numbering: level 1 = one digit 1–9; each deeper level adds two digits (01–99).
  * Same segment rule as hierarchical general ledger (e.g. 101 → 10101 → 1010101).
  */
 function getSegmentParentCode(accountCode) {
@@ -697,7 +697,7 @@ function formatYearLabel(isoDate) {
   return moment(isoDate).format("YYYY");
 }
 
-/** DD/MM/YYYY — matches Inventria report headers (General Ledger, Balance Sheet) */
+/** DD/MM/YYYY — matches AaErp report headers (General Ledger, Balance Sheet) */
 function formatStatementHeaderDate(isoDate) {
   if (!isoDate) return "";
   return moment(isoDate).format("DD/MM/YYYY");
@@ -2170,7 +2170,7 @@ exports.getStatementOfFinancialPosition = async (req, res) => {
 
     // ── 2. Fetch net income for BOTH periods ──────────────────────────────────
     // Net income = revenue (cr-dr) − expense (dr-cr) via account_nature.
-    // Inventria CoA uses 6xx revenue / 7–8xx expense (not classic 4/5). No status filter.
+    // AaErp CoA uses 6xx revenue / 7–8xx expense (not classic 4/5). No status filter.
     const netIncomeQuery = `
       SELECT
         COALESCE(SUM(
@@ -2426,7 +2426,7 @@ exports.getCashFlowStatement = async (req, res) => {
       startDate = earliest?.earliest_date || new Date().getFullYear() + "-01-01";
     }
 
-    // Inventria CoA often leaves subcategory null and tags banks as "Current assets".
+    // AaErp CoA often leaves subcategory null and tags banks as "Current assets".
     // Match cash/bank by subcategory, type, category, description, or cash hierarchy codes.
     const SQL_IS_CASH_OR_BANK = `(
       LOWER(COALESCE(ac.subcategory, '')) IN (
@@ -2991,7 +2991,7 @@ const COLUMN_LABELS = {
   accumulated_other_comprehensive_income: "Other Comprehensive Income",
 };
 
-/** Infer SOCE column when CoA subcategory is null (common on Inventria charts). */
+/** Infer SOCE column when CoA subcategory is null (common on AaErp charts). */
 function resolveEquitySubcategory(acc) {
   const raw = String(acc.subcategory || "").trim();
   if (raw) return raw;

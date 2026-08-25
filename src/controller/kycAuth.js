@@ -2,7 +2,7 @@
 
 /**
  * KYC auth — signup / phone OTP / login (password + email OTP) / email verification against `kyc_users` only.
- * Intentionally does NOT create FlowBooks `users` or business records.
+ * Intentionally does NOT create AA ERP `users` or business records.
  */
 
 const crypto = require("crypto");
@@ -89,7 +89,7 @@ function getKycFrontendBaseUrl() {
   const raw = isProd
     ? process.env.KYC_FRONTEND_URL_PROD ||
       process.env.KYC_FRONTEND_URL ||
-      "https://connect.flowbooks.org"
+      "https://connect.aa_erp.org"
     : process.env.KYC_FRONTEND_URL_DEV || "http://localhost:5173";
   return String(raw).replace(/\/$/, "");
 }
@@ -118,22 +118,22 @@ function getCompanyMailBranding() {
   return {
     companyLogoUrl:
       process.env.COMPANY_LOGO_URL ||
-      "https://res.cloudinary.com/drxkp1erj/image/upload/flowbooks-blue_utcqmg.png",
-    companyWebsite: process.env.COMPANY_WEBSITE || "https://flowbooks.org",
-    companyEmail: process.env.COMPANY_EMAIL || "hello@flowbooks.org",
+      "https://res.cloudinary.com/drxkp1erj/image/upload/aa_erp-blue_utcqmg.png",
+    companyWebsite: process.env.COMPANY_WEBSITE || "https://aa_erp.org",
+    companyEmail: process.env.COMPANY_EMAIL || "hello@aa_erp.org",
     companyPhone: process.env.COMPANY_PHONE || "+2348067643479",
-    companyTwitter: process.env.COMPANY_TWITTER || "https://x.com/flowbooksng",
+    companyTwitter: process.env.COMPANY_TWITTER || "https://x.com/aa_erpng",
     companyInstagram:
-      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/flowbooksng",
+      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/aa_erpng",
     companyLinkedIn:
       process.env.COMPANY_LINKEDIN ||
-      "https://www.linkedin.com/company/flowbooksng",
+      "https://www.linkedin.com/company/aa_erpng",
     companyFacebook:
-      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/flowbooksng",
+      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng",
   };
 }
 
-/** Standard FlowBooks mail footer (website, email, phone, social icons). */
+/** Standard AA ERP mail footer (website, email, phone, social icons). */
 function buildCompanyMailFooter(branding = getCompanyMailBranding()) {
   const {
     companyWebsite,
@@ -244,7 +244,7 @@ async function saveAndSendPhoneOtp(user) {
     throw new Error("A valid phone number is required to send SMS");
   }
 
-  const message = `Your FlowBooks One-time Pass is ${formatOtpForSms(otp)}. Use immediately`;
+  const message = `Your AA ERP One-time Pass is ${formatOtpForSms(otp)}. Use immediately`;
   let smsSent = false;
   let smsError = null;
   try {
@@ -279,20 +279,20 @@ async function sendVerificationEmail({ email, firstName, token }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"FlowBooks KYC" <hello@flowbooks.org>',
+    from: '"AA ERP KYC" <hello@aa_erp.org>',
     to: email,
-    subject: "FlowBooks KYC - Verify your email",
+    subject: "AA ERP KYC - Verify your email",
     category: "KYC Email Verification",
     html: `
       <div style="background-color:#f5f5f7;padding:24px 0;font-family:Arial,sans-serif;">
         <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
           <div style="padding:20px 24px 0 24px;">
-            <img src="${companyLogoUrl}" alt="FlowBooks" style="display:block;height:32px;width:auto;object-fit:contain;" />
+            <img src="${companyLogoUrl}" alt="AA ERP" style="display:block;height:32px;width:auto;object-fit:contain;" />
           </div>
           <div style="padding:24px 24px 16px 24px;">
             <h2 style="margin:0 0 16px;font-size:22px;color:#111;">Hi ${firstName || "there"}!</h2>
             <p style="margin:0 0 12px;font-size:14px;color:#333;line-height:1.6;">
-              Welcome to <strong style="color:#4267B2;">FlowBooks KYC</strong>.
+              Welcome to <strong style="color:#4267B2;">AA ERP KYC</strong>.
             </p>
             <p style="margin:0 0 20px;font-size:14px;color:#333;line-height:1.6;">
               Please verify your email address to activate your account.
@@ -308,7 +308,7 @@ async function sendVerificationEmail({ email, firstName, token }) {
             </p>
             <p style="margin:0 0 8px;font-size:13px;color:#555;">
               With respect,<br/>
-              <strong>FlowBooks Team</strong>
+              <strong>AA ERP Team</strong>
             </p>
           </div>
           ${buildCompanyMailFooter(branding)}
@@ -324,20 +324,20 @@ async function sendLoginOtpEmail({ email, firstName, otp }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"FlowBooks KYC" <hello@flowbooks.org>',
+    from: '"AA ERP KYC" <hello@aa_erp.org>',
     to: email,
-    subject: "Your FlowBooks KYC login code",
+    subject: "Your AA ERP KYC login code",
     category: "KYC Login OTP",
     html: `
       <div style="background-color:#f5f5f7;padding:24px 0;font-family:Arial,sans-serif;">
         <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
           <div style="padding:20px 24px 0 24px;">
-            <img src="${companyLogoUrl}" alt="FlowBooks" style="display:block;height:32px;width:auto;object-fit:contain;" />
+            <img src="${companyLogoUrl}" alt="AA ERP" style="display:block;height:32px;width:auto;object-fit:contain;" />
           </div>
           <div style="padding:24px 24px 16px 24px;">
             <h2 style="margin:0 0 16px;font-size:22px;color:#111;">Hi ${firstName || "there"}!</h2>
             <p style="margin:0 0 12px;font-size:14px;color:#333;line-height:1.6;">
-              Use this code to finish signing in to <strong style="color:#4267B2;">FlowBooks KYC</strong>.
+              Use this code to finish signing in to <strong style="color:#4267B2;">AA ERP KYC</strong>.
             </p>
             <div style="text-align:center;margin:24px 0;">
               <div style="display:inline-block;background:#f0f4ff;color:#111;padding:14px 28px;border-radius:8px;font-size:28px;letter-spacing:8px;font-weight:bold;">
@@ -349,7 +349,7 @@ async function sendLoginOtpEmail({ email, firstName, otp }) {
             </p>
             <p style="margin:0 0 8px;font-size:13px;color:#555;">
               With respect,<br/>
-              <strong>FlowBooks Team</strong>
+              <strong>AA ERP Team</strong>
             </p>
           </div>
           ${buildCompanyMailFooter(branding)}
@@ -808,20 +808,20 @@ async function sendPasswordResetEmail({ email, firstName, token }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"FlowBooks KYC" <hello@flowbooks.org>',
+    from: '"AA ERP KYC" <hello@aa_erp.org>',
     to: email,
-    subject: "Reset your FlowBooks KYC password",
+    subject: "Reset your AA ERP KYC password",
     category: "KYC Password Reset",
     html: `
       <div style="background-color:#f5f5f7;padding:24px 0;font-family:Arial,sans-serif;">
         <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
           <div style="padding:20px 24px 0 24px;">
-            <img src="${companyLogoUrl}" alt="FlowBooks" style="display:block;height:32px;width:auto;" />
+            <img src="${companyLogoUrl}" alt="AA ERP" style="display:block;height:32px;width:auto;" />
           </div>
           <div style="padding:24px 24px 16px 24px;">
             <h2 style="margin:0 0 16px;font-size:22px;color:#111;">Hi ${firstName || "there"}!</h2>
             <p style="margin:0 0 12px;font-size:14px;color:#333;line-height:1.6;">
-              We received a request to reset your <strong style="color:#4267B2;">FlowBooks KYC</strong> password.
+              We received a request to reset your <strong style="color:#4267B2;">AA ERP KYC</strong> password.
             </p>
             <p style="margin:0 0 20px;font-size:14px;color:#333;line-height:1.6;">
               Click the button below to choose a new password. This link expires in 1 hour.
@@ -837,7 +837,7 @@ async function sendPasswordResetEmail({ email, firstName, token }) {
             </p>
             <p style="margin:0 0 8px;font-size:13px;color:#555;">
               With respect,<br/>
-              <strong>FlowBooks Team</strong>
+              <strong>AA ERP Team</strong>
             </p>
           </div>
           ${buildCompanyMailFooter(branding)}
@@ -2079,7 +2079,7 @@ exports.uploadBusinessDocument = async (req, res) => {
       });
     }
 
-    const basePath = (process.env.BASE_PATH || "/flowbooks").replace(
+    const basePath = (process.env.BASE_PATH || "/aa_erp").replace(
       /\/$/,
       "",
     );

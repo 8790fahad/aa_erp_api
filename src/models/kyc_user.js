@@ -1,10 +1,10 @@
 "use strict";
 
 /**
- * KYC signups — accounts registered through the FlowBooks KYC app.
+ * KYC signups — accounts registered through the AA ERP KYC app.
  *
  * Fully self-contained: password + email verification live here.
- * Do NOT use the main FlowBooks `users` table for KYC auth.
+ * Do NOT use the main AA ERP `users` table for KYC auth.
  */
 module.exports = (sequelize, DataTypes) => {
   const KycUser = sequelize.define(
@@ -18,7 +18,7 @@ module.exports = (sequelize, DataTypes) => {
       facility_id: {
         type: DataTypes.STRING(50),
         allowNull: true,
-        comment: "Optional later link to a FlowBooks business (not set at KYC signup)",
+        comment: "Optional later link to a AA ERP business (not set at KYC signup)",
       },
       business_name: {
         type: DataTypes.STRING(255),

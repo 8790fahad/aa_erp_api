@@ -2,7 +2,7 @@
 
 ## Overview
 
-This system provides comprehensive accounting reports that are compliant with International Financial Reporting Standards (IFRS) and Nigerian Federal Inland Revenue Service (FIRS) requirements. The system generates both financial statements and tax compliance reports based on the `kirmaskngov_inventria_new` database.
+This system provides comprehensive accounting reports that are compliant with International Financial Reporting Standards (IFRS) and Nigerian Federal Inland Revenue Service (FIRS) requirements. The system generates both financial statements and tax compliance reports based on the `kirmaskngov_aa_erp` database.
 
 ## Features
 

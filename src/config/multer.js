@@ -34,7 +34,7 @@ const lab = new CloudinaryStorage({
 const logos = new CloudinaryStorage({
   cloudinary,
   params: {
-    folder: "inventria/logos",
+    folder: "aa_erp/logos",
     format: "png",
     public_id: (req, file) => file.originalname,
   },

@@ -1,21 +1,21 @@
-Subject: FlowBooks E-Invoicing API — VAPT kickoff pack (questionnaire + access)
+Subject: AA ERP E-Invoicing API — VAPT kickoff pack (questionnaire + access)
 
 ---
 
 Dear [Assessor Name],
 
-Please find attached our completed VAPT questionnaire for the **FlowBooks NRS / FIRS E-Invoicing API** engagement.
+Please find attached our completed VAPT questionnaire for the **AA ERP NRS / FIRS E-Invoicing API** engagement.
 
 **Scope**
 
 - In scope: E-Invoicing REST APIs only (OAuth token, create invoice, status, payment notify, transmit).
-- Out of scope (unless expanded): KYC Connect UI, general FlowBooks ERP APIs, and frontend applications.
+- Out of scope (unless expanded): KYC Connect UI, general AA ERP ERP APIs, and frontend applications.
 
 **Documentation**
 
-- API docs: https://server.brainstorm.ng/flowbooks/e-invoicing-api-docs
-- OpenAPI: https://server.brainstorm.ng/flowbooks/e-invoicing-api-docs.json
-- Postman: https://server.brainstorm.ng/flowbooks/e-invoicing-api-docs/postman.json
+- API docs: https://server.brainstorm.ng/aa_erp/e-invoicing-api-docs
+- OpenAPI: https://server.brainstorm.ng/aa_erp/e-invoicing-api-docs.json
+- Postman: https://server.brainstorm.ng/aa_erp/e-invoicing-api-docs/postman.json
 
 **Authentication**
 
@@ -25,12 +25,12 @@ Please find attached our completed VAPT questionnaire for the **FlowBooks NRS / 
 
 **Test environment**
 
-- Preferred: UAT / sandbox against `https://server.brainstorm.ng/flowbooks`
+- Preferred: UAT / sandbox against `https://server.brainstorm.ng/aa_erp`
 - Please share your scanner source IP addresses so we can allow-list them if required.
 
 **Attachments**
 
-1. `FlowBooks_E-Invoicing_VAPT_Questionnaire_Responses.xlsx`
+1. `AA ERP_E-Invoicing_VAPT_Questionnaire_Responses.xlsx`
 2. `[Password-protected credentials file — to follow / attached separately]`
 
 Kindly confirm receipt and proposed start date. We are available for a short kickoff call if helpful.
@@ -38,5 +38,5 @@ Kindly confirm receipt and proposed start date. We are available for a short kic
 Best regards,
 [Your Name]
 [Title]
-FlowBooks / Brainstorm
+AA ERP / Brainstorm
 [Phone] | [Email]

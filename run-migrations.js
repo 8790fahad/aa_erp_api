@@ -1,5 +1,5 @@
 /**
- * Run migrations in flowbooks_api/migrations (sorted by filename).
+ * Run migrations in aa_erp_api/migrations (sorted by filename).
  * Skips files already recorded in SequelizeMeta (same idea as sequelize-cli).
  *
  * Uses .env: DB_HOST, DB_USERNAME, DB_PASSWORD, DB_NAME, DB_DIALECT
@@ -23,7 +23,7 @@ const config = {
 
 if (!config.database || !config.username) {
   console.error(
-    "❌ Set DB_NAME and DB_USERNAME (and DB_HOST, DB_PASSWORD) in flowbooks_api/.env",
+    "❌ Set DB_NAME and DB_USERNAME (and DB_HOST, DB_PASSWORD) in aa_erp_api/.env",
   );
   process.exit(1);
 }

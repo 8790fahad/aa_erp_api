@@ -1,4 +1,4 @@
-# FlowBooks — Production Readiness & VAPT Handoff Checklist
+# AA ERP — Production Readiness & VAPT Handoff Checklist
 
 This document operationalizes the "Overall Assessment" from the Pre-VAPT
 Security Assessment. Application-level code fixes are complete (see
@@ -134,5 +134,5 @@ Prepare and share with the assessor to streamline the engagement:
 - [ ] Sections 1–6 complete and verified on the UAT/production environment.
 - [ ] Owner: ____________________  Date: ____________
 
-Once the above are complete, FlowBooks is positioned for a formal third-party
+Once the above are complete, AA ERP is positioned for a formal third-party
 VAPT and subsequent submission to MBS.

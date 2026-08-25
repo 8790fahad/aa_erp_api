@@ -2,7 +2,7 @@
 
 ## 📋 Overview
 
-A comprehensive Journal Entries module for Inventria's accounting system, providing full CRUD operations, posting, reversals, and audit trails for double-entry bookkeeping.
+A comprehensive Journal Entries module for AaErp's accounting system, providing full CRUD operations, posting, reversals, and audit trails for double-entry bookkeeping.
 
 ## ✨ Features
 
@@ -38,7 +38,7 @@ A comprehensive Journal Entries module for Inventria's accounting system, provid
 ## 📁 File Structure
 
 ```
-flowbooks_api/
+aa_erp_api/
 ├── src/
 │   ├── migrations/
 │   │   └── 20240101000000-create-journal-entries.js     # Database schema
@@ -56,7 +56,7 @@ flowbooks_api/
 │   └── tests/
 │       └── journalEntry.test.js                         # Unit & integration tests
 │
-└── src/models/inventria_v2/src/components/
+└── src/models/aa_erp_v2/src/components/
     ├── pages/account/
     │   ├── JournalEntryList.jsx                         # List page
     │   ├── JournalEntryForm.jsx                         # Create/Edit form
@@ -132,7 +132,7 @@ Detail table storing individual debit/credit lines.
 ### 1. Run Database Migration
 
 ```bash
-cd flowbooks_api
+cd aa_erp_api
 npx sequelize-cli db:migrate --name 20240101000000-create-journal-entries.js
 ```
 
@@ -453,16 +453,16 @@ To contribute improvements:
 
 ## 📞 Support
 
-- **Email**: support@inventria.com
-- **Documentation**: https://docs.inventria.com
+- **Email**: support@aa_erp.com
+- **Documentation**: https://docs.aa_erp.com
 - **Issues**: GitHub Issues
 
 ---
 
 ## 📜 License
 
-Part of Inventria ERP System
-© 2024 Inventria. All rights reserved.
+Part of AaErp ERP System
+© 2024 AaErp. All rights reserved.
 
 ---
 

@@ -1,4 +1,4 @@
-# FlowBooks E-Invoicing API
+# AA ERP E-Invoicing API
 
 **Document Version:** 2.1  
 **Last Updated:** August 2026  
@@ -12,7 +12,7 @@
 | OpenAPI JSON | `/e-invoicing-api-docs.json` |
 | Sample invoice (HTML) | `/e-invoicing-api-docs/sample-invoice` |
 | Try-it (Swagger) | `/e-invoicing-api-docs/try` |
-| Production | `https://server.brainstorm.ng/inventria_new/e-invoicing-api-docs` |
+| Production | `https://server.brainstorm.ng/aa_erp/e-invoicing-api-docs` |
 
 Reference: [NRS / FIRS e-Invoicing API](https://einvoice.firs.gov.ng/docs/introduction?version=1.1)
 
@@ -64,7 +64,7 @@ HSN codes for goods must use dotted UN style (e.g. `8471.30`). Service lines use
   "accounting_supplier_party": {
     "party_name": "Brainstorm IT Solutions",
     "tin": "12345678-0001",
-    "email": "hello@flowbooks.org",
+    "email": "hello@aa_erp.org",
     "telephone": "+2348067643479",
     "business_description": "Information technology and software services",
     "postal_address": {
@@ -98,8 +98,8 @@ HSN codes for goods must use dotted UN style (e.g. `8471.30`). Service lines use
       "invoiced_quantity": 1.0,
       "line_extension_amount": 1500000.0,
       "item": {
-        "name": "FlowBooks Cloud Accounting — Annual Licence",
-        "description": "12-month SaaS licence for FlowBooks accounting (GL, sales, purchases, inventory, VAT returns) for one legal entity.",
+        "name": "AA ERP Cloud Accounting — Annual Licence",
+        "description": "12-month SaaS licence for AA ERP accounting (GL, sales, purchases, inventory, VAT returns) for one legal entity.",
         "sellers_item_identification": "6201"
       },
       "price": {

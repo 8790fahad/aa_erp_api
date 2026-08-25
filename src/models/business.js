@@ -110,7 +110,7 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(400),
         allowNull: true,
       },
-      // Enable/disable FlowBooks online ordering (WhatsApp store, etc.)
+      // Enable/disable AA ERP online ordering (WhatsApp store, etc.)
       enable_online_ordering: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
@@ -123,14 +123,14 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         unique: true,
         comment:
-          "Short slug for marketplace tiny link (e.g. flowbooks.org/ma)",
+          "Short slug for marketplace tiny link (e.g. aa_erp.org/ma)",
       },
       link_user: {
         type: DataTypes.STRING(50),
         allowNull: true,
         unique: true,
         comment:
-          "Custom username for marketplace link (e.g. flowbooks.org/i/myshop)",
+          "Custom username for marketplace link (e.g. aa_erp.org/i/myshop)",
       },
       marketplace_tiny_link: {
         type: DataTypes.STRING(255),

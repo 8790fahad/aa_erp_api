@@ -22,7 +22,7 @@ const UNUSED_TABLES = [
   "account_1",
   "account_category3",
   "account_new",
-  "inventria_account_",
+  "___PROTECT_AA_ERP_ACCOUNT___",
   "asset_maintenances",
   "bank_details",
   "branch_requisition_status",

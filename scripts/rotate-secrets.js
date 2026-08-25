@@ -2,7 +2,7 @@
 /**
  * Secret rotation helper.
  *
- * Generates cryptographically strong values for every secret FlowBooks uses,
+ * Generates cryptographically strong values for every secret AA ERP uses,
  * ready to paste into your production secret store / .env. Run this before a
  * VAPT engagement and any time a secret may have been exposed (e.g. committed
  * to git, shared, or logged).

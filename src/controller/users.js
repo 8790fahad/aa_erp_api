@@ -174,7 +174,7 @@ function getKycFrontendBaseUrl() {
   const raw = isProd
     ? process.env.KYC_FRONTEND_URL_PROD ||
       process.env.KYC_FRONTEND_URL ||
-      "https://connect.flowbooks.org"
+      "https://connect.aa_erp.org"
     : process.env.KYC_FRONTEND_URL_DEV || "http://localhost:5173";
   return String(raw).replace(/\/$/, "");
 }
@@ -1701,26 +1701,26 @@ exports.create = async (req, res) => {
         }),
       );
       const companyWebsite =
-        process.env.COMPANY_WEBSITE || "https://flowbooks.org";
-      const companyEmail = process.env.COMPANY_EMAIL || "hello@flowbooks.org";
+        process.env.COMPANY_WEBSITE || "https://aa_erp.org";
+      const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
       const companyPhone = process.env.COMPANY_PHONE || "+2348067643479";
       const companyTwitter =
-        process.env.COMPANY_TWITTER || "https://x.com/flowbooksng";
+        process.env.COMPANY_TWITTER || "https://x.com/aa_erpng";
       const companyInstagram =
         process.env.COMPANY_INSTAGRAM ||
-        "https://www.instagram.com/flowbooksng";
+        "https://www.instagram.com/aa_erpng";
       const companyLinkedIn =
         process.env.COMPANY_LINKEDIN ||
-        "https://www.linkedin.com/company/flowbooksng";
+        "https://www.linkedin.com/company/aa_erpng";
       const companyFacebook =
-        process.env.COMPANY_FACEBOOK || "https://www.facebook.com/flowbooksng";
+        process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
       const companyLogoUrl =
-        process.env.COMPANY_LOGO_URL || "https://app.flowbooks.org/logo.png";
+        process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
 
       const mailOptions = {
-        from: '"FlowBooks" <no-reply@flowbooks.org>',
+        from: '"AA ERP" <no-reply@aa_erp.org>',
         to: email,
-        subject: "FlowBooks - Email Verification Link",
+        subject: "AA ERP - Email Verification Link",
         category: "Email Verification Link",
         html: `
           <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
@@ -1728,7 +1728,7 @@ exports.create = async (req, res) => {
               <div style="padding:20px 24px 0 24px;">
                 <img
                   src="${companyLogoUrl}"
-                  alt="FlowBooks"
+                  alt="AA ERP"
                   style="display:block;height:32px;width:auto;object-fit:contain;"
                 />
               </div>
@@ -1736,10 +1736,10 @@ exports.create = async (req, res) => {
               <div style="padding:24px 24px 16px 24px;">
                 <h2 style="margin:0 0 16px 0;font-size:22px;color:#111;">Hi ${fullname || "there"}!</h2>
                 <p style="margin:0 0 12px 0;font-size:14px;color:#333;line-height:1.6;">
-                  Welcome to <strong style="color:#4267B2;">FlowBooks</strong> 🎉
+                  Welcome to <strong style="color:#4267B2;">AA ERP</strong> 🎉
                 </p>
                 <p style="margin:0 0 20px 0;font-size:14px;color:#333;line-height:1.6;">
-                  To finish setting up your account and start using FlowBooks, please verify your email address.
+                  To finish setting up your account and start using AA ERP, please verify your email address.
                 </p>
 
                 <div style="border:1px solid #f3b3c0;background:#fff4f6;border-radius:12px;padding:16px 18px;margin-bottom:20px;text-align:center;">
@@ -1757,7 +1757,7 @@ exports.create = async (req, res) => {
 
                 <p style="margin:0 0 8px 0;font-size:13px;color:#555;">
                   With respect,<br/>
-                  <strong>FlowBooks Team</strong>
+                  <strong>AA ERP Team</strong>
                 </p>
               </div>
 
@@ -1916,29 +1916,29 @@ exports.checkEmail = async (req, res) => {
     const resetUrl = buildEmailVerificationUrl(resetToken, email, "reset");
 
     const companyWebsite =
-      process.env.COMPANY_WEBSITE || "https://flowbooks.org";
-    const companyEmail = process.env.COMPANY_EMAIL || "hello@flowbooks.org";
+      process.env.COMPANY_WEBSITE || "https://aa_erp.org";
+    const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
     const companyPhone = process.env.COMPANY_PHONE || "+2348067643479";
     const companyTwitter =
-      process.env.COMPANY_TWITTER || "https://x.com/flowbooksng";
+      process.env.COMPANY_TWITTER || "https://x.com/aa_erpng";
     const companyInstagram =
-      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/flowbooksng";
+      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/aa_erpng";
     const companyLinkedIn =
       process.env.COMPANY_LINKEDIN ||
-      "https://www.linkedin.com/company/flowbooksng";
+      "https://www.linkedin.com/company/aa_erpng";
     const companyFacebook =
-      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/flowbooksng";
+      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
     const companyLogoUrl =
-      process.env.COMPANY_LOGO_URL || "https://app.flowbooks.org/logo.png";
+      process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
     const transport = nodemailer.createTransport(
       MailtrapTransport({
         token: process.env.MAILTRAP_TOKEN,
       }),
     );
     const mailOptions = {
-      from: '"FlowBooks" <no-reply@flowbooks.org>',
+      from: '"AA ERP" <no-reply@aa_erp.org>',
       to: email,
-      subject: "FlowBooks - Password Reset Verification Link",
+      subject: "AA ERP - Password Reset Verification Link",
       category: "Password Reset Link",
       html: `
         <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
@@ -1946,7 +1946,7 @@ exports.checkEmail = async (req, res) => {
             <div style="padding:20px 24px 0 24px;">
               <img
                 src="${companyLogoUrl}"
-                alt="FlowBooks"
+                alt="AA ERP"
                 style="display:block;height:32px;width:auto;object-fit:contain;"
               />
             </div>
@@ -1954,7 +1954,7 @@ exports.checkEmail = async (req, res) => {
             <div style="padding:24px 24px 16px 24px;">
               <h2 style="margin:0 0 16px 0;font-size:22px;color:#111;">Hi ${user.firstname}!</h2>
               <p style="margin:0 0 12px 0;font-size:14px;color:#333;line-height:1.6;">
-                We received a request to reset your <strong style="color:#4267B2;">FlowBooks</strong> account password.
+                We received a request to reset your <strong style="color:#4267B2;">AA ERP</strong> account password.
               </p>
               <p style="margin:0 0 20px 0;font-size:14px;color:#333;line-height:1.6;">
                 To create a new password for your account, please click the button below.
@@ -1975,7 +1975,7 @@ exports.checkEmail = async (req, res) => {
 
               <p style="margin:0 0 8px 0;font-size:13px;color:#555;">
                 With respect,<br/>
-                <strong>FlowBooks Team</strong>
+                <strong>AA ERP Team</strong>
               </p>
             </div>
 
@@ -2045,29 +2045,29 @@ exports.inviteStaff = async (req, res) => {
       }),
     );
     const companyWebsite =
-      process.env.COMPANY_WEBSITE || "https://app.flowbooks.org";
-    const companyEmail = process.env.COMPANY_EMAIL || "hello@flowbooks.org";
+      process.env.COMPANY_WEBSITE || "https://app.aa_erp.org";
+    const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
     const companyPhone = process.env.COMPANY_PHONE || "+2348067643479";
     const companyTwitter =
-      process.env.COMPANY_TWITTER || "twitter.com/flowbooksng";
+      process.env.COMPANY_TWITTER || "twitter.com/aa_erpng";
     const companyInstagram =
-      process.env.COMPANY_INSTAGRAM || "instagram.com/flowbooksng";
+      process.env.COMPANY_INSTAGRAM || "instagram.com/aa_erpng";
     const companyFacebook =
-      process.env.COMPANY_FACEBOOK || "facebook.com/flowbooksng";
+      process.env.COMPANY_FACEBOOK || "facebook.com/aa_erpng";
     const companyLinkedIn =
       process.env.COMPANY_LINKEDIN || "linkedin.com/company/yourcompany";
     const companyLogoUrl =
-      process.env.COMPANY_LOGO_URL || "https://app.flowbooks.org/logo.png";
+      process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
     console.log(companyLogoUrl);
 
     if (user) {
-      // ✅ Send invite with embedded userId & businessId  https://dashboard.inventria.app/accept-invite?userId=${user.id}&businessId=${businessId}`;
-      const actionLink = `https://app.flowbooks.org/accept-invite?userId=${user.id}&businessId=${businessId}`;
+      // ✅ Send invite with embedded userId & businessId  https://dashboard.aa_erp.app/accept-invite?userId=${user.id}&businessId=${businessId}`;
+      const actionLink = `https://app.aa_erp.org/accept-invite?userId=${user.id}&businessId=${businessId}`;
 
       const mailOptions = {
-        from: '"FlowBooks" <no-reply@flowbooks.org>',
+        from: '"AA ERP" <no-reply@aa_erp.org>',
         to: email,
-        subject: "You've Been Invited to Join FlowBooks as Staff",
+        subject: "You've Been Invited to Join AA ERP as Staff",
         html: `
           <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
             <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,0.06);overflow:hidden;">
@@ -2075,7 +2075,7 @@ exports.inviteStaff = async (req, res) => {
               <div style="font-weight:bold;font-size:18px;color:#333;">
                 <img
                   src="${companyLogoUrl}"
-                  alt="FlowBooks"
+                  alt="AA ERP"
                   style="display:block;height:32px;width:auto;object-fit:contain;"
                 />
               </div>
@@ -2084,7 +2084,7 @@ exports.inviteStaff = async (req, res) => {
               <div style="padding:24px 24px 16px 24px;">
                 <h2 style="margin:0 0 16px 0;font-size:22px;color:#111;">Hi ${user.firstname}!</h2>
                 <p style="margin:0 0 12px 0;font-size:14px;color:#333;line-height:1.6;">
-                  You have been invited to join the <strong>FlowBooks</strong> workspace as a staff member.
+                  You have been invited to join the <strong>AA ERP</strong> workspace as a staff member.
                 </p>
                 <p style="margin:0 0 20px 0;font-size:14px;color:#333;line-height:1.6;">
                   To complete your registration and activate your staff account, please use the link below.
@@ -2092,7 +2092,7 @@ exports.inviteStaff = async (req, res) => {
 
                 <div style="border:1px solid #f3b3c0;background:#fff4f6;border-radius:12px;padding:16px 18px;margin-bottom:20px;">
                   <p style="margin:0 0 8px 0;font-size:14px;color:#b0194a;line-height:1.6;">
-                    Account activation is required to complete your invitation and access FlowBooks.
+                    Account activation is required to complete your invitation and access AA ERP.
                   </p>
                   <p style="margin:0;font-size:14px;line-height:1.6;">
                     Please follow this link:
@@ -2108,7 +2108,7 @@ exports.inviteStaff = async (req, res) => {
 
                 <p style="margin:0 0 8px 0;font-size:13px;color:#555;">
                   With respect,<br/>
-                  <strong>FlowBooks Team</strong>
+                  <strong>AA ERP Team</strong>
                 </p>
               </div>
 
@@ -2380,26 +2380,26 @@ exports.verifyUser = async (req, res) => {
         }),
       );
       const companyWebsite =
-        process.env.COMPANY_WEBSITE || "https://flowbooks.org";
-      const companyEmail = process.env.COMPANY_EMAIL || "hello@flowbooks.org";
+        process.env.COMPANY_WEBSITE || "https://aa_erp.org";
+      const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
       const companyPhone = process.env.COMPANY_PHONE || "+2348067643479";
       const companyTwitter =
-        process.env.COMPANY_TWITTER || "https://x.com/flowbooksng";
+        process.env.COMPANY_TWITTER || "https://x.com/aa_erpng";
       const companyInstagram =
         process.env.COMPANY_INSTAGRAM ||
-        "https://www.instagram.com/flowbooksng";
+        "https://www.instagram.com/aa_erpng";
       const companyLinkedIn =
         process.env.COMPANY_LINKEDIN ||
-        "https://www.linkedin.com/company/flowbooksng";
+        "https://www.linkedin.com/company/aa_erpng";
       const companyFacebook =
-        process.env.COMPANY_FACEBOOK || "https://www.facebook.com/flowbooksng";
+        process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
       const companyLogoUrl =
-        process.env.COMPANY_LOGO_URL || "https://app.flowbooks.org/logo.png";
+        process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
 
       const mailOptions = {
-        from: '"FlowBooks" <no-reply@flowbooks.org>',
+        from: '"AA ERP" <no-reply@aa_erp.org>',
         to: email,
-        subject: "FlowBooks - Email Verification Link",
+        subject: "AA ERP - Email Verification Link",
         category: "Email Verification Link",
         html: `
           <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
@@ -2407,7 +2407,7 @@ exports.verifyUser = async (req, res) => {
               <div style="padding:20px 24px 0 24px;">
                 <img
                   src="${companyLogoUrl}"
-                  alt="FlowBooks"
+                  alt="AA ERP"
                   style="display:block;height:32px;width:auto;object-fit:contain;"
                 />
               </div>
@@ -2415,10 +2415,10 @@ exports.verifyUser = async (req, res) => {
               <div style="padding:24px 24px 16px 24px;">
                 <h2 style="margin:0 0 16px 0;font-size:22px;color:#111;">Hi!</h2>
                 <p style="margin:0 0 12px 0;font-size:14px;color:#333;line-height:1.6;">
-                  Thank you for using <strong style="color:#4267B2;">FlowBooks</strong>!
+                  Thank you for using <strong style="color:#4267B2;">AA ERP</strong>!
                 </p>
                 <p style="margin:0 0 20px 0;font-size:14px;color:#333;line-height:1.6;">
-                  To finish setting up your account and start using FlowBooks, please verify your email address.
+                  To finish setting up your account and start using AA ERP, please verify your email address.
                 </p>
 
                 <div style="border:1px solid #f3b3c0;background:#fff4f6;border-radius:12px;padding:16px 18px;margin-bottom:20px;text-align:center;">
@@ -2436,7 +2436,7 @@ exports.verifyUser = async (req, res) => {
 
                 <p style="margin:0 0 8px 0;font-size:13px;color:#555;">
                   With respect,<br/>
-                  <strong>FlowBooks Team</strong>
+                  <strong>AA ERP Team</strong>
                 </p>
               </div>
 

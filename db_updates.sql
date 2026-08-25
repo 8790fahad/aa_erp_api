@@ -1,4 +1,4 @@
--- SQL queries to manually update the Inventria HR Module Database
+-- SQL queries to manually update the AaErp HR Module Database
 
 -- 1. Create the loans table
 CREATE TABLE IF NOT EXISTS `loans` (

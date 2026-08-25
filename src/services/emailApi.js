@@ -10,11 +10,11 @@ const constants = require('./constants').constants;
 const transport = require('../config/nodemailer');
 
 // Company-wide contact details for email footers
-const COMPANY_NAME = process.env.COMPANY_NAME || "Inventria";
+const COMPANY_NAME = process.env.COMPANY_NAME || "AaErp";
 const COMPANY_WEBSITE =
-  process.env.COMPANY_WEBSITE || "https://app.flowbooks.org";
+  process.env.COMPANY_WEBSITE || "https://app.aa_erp.org";
 const COMPANY_EMAIL =
-  process.env.COMPANY_EMAIL || "hello@inventria.app";
+  process.env.COMPANY_EMAIL || "hello@aa_erp.app";
 const COMPANY_PHONE =
   process.env.COMPANY_PHONE || "+234 000 000 0000";
 const COMPANY_TWITTER =
@@ -59,7 +59,7 @@ function sendMail(userId, type) {
       switch (type) {
         case constants.WELCOME_MAIL:
           templateFile = "welcome.ejs";
-          subject = "Welcome to Inventria!";
+          subject = "Welcome to AaErp!";
           break;
         case constants.ACCOUNT_APPROVAL:
           templateFile = "accountApproval.ejs";

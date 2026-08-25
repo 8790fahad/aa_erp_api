@@ -8,7 +8,7 @@ const request = require("request");
 const BULKSMS_API_BASE =
   process.env.BULKSMS_API_BASE || "https://www.bulksmsnigeria.com/api/v2";
 const BULKSMS_API_TOKEN = process.env.BULKSMS_API_TOKEN || "";
-const BULKSMS_SENDER_ID = process.env.BULKSMS_SENDER_ID || "FLOWBOOKS";
+const BULKSMS_SENDER_ID = process.env.BULKSMS_SENDER_ID || "AA_ERP";
 /** Preferred OTP route — corporate/DND. Account must have this gateway enabled. */
 const BULKSMS_OTP_GATEWAY =
   process.env.BULKSMS_OTP_GATEWAY || "direct-corporate";

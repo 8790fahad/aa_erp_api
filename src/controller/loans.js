@@ -30,6 +30,25 @@ async function allocateLoanReference(facilityId) {
   return formatLoanReference(seq);
 }
 
+/** Parse YYYY-MM (or Date) into the 1st of that month for loan deduction start. */
+function parseLoanStartDate(startMonth, startDate) {
+  if (startMonth != null && String(startMonth).trim()) {
+    const raw = String(startMonth).trim();
+    const m = raw.match(/^(\d{4})-(\d{2})$/);
+    if (!m) return null;
+    const year = parseInt(m[1], 10);
+    const month = parseInt(m[2], 10);
+    if (!year || month < 1 || month > 12) return null;
+    return new Date(year, month - 1, 1);
+  }
+  if (startDate) {
+    const d = new Date(startDate);
+    if (Number.isNaN(d.getTime())) return null;
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  }
+  return null;
+}
+
 /**
  * Helper to record a GL transaction (Double Entry)
  */
@@ -195,12 +214,22 @@ exports.createLoan = async (req, res) => {
       reference,
       chequeNumber,
       postDisbursement = true,
+      startMonth,
+      startDate,
     } = req.body;
 
     if (!employeeId || !amount || !durationMonths) {
       return res.status(400).json({
         success: false,
         message: "Missing required loan fields",
+      });
+    }
+
+    const loanStartDate = parseLoanStartDate(startMonth, startDate);
+    if (!loanStartDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Select the month when the loan starts applying",
       });
     }
 
@@ -293,7 +322,7 @@ exports.createLoan = async (req, res) => {
         monthlyDeductionAmount || loanAmount / months,
       createdBy: resolvedUserId,
       status: shouldPost ? "Approved" : "Pending",
-      startDate: shouldPost ? new Date() : null,
+      startDate: loanStartDate,
       receivableHead: setupReceivable,
       paymentMode: mode,
       bankHead: resolvedBankHead,
@@ -406,6 +435,8 @@ exports.updateLoan = async (req, res) => {
       cashHead,
       receivableHead,
       loanSetupId,
+      startMonth,
+      startDate,
     } = req.body;
 
     const loan = await db.loans.findOne({
@@ -465,6 +496,17 @@ exports.updateLoan = async (req, res) => {
         outstanding > 0 ? outstanding / months : 0;
     }
 
+    if (startMonth !== undefined || startDate !== undefined) {
+      const parsed = parseLoanStartDate(startMonth, startDate);
+      if (!parsed) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid start month for loan deductions",
+        });
+      }
+      loan.startDate = parsed;
+    }
+
     if (loan.status === "Pending") {
       loan.amount = amount !== undefined ? amount : loan.amount;
       loan.purpose = purpose || loan.purpose;
@@ -517,7 +559,19 @@ exports.updateLoan = async (req, res) => {
 exports.updateLoanStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, remarks, startDate, userId, facilityId, paymentMode, bankHead, cashHead, reference, chequeNumber } = req.body;
+    const {
+      status,
+      remarks,
+      startDate,
+      startMonth,
+      userId,
+      facilityId,
+      paymentMode,
+      bankHead,
+      cashHead,
+      reference,
+      chequeNumber,
+    } = req.body;
     
     const loan = await db.loans.findOne({
       where: { id, facilityId: facilityId || req.user?.facilityId },
@@ -583,7 +637,13 @@ exports.updateLoanStatus = async (req, res) => {
 
     loan.status = status;
     loan.updatedBy = userId || req.user?.id;
-    if (startDate) loan.startDate = startDate;
+    const parsedStart = parseLoanStartDate(startMonth, startDate);
+    if (parsedStart) {
+      loan.startDate = parsedStart;
+    } else if (status === "Approved" && !loan.startDate) {
+      // Fallback for legacy pending loans with no start month set
+      loan.startDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    }
 
     await loan.save();
 

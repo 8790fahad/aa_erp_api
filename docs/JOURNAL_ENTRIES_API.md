@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Journal Entries module provides comprehensive functionality for creating, managing, and tracking accounting journal entries in Inventria. This module supports draft creation, posting, reversal, and audit trail capabilities.
+The Journal Entries module provides comprehensive functionality for creating, managing, and tracking accounting journal entries in AaErp. This module supports draft creation, posting, reversal, and audit trail capabilities.
 
 ## Table of Contents
 
@@ -590,8 +590,8 @@ npm test -- --coverage journalEntry.test.js
 ## Support
 
 For issues or questions, contact:
-- Technical Support: support@inventria.com
-- Documentation: https://docs.inventria.com/journal-entries
+- Technical Support: support@aa_erp.com
+- Documentation: https://docs.aa_erp.com/journal-entries
 
 ---
 

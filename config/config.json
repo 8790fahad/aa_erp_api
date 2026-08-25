@@ -2,7 +2,7 @@
   "development": {
     "username": "root",
     "password": "",
-    "database": "flowbooks",
+    "database": "aa_erp",
     "host": "127.0.0.1",
     "dialect": "mysql"
   },

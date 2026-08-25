@@ -1,4 +1,4 @@
-# FlowBooks — Pre-VAPT Security Assessment (Internal)
+# AA ERP — Pre-VAPT Security Assessment (Internal)
 
 **Date:** 16 July 2026 (regenerated)  
 **Scope:** E-invoicing API (`/api/v1/invoice/*`) and KYC Connect (`/api/kyc/*`)  
@@ -121,5 +121,5 @@ Docs: `{BASE}/e-invoicing-api-docs` · OpenAPI `{BASE}/e-invoicing-api-docs.json
 
 ---
 
-**Prepared for:** FlowBooks / Brainstorm engineering  
+**Prepared for:** AA ERP / Brainstorm engineering  
 **Next step:** Restart API on UAT, complete ops checklist, engage external VAPT, submit combined pack to MBS.

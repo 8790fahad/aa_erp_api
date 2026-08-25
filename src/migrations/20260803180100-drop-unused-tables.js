@@ -26,7 +26,7 @@ const UNUSED_TABLES = [
   "account_1",
   "account_category3",
   "account_new",
-  "inventria_account_",
+  "___PROTECT_AA_ERP_ACCOUNT___",
   // Empty / unused leftovers
   // NOTE: Do NOT drop Teams — used by src/controller/team.js and models/team.js
   "asset_maintenances",

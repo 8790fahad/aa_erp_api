@@ -52,7 +52,7 @@ function buildEmailHtml(businessName, summary, asOf) {
       <table style="width:100%;border-collapse:collapse;font-size:13px;">${agingTable(summary.receivableAging)}</table>
       <h3 style="font-size:14px;color:#1a2d5e;margin-top:20px;">Payable aging</h3>
       <table style="width:100%;border-collapse:collapse;font-size:13px;">${agingTable(summary.payableAging)}</table>
-      <p style="font-size:12px;color:#9ca3af;margin-top:24px;">Sent automatically every Monday by Inventria.</p>
+      <p style="font-size:12px;color:#9ca3af;margin-top:24px;">Sent automatically every Monday by AaErp.</p>
     </div>
   `;
 }

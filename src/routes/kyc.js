@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * KYC auth routes — isolated from FlowBooks `/api/auth/*` user/business signup.
+ * KYC auth routes — isolated from AA ERP `/api/auth/*` user/business signup.
  */
 const rateLimit = require("express-rate-limit");
 const passport = require("passport");

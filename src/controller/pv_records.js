@@ -1585,12 +1585,12 @@ exports.getPurchaseOrderPdf = async (req, res) => {
     const _data = {
       // Company information from activeBusiness state
       company: {
-        name: business?.business_name || "INVENTRIA MANUFACTURING LTD",
+        name: business?.business_name || "AA_ERP MANUFACTURING LTD",
         address:
           business?.address ||
           "Plot 25, Industrial Complex, Phase III, Lagos, Nigeria",
         phone: business?.phone || "+234 803 555 0123",
-        email: business?.email || "procurement@inventria.app",
+        email: business?.email || "procurement@aa_erp.app",
       },
 
       // Purchase order details

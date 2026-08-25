@@ -33,10 +33,10 @@ if (trustProxyIps && trustProxyIps.trim()) {
   app.set("trust proxy", 1);
 }
 // Base path under which the API is mounted (public URL prefix)
-const BASE_PATH = process.env.BASE_PATH || "/flowbooks";
+const BASE_PATH = process.env.BASE_PATH || "/aa_erp";
 const welcomePayload = {
   msg: "Welcome",
-  description: "FlowBooks API Server",
+  description: "AA ERP API Server",
   version: "2.0.0",
   documentation: `${(process.env.APP_URL || "").replace(/\/$/, "")}${BASE_PATH}/api-docs`,
   compliance:
@@ -62,15 +62,15 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://ashiru-ali.com",
   "https://www.ashiru-ali.com",
   "http://www.ashiru-ali.com",
-  "https://dashboard.inventria.app",
-  "http://flowbooks.org",
-  "https://flowbooks.org",
-  "http://app.flowbooks.org",
-  "https://app.flowbooks.org",
-  "http://connect.flowbooks.org",
-  "https://connect.flowbooks.org",
-  "http://marketspace.flowbooks.org",
-  "https://marketspace.flowbooks.org",
+  "https://dashboard.aa_erp.app",
+  "http://aa_erp.org",
+  "https://aa_erp.org",
+  "http://app.aa_erp.org",
+  "https://app.aa_erp.org",
+  "http://connect.aa_erp.org",
+  "https://connect.aa_erp.org",
+  "http://marketspace.aa_erp.org",
+  "https://marketspace.aa_erp.org",
   "http://localhost:42790",
   "http://localhost:3000",
   "http://localhost:5173",
@@ -201,7 +201,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// Belt-and-suspenders: set ACAO early so error/timeout paths still expose CORS to connect.flowbooks.org.
+// Belt-and-suspenders: set ACAO early so error/timeout paths still expose CORS to connect.aa_erp.org.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && isAllowedCorsOrigin(origin)) {
@@ -211,7 +211,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Apache/nginx often forwards the public URL path (e.g. /flowbooks/api/...) while routes are registered at /api/...
+// Apache/nginx often forwards the public URL path (e.g. /aa_erp/api/...) while routes are registered at /api/...
 // Strip BASE_PATH so OPTIONS preflight and POST hit the same handlers and cors() can attach headers.
 if (BASE_PATH && BASE_PATH !== "/") {
   const baseNoTrailing = BASE_PATH.endsWith("/")
@@ -274,7 +274,7 @@ app.use(
   helmet.permittedCrossDomainPolicies({ permittedPolicies: "none" }),
 );
 
-// Health / sanity checks — must be AFTER BASE_PATH strip so /flowbooks/ and /flowbooks/welcome match.
+// Health / sanity checks — must be AFTER BASE_PATH strip so /aa_erp/ and /aa_erp/welcome match.
 app.get("/", (req, res) => {
   res.json(welcomePayload);
 });
