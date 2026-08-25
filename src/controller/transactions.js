@@ -2551,6 +2551,10 @@ exports.createSale = async (req, res) => {
       apply_prepayment = false,
       amountPaid: amountPaidFromClient = 0,
       defer_payment = false,
+      assigned_cashier_id = null,
+      assigned_cashier_name = null,
+      cashier_user_id = null,
+      cashier_name = null,
     } = req.body;
 
     console.log(req.body, "=============> req.body");
@@ -4609,6 +4613,8 @@ exports.createSale = async (req, res) => {
         branchId: saleBranchId,
         createdBy: created_by,
         discountAmount,
+        assignedCashierId: assigned_cashier_id || cashier_user_id || null,
+        assignedCashierName: assigned_cashier_name || cashier_name || null,
       });
     } catch (wfErr) {
       console.error("Sale workflow create skipped:", wfErr.message);

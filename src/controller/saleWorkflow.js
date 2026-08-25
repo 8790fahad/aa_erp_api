@@ -206,17 +206,19 @@ async function applyPaymentTypeToWorkflow(
     paymentType === "credit" &&
     (earlyCashier.has(row.status) || earlyWarehouse.has(row.status))
   ) {
+    // Credit must always wait for Credit Approval before Invoice Separation
     row.status = "awaiting_credit_approval";
     row.history = pushHistory(
       row.history,
       "awaiting_credit_approval",
       updated_by,
-      "Switched to credit — awaiting credit approval",
+      "Switched to credit — must be approved on Credit tab before Invoice Separation",
     );
   }
 
   if (
     paidLike.has(paymentType) &&
+    paymentType !== "credit" &&
     (earlyWarehouse.has(row.status) ||
       row.status === "awaiting_credit_approval" ||
       earlyCashier.has(row.status))
@@ -635,6 +637,8 @@ async function createSaleWorkflowRecord(
     createdBy,
     holdOvernight = false,
     discountAmount = 0,
+    assignedCashierId = null,
+    assignedCashierName = null,
   },
   transaction,
 ) {
@@ -647,6 +651,14 @@ async function createSaleWorkflowRecord(
   const hasDiscount = Number(discountAmount) > 0;
   const depositFullyApplied =
     paymentType === "deposit" && Number(amount) <= 0;
+  const cashierId =
+    assignedCashierId != null && String(assignedCashierId).trim()
+      ? String(assignedCashierId).trim()
+      : null;
+  const cashierName =
+    assignedCashierName != null && String(assignedCashierName).trim()
+      ? String(assignedCashierName).trim()
+      : null;
 
   // Discounted invoices must be approved before Collection Points / credit path
   let initialStatus;
@@ -659,15 +671,19 @@ async function createSaleWorkflowRecord(
       initialStatus = "invoice_separation";
       statusNote = "Deposit applied — ready for separation";
     } else {
-      initialStatus = "awaiting_credit_approval";
-      statusNote = "Deposit applied — remaining balance awaiting credit approval";
+      // Do not send to Credit Approval yet — user applies deposit first
+      initialStatus = "awaiting_payment";
+      statusNote =
+        "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
     }
   } else if (isPaid) {
     initialStatus = "awaiting_cashier_confirm";
     statusNote =
       paymentType === "credit_split"
         ? "Awaiting cash + transfer collection (credit remainder)"
-        : "Awaiting cashier payment confirmation";
+        : cashierName
+          ? `Awaiting cashier payment confirmation (${cashierName})`
+          : "Awaiting cashier payment confirmation";
   } else if (paymentType === "warehouse") {
     initialStatus = "invoice_separation";
     statusNote = "Warehouse invoice treatment — ready for separation";
@@ -681,6 +697,14 @@ async function createSaleWorkflowRecord(
   history = pushHistory(history, "invoice_generated", createdBy, "Invoice generated");
   history = pushHistory(history, "submitted", createdBy, "Submitted for processing");
   history = pushHistory(history, initialStatus, createdBy, statusNote);
+  if (cashierId && isPaid) {
+    history = pushHistory(
+      history,
+      initialStatus,
+      createdBy,
+      `Assigned cashier user id ${cashierId}${cashierName ? ` (${cashierName})` : ""}`,
+    );
+  }
 
   const [row] = await db.SaleWorkflow.findOrCreate({
     where: { facility_id: facilityId, sale_code: saleCode },
@@ -693,6 +717,8 @@ async function createSaleWorkflowRecord(
       status: initialStatus,
       amount: amount != null ? Number(amount) : null,
       branch_id: branchId || null,
+      assigned_cashier_id: isPaid ? cashierId : null,
+      assigned_cashier_name: isPaid ? cashierName : null,
       hold_overnight: Boolean(holdOvernight),
       history,
       created_by: createdBy || null,
@@ -997,7 +1023,35 @@ exports.advanceSaleWorkflow = async (req, res) => {
         advanceNote || "Credit approved",
       );
       next = "invoice_separation";
-      advanceNote = "Ready for invoice separation by branch";
+      advanceNote =
+        "Credit approved — sent to Invoice Separation (approval required before separation)";
+    }
+
+    // Credit must never skip approval and jump to Separation / Warehouse
+    if (
+      isCredit &&
+      (!action || action === "advance" || action === "set_status") &&
+      [
+        "invoice_separation",
+        "final_invoice",
+        "warehouse_picking",
+        "dual_signature",
+        "goods_released",
+        "completed",
+        "payment_confirmed",
+      ].includes(next) &&
+      row.status !== "awaiting_credit_approval" &&
+      row.status !== "credit_approved" &&
+      !normalizeHistory(row.history).some(
+        (h) => String(h?.status || "") === "credit_approved",
+      )
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Credit invoices must be approved on the Credit tab at Collection Points before Invoice Separation",
+      });
     }
 
     // Discount approval → release to cashier (or credit approval for credit sales)
@@ -1099,7 +1153,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
  */
 exports.getCashierDashboard = async (req, res) => {
   try {
-    const { facilityId, cashierType, branchId } = req.query;
+    const { facilityId, cashierType, branchId, userId, role } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
@@ -1120,6 +1174,21 @@ exports.getCashierDashboard = async (req, res) => {
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
       if (Number.isFinite(bid) && bid > 0) where.branch_id = bid;
+    }
+
+    // Cashiers only see invoices assigned to their user id
+    const roleNorm = String(role || "")
+      .toLowerCase()
+      .trim();
+    const isCashierRole =
+      roleNorm === "cashier" ||
+      roleNorm === "casher" ||
+      roleNorm.includes("cashier") ||
+      roleNorm.includes("casher");
+    const cashierUserId =
+      userId != null && String(userId).trim() ? String(userId).trim() : "";
+    if (isCashierRole && cashierUserId) {
+      where.assigned_cashier_id = cashierUserId;
     }
 
     const ct = String(cashierType || "").toLowerCase();
@@ -1198,6 +1267,7 @@ exports.getCashierDashboard = async (req, res) => {
     }
 
     // Credit sales awaiting approval (Collection Points → Credit tab)
+    // Fresh Apply Deposit invoices use awaiting_payment — only deposit remainders land here
     const creditWhere = {
       facility_id: facilityId,
       status: "awaiting_credit_approval",
@@ -1746,6 +1816,14 @@ exports.cashierConfirmPayment = async (req, res) => {
         success: false,
         message:
           "Credit invoices must be approved on the Credit tab at Collection Points — they cannot be collected as cash/transfer",
+      });
+    }
+    if (paymentType === "deposit") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Deposit invoices must be settled on Apply Deposit — they cannot be collected as cash/transfer",
       });
     }
     // collection_side / cashier_type here is the active collection tab for this request
@@ -2355,7 +2433,12 @@ exports.completeSeparation = async (req, res) => {
       String(row.payment_type || "")
         .toLowerCase()
         .trim() === "credit" &&
-      row.status === "awaiting_credit_approval"
+      row.status !== "credit_approved" &&
+      row.status !== "invoice_separation" &&
+      row.status !== "final_invoice" &&
+      !normalizeHistory(row.history).some(
+        (h) => String(h?.status || "") === "credit_approved",
+      )
     ) {
       await transaction.rollback();
       return res.status(400).json({

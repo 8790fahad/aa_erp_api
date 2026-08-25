@@ -98,15 +98,19 @@ function nextStageFor(current, paymentType) {
     invoice_generated: "submitted",
     submitted: isPaid
       ? "awaiting_cashier_confirm"
-      : isWarehouse || isDeposit
+      : isWarehouse
         ? "invoice_separation"
-        : "awaiting_credit_approval",
+        : isDeposit
+          ? "awaiting_payment"
+          : "awaiting_credit_approval",
     awaiting_discount_approval: isPaid
       ? "awaiting_cashier_confirm"
       : isDeposit
-        ? "invoice_separation"
+        ? "awaiting_payment"
         : "awaiting_credit_approval",
-    awaiting_payment: "awaiting_cashier_confirm",
+    awaiting_payment: isDeposit
+      ? "invoice_separation"
+      : "awaiting_cashier_confirm",
     awaiting_cashier_confirm: "payment_confirmed",
     payment_confirmed: "invoice_separation",
     awaiting_credit_approval: "credit_approved",
@@ -135,7 +139,7 @@ function stagesForPaymentType(paymentType) {
   // Cash/transfer: Invoice → Cashier → Separation → Warehouse → Done
   // Warehouse: Invoice → Separation → Warehouse → Done (no cashier)
   // Credit: Invoice → Credit approval → Separation → Warehouse → Done
-  // Deposit: Invoice → Separation (or credit approval if remainder) → Warehouse → Done
+  // Deposit: Invoice → Apply Deposit → (Credit if remainder) → Separation → Warehouse → Done
   const core = [
     { id: "invoice_generated", label: "Invoice generated", phase: "order", color: "slate" },
   ];
@@ -146,17 +150,17 @@ function stagesForPaymentType(paymentType) {
       phase: "payment_cash",
       color: "amber",
     });
-  } else if (!isWarehouse && !isDeposit) {
+  } else if (isDeposit) {
+    core.push({
+      id: "awaiting_payment",
+      label: "Apply Deposit",
+      phase: "payment_cash",
+      color: "teal",
+    });
+  } else if (!isWarehouse) {
     core.push({
       id: "awaiting_credit_approval",
       label: "Credit approval",
-      phase: "payment_credit",
-      color: "rose",
-    });
-  } else if (isDeposit) {
-    core.push({
-      id: "awaiting_credit_approval",
-      label: "Deposit / credit",
       phase: "payment_credit",
       color: "rose",
     });
@@ -243,6 +247,15 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.INTEGER,
         allowNull: true,
       },
+      assigned_cashier_id: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        comment: "User id of cashier assigned at invoice create",
+      },
+      assigned_cashier_name: {
+        type: DataTypes.STRING(150),
+        allowNull: true,
+      },
       hold_overnight: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
@@ -276,6 +289,7 @@ module.exports = (sequelize, DataTypes) => {
         { unique: true, fields: ["facility_id", "sale_code"] },
         { fields: ["status"] },
         { fields: ["payment_type"] },
+        { fields: ["assigned_cashier_id"] },
       ],
     },
   );

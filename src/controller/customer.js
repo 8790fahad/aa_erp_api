@@ -5255,6 +5255,55 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
 
         remainingPool -= applyAmt;
         settled.push({ invoice_ref, amount: applyAmt });
+
+        // Move sale workflow after deposit application
+        if (db.SaleWorkflow) {
+          const wf = await db.SaleWorkflow.findOne({
+            where: {
+              facility_id: facilityId,
+              sale_code: invoice_ref,
+            },
+            transaction: t,
+          });
+          if (wf) {
+            // wf.amount is outstanding balance (reduced on each apply)
+            const due = Number(wf.amount) || 0;
+            const remaining = Number((due - applyAmt).toFixed(2));
+            const history = Array.isArray(wf.history) ? [...wf.history] : [];
+            history.push({
+              status: wf.status,
+              at: new Date().toISOString(),
+              by: userId,
+              note: `Deposit applied ₦${applyAmt.toFixed(2)} (balance was ₦${due.toFixed(2)})`,
+            });
+
+            if (remaining <= 0.05) {
+              wf.status = "invoice_separation";
+              wf.amount = 0;
+              history.push({
+                status: "invoice_separation",
+                at: new Date().toISOString(),
+                by: userId,
+                note: "Deposit fully applied — ready for Invoice Separation",
+              });
+            } else {
+              // Remainder goes to Credit Approval (not Separation yet)
+              wf.status = "awaiting_credit_approval";
+              wf.amount = remaining;
+              wf.payment_type = wf.payment_type || "deposit";
+              history.push({
+                status: "awaiting_credit_approval",
+                at: new Date().toISOString(),
+                by: userId,
+                note: `Deposit partial — ₦${remaining.toFixed(2)} remainder awaits Credit Approval before Separation`,
+              });
+            }
+            wf.history = history;
+            if (typeof wf.changed === "function") wf.changed("history", true);
+            wf.updated_by = userId;
+            await wf.save({ transaction: t });
+          }
+        }
       }
 
       return settled;
