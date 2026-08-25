@@ -387,6 +387,7 @@ require("./routes/engineering")(app);
 require("./routes/inventory")(app);
 require("./routes/audit")(app);
 require("./routes/activityAudit")(app);
+require("./routes/notifications")(app);
 require("./routes/stoctmangement")(app);
 require("./routes/sales")(app);
 require("./routes/saleWorkflow")(app);

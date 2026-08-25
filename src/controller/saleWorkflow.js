@@ -2233,6 +2233,25 @@ exports.cashierConfirmPayment = async (req, res) => {
 
       await transaction.commit();
 
+      try {
+        const { notifyBusinessMembers } = require("../services/notifications");
+        void notifyBusinessMembers({
+          facilityId,
+          excludeUserId: updated_by,
+          actorUserId: updated_by,
+          type: "payment_collected",
+          title: `Payment collected for ${saleRef}`,
+          body: row.customer_name
+            ? `${row.customer_name} — ready for separation`
+            : "Ready for invoice separation",
+          link: "/app/payments/collection-points",
+          entityType: "invoice",
+          entityId: saleRef,
+        });
+      } catch (notifErr) {
+        console.warn("Payment notification skipped:", notifErr?.message || notifErr);
+      }
+
       return res.json({
         success: true,
         message: `Payment confirmed for ${saleRef} — ready for separation`,
@@ -2262,6 +2281,26 @@ exports.cashierConfirmPayment = async (req, res) => {
         : resolvedSide === "cash"
           ? "Cash"
           : "Payment";
+
+    try {
+      const { notifyBusinessMembers } = require("../services/notifications");
+      void notifyBusinessMembers({
+        facilityId,
+        excludeUserId: updated_by,
+        actorUserId: updated_by,
+        type: "payment_collected",
+        title: `${sideLabel} recorded for ${saleRef}`,
+        body: `Remaining ₦${rem.toFixed(2)}${
+          row.customer_name ? ` — ${row.customer_name}` : ""
+        }`,
+        link: "/app/payments/collection-points",
+        entityType: "invoice",
+        entityId: saleRef,
+      });
+    } catch (notifErr) {
+      console.warn("Payment notification skipped:", notifErr?.message || notifErr);
+    }
+
     return res.json({
       success: true,
       message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${rem.toFixed(2)} — collect from Cash and/or Transfer${

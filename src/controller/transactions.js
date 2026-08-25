@@ -4624,6 +4624,34 @@ exports.createSale = async (req, res) => {
       console.error("Sale workflow create skipped:", wfErr?.message || wfErr, wfErr?.stack || "");
     }
 
+    // In-app notification (business members except actor)
+    try {
+      const { notifyBusinessMembers } = require("../services/notifications");
+      const customerLabel =
+        customer?.fullname ||
+        customer?.company_name ||
+        [customer?.first_name, customer?.last_name].filter(Boolean).join(" ") ||
+        customer_id ||
+        "customer";
+      const amountLabel = Number(netAmount || 0).toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      void notifyBusinessMembers({
+        facilityId,
+        excludeUserId: created_by,
+        actorUserId: created_by,
+        type: "invoice_created",
+        title: `Invoice ${saleRef} created`,
+        body: `${isCashSale ? "Cash" : "Credit"} sale for ${customerLabel} — ₦${amountLabel}`,
+        link: "/app/sales/invoices",
+        entityType: "invoice",
+        entityId: saleRef,
+      });
+    } catch (notifErr) {
+      console.warn("Invoice notification skipped:", notifErr?.message || notifErr);
+    }
+
     // ===================================================================
     // RESPONSE
     // ===================================================================

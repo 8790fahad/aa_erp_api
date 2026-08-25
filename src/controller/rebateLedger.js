@@ -599,6 +599,27 @@ exports.issueCreditNote = async (req, res) => {
       });
     }
 
+    try {
+      const { notifyBusinessMembers } = require("../services/notifications");
+      const amountLabel = Number(amount || 0).toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      void notifyBusinessMembers({
+        facilityId,
+        excludeUserId: userId,
+        actorUserId: userId,
+        type: "rebate_credit_note",
+        title: `Credit note ${creditNoteNumber} issued`,
+        body: `Rebate for ${entityName} — ₦${amountLabel} (${rule.name || "rule"})`,
+        link: "/app/sales/rebate",
+        entityType: "rebate",
+        entityId: String(creditNoteNumber),
+      });
+    } catch (notifErr) {
+      console.warn("Rebate credit-note notification skipped:", notifErr?.message || notifErr);
+    }
+
     return res.status(201).json({
       success: true,
       message: isPurchase
@@ -973,6 +994,29 @@ exports.issuePayment = async (req, res) => {
     }
 
     await transaction.commit();
+
+    try {
+      const { notifyBusinessMembers } = require("../services/notifications");
+      const amountLabel = Number(amount || 0).toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      void notifyBusinessMembers({
+        facilityId,
+        excludeUserId: userId,
+        actorUserId: userId,
+        type: "rebate_payment",
+        title: isPurchase
+          ? `Purchase rebate received (${paymentRef})`
+          : `Rebate paid (${paymentRef})`,
+        body: `${customerName} via ${mode} — ₦${amountLabel}`,
+        link: "/app/sales/rebate",
+        entityType: "rebate",
+        entityId: String(paymentRef),
+      });
+    } catch (notifErr) {
+      console.warn("Rebate payment notification skipped:", notifErr?.message || notifErr);
+    }
 
     return res.status(201).json({
       success: true,
