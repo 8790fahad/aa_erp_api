@@ -8533,6 +8533,16 @@ exports.getReadyForSalesItems = async (req, res) => {
       ? ""
       : "WHERE sd.`balance` > 0";
 
+    // Pickers (New Invoice) opt in so stopped products can be listed as
+    // unselectable instead of silently disappearing. Other callers keep the
+    // old behaviour of omitting them entirely.
+    const includeStopped = ["1", "true", "yes"].includes(
+      String(req.query.includeStopped || "").toLowerCase(),
+    );
+    const salesStoppedCondition = includeStopped
+      ? ""
+      : "AND (p.`sales_stopped` IS NULL OR p.`sales_stopped` = 0)";
+
     // All sales-floor stock for the facility — no branch filter.
     // Same SKU appears once per branchId with its own balance.
     const query = `
@@ -8574,7 +8584,7 @@ exports.getReadyForSalesItems = async (req, res) => {
       ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
-        AND (p.\`sales_stopped\` IS NULL OR p.\`sales_stopped\` = 0)
+        ${salesStoppedCondition}
       ORDER BY
         COALESCE(b.\`branch_name\`, ''),
         sd.\`item_name\`,
@@ -8686,6 +8696,14 @@ exports.getServiceProducts = async (req, res) => {
   try {
     const { facilityId } = req.params;
     const { attachSalesLimitInfo } = require("../services/salesLimits");
+
+    const includeStopped = ["1", "true", "yes"].includes(
+      String(req.query.includeStopped || "").toLowerCase(),
+    );
+    const salesStoppedCondition = includeStopped
+      ? ""
+      : "AND (p.sales_stopped IS NULL OR p.sales_stopped = 0)";
+
     const results = await db.sequelize.query(
       `SELECT
     p.id,
@@ -8713,7 +8731,7 @@ FROM products p
 WHERE p.facility_id = :facilityId
     AND p.item_type = 'Service'
     AND p.status = 'Active'
-    AND (p.sales_stopped IS NULL OR p.sales_stopped = 0)
+    ${salesStoppedCondition}
 ORDER BY p.name ASC;`,
       {
         replacements: { facilityId },
