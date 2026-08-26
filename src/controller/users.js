@@ -73,49 +73,44 @@ async function syncUserBranches(
   ];
 
   const opts = transaction ? { transaction } : {};
+  const QueryTypes = db.Sequelize.QueryTypes;
+  const userIdStr = String(userId);
+  const facilityIdStr = String(facilityId);
 
   if (!db.UserBranch) return ids;
 
-  // Collation-safe destroy (facility_id / user_id may differ from connection collation)
+  // Collation-safe destroy — always RAW so OkPacket is never treated as SELECT rows
   await db.sequelize.query(
     `DELETE FROM user_branches
      WHERE BINARY user_id = BINARY :userId
        AND BINARY facility_id = BINARY :facilityId`,
     {
-      replacements: { userId: String(userId), facilityId: String(facilityId) },
+      replacements: { userId: userIdStr, facilityId: facilityIdStr },
+      type: QueryTypes.RAW,
       ...opts,
     },
   );
 
   if (ids.length === 0) {
-    await db.sequelize.query(
-      `UPDATE users SET branchId = NULL
-       WHERE BINARY id = BINARY :userId`,
-      {
-        replacements: { userId: String(userId) },
-        ...opts,
-      },
+    await User.update(
+      { branchId: null },
+      { where: { id: userIdStr }, ...opts },
     );
     return [];
   }
 
   const rows = ids.map((branchId, index) => ({
-    user_id: userId,
+    user_id: userIdStr,
     branch_id: branchId,
-    facility_id: facilityId,
+    facility_id: facilityIdStr,
     is_primary: index === 0,
   }));
 
   await db.UserBranch.bulkCreate(rows, opts);
 
-  // Update primary branch by id only — avoid email/facilityId string '=' clashes
-  await db.sequelize.query(
-    `UPDATE users SET branchId = :branchId
-     WHERE BINARY id = BINARY :userId`,
-    {
-      replacements: { branchId: ids[0], userId: String(userId) },
-      ...opts,
-    },
+  await User.update(
+    { branchId: ids[0] },
+    { where: { id: userIdStr }, ...opts },
   );
 
   return ids;
@@ -830,11 +825,10 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
-        rolesCreated += 1;
       }
 
       roleByName.set(key, role);
-      return { id: role.id, name: role.name, created: !cached };
+      return { id: role.id, name: role.name, created: true };
     };
 
     /**
@@ -879,6 +873,7 @@ exports.bulkCreateStaff = async (req, res) => {
           return nameKey === key || codeKey === key;
         }) || null;
 
+      let created = false;
       if (!branch) {
         const [{ branch_count } = {}] = await db.sequelize.query(
           `SELECT COUNT(*) AS branch_count
@@ -914,7 +909,7 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
-        branchesCreated += 1;
+        created = true;
       }
 
       const plain = {
@@ -934,7 +929,7 @@ exports.bulkCreateStaff = async (req, res) => {
           plain,
         );
       }
-      return { branch: plain, created: true };
+      return { branch: plain, created };
     };
 
     const seenEmails = new Set();
