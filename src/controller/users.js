@@ -74,43 +74,67 @@ async function syncUserBranches(
 
   const opts = transaction ? { transaction } : {};
   const QueryTypes = db.Sequelize.QueryTypes;
-  const userIdStr = String(userId);
-  const facilityIdStr = String(facilityId);
+  const uid = String(userId);
+  const fid = String(facilityId);
 
   if (!db.UserBranch) return ids;
 
-  // Collation-safe destroy — always RAW so OkPacket is never treated as SELECT rows
+  // Always use explicit query types — mysql2 OkPacket is not a row array.
+  // Using type SELECT/model on UPDATE/DELETE causes: valueSets.map is not a function.
   await db.sequelize.query(
     `DELETE FROM user_branches
      WHERE BINARY user_id = BINARY :userId
        AND BINARY facility_id = BINARY :facilityId`,
     {
-      replacements: { userId: userIdStr, facilityId: facilityIdStr },
-      type: QueryTypes.RAW,
+      replacements: { userId: uid, facilityId: fid },
       ...opts,
+      type: QueryTypes.RAW,
     },
   );
 
   if (ids.length === 0) {
-    await User.update(
-      { branchId: null },
-      { where: { id: userIdStr }, ...opts },
+    await db.sequelize.query(
+      `UPDATE users SET branchId = NULL
+       WHERE BINARY id = BINARY :userId`,
+      {
+        replacements: { userId: uid },
+        ...opts,
+        type: QueryTypes.UPDATE,
+      },
     );
     return [];
   }
 
-  const rows = ids.map((branchId, index) => ({
-    user_id: userIdStr,
-    branch_id: branchId,
-    facility_id: facilityIdStr,
-    is_primary: index === 0,
-  }));
+  const valueSql = ids
+    .map(
+      (_, i) =>
+        `(:userId, :branchId${i}, :facilityId, ${i === 0 ? "1" : "0"}, NOW(), NOW())`,
+    )
+    .join(", ");
+  const replacements = { userId: uid, facilityId: fid };
+  ids.forEach((branchId, i) => {
+    replacements[`branchId${i}`] = branchId;
+  });
 
-  await db.UserBranch.bulkCreate(rows, opts);
+  await db.sequelize.query(
+    `INSERT INTO user_branches
+       (user_id, branch_id, facility_id, is_primary, created_at, updated_at)
+     VALUES ${valueSql}`,
+    {
+      replacements,
+      ...opts,
+      type: QueryTypes.INSERT,
+    },
+  );
 
-  await User.update(
-    { branchId: ids[0] },
-    { where: { id: userIdStr }, ...opts },
+  await db.sequelize.query(
+    `UPDATE users SET branchId = :branchId
+     WHERE BINARY id = BINARY :userId`,
+    {
+      replacements: { branchId: ids[0], userId: uid },
+      ...opts,
+      type: QueryTypes.UPDATE,
+    },
   );
 
   return ids;
@@ -815,6 +839,7 @@ exports.bulkCreateStaff = async (req, res) => {
               .toLowerCase() === key,
         ) || null;
 
+      let createdRole = false;
       if (!role) {
         role = await db.Role.create(
           {
@@ -825,10 +850,11 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
+        createdRole = true;
       }
 
       roleByName.set(key, role);
-      return { id: role.id, name: role.name, created: true };
+      return { id: role.id, name: role.name, created: createdRole };
     };
 
     /**
@@ -873,7 +899,7 @@ exports.bulkCreateStaff = async (req, res) => {
           return nameKey === key || codeKey === key;
         }) || null;
 
-      let created = false;
+      let createdBranch = false;
       if (!branch) {
         const [{ branch_count } = {}] = await db.sequelize.query(
           `SELECT COUNT(*) AS branch_count
@@ -909,7 +935,7 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
-        created = true;
+        createdBranch = true;
       }
 
       const plain = {
@@ -929,7 +955,7 @@ exports.bulkCreateStaff = async (req, res) => {
           plain,
         );
       }
-      return { branch: plain, created };
+      return { branch: plain, created: createdBranch };
     };
 
     const seenEmails = new Set();
@@ -953,6 +979,18 @@ exports.bulkCreateStaff = async (req, res) => {
         .trim()
         .toLowerCase() || "verified";
 
+      // Skip blank Excel rows (trailing empties from sheet export)
+      if (
+        !firstname &&
+        !lastname &&
+        !email &&
+        !phone &&
+        !roleInput &&
+        !branchLabel
+      ) {
+        continue;
+      }
+
       if (
         !firstname ||
         !lastname ||
@@ -964,7 +1002,7 @@ exports.bulkCreateStaff = async (req, res) => {
         errors.push({
           row: rowNum,
           message:
-            "First name, last name, email, phone, role, and branch are required",
+            "First name, last name, email, phone, role, and warehouse are required",
         });
         continue;
       }
@@ -1021,10 +1059,8 @@ exports.bulkCreateStaff = async (req, res) => {
 
         const resolvedRole = await resolveOrCreateRole(roleInput, transaction);
         const role = resolvedRole.name;
-        const { branch } = await resolveOrCreateBranch(
-          branchLabel,
-          transaction,
-        );
+        const { branch, created: branchWasCreated } =
+          await resolveOrCreateBranch(branchLabel, transaction);
 
         const entryInCode = await getAndUpdateNumber(
           "user",
@@ -1069,6 +1105,7 @@ exports.bulkCreateStaff = async (req, res) => {
               accessTo: "",
               functionalities: "",
             },
+            type: db.Sequelize.QueryTypes.INSERT,
             transaction,
           },
         );
@@ -1083,6 +1120,8 @@ exports.bulkCreateStaff = async (req, res) => {
 
         await transaction.commit();
         created += 1;
+        if (resolvedRole.created) rolesCreated += 1;
+        if (branchWasCreated) branchesCreated += 1;
       } catch (rowErr) {
         await transaction.rollback();
         errors.push({

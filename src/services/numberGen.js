@@ -11,7 +11,6 @@ function binEq(columnSql, paramName) {
 // controllers/numberGeneratorController.js
 exports.getAndUpdateNumber = async (prefix, facilityId, transaction = null) => {
   const opts = transaction ? { transaction } : {};
-  const QueryTypes = db.Sequelize.QueryTypes;
 
   try {
     const results = await db.sequelize.query(
@@ -21,7 +20,7 @@ exports.getAndUpdateNumber = async (prefix, facilityId, transaction = null) => {
          AND ${binEq("facilityId", "facilityId")}`,
       {
         replacements: { prefix, facilityId },
-        type: QueryTypes.SELECT,
+        type: db.Sequelize.QueryTypes.SELECT,
         ...opts,
       },
     );
@@ -32,7 +31,7 @@ exports.getAndUpdateNumber = async (prefix, facilityId, transaction = null) => {
          VALUES (:description, :prefix, 2, :facilityId)`,
         {
           replacements: { description: prefix, prefix, facilityId },
-          type: QueryTypes.INSERT,
+          type: db.Sequelize.QueryTypes.INSERT,
           ...opts,
         },
       );
@@ -47,7 +46,7 @@ exports.getAndUpdateNumber = async (prefix, facilityId, transaction = null) => {
          AND ${binEq("facilityId", "facilityId")}`,
       {
         replacements: { prefix, facilityId },
-        type: QueryTypes.UPDATE,
+        type: db.Sequelize.QueryTypes.UPDATE,
         ...opts,
       },
     );
