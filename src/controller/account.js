@@ -8624,6 +8624,15 @@ exports.getReadyForSalesByBranch = async (req, res) => {
       ? ""
       : "WHERE sd.`balance` > 0";
 
+    // Pickers can opt in via ?includeStopped=1 so stopped products stay
+    // visible (selection is blocked client/server side).
+    const includeStopped = ["1", "true", "yes"].includes(
+      String(req.query.includeStopped || "").toLowerCase(),
+    );
+    const salesStoppedCondition = includeStopped
+      ? ""
+      : "AND (p.`sales_stopped` IS NULL OR p.`sales_stopped` = 0)";
+
     // Default: all branches, one row per (product, branch). Optional
     // branchId query param still supported for callers that need it.
     let query = `
@@ -8665,7 +8674,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
       ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
-        AND (p.\`sales_stopped\` IS NULL OR p.\`sales_stopped\` = 0)
+        ${salesStoppedCondition}
     `;
 
     const replacements = { facilityId };

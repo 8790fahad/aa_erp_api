@@ -2862,11 +2862,31 @@ exports.createSale = async (req, res) => {
         .json({ success: false, message: "Customer not found" });
     }
 
-    // Enforce credit limit for credit sales when limit is configured
+    // ===================================================================
+    // CREDIT LIMIT (Credit / deposit / credit-split invoices)
+    // ===================================================================
+    const paymentModeNorm = String(modeOfPayment || "")
+      .toLowerCase()
+      .trim();
+    const needsCreditLimitCheck =
+      isCreditSale ||
+      paymentModeNorm === "credit" ||
+      paymentModeNorm === "deposit" ||
+      paymentModeNorm === "credit_split" ||
+      paymentModeNorm.includes("credit");
+
     const creditLimit = parseFloat(customer.credit_limit || 0);
-    if (isCreditSale && creditLimit > 0) {
-      const outstanding =
-        parseFloat(customer.balance || customer.amount || 0) || 0;
+    if (needsCreditLimitCheck && creditLimit > 0) {
+      const glBalance =
+        parseFloat(await getBalance(customer_id, facilityId)) || 0;
+      // getBalance = SUM(cr)-SUM(dr); negative ⇒ customer owes A/R
+      const outstandingFromGl = Math.max(0, -glBalance);
+      const outstandingFromCustomer =
+        Math.max(
+          0,
+          parseFloat(customer.balance || customer.amount || 0) || 0,
+        );
+      const outstanding = Math.max(outstandingFromGl, outstandingFromCustomer);
       const thisSale =
         parseFloat(total_amount) ||
         (Array.isArray(items)
@@ -2882,8 +2902,64 @@ exports.createSale = async (req, res) => {
         await t.rollback();
         return res.status(400).json({
           success: false,
-          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(2)}, Outstanding: ${outstanding.toFixed(2)}, This sale: ${thisSale.toFixed(2)}`,
+          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(
+            2,
+          )}, Outstanding: ${outstanding.toFixed(
+            2,
+          )}, This sale: ${thisSale.toFixed(2)}`,
         });
+      }
+    }
+
+    // ===================================================================
+    // STOP SALES + SALES TARGET (early, before ledger / stock work)
+    // Aggregates qty by SKU so multi-line carts cannot bypass limits.
+    // ===================================================================
+    {
+      const earlyQtyBySku = new Map();
+      for (const itm of items) {
+        const sku = itm.product_id || itm.sku;
+        const qty = Number(itm.quantity || itm.qty || 0);
+        if (!sku || !(qty > 0)) continue;
+        earlyQtyBySku.set(String(sku), (earlyQtyBySku.get(String(sku)) || 0) + qty);
+      }
+      for (const [sku, qty] of earlyQtyBySku.entries()) {
+        const product = await db.Product.findOne({
+          where: { sku, facility_id: facilityId },
+          attributes: [
+            "id",
+            "sku",
+            "name",
+            "daily_sales_limit",
+            "weekly_sales_limit",
+            "monthly_sales_limit",
+            "sales_stopped",
+          ],
+          transaction: t,
+        });
+        if (!product) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Product not found: ${sku}`,
+          });
+        }
+        try {
+          await assertProductSalesLimits({
+            product,
+            sku,
+            facilityId,
+            qty,
+            saleDate,
+            transaction: t,
+          });
+        } catch (limitErr) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message: limitErr.message || "Sales limit exceeded",
+          });
+        }
       }
     }
 
@@ -4715,7 +4791,7 @@ exports.createSale = async (req, res) => {
     await t.rollback();
     console.error("createSale error:", err.message, err.stack);
     const isClientError =
-      /Insufficient quantity|Invalid item|not found|required|limit reached|sales .+ limit/i.test(
+      /Insufficient quantity|Invalid item|not found|required|limit reached|sales .+ limit|sales are stopped|credit limit|cannot be sold/i.test(
         String(err.message || ""),
       );
     return res.status(isClientError ? 400 : 500).json({

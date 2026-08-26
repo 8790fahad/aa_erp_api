@@ -171,7 +171,16 @@ async function getProductSalesLimitSnapshot({
 }
 
 function isSalesStopped(value) {
-  return value === true || value === 1 || value === "1";
+  if (value == null || value === false || value === 0 || value === "0") {
+    return false;
+  }
+  if (value === true || value === 1 || value === "1") return true;
+  // mysql2 sometimes returns TINYINT/BOOLEAN as Buffer
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+    return value.length > 0 && value[0] !== 0;
+  }
+  const s = String(value).toLowerCase().trim();
+  return s === "true" || s === "yes" || s === "on";
 }
 
 /**
