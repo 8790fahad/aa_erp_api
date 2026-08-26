@@ -690,6 +690,7 @@ exports.bulkCreateStaff = async (req, res) => {
   const errors = [];
   let created = 0;
   let rolesCreated = 0;
+  let branchesCreated = 0;
 
   try {
     const Branch = db.branches || db.Branch;
@@ -797,6 +798,108 @@ exports.bulkCreateStaff = async (req, res) => {
       return { id: role.id, name: role.name, created: true };
     };
 
+    /**
+     * Find branch by name or code (case-insensitive). If missing, create it
+     * so subsequent staff rows can reuse the same branch.
+     */
+    const resolveOrCreateBranch = async (branchLabel, transaction) => {
+      const key = String(branchLabel || "")
+        .trim()
+        .toLowerCase();
+      if (!key) {
+        throw new Error("Branch name is required");
+      }
+
+      const cached =
+        branchByName.get(key) || branchByCode.get(key) || null;
+      if (cached) {
+        return { branch: cached, created: false };
+      }
+
+      if (!Branch) {
+        throw new Error(`Branch/warehouse not found: ${branchLabel}`);
+      }
+
+      let branch = await Branch.findOne({
+        where: { facilityId, branch_name: branchLabel.trim() },
+        attributes: ["id", "branch_name", "branch_id"],
+        transaction,
+      });
+
+      if (!branch) {
+        const allForFacility = await Branch.findAll({
+          where: { facilityId },
+          attributes: ["id", "branch_name", "branch_id"],
+          transaction,
+        });
+        branch =
+          allForFacility.find((b) => {
+            const nameKey = String(b.branch_name || "")
+              .trim()
+              .toLowerCase();
+            const codeKey = String(b.branch_id || "")
+              .trim()
+              .toLowerCase();
+            return nameKey === key || codeKey === key;
+          }) || null;
+      }
+
+      if (!branch) {
+        const [{ branch_count } = {}] = await db.sequelize.query(
+          `SELECT COUNT(*) AS branch_count FROM branches WHERE facilityId = :facilityId`,
+          {
+            replacements: { facilityId },
+            type: db.Sequelize.QueryTypes.SELECT,
+            transaction,
+          },
+        );
+        const isFirst = Number(branch_count || 0) === 0;
+        const createdBy =
+          req.body.createdBy || req.body.created_by || "";
+
+        branch = await Branch.create(
+          {
+            branch_id: `BR-${Date.now().toString(36).toUpperCase()}-${Math.random()
+              .toString(36)
+              .slice(2, 6)
+              .toUpperCase()}`,
+            branch_name: branchLabel.trim(),
+            state: "",
+            address: "",
+            phone: "",
+            crm: "",
+            facilityId,
+            store_type: "",
+            admin: "",
+            created_by: String(createdBy),
+            admin_name: "",
+            is_default: isFirst,
+          },
+          { transaction },
+        );
+        branchesCreated += 1;
+      }
+
+      const plain = {
+        id: branch.id,
+        branch_name: branch.branch_name,
+        branch_id: branch.branch_id,
+      };
+      branchByName.set(
+        String(plain.branch_name || "")
+          .trim()
+          .toLowerCase(),
+        plain,
+      );
+      if (plain.branch_id) {
+        branchByCode.set(
+          String(plain.branch_id).trim().toLowerCase(),
+          plain,
+        );
+      }
+      return { branch: plain, created: true };
+    };
+
     const seenEmails = new Set();
     const seenPhones = new Set();
 
@@ -871,17 +974,6 @@ exports.bulkCreateStaff = async (req, res) => {
         continue;
       }
 
-      const branchKey = branchLabel.toLowerCase();
-      const branch =
-        branchByName.get(branchKey) || branchByCode.get(branchKey) || null;
-      if (!branch) {
-        errors.push({
-          row: rowNum,
-          message: `Branch/warehouse not found: ${branchLabel}`,
-        });
-        continue;
-      }
-
       const allowedStatus = ["verified", "pending", "suspended"];
       const resolvedStatus = allowedStatus.includes(status)
         ? status
@@ -891,6 +983,10 @@ exports.bulkCreateStaff = async (req, res) => {
       try {
         const resolvedRole = await resolveOrCreateRole(roleInput, transaction);
         const role = resolvedRole.name;
+        const { branch } = await resolveOrCreateBranch(
+          branchLabel,
+          transaction,
+        );
 
         const [genResult] = await db.sequelize.query(
           `CALL nurmber_generator1(:in_query_type,:facilityId)`,
@@ -981,11 +1077,14 @@ exports.bulkCreateStaff = async (req, res) => {
       message: success
         ? `Bulk import complete: ${created} staff created${
             rolesCreated ? `, ${rolesCreated} role(s) created` : ""
+          }${
+            branchesCreated ? `, ${branchesCreated} branch(es) created` : ""
           }${failed ? `, ${failed} failed` : ""}`
         : "Upload failed — no records were imported",
       data: {
         created,
         roles_created: rolesCreated,
+        branches_created: branchesCreated,
         failed,
         errors,
       },
