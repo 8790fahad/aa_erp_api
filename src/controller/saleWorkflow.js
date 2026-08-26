@@ -660,7 +660,7 @@ async function createSaleWorkflowRecord(
       ? String(assignedCashierName).trim()
       : null;
 
-  // Discounted invoices must be approved before Collection Points / credit path
+  // Discounted invoices must be approved before Verification Points / credit path
   let initialStatus;
   let statusNote;
   if (hasDiscount && paymentType !== "deposit") {
@@ -915,7 +915,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         .toLowerCase()
         .trim() === "credit";
 
-    // Approve / reject payment mode switch (Collection Points)
+    // Approve / reject payment mode switch (Verification Points)
     if (
       row.status === "awaiting_payment_mode_approval" &&
       (!action || action === "advance" || action === "reject_payment_mode")
@@ -1050,7 +1050,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit invoices must be approved on the Credit tab at Collection Points before Invoice Separation",
+          "Credit invoices must be approved on the Credit tab at Verification Points before Invoice Separation",
       });
     }
 
@@ -1065,7 +1065,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
           ? advanceNote ||
             "Discount approved — awaiting credit approval"
           : advanceNote ||
-            "Discount approved — ready for Collection Points";
+            "Discount approved — ready for Verification Points";
     }
 
     if (!next) {
@@ -1270,7 +1270,7 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
-    // Credit sales awaiting approval (Collection Points → Credit tab)
+    // Credit sales awaiting approval (Verification Points → Credit tab)
     // Fresh Apply Deposit invoices use awaiting_payment — only deposit remainders land here
     const creditWhere = {
       facility_id: facilityId,
@@ -1304,7 +1304,7 @@ exports.getCashierDashboard = async (req, res) => {
       };
     });
 
-    // Discounted invoices awaiting approval before Collection Points
+    // Discounted invoices awaiting approval before Verification Points
     const discountWhere = {
       facility_id: facilityId,
       status: "awaiting_discount_approval",
@@ -1440,7 +1440,7 @@ exports.getCashierDashboard = async (req, res) => {
            OR ce.receiptNo LIKE 'AD-%'
            OR ce.description LIKE '%advance%'
            OR ce.description LIKE '%Advance%'
-           OR ce.description LIKE '%Collection Points advance%'
+           OR ce.description LIKE '%Verification Points advance%' OR ce.description LIKE '%Collection Points advance%'
          )
          ${branchClause}
        GROUP BY LOWER(TRIM(ce.mode_of_payment))`,
@@ -1472,7 +1472,7 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
-    // Recent customer advances for Collection Points history (Cash / Transfer tabs)
+    // Recent customer advances for Verification Points history (Cash / Transfer tabs)
     const advanceRows = await db.sequelize.query(
       `SELECT
          ce.entry_id,
@@ -1495,6 +1495,7 @@ exports.getCashierDashboard = async (req, res) => {
            ce.receiptNo LIKE 'AD-%'
            OR LOWER(ce.description) LIKE '%advance%'
            OR LOWER(ce.description) LIKE '%collection points advance%'
+           OR LOWER(ce.description) LIKE '%verification points advance%'
          )
          AND (
            ce.description NOT LIKE 'Sale payment%'
@@ -1819,7 +1820,7 @@ exports.cashierConfirmPayment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit invoices must be approved on the Credit tab at Collection Points — they cannot be collected as cash/transfer",
+          "Credit invoices must be approved on the Credit tab at Verification Points — they cannot be collected as cash/transfer",
       });
     }
     if (paymentType === "deposit") {
@@ -2244,7 +2245,7 @@ exports.cashierConfirmPayment = async (req, res) => {
           body: row.customer_name
             ? `${row.customer_name} — ready for separation`
             : "Ready for invoice separation",
-          link: "/app/payments/collection-points",
+          link: "/app/payments/verification-points",
           entityType: "invoice",
           entityId: saleRef,
         });
@@ -2293,7 +2294,7 @@ exports.cashierConfirmPayment = async (req, res) => {
         body: `Remaining ₦${rem.toFixed(2)}${
           row.customer_name ? ` — ${row.customer_name}` : ""
         }`,
-        link: "/app/payments/collection-points",
+        link: "/app/payments/verification-points",
         entityType: "invoice",
         entityId: saleRef,
       });
@@ -2610,7 +2611,7 @@ exports.completeSeparation = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit approval is required at Collection Points before Invoice Separation",
+          "Credit approval is required at Verification Points before Invoice Separation",
       });
     }
 
@@ -2950,7 +2951,7 @@ const SPECIAL_TREATMENT_TYPES = [
 ];
 
 /**
- * Switch payment mode on a sale (Collection Points / special treatment).
+ * Switch payment mode on a sale (Verification Points / special treatment).
  * When requireApproval is true, queues awaiting_payment_mode_approval instead of applying.
  */
 exports.applySpecialInvoiceTreatment = async (req, res) => {
