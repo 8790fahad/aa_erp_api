@@ -56,6 +56,30 @@ exports.createProduct = async (req, res) => {
       });
     }
 
+    try {
+      const existing = await db.Product.findOne({
+        where: {
+          facility_id: facilityId,
+          [db.Sequelize.Op.and]: db.sequelize.where(
+            db.sequelize.fn(
+              "LOWER",
+              db.sequelize.fn("TRIM", db.sequelize.col("name")),
+            ),
+            String(name).trim().toLowerCase(),
+          ),
+        },
+        attributes: ["id"],
+      });
+      if (existing) {
+        return res.status(400).json({
+          success: false,
+          message: `Product name "${String(name).trim()}" already exists. Product name must be unique.`,
+        });
+      }
+    } catch (dupErr) {
+      console.error("createProduct name check:", dupErr);
+    }
+
     // Generate product ID using numberGenerator
     numberGenerator(
       { query_type: "PRODUCT", facilityId },

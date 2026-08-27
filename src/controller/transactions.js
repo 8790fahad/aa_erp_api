@@ -1527,17 +1527,32 @@ exports.getSaleByCode = async (req, res) => {
 
     let workflowPaymentType = null;
     let workflowAmount = null;
+    let workflowHistory = [];
+    let creditPaidFromWorkflow = 0;
+    let originalInvoiceFromWorkflow = null;
     try {
       if (db.SaleWorkflow) {
         const wf = await db.SaleWorkflow.findOne({
           where: { facility_id: facilityId, sale_code: saleCode },
-          attributes: ["payment_type", "amount", "status"],
+          attributes: ["payment_type", "amount", "status", "history"],
           raw: true,
         });
         if (wf) {
           workflowPaymentType = wf.payment_type || null;
           workflowAmount =
             wf.amount != null ? Number(wf.amount) : null;
+          workflowHistory = Array.isArray(wf.history) ? wf.history : [];
+          // Prefer latest credit_remainder from Credit + Cash + Transfer flow
+          for (let i = workflowHistory.length - 1; i >= 0; i -= 1) {
+            const cr = workflowHistory[i]?.credit_remainder;
+            if (cr && Number(cr.remainder) > 0) {
+              creditPaidFromWorkflow = Number(cr.remainder) || 0;
+              if (cr.original_amount != null) {
+                originalInvoiceFromWorkflow = Number(cr.original_amount);
+              }
+              break;
+            }
+          }
         }
       }
     } catch (wfErr) {
@@ -1555,23 +1570,63 @@ exports.getSaleByCode = async (req, res) => {
       baseEntry?.mode_of_payment ||
       "CREDIT";
 
+    const invoiceTotalAmount = Number(totalAmount) || 0;
+    // Credit portion: explicit remainder, or unpaid balance on credit / credit_split
+    let creditPaid = creditPaidFromWorkflow;
+    if (creditPaid <= 0.05) {
+      const unpaid = Number(
+        (invoiceTotalAmount - cashPaid - transferPaid).toFixed(2),
+      );
+      const pt = String(modeOfPayment || "").toLowerCase();
+      if (
+        unpaid > 0.05 &&
+        (pt === "credit" ||
+          pt === "credit_split" ||
+          pt.includes("credit") ||
+          String(workflowPaymentType || "")
+            .toLowerCase()
+            .includes("credit"))
+      ) {
+        creditPaid = unpaid;
+      }
+    }
+
     // Prefer derived label when we have concrete payment lines
-    if (cashPaid > 0 && transferPaid > 0) {
+    if (cashPaid > 0.05 && transferPaid > 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (cashPaid > 0.05 && transferPaid > 0.05) {
       modeOfPayment = "split";
-    } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length) {
+    } else if (cashPaid > 0.05 && transferPaid <= 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (transferPaid > 0.05 && cashPaid <= 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length && creditPaid <= 0.05) {
       modeOfPayment = "cash";
-    } else if (transferPaid > 0 && cashPaid <= 0) {
+    } else if (transferPaid > 0 && cashPaid <= 0 && creditPaid <= 0.05) {
       modeOfPayment = "transfer";
+    } else if (creditPaid > 0.05 && cashPaid <= 0.05 && transferPaid <= 0.05) {
+      modeOfPayment = "credit";
     }
 
     const amountPaid =
       amountPaidFromEntries > 0
         ? amountPaidFromEntries
-        : String(modeOfPayment).toUpperCase() === "CREDIT"
-          ? 0
+        : String(modeOfPayment).toUpperCase() === "CREDIT" ||
+            String(modeOfPayment).toLowerCase() === "credit_split"
+          ? cashPaid + transferPaid
           : workflowAmount != null && Number.isFinite(workflowAmount)
             ? workflowAmount
             : 0;
+
+    if (creditPaid > 0.05) {
+      paymentBreakdown.push({
+        mode: "credit",
+        amount: creditPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Credit",
+      });
+    }
 
     const transaction = {
       id: saleCode,
@@ -1581,8 +1636,14 @@ exports.getSaleByCode = async (req, res) => {
       payment_type: modeOfPayment,
       cash_paid: cashPaid,
       transfer_paid: transferPaid,
+      credit_paid: creditPaid,
       transfer_banks: transferBanks,
       payment_breakdown: paymentBreakdown,
+      invoice_total_amount:
+        originalInvoiceFromWorkflow != null &&
+        Number.isFinite(originalInvoiceFromWorkflow)
+          ? originalInvoiceFromWorkflow
+          : invoiceTotalAmount,
       created_by: baseEntry?.created_by,
     };
 
@@ -1612,8 +1673,10 @@ exports.getSaleByCode = async (req, res) => {
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
+        credit_paid: creditPaid,
         transfer_banks: transferBanks,
         payment_breakdown: paymentBreakdown,
+        invoice_total_amount: transaction.invoice_total_amount,
         transaction,
         date: createdAt,
         customer: customer

@@ -242,6 +242,16 @@ async function applyPaymentTypeToWorkflow(
   return { changed: true, skipped: false };
 }
 
+/** Latest credit remainder payload from Credit + Cash + Transfer flow. */
+function getCreditRemainderFromHistory(history) {
+  const list = normalizeHistory(history);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const cr = list[i]?.credit_remainder;
+    if (cr && Number(cr.remainder) > 0) return cr;
+  }
+  return null;
+}
+
 /** Track partial Cash + Transfer collections on split invoices. */
 function getSplitCollectionProgress(history) {
   const list = normalizeHistory(history);
@@ -275,6 +285,9 @@ function getSplitCollectionProgress(history) {
     }
   }
   const collected_total = Number((cash + transfer).toFixed(2));
+  const creditRem = getCreditRemainderFromHistory(history);
+  const creditFromHistory =
+    creditRem != null ? Number(creditRem.remainder) || 0 : null;
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
@@ -287,7 +300,54 @@ function getSplitCollectionProgress(history) {
     cash_at,
     transfer_at,
     collected_total,
+    credit:
+      creditFromHistory != null
+        ? Number(creditFromHistory.toFixed(2))
+        : null,
+    original_amount:
+      creditRem?.original_amount != null
+        ? Number(creditRem.original_amount)
+        : null,
   };
+}
+
+/** Attach split/credit progress for credit_split and credit-remainder rows. */
+function buildSplitProgressForRow(plain) {
+  const pt = String(plain?.payment_type || "").toLowerCase();
+  const progress = getSplitCollectionProgress(plain?.history);
+  const creditRem = getCreditRemainderFromHistory(plain?.history);
+  const amountDue = Number(plain?.amount) || 0;
+  if (pt === "credit_split") {
+    const credit = Number(
+      (amountDue - (progress.collected_total || 0)).toFixed(2),
+    );
+    return {
+      ...progress,
+      credit: credit > 0.05 ? credit : 0,
+      original_amount: amountDue,
+    };
+  }
+  if (pt === "credit" && (creditRem || progress.collected_total > 0.05)) {
+    return {
+      ...progress,
+      credit:
+        progress.credit != null
+          ? progress.credit
+          : Number(amountDue.toFixed(2)),
+      original_amount:
+        progress.original_amount != null
+          ? progress.original_amount
+          : Number(
+              (
+                (progress.collected_total || 0) + amountDue
+              ).toFixed(2),
+            ),
+    };
+  }
+  if (isSplitPaymentType(pt)) {
+    return progress;
+  }
+  return null;
 }
 
 /** Persist workflow history JSON (Sequelize may miss nested mutations). */
@@ -1247,9 +1307,7 @@ exports.getCashierDashboard = async (req, res) => {
     const pendingRows = pending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
-      const split_progress = isSplitPaymentType(plain.payment_type)
-          ? getSplitCollectionProgress(plain.history)
-          : null;
+      const split_progress = buildSplitProgressForRow(plain);
       return {
         ...plain,
         history: normalizeHistory(plain.history),
@@ -1267,34 +1325,6 @@ exports.getCashierDashboard = async (req, res) => {
       if (r.split_progress?.transfer_by)
         collectorIds.add(String(r.split_progress.transfer_by));
     });
-    if (collectorIds.size && db.users) {
-      try {
-        const users = await db.users.findAll({
-          where: { id: [...collectorIds] },
-          attributes: ["id", "firstname", "lastname", "username"],
-        });
-        const nameById = {};
-        users.forEach((u) => {
-          nameById[String(u.id)] =
-            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
-            u.username ||
-            String(u.id);
-        });
-        pendingRows.forEach((r) => {
-          if (!r.split_progress) return;
-          if (!r.split_progress.cash_by_name && r.split_progress.cash_by) {
-            r.split_progress.cash_by_name =
-              nameById[String(r.split_progress.cash_by)] || null;
-          }
-          if (!r.split_progress.transfer_by_name && r.split_progress.transfer_by) {
-            r.split_progress.transfer_by_name =
-              nameById[String(r.split_progress.transfer_by)] || null;
-          }
-        });
-      } catch (_) {
-        /* ignore name lookup failures */
-      }
-    }
 
     // Credit sales awaiting approval (Verification Points → Credit tab)
     // Fresh Apply Deposit invoices use awaiting_payment — only deposit remainders land here
@@ -1322,13 +1352,56 @@ exports.getCashierDashboard = async (req, res) => {
     const creditRows = creditPending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
+      const split_progress = buildSplitProgressForRow(plain);
       return {
         ...plain,
+        history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "rose",
         amount: Number(plain.amount) || 0,
+        split_progress,
       };
     });
+    creditRows.forEach((r) => {
+      if (r.split_progress?.cash_by)
+        collectorIds.add(String(r.split_progress.cash_by));
+      if (r.split_progress?.transfer_by)
+        collectorIds.add(String(r.split_progress.transfer_by));
+    });
+
+    if (collectorIds.size && db.users) {
+      try {
+        const users = await db.users.findAll({
+          where: { id: [...collectorIds] },
+          attributes: ["id", "firstname", "lastname", "username"],
+        });
+        const nameById = {};
+        users.forEach((u) => {
+          nameById[String(u.id)] =
+            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
+            u.username ||
+            String(u.id);
+        });
+        const applyNames = (r) => {
+          if (!r.split_progress) return;
+          if (!r.split_progress.cash_by_name && r.split_progress.cash_by) {
+            r.split_progress.cash_by_name =
+              nameById[String(r.split_progress.cash_by)] || null;
+          }
+          if (
+            !r.split_progress.transfer_by_name &&
+            r.split_progress.transfer_by
+          ) {
+            r.split_progress.transfer_by_name =
+              nameById[String(r.split_progress.transfer_by)] || null;
+          }
+        };
+        pendingRows.forEach(applyNames);
+        creditRows.forEach(applyNames);
+      } catch (_) {
+        /* ignore name lookup failures */
+      }
+    }
 
     // Discounted invoices awaiting approval before Verification Points
     const discountWhere = {
@@ -2483,20 +2556,27 @@ exports.sendCreditRemainder = async (req, res) => {
     row.payment_type = "credit";
     row.status = "awaiting_credit_approval";
     row.updated_by = updated_by || row.updated_by;
+    const cashCollected = progress.cash || 0;
+    const transferCollected = progress.transfer || 0;
+    const noteText =
+      cashCollected <= 0.05 && transferCollected <= 0.05
+        ? `Full amount ₦${remaining.toFixed(2)} confirmed as Credit — awaiting Credit Approval`
+        : `Cash ₦${cashCollected.toFixed(2)} + Transfer ₦${transferCollected.toFixed(2)} collected; Credit ₦${remaining.toFixed(2)} sent to Credit Approval`;
     setWorkflowHistory(
       row,
       pushHistory(
         row.history,
         "awaiting_credit_approval",
         updated_by,
-        note ||
-          `Cash/transfer collected ₦${Number(progress.collected_total || 0).toFixed(2)}; remainder ₦${remaining.toFixed(2)} sent to Credit Approval`,
+        note || noteText,
         {
           credit_remainder: {
             from: "credit_split",
-            cash_collected: progress.cash || 0,
-            transfer_collected: progress.transfer || 0,
+            original_amount: amountDue,
+            cash_collected: cashCollected,
+            transfer_collected: transferCollected,
             remainder: remaining,
+            credit: remaining,
           },
         },
       ),
@@ -2506,12 +2586,19 @@ exports.sendCreditRemainder = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Remainder ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
+      message:
+        cashCollected <= 0.05 && transferCollected <= 0.05
+          ? `₦${remaining.toFixed(2)} confirmed as Credit for ${saleCode} — approve on Credit tab`
+          : `Credit ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
-        split_progress: progress,
+        split_progress: {
+          ...progress,
+          credit: remaining,
+          original_amount: amountDue,
+        },
       },
     });
   } catch (err) {

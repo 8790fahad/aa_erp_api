@@ -16,6 +16,10 @@ module.exports = (app) => {
   app.get("/api/products/get-by-item-type/:facilityId", productsController.getProductByItemType);
   app.get("/api/products/list-by-type/:facilityId", productsController.getProductByType);
   app.get(
+    "/api/products/check-name/:facilityId",
+    productsController.checkProductName
+  );
+  app.get(
     "/api/products/:facilityId/:productId",
     productsController.getProductById
   );
