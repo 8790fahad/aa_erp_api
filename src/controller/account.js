@@ -14051,6 +14051,131 @@ exports.getExpenseBill = async (req, res) => {
   }
 };
 
+function isCashTransferSplitPaymentMode(mode) {
+  const m = String(mode || "")
+    .toLowerCase()
+    .trim();
+  return m === "cash+transfer" || m === "split" || m === "cash_transfer";
+}
+
+/**
+ * Resolve payment_splits (cash + bank) into GL credit legs.
+ * Returns null when not a split payment (caller uses single-mode path).
+ */
+async function resolveSupplierPaymentSplits({
+  payment_splits,
+  mode_of_payment,
+  accountHead,
+  bankAccount,
+  facilityId,
+  transaction,
+  expectedTotal,
+}) {
+  const rawFromBody = Array.isArray(payment_splits)
+    ? payment_splits.filter((s) => s && Number(s.amount) > 0)
+    : [];
+  const isSplit =
+    isCashTransferSplitPaymentMode(mode_of_payment) || rawFromBody.length > 0;
+  if (!isSplit) return null;
+
+  if (rawFromBody.length === 0) {
+    throw new Error(
+      "payment_splits with amounts are required for Cash + Transfer",
+    );
+  }
+
+  const resolved = [];
+  for (const split of rawFromBody) {
+    const mode = String(split.mode || "")
+      .toLowerCase()
+      .trim();
+    const amount = parseFloat(Number(split.amount).toFixed(2));
+    if (!(amount > 0)) continue;
+
+    if (mode === "cash") {
+      const head =
+        split.accountHead?.head ||
+        split.account_head ||
+        accountHead?.head;
+      if (!head) {
+        throw new Error("Cash account is required for the cash portion");
+      }
+      const paymentAccount = await db.AccountCategory.findOne({
+        where: { code: head, facility_id: facilityId },
+        transaction,
+      });
+      if (!paymentAccount) {
+        throw new Error(`Cash account not found: ${head}`);
+      }
+      resolved.push({
+        mode: "cash",
+        amount,
+        paymentAccount,
+        paymentName: paymentAccount.description || "Cash in Hand",
+        bankAccountId: head,
+        bankAcc: null,
+      });
+    } else if (
+      mode === "bank" ||
+      mode === "transfer" ||
+      mode === "bank transfer"
+    ) {
+      const bankId = split.bankAccount?.id || bankAccount?.id;
+      if (!bankId) {
+        throw new Error("Bank account is required for the transfer portion");
+      }
+      const bankAcc = await db.bank_account.findOne({
+        where: { id: bankId, facilityId, status: "active" },
+        transaction,
+      });
+      if (!bankAcc) throw new Error("Bank account not found or inactive");
+      if (!bankAcc.head) {
+        throw new Error(
+          `Bank account '${bankAcc.account_name}' has no GL head assigned`,
+        );
+      }
+      const paymentAccount = await db.AccountCategory.findOne({
+        where: { code: bankAcc.head, facility_id: facilityId },
+        transaction,
+      });
+      if (!paymentAccount) {
+        throw new Error(`GL account not found for bank head: ${bankAcc.head}`);
+      }
+      resolved.push({
+        mode: "bank",
+        amount,
+        paymentAccount,
+        paymentName: bankAcc.account_name || paymentAccount.description,
+        bankAccountId: bankAcc.id,
+        bankAcc,
+      });
+    } else {
+      throw new Error(`Unsupported payment split mode: ${mode || "(empty)"}`);
+    }
+  }
+
+  if (resolved.length === 0) {
+    throw new Error("Cash + Transfer requires at least one payment split");
+  }
+
+  const sum = parseFloat(
+    resolved.reduce((s, x) => s + x.amount, 0).toFixed(2),
+  );
+  if (
+    expectedTotal != null &&
+    Number.isFinite(Number(expectedTotal)) &&
+    Math.abs(sum - Number(expectedTotal)) > 0.02
+  ) {
+    throw new Error(
+      `Cash + Transfer amounts (${sum.toFixed(2)}) must equal total (${Number(
+        expectedTotal,
+      ).toFixed(2)})`,
+    );
+  }
+
+  return resolved;
+}
+
 exports.directPurchaseExpenses = async (req, res) => {
   const {
     data = [],
@@ -14064,13 +14189,19 @@ exports.directPurchaseExpenses = async (req, res) => {
     tax_amount = 0,
     taxes = [],
     apply_prepayment = false,
-    mode_of_payment = "credit", // credit | cash | bank | cheque
+    mode_of_payment = "credit", // credit | cash | bank | cheque | cash+transfer
     bankAccount = {},
     accountHead = {},
     cheque_number,
+    payment_splits = [],
   } = req.body;
 
-  const isCashLike = ["cash", "bank", "cheque"].includes(mode_of_payment);
+  const isSplitPayment =
+    isCashTransferSplitPaymentMode(mode_of_payment) ||
+    (Array.isArray(payment_splits) &&
+      payment_splits.some((s) => s && Number(s.amount) > 0));
+  const isCashLike =
+    ["cash", "bank", "cheque"].includes(mode_of_payment) || isSplitPayment;
 
   // === VALIDATIONS ===
   if (!facilityId)
@@ -14154,8 +14285,11 @@ exports.directPurchaseExpenses = async (req, res) => {
     let paymentAccount = null;
     let paymentName = "";
     let bankAcc = null;
+    let resolvedPaymentSplits = null;
     if (isCashLike) {
-      if (mode_of_payment === "cash") {
+      if (isSplitPayment) {
+        // Resolved after grandTotal is known (below)
+      } else if (mode_of_payment === "cash") {
         if (!accountHead?.head) {
           throw new Error("accountHead.head is required for cash payment");
         }
@@ -14526,7 +14660,38 @@ exports.directPurchaseExpenses = async (req, res) => {
       .filter(Boolean)
       .join(", ");
 
-    if (isCashLike && paymentAccount) {
+    if (isCashLike && isSplitPayment) {
+      resolvedPaymentSplits = await resolveSupplierPaymentSplits({
+        payment_splits,
+        mode_of_payment,
+        accountHead,
+        bankAccount,
+        facilityId,
+        transaction,
+        expectedTotal: grandTotal,
+      });
+      for (const split of resolvedPaymentSplits) {
+        ledgerEntries.push({
+          account_code: split.paymentAccount.code,
+          account_subhead: split.paymentAccount.parent_code || 0,
+          dr: 0,
+          cr: split.amount,
+          account_description:
+            split.paymentAccount.description || split.paymentName,
+          transaction_description: expenseLineNamesList
+            ? `Direct Expense - Paid via ${String(split.mode).toUpperCase()} (${split.paymentName}) - ${pvCode}: ${expenseLineNamesList}`
+            : `Direct Expense - Paid via ${String(split.mode).toUpperCase()} (${split.paymentName}) - ${pvCode}`,
+          type: "payment",
+          bank_account_id: split.bankAccountId || null,
+          mode_of_payment: split.mode,
+          cheque_no: null,
+          transaction_ref: supplier_no,
+        });
+      }
+      paymentName = resolvedPaymentSplits
+        .map((s) => `${s.mode}:${s.amount}`)
+        .join(" + ");
+    } else if (isCashLike && paymentAccount) {
       // Immediate payment: Cr Cash/Bank for the bill total (expense + exclusive VAT).
       ledgerEntries.push({
         account_code: paymentAccount.code,
@@ -15902,9 +16067,14 @@ exports.directConsumables = async (req, res) => {
     transaction_date,
     bankAccount = {}, // { id, account_name, ... }
     accountHead = {}, // { head: "104" } for cash
-    mode_of_payment, // "cash" | "bank" | "cheque"
+    mode_of_payment, // "cash" | "bank" | "cheque" | "cash+transfer"
+    payment_splits = [],
   } = req.body;
   console.log(req.body);
+  const isSplitPayment =
+    isCashTransferSplitPaymentMode(mode_of_payment) ||
+    (Array.isArray(payment_splits) &&
+      payment_splits.some((s) => s && Number(s.amount) > 0));
   // === VALIDATIONS ===
   if (!facilityId)
     return res
@@ -15918,10 +16088,13 @@ exports.directConsumables = async (req, res) => {
     return res
       .status(400)
       .json({ success: false, message: "data must be a non-empty array" });
-  if (!["cash", "bank", "cheque"].includes(mode_of_payment))
+  if (
+    !["cash", "bank", "cheque"].includes(mode_of_payment) &&
+    !isSplitPayment
+  )
     return res.status(400).json({
       success: false,
-      message: "mode_of_payment must be cash, bank, or cheque",
+      message: "mode_of_payment must be cash, bank, cheque, or cash+transfer",
     });
 
   const userId = user_id || req.user?.id;
@@ -16067,8 +16240,39 @@ exports.directConsumables = async (req, res) => {
     let paymentAccount = null;
     let paymentHead = null;
     let paymentName = "Cash/Bank";
+    let resolvedPaymentSplits = null;
 
-    if (mode_of_payment === "cash") {
+    if (isSplitPayment) {
+      resolvedPaymentSplits = await resolveSupplierPaymentSplits({
+        payment_splits,
+        mode_of_payment,
+        accountHead,
+        bankAccount,
+        facilityId,
+        transaction,
+        expectedTotal: totalAmount,
+      });
+      for (const split of resolvedPaymentSplits) {
+        ledgerEntries.push({
+          account_code: split.paymentAccount.code,
+          account_subhead: split.paymentAccount.parent_code || 0,
+          dr: 0,
+          cr: split.amount,
+          account_description:
+            split.paymentAccount.description || split.paymentName,
+          transaction_description: `${narration} - Paid via ${String(
+            split.mode,
+          ).toUpperCase()}`,
+          type: "bank",
+        });
+      }
+      paymentName = resolvedPaymentSplits
+        .map((s) => `${s.mode}:${s.amount}`)
+        .join(" + ");
+      paymentHead = resolvedPaymentSplits
+        .map((s) => s.paymentAccount.code)
+        .join(",");
+    } else if (mode_of_payment === "cash") {
       if (!accountHead?.head)
         throw new Error("accountHead.head required for cash payment");
       paymentHead = accountHead.head;
@@ -16105,16 +16309,18 @@ exports.directConsumables = async (req, res) => {
         throw new Error(`GL account not found for head: ${bankAcc.head}`);
     }
 
-    // === Credit Cash/Bank (Instant Payment) ===
-    ledgerEntries.push({
-      account_code: paymentAccount.code,
-      account_subhead: paymentAccount.parent_code || 0,
-      dr: 0,
-      cr: totalAmount,
-      account_description: paymentAccount.description || paymentName,
-      transaction_description: `${narration} - Paid via ${mode_of_payment.toUpperCase()}`,
-      type: "bank",
-    });
+    // === Credit Cash/Bank (Instant Payment) — single mode only ===
+    if (!isSplitPayment) {
+      ledgerEntries.push({
+        account_code: paymentAccount.code,
+        account_subhead: paymentAccount.parent_code || 0,
+        dr: 0,
+        cr: totalAmount,
+        account_description: paymentAccount.description || paymentName,
+        transaction_description: `${narration} - Paid via ${mode_of_payment.toUpperCase()}`,
+        type: "bank",
+      });
+    }
 
     // === SAVE TO GENERAL LEDGER ===
     for (const entry of ledgerEntries) {
