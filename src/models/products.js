@@ -262,6 +262,11 @@ module.exports = (sequelize, DataTypes) => {
           unique: true,
           fields: ["sku", "facility_id"], // Composite unique key
         },
+        {
+          unique: true,
+          name: "products_facility_name_uq",
+          fields: ["facility_id", "name"],
+        },
         { fields: ["facility_id"] },
         { fields: ["item_type"] },
         { fields: ["status"] },
