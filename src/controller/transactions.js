@@ -9,7 +9,7 @@ const UUIDV4 = require("uuid").v4;
 const { Op } = require("sequelize");
 const { sellingApi } = require("./api/transactionsApi");
 const { getAndUpdateNumber } = require("../services/numberGen");
-const { getSellableQtyAtBranch } = require("../services/sellableStock");
+const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
 // getBalance function - inline implementation to avoid ES6/CommonJS import issues
@@ -3711,32 +3711,92 @@ exports.createSale = async (req, res) => {
         const allowSalesWithoutStock =
           business?.allow_sales_without_stock || false;
 
-        const stockBranchId =
-          parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
-          saleBranchId ||
-          0;
+        const rawLineBranch = itm.branchId ?? itm.branch_id;
+        const hasExplicitLineBranch =
+          rawLineBranch != null &&
+          String(rawLineBranch).trim() !== "" &&
+          Number.isFinite(parseInt(String(rawLineBranch), 10)) &&
+          parseInt(String(rawLineBranch), 10) > 0;
+
+        let stockBranchId = hasExplicitLineBranch
+          ? parseInt(String(rawLineBranch), 10)
+          : parseInt(saleBranchId, 10) || 0;
+
         const stockKey = `${sku}|${stockBranchId}`;
 
         if (!remainingSellableByKey.has(stockKey)) {
-          const currentBalance = await getSellableQtyAtBranch({
+          let currentBalance = await getSellableQtyAtBranch({
             sku,
             facilityId,
             branchId: stockBranchId,
             transaction: t,
           });
-          remainingSellableByKey.set(stockKey, currentBalance);
+
+          // Wrong warehouse on the line (often the cashier's assigned branch)
+          // while Make Sale showed stock at another warehouse — re-home the line.
+          const mayRetarget =
+            !hasExplicitLineBranch ||
+            (saleBranchId > 0 && stockBranchId === saleBranchId);
+
+          if (
+            !allowSalesWithoutStock &&
+            currentBalance < qty &&
+            mayRetarget
+          ) {
+            const alts = await listSellableBranchesForSku({
+              sku,
+              facilityId,
+              transaction: t,
+            });
+            const fit = alts.find((a) => a.balance >= qty);
+            if (fit && fit.branchId > 0) {
+              stockBranchId = fit.branchId;
+              currentBalance = fit.balance;
+              itm.branchId = fit.branchId;
+              itm.branch_id = fit.branchId;
+            }
+          }
+
+          remainingSellableByKey.set(
+            `${sku}|${stockBranchId}`,
+            currentBalance,
+          );
         }
 
-        const available = remainingSellableByKey.get(stockKey) || 0;
+        stockBranchId =
+          parseInt(itm.branchId ?? itm.branch_id ?? stockBranchId, 10) ||
+          stockBranchId;
+        const resolvedKey = `${sku}|${stockBranchId}`;
+        const available = remainingSellableByKey.get(resolvedKey) ?? 0;
+
         if (!allowSalesWithoutStock && available < qty) {
           const productLabel = (product.name || sku).trim();
-          const branchHint =
+          let branchHint =
             stockBranchId > 0 ? ` (branch id ${stockBranchId})` : "";
+          try {
+            const alts = await listSellableBranchesForSku({
+              sku,
+              facilityId,
+              transaction: t,
+            });
+            if (alts.length) {
+              const where = alts
+                .slice(0, 3)
+                .map(
+                  (a) =>
+                    `${a.branch_name || `branch ${a.branchId}`}: ${a.balance}`,
+                )
+                .join("; ");
+              branchHint += `. Stock is at: ${where}`;
+            }
+          } catch (_) {
+            /* ignore */
+          }
           throw new Error(
             `Insufficient quantity for ${productLabel}${branchHint}. Available: ${available}, Requested: ${qty}`,
           );
         }
-        remainingSellableByKey.set(stockKey, available - qty);
+        remainingSellableByKey.set(resolvedKey, available - qty);
       }
 
       const lineTotal = qty * price;
