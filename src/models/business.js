@@ -242,7 +242,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
       business_phone: {
-        type: DataTypes.STRING(50),
+        type: DataTypes.STRING(120),
         allowNull: true,
       },
       business_includes_logistics: {

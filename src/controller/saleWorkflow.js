@@ -1,5 +1,6 @@
 const db = require("../models");
 const { Op } = require("sequelize");
+const moment = require("moment");
 const {
   SALE_WORKFLOW_STAGES,
   nextStageFor,
@@ -1153,7 +1154,17 @@ exports.advanceSaleWorkflow = async (req, res) => {
  */
 exports.getCashierDashboard = async (req, res) => {
   try {
-    const { facilityId, cashierType, branchId, userId, role } = req.query;
+    const {
+      facilityId,
+      cashierType,
+      branchId,
+      userId,
+      role,
+      historyFrom,
+      historyTo,
+      fromDate,
+      toDate,
+    } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
@@ -1165,6 +1176,21 @@ exports.getCashierDashboard = async (req, res) => {
         success: false,
         message: "SaleWorkflow model not loaded",
       });
+    }
+
+    const todayYmd = moment().format("YYYY-MM-DD");
+    const parseYmd = (v) => {
+      const s = String(v || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+      return s;
+    };
+    let histFrom =
+      parseYmd(historyFrom) || parseYmd(fromDate) || todayYmd;
+    let histTo = parseYmd(historyTo) || parseYmd(toDate) || histFrom;
+    if (histFrom > histTo) {
+      const tmp = histFrom;
+      histFrom = histTo;
+      histTo = tmp;
     }
 
     const where = {
@@ -1414,7 +1440,12 @@ exports.getCashierDashboard = async (req, res) => {
     }
 
     // Today's confirmed payments from customer_entries (invoice collections + advances)
-    const todayReplacements = { facilityId };
+    // Use history date range so summary cards match History fetch
+    const todayReplacements = {
+      facilityId,
+      histFrom,
+      histTo,
+    };
     let branchClause = "";
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -1432,7 +1463,7 @@ exports.getCashierDashboard = async (req, res) => {
        WHERE ce.facilityId = :facilityId
          AND ce.type = 'deposit'
          AND ce.cost > 0
-         AND DATE(ce.created_at) = CURDATE()
+         AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
          AND (
            ce.description LIKE 'Sale payment%'
            OR ce.link_id LIKE 'INV-%'
@@ -1472,6 +1503,40 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
+    // Credit invoices approved today (left awaiting_credit_approval)
+    const approvedCreditTodayRows = await db.sequelize.query(
+      `SELECT
+         COALESCE(SUM(sw.amount), 0) AS total,
+         COUNT(*) AS cnt
+       FROM sale_workflows sw
+       WHERE sw.facility_id = :facilityId
+         AND sw.payment_type IN ('credit', 'deposit')
+         AND sw.status IN (
+           'credit_approved',
+           'invoice_separation',
+           'final_invoice',
+           'warehouse_picking',
+           'dual_signature',
+           'goods_released',
+           'completed'
+         )
+         AND sw.amount > 0
+         AND DATE(sw.updated_at) BETWEEN :histFrom AND :histTo
+         ${
+           branchId && branchId !== "all" && Number.isFinite(parseInt(branchId, 10))
+             ? "AND sw.branch_id = :branchId"
+             : ""
+         }`,
+      {
+        replacements: todayReplacements,
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const approved_credit_today =
+      Number(approvedCreditTodayRows?.[0]?.total) || 0;
+    const approved_credit_count_today =
+      Number(approvedCreditTodayRows?.[0]?.cnt) || 0;
+
     // Recent customer advances for Verification Points history (Cash / Transfer tabs)
     const advanceRows = await db.sequelize.query(
       `SELECT
@@ -1500,9 +1565,10 @@ exports.getCashierDashboard = async (req, res) => {
          AND (
            ce.description NOT LIKE 'Sale payment%'
          )
+         AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
          ${branchClause}
        ORDER BY ce.created_at DESC
-       LIMIT 80`,
+       LIMIT 300`,
       {
         replacements: todayReplacements,
         type: db.Sequelize.QueryTypes.SELECT,
@@ -1569,10 +1635,18 @@ exports.getCashierDashboard = async (req, res) => {
     else if (ct === "split") historyWhere.payment_type = ["split", "credit_split"];
     else if (ct === "credit") historyWhere.payment_type = ["credit", "deposit"];
 
+    // History is always date-scoped (default: today)
+    historyWhere.updated_at = {
+      [Op.between]: [
+        new Date(`${histFrom}T00:00:00.000`),
+        new Date(`${histTo}T23:59:59.999`),
+      ],
+    };
+
     const history = await db.SaleWorkflow.findAll({
       where: historyWhere,
       order: [["updated_at", "DESC"]],
-      limit: 100,
+      limit: 500,
     });
 
     const workflowHistory = history.map((r) => {
@@ -1609,6 +1683,10 @@ exports.getCashierDashboard = async (req, res) => {
           collected_cash_today: collected_cash,
           collected_transfer_today: collected_transfer,
           collected_today: collected_cash + collected_transfer,
+          approved_credit_today,
+          approved_credit_count_today,
+          history_from: histFrom,
+          history_to: histTo,
         },
       },
     });

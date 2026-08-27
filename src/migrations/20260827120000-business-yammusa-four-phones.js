@@ -1,16 +1,29 @@
 "use strict";
 
+const { Sequelize } = require("sequelize");
+
 /**
- * Update ALH ALI MUHAMMAD YAMMUSA business phones.
+ * YAMMUSA phones: keep originals + add two new (4 total).
+ * Widen business_phone for multiple numbers.
  * Business: 094c6e1e-dd07-48c4-a344-6e9d58cd7861
+ *
+ * Tel: 08036032541, 07032144609, 07077222277, 08081634455
  */
 const BUSINESS_ID = "094c6e1e-dd07-48c4-a344-6e9d58cd7861";
-const NEW_PHONE =
+const FOUR_PHONES =
   "08036032541, 07032144609, 07077222277, 08081634455";
-const OLD_PHONE = "08036032541, 07032144609";
+const PREVIOUS_PHONES = "07077222277, 08081634455";
 
 module.exports = {
   async up(queryInterface) {
+    const table = await queryInterface.describeTable("business");
+    if (table.business_phone) {
+      await queryInterface.changeColumn("business", "business_phone", {
+        type: Sequelize.STRING(120),
+        allowNull: true,
+      });
+    }
+
     await queryInterface.sequelize.query(
       `
       UPDATE business
@@ -23,7 +36,7 @@ module.exports = {
       {
         replacements: {
           id: BUSINESS_ID,
-          phone: NEW_PHONE,
+          phone: FOUR_PHONES,
         },
       },
     );
@@ -42,7 +55,7 @@ module.exports = {
       {
         replacements: {
           id: BUSINESS_ID,
-          phone: OLD_PHONE,
+          phone: PREVIOUS_PHONES,
         },
       },
     );

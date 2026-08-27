@@ -6,7 +6,8 @@ const path = require("path");
 const BUSINESS_ID = "094c6e1e-dd07-48c4-a344-6e9d58cd7861";
 const NEW_NAME = "ALH ALI MUHAMMAD YAMMUSA";
 const NEW_ADDRESS = "#52E Ado Bayero Road Singer Market, Kano.";
-const NEW_PHONE = "08036032541, 07032144609";
+const NEW_PHONE =
+  "08036032541, 07032144609, 07077222277, 08081634455";
 const OLD_NAME = "YAMMUSA GLOBAL FARMS & AGRO ALLIED SERVICES";
 const OLD_ADDRESS =
   "NO. 9 SHEHU NA ALLAH STREET, YANKABA, NASARAWA LGA, KANO, KANO STATE";
@@ -55,7 +56,7 @@ function loadLogoDataUri() {
  * Rebrand YAMMUSA business:
  * - Name: ALH ALI MUHAMMAD YAMMUSA
  * - Address: #52E Ado Bayero Road Singer Market, Kano.
- * - Phones: 08036032541, 07032144609
+ * - Phones: 08036032541, 07032144609, 07077222277, 08081634455
  * - Logo: circular Salt/Rice emblem (migrations/assets/yammusa-logo.png)
  */
 module.exports = {
