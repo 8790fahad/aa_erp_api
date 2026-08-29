@@ -1,42 +1,45 @@
 const db = require("../models");
 
-// controllers/numberGeneratorController.js
-exports.getAndUpdateNumber = async (prefix, facilityId) => {
+/**
+ * CALL results arrive as { code_no }, [{ code_no }] or [[{ code_no }]] depending
+ * on the driver and whether Sequelize unwraps the result set.
+ */
+function extractReservedNumber(result) {
+  if (result == null) return null;
 
-  try {
-    const results = await db.sequelize.query(
-      `SELECT code_no
-       FROM number_generator
-       WHERE prefix = :prefix
-         AND facilityId = :facilityId`,
-      {
-        replacements: { prefix, facilityId },
-        type: db.Sequelize.QueryTypes.SELECT,
-      }
-    );
-
-    if (!results || results.length === 0) {
-      await db.sequelize.query(
-        `INSERT INTO number_generator (description, prefix, code_no, facilityId)
-         VALUES (:description, :prefix, 2, :facilityId)`,
-        { replacements: { description:prefix, prefix, facilityId } }
-      );
-      return 1;
+  if (Array.isArray(result)) {
+    for (const entry of result) {
+      const found = extractReservedNumber(entry);
+      if (found != null) return found;
     }
-
-    const currentNumber = results[0].code_no;
-    await db.sequelize.query(
-      `UPDATE number_generator
-       SET code_no = code_no + 1
-       WHERE prefix = :prefix
-         AND facilityId = :facilityId`,
-      {
-        replacements: { prefix, facilityId },
-      }
-    );
-    return currentNumber;
-  } catch (error) {
-    console.error("Error getting/updating number:", error);
-    throw error; // Changed from res.status(...) since res is not available here
+    return null;
   }
+
+  if (typeof result !== "object") return null;
+
+  const value = Number(result.code_no);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Reserve the next number in a facility's series and return it.
+ *
+ * The reservation happens inside nurmber_generator1 as a single locking
+ * statement, so two concurrent callers can never receive the same number.
+ * Callers must not separately advance the counter afterwards.
+ */
+exports.getAndUpdateNumber = async (prefix, facilityId) => {
+  const result = await db.sequelize.query(
+    `CALL nurmber_generator1(:prefix, :facilityId)`,
+    { replacements: { prefix, facilityId } },
+  );
+
+  const reserved = extractReservedNumber(result);
+  if (reserved == null) {
+    throw new Error(
+      `Failed to reserve a number for prefix "${prefix}" (facility ${facilityId}).`,
+    );
+  }
+
+  return reserved;
 };
