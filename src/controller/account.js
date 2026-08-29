@@ -23,6 +23,10 @@ const getAccountEntriesVersionId =
   require("./helpers").getAccountEntriesVersionId;
 const { QueryTypes, Op, Sequelize } = require("sequelize");
 const { findAccountCategoryForFacility } = require("./accountCategory");
+const {
+  viewablePoDocumentUrl,
+  downloadablePoDocumentUrl,
+} = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const {
   fetchEnrichedSalesInvoices,
@@ -11986,11 +11990,93 @@ exports.getRequisitionSummary = (req, res) => {
 /**
  * Purchase requisition queries — direct SQL/ORM (no stored procedure).
  */
+function parseQueryDate(value) {
+  if (!value) return null;
+  const normalized = String(value).trim().replace(/\//g, "-");
+  const parsed = moment(normalized, ["YYYY-MM-DD", "YYYY/MM/DD"], true);
+  return parsed.isValid() ? parsed.format("YYYY-MM-DD") : null;
+}
+
+function withDateRange(where, from_date, to_date) {
+  const from = parseQueryDate(from_date);
+  const to = parseQueryDate(to_date);
+  const dateWhere = {};
+  if (from) dateWhere[Op.gte] = from;
+  if (to) dateWhere[Op.lte] = to;
+  if (Object.keys(dateWhere).length) {
+    where.date = dateWhere;
+  }
+  return where;
+}
+
+function withSearch(where, search) {
+  const q = String(search || "").trim();
+  if (!q) return where;
+  const like = { [Op.like]: `%${q}%` };
+  return {
+    [Op.and]: [
+      where,
+      {
+        [Op.or]: [
+          { pr_no: like },
+          { supplier_name: like },
+          { reason: like },
+          { branch: like },
+        ],
+      },
+    ],
+  };
+}
+
+function normalizePage(page, pageSize) {
+  const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
+  const current = Math.max(1, parseInt(page, 10) || 1);
+  return { page: current, pageSize: size, offset: (current - 1) * size };
+}
+
+async function findRequisitions(
+  where,
+  { page, pageSize, transaction } = {},
+) {
+  const opts = transaction ? { transaction } : {};
+  const order = [
+    ["date", "DESC"],
+    ["created_at", "DESC"],
+  ];
+  const shouldPage =
+    page != null && page !== "" && pageSize != null && pageSize !== "";
+  if (!shouldPage) {
+    return db.PurchaseRequisition.findAll({
+      where,
+      order,
+      ...opts,
+      raw: true,
+    });
+  }
+  const paging = normalizePage(page, pageSize);
+  const { rows, count } = await db.PurchaseRequisition.findAndCountAll({
+    where,
+    order,
+    limit: paging.pageSize,
+    offset: paging.offset,
+    ...opts,
+    raw: true,
+  });
+  return {
+    rows,
+    count,
+    page: paging.page,
+    pageSize: paging.pageSize,
+  };
+}
+
 async function runPurchaseRequisitionQuery({
   query_type = "",
   branch = "",
   branch_id = "",
   date = null,
+  from_date = null,
+  to_date = null,
   reason = "",
   facilityId,
   requisitor = "",
@@ -12002,6 +12088,10 @@ async function runPurchaseRequisitionQuery({
   po_no = "",
   account_code = "",
   transaction = null,
+  page = null,
+  pageSize = null,
+  search = "",
+  status = "",
 }) {
   const qt = String(query_type || "").trim();
   const opts = transaction ? { transaction } : {};
@@ -12032,29 +12122,26 @@ async function runPurchaseRequisitionQuery({
   }
 
   if (qt === "select" || qt === "select-pending") {
-    const rows = await db.PurchaseRequisition.findAll({
-      where: { facilityId, status: "Pending" },
-      order: [
-        ["date", "DESC"],
-        ["created_at", "DESC"],
-      ],
-      ...opts,
-      raw: true,
-    });
-    return rows;
+    return findRequisitions(
+      withSearch(
+        withDateRange({ facilityId, status: "Pending" }, from_date, to_date),
+        search,
+      ),
+      { page, pageSize, transaction },
+    );
   }
 
   if (qt === "select-history" || qt === "select-all") {
-    const rows = await db.PurchaseRequisition.findAll({
-      where: { facilityId },
-      order: [
-        ["date", "DESC"],
-        ["created_at", "DESC"],
-      ],
-      ...opts,
-      raw: true,
+    const historyWhere = withDateRange({ facilityId }, from_date, to_date);
+    const statusValue = String(status || "").trim();
+    if (statusValue && statusValue.toLowerCase() !== "all") {
+      historyWhere.status = statusValue;
+    }
+    return findRequisitions(withSearch(historyWhere, search), {
+      page,
+      pageSize,
+      transaction,
     });
-    return rows;
   }
 
   if (qt === "select-approved") {
@@ -12179,6 +12266,10 @@ exports.getRequisition = async (req, res) => {
     branch = "",
     branch_id = "",
     date = null,
+    from_date = null,
+    to_date = null,
+    fromDate = null,
+    toDate = null,
     reason = "",
     requisitor = "",
     user_id = "",
@@ -12190,6 +12281,10 @@ exports.getRequisition = async (req, res) => {
     pr_no = "",
     po_no = "",
     account_code = "",
+    page = null,
+    pageSize = null,
+    search = "",
+    status = "",
   } = req.body;
 
   try {
@@ -12205,6 +12300,8 @@ exports.getRequisition = async (req, res) => {
       branch,
       branch_id,
       date,
+      from_date: from_date || fromDate,
+      to_date: to_date || toDate,
       reason,
       facilityId,
       requisitor,
@@ -12215,7 +12312,22 @@ exports.getRequisition = async (req, res) => {
       pr_no,
       po_no,
       account_code,
+      page,
+      pageSize,
+      search,
+      status,
     });
+
+    if (results && !Array.isArray(results) && Array.isArray(results.rows)) {
+      return res.json({
+        success: true,
+        results: results.rows,
+        total: results.count,
+        page: results.page,
+        pageSize: results.pageSize,
+        message: "Requisition fetched successfully",
+      });
+    }
 
     return res.json({
       success: true,
@@ -12322,12 +12434,21 @@ exports.insertRequisition = async (req, res) => {
             facilityId,
             pr_no: newCode,
             item_code: expense.item_code || expense.code || "",
-            chart_code: expense.chart_code || "",
+            chart_code:
+              expense.chart_code ||
+              expense.item_code ||
+              expense.code ||
+              "0",
             item_name: expense.item || expense.item_name || "",
             est_cost: expense.estCost || expense.est_cost || 0,
-            unit_category: expense.category || expense.unit_category || "",
-            unit_measure: expense.unit || expense.unit_measure || expense.uom || "",
-            quantity: expense.quantity || 0,
+            unit_category:
+              expense.category ||
+              expense.unit_category ||
+              expense.uom ||
+              "unit",
+            unit_measure:
+              expense.unit || expense.unit_measure || expense.uom || "",
+            quantity: Math.round(Number(expense.quantity) || 0) || 1,
             created_at: new Date(),
           },
           { transaction },
@@ -12345,7 +12466,7 @@ exports.insertRequisition = async (req, res) => {
           : null;
       docsToSave.push({
         document_name: customName || file.originalname,
-        file_path: file.filename,
+        file_path: storedPoDocumentPath(file),
         original_name: file.originalname,
         file_size: file.size,
         mime_type: file.mimetype,
@@ -12480,8 +12601,7 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
     if (pr_no) {
       where.push("pr_no = :pr_no");
       replacements.pr_no = pr_no;
-    }
-    if (po_no) {
+    } else if (po_no) {
       where.push("po_no = :po_no");
       replacements.po_no = po_no;
     }
@@ -12495,7 +12615,16 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
       { replacements },
     );
 
-    return res.json({ success: true, results: rows || [] });
+    const results = (rows || []).map((row) => ({
+      ...row,
+      url: viewablePoDocumentUrl(row.file_path),
+      download_url: downloadablePoDocumentUrl(
+        row.file_path,
+        row.document_name || row.original_name,
+      ),
+    }));
+
+    return res.json({ success: true, results });
   } catch (error) {
     console.error("Error fetching PO documents:", error);
     return res.status(500).json({
@@ -12506,7 +12635,22 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
   }
 };
 
-/** Save files to disk immediately and return paths so the form can link them on submit. */
+/** Cloudinary URL only — never a local disk path. */
+function storedPoDocumentPath(file) {
+  if (!file) return "";
+  if (typeof file.path === "string" && /^https?:\/\//i.test(file.path)) {
+    return file.path;
+  }
+  if (
+    typeof file.secure_url === "string" &&
+    /^https?:\/\//i.test(file.secure_url)
+  ) {
+    return file.secure_url;
+  }
+  return "";
+}
+
+/** Save files to Cloudinary immediately and return URLs so the form can link them on submit. */
 exports.stagePurchaseOrderDocuments = async (req, res) => {
   try {
     const po_documents = req?.files?.po_documents || [];
@@ -12517,14 +12661,26 @@ exports.stagePurchaseOrderDocuments = async (req, res) => {
       });
     }
 
-    const results = po_documents.map((file) => ({
-      original_name: file.originalname,
-      document_name: file.originalname,
-      file_path: file.filename,
-      file_size: file.size,
-      mime_type: file.mimetype,
-      url: `/public/uploads/${file.filename}`,
-    }));
+    const results = [];
+    for (const file of po_documents) {
+      const file_path = storedPoDocumentPath(file);
+      if (!file_path) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
+        });
+      }
+      results.push({
+        original_name: file.originalname,
+        document_name: file.originalname,
+        file_path,
+        file_size: file.size,
+        mime_type: file.mimetype,
+        url: viewablePoDocumentUrl(file_path),
+        download_url: downloadablePoDocumentUrl(file_path, file.originalname),
+      });
+    }
 
     return res.json({
       success: true,
@@ -12535,7 +12691,7 @@ exports.stagePurchaseOrderDocuments = async (req, res) => {
     console.error("Error staging PO documents:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to upload documents",
+      message: "Failed to upload documents to Cloudinary",
       error: error.message,
     });
   }
@@ -12582,6 +12738,14 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
 
     const saved = [];
     for (const file of po_documents) {
+      const file_path = storedPoDocumentPath(file);
+      if (!file_path) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
+        });
+      }
       await db.sequelize.query(
         `INSERT INTO purchase_order_documents
           (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
@@ -12593,7 +12757,7 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
             po_no: po_no || null,
             facilityId,
             document_name: file.originalname,
-            file_path: file.filename,
+            file_path,
             original_name: file.originalname,
             file_size: file.size,
             mime_type: file.mimetype,
@@ -12604,7 +12768,9 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
       );
       saved.push({
         document_name: file.originalname,
-        file_path: file.filename,
+        file_path,
+        url: viewablePoDocumentUrl(file_path),
+        download_url: downloadablePoDocumentUrl(file_path, file.originalname),
       });
     }
 

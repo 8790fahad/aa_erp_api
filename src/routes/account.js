@@ -12,6 +12,7 @@ const {
 } = require("../controller/api/transactionsApi");
 // const { createNewProduction } = require("../controller/production");
 const upload = require("../config/new_multer");
+const { handlePoDocumentUpload } = require("../config/multer");
 const { generateGoodReceive } = require("../controller/goodsReceiveNew");
 
 module.exports = (app) => {
@@ -322,7 +323,7 @@ module.exports = (app) => {
   app.post("/account/get-purchase-requisition", account.getRequisition);
   app.post(
     "/account/purchase-requisition",
-    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
+    handlePoDocumentUpload,
     account.insertRequisition,
   );
   app.get(
@@ -331,12 +332,12 @@ module.exports = (app) => {
   );
   app.post(
     "/account/purchase-order-documents/stage",
-    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
+    handlePoDocumentUpload,
     account.stagePurchaseOrderDocuments,
   );
   app.post(
     "/account/purchase-order-documents",
-    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
+    handlePoDocumentUpload,
     account.uploadPurchaseOrderDocuments,
   );
   app.post("/account/update-purchase-requisition", account.updateRequisition);
