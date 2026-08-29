@@ -23,6 +23,10 @@ const getAccountEntriesVersionId =
   require("./helpers").getAccountEntriesVersionId;
 const { QueryTypes, Op, Sequelize } = require("sequelize");
 const { findAccountCategoryForFacility } = require("./accountCategory");
+const {
+  viewablePoDocumentUrl,
+  downloadablePoDocumentUrl,
+} = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const {
   fetchEnrichedSalesInvoices,
@@ -44,6 +48,7 @@ const {
   recordActivity,
   pickActor,
 } = require("../services/activityAuditService");
+const { isProductTaxable } = require("../constants/taxableStatus");
 
 exports.getAccountByCategory = (req, res) => {
   const { category } = req.params;
@@ -8519,7 +8524,10 @@ WHERE se.branch_name in ("Finished Good","Resalable") and p.item_type in ("Finis
 exports.getReadyForSalesItems = async (req, res) => {
   try {
     const { facilityId } = req.params;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8599,7 +8607,10 @@ exports.getReadyForSalesItems = async (req, res) => {
 
     await attachSalesLimitInfo(results, facilityId);
 
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.error("Error fetching ready for sales items:", err);
     res.status(500).json({ success: false, err: err.message });
@@ -8610,7 +8621,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
   try {
     const { facilityId } = req.params;
     const { branchId } = req.query;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8623,6 +8637,15 @@ exports.getReadyForSalesByBranch = async (req, res) => {
     const balanceClause = allowSalesWithoutStock
       ? ""
       : "WHERE sd.`balance` > 0";
+
+    // Pickers can opt in via ?includeStopped=1 so stopped products stay
+    // visible (selection is blocked client/server side).
+    const includeStopped = ["1", "true", "yes"].includes(
+      String(req.query.includeStopped || "").toLowerCase(),
+    );
+    const salesStoppedCondition = includeStopped
+      ? ""
+      : "AND (p.`sales_stopped` IS NULL OR p.`sales_stopped` = 0)";
 
     // Default: all branches, one row per (product, branch). Optional
     // branchId query param still supported for callers that need it.
@@ -8665,7 +8688,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
       ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
-        AND (p.\`sales_stopped\` IS NULL OR p.\`sales_stopped\` = 0)
+        ${salesStoppedCondition}
     `;
 
     const replacements = { facilityId };
@@ -8684,7 +8707,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 
     await attachSalesLimitInfo(results, facilityId);
 
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.error("Error fetching ready for sales items by branch:", err);
     res.status(500).json({ success: false, err: err.message });
@@ -8695,7 +8721,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 exports.getServiceProducts = async (req, res) => {
   try {
     const { facilityId } = req.params;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     const includeStopped = ["1", "true", "yes"].includes(
       String(req.query.includeStopped || "").toLowerCase(),
@@ -8739,7 +8768,10 @@ ORDER BY p.name ASC;`,
       },
     );
     await attachSalesLimitInfo(results, facilityId);
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.log(err);
     res.status(500).json({ err: err.message || err });
@@ -10058,6 +10090,124 @@ exports.updateInvoiceClosingSettings = async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating invoice closing settings:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
+/**
+ * POST /account/update-session-lock/:facilityId/:user_id
+ * body: { session_lock_enabled, session_lock_idle_minutes }
+ * Business-wide idle lock — applies to every user of this facility.
+ */
+exports.updateSessionLockSettings = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const body = req.body || {};
+
+    const updatePayload = {};
+
+    if (body.session_lock_enabled !== undefined) {
+      updatePayload.session_lock_enabled =
+        body.session_lock_enabled === true ||
+        body.session_lock_enabled === "true" ||
+        body.session_lock_enabled === 1 ||
+        body.session_lock_enabled === "1";
+    }
+
+    if (body.session_lock_idle_minutes !== undefined) {
+      const minutes = Math.round(Number(body.session_lock_idle_minutes));
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 240) {
+        return res.status(400).json({
+          success: false,
+          message: "session_lock_idle_minutes must be between 1 and 240",
+        });
+      }
+      updatePayload.session_lock_idle_minutes = minutes;
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No session lock settings provided",
+      });
+    }
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+    });
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.id,
+        b.business_name,
+        b.business_type,
+        b.business_logo,
+        b.primary_color,
+        b.secondary_color,
+        b.business_phone,
+        b.prefix,
+        b.payable_code,
+        b.receivable_code,
+        b.cost_of_sale,
+        b.payable_accural_code,
+        b.receivable_accural_code,
+        b.sale_revenue_code,
+        b.inv_ev_m,
+        b.costing_method,
+        b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
+        b.invoice_closing_enabled,
+        b.invoice_closing_time,
+        b.invoice_closing_timezone,
+        b.invoice_closing_last_run,
+        b.session_lock_enabled,
+        b.session_lock_idle_minutes,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Session lock",
+      after: updatePayload,
+      remark: "Business session lock settings updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: "Session lock settings updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating session lock settings:", err);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -11840,11 +11990,93 @@ exports.getRequisitionSummary = (req, res) => {
 /**
  * Purchase requisition queries — direct SQL/ORM (no stored procedure).
  */
+function parseQueryDate(value) {
+  if (!value) return null;
+  const normalized = String(value).trim().replace(/\//g, "-");
+  const parsed = moment(normalized, ["YYYY-MM-DD", "YYYY/MM/DD"], true);
+  return parsed.isValid() ? parsed.format("YYYY-MM-DD") : null;
+}
+
+function withDateRange(where, from_date, to_date) {
+  const from = parseQueryDate(from_date);
+  const to = parseQueryDate(to_date);
+  const dateWhere = {};
+  if (from) dateWhere[Op.gte] = from;
+  if (to) dateWhere[Op.lte] = to;
+  if (Object.keys(dateWhere).length) {
+    where.date = dateWhere;
+  }
+  return where;
+}
+
+function withSearch(where, search) {
+  const q = String(search || "").trim();
+  if (!q) return where;
+  const like = { [Op.like]: `%${q}%` };
+  return {
+    [Op.and]: [
+      where,
+      {
+        [Op.or]: [
+          { pr_no: like },
+          { supplier_name: like },
+          { reason: like },
+          { branch: like },
+        ],
+      },
+    ],
+  };
+}
+
+function normalizePage(page, pageSize) {
+  const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
+  const current = Math.max(1, parseInt(page, 10) || 1);
+  return { page: current, pageSize: size, offset: (current - 1) * size };
+}
+
+async function findRequisitions(
+  where,
+  { page, pageSize, transaction } = {},
+) {
+  const opts = transaction ? { transaction } : {};
+  const order = [
+    ["date", "DESC"],
+    ["created_at", "DESC"],
+  ];
+  const shouldPage =
+    page != null && page !== "" && pageSize != null && pageSize !== "";
+  if (!shouldPage) {
+    return db.PurchaseRequisition.findAll({
+      where,
+      order,
+      ...opts,
+      raw: true,
+    });
+  }
+  const paging = normalizePage(page, pageSize);
+  const { rows, count } = await db.PurchaseRequisition.findAndCountAll({
+    where,
+    order,
+    limit: paging.pageSize,
+    offset: paging.offset,
+    ...opts,
+    raw: true,
+  });
+  return {
+    rows,
+    count,
+    page: paging.page,
+    pageSize: paging.pageSize,
+  };
+}
+
 async function runPurchaseRequisitionQuery({
   query_type = "",
   branch = "",
   branch_id = "",
   date = null,
+  from_date = null,
+  to_date = null,
   reason = "",
   facilityId,
   requisitor = "",
@@ -11856,6 +12088,10 @@ async function runPurchaseRequisitionQuery({
   po_no = "",
   account_code = "",
   transaction = null,
+  page = null,
+  pageSize = null,
+  search = "",
+  status = "",
 }) {
   const qt = String(query_type || "").trim();
   const opts = transaction ? { transaction } : {};
@@ -11886,29 +12122,26 @@ async function runPurchaseRequisitionQuery({
   }
 
   if (qt === "select" || qt === "select-pending") {
-    const rows = await db.PurchaseRequisition.findAll({
-      where: { facilityId, status: "Pending" },
-      order: [
-        ["date", "DESC"],
-        ["created_at", "DESC"],
-      ],
-      ...opts,
-      raw: true,
-    });
-    return rows;
+    return findRequisitions(
+      withSearch(
+        withDateRange({ facilityId, status: "Pending" }, from_date, to_date),
+        search,
+      ),
+      { page, pageSize, transaction },
+    );
   }
 
   if (qt === "select-history" || qt === "select-all") {
-    const rows = await db.PurchaseRequisition.findAll({
-      where: { facilityId },
-      order: [
-        ["date", "DESC"],
-        ["created_at", "DESC"],
-      ],
-      ...opts,
-      raw: true,
+    const historyWhere = withDateRange({ facilityId }, from_date, to_date);
+    const statusValue = String(status || "").trim();
+    if (statusValue && statusValue.toLowerCase() !== "all") {
+      historyWhere.status = statusValue;
+    }
+    return findRequisitions(withSearch(historyWhere, search), {
+      page,
+      pageSize,
+      transaction,
     });
-    return rows;
   }
 
   if (qt === "select-approved") {
@@ -12033,6 +12266,10 @@ exports.getRequisition = async (req, res) => {
     branch = "",
     branch_id = "",
     date = null,
+    from_date = null,
+    to_date = null,
+    fromDate = null,
+    toDate = null,
     reason = "",
     requisitor = "",
     user_id = "",
@@ -12044,6 +12281,10 @@ exports.getRequisition = async (req, res) => {
     pr_no = "",
     po_no = "",
     account_code = "",
+    page = null,
+    pageSize = null,
+    search = "",
+    status = "",
   } = req.body;
 
   try {
@@ -12059,6 +12300,8 @@ exports.getRequisition = async (req, res) => {
       branch,
       branch_id,
       date,
+      from_date: from_date || fromDate,
+      to_date: to_date || toDate,
       reason,
       facilityId,
       requisitor,
@@ -12069,7 +12312,22 @@ exports.getRequisition = async (req, res) => {
       pr_no,
       po_no,
       account_code,
+      page,
+      pageSize,
+      search,
+      status,
     });
+
+    if (results && !Array.isArray(results) && Array.isArray(results.rows)) {
+      return res.json({
+        success: true,
+        results: results.rows,
+        total: results.count,
+        page: results.page,
+        pageSize: results.pageSize,
+        message: "Requisition fetched successfully",
+      });
+    }
 
     return res.json({
       success: true,
@@ -12128,6 +12386,15 @@ exports.insertRequisition = async (req, res) => {
 
   const po_documents = req?.files?.po_documents || [];
   const document_names = body.document_names;
+  let linked_documents = body.linked_documents || [];
+  if (typeof linked_documents === "string") {
+    try {
+      linked_documents = JSON.parse(linked_documents);
+    } catch (_) {
+      linked_documents = [];
+    }
+  }
+  if (!Array.isArray(linked_documents)) linked_documents = [];
   const transaction = await db.sequelize.transaction();
 
   try {
@@ -12167,12 +12434,21 @@ exports.insertRequisition = async (req, res) => {
             facilityId,
             pr_no: newCode,
             item_code: expense.item_code || expense.code || "",
-            chart_code: expense.chart_code || "",
+            chart_code:
+              expense.chart_code ||
+              expense.item_code ||
+              expense.code ||
+              "0",
             item_name: expense.item || expense.item_name || "",
             est_cost: expense.estCost || expense.est_cost || 0,
-            unit_category: expense.category || expense.unit_category || "",
-            unit_measure: expense.unit || expense.unit_measure || expense.uom || "",
-            quantity: expense.quantity || 0,
+            unit_category:
+              expense.category ||
+              expense.unit_category ||
+              expense.uom ||
+              "unit",
+            unit_measure:
+              expense.unit || expense.unit_measure || expense.uom || "",
+            quantity: Math.round(Number(expense.quantity) || 0) || 1,
             created_at: new Date(),
           },
           { transaction },
@@ -12180,7 +12456,34 @@ exports.insertRequisition = async (req, res) => {
       }
     }
 
-    if (po_documents.length > 0) {
+    const docsToSave = [];
+    for (let i = 0; i < po_documents.length; i++) {
+      const file = po_documents[i];
+      const customName = Array.isArray(document_names)
+        ? document_names[i]
+        : typeof document_names === "string"
+          ? document_names
+          : null;
+      docsToSave.push({
+        document_name: customName || file.originalname,
+        file_path: storedPoDocumentPath(file),
+        original_name: file.originalname,
+        file_size: file.size,
+        mime_type: file.mimetype,
+      });
+    }
+    for (const doc of linked_documents) {
+      if (!doc?.file_path) continue;
+      docsToSave.push({
+        document_name: doc.document_name || doc.original_name || doc.file_path,
+        file_path: doc.file_path,
+        original_name: doc.original_name || doc.document_name || null,
+        file_size: doc.file_size || null,
+        mime_type: doc.mime_type || null,
+      });
+    }
+
+    if (docsToSave.length > 0) {
       await db.sequelize.query(
         `CREATE TABLE IF NOT EXISTS purchase_order_documents (
           id INT AUTO_INCREMENT PRIMARY KEY,
@@ -12201,14 +12504,7 @@ exports.insertRequisition = async (req, res) => {
         { transaction },
       );
 
-      for (let i = 0; i < po_documents.length; i++) {
-        const file = po_documents[i];
-        const customName = Array.isArray(document_names)
-          ? document_names[i]
-          : typeof document_names === "string"
-            ? document_names
-            : null;
-
+      for (const doc of docsToSave) {
         await db.sequelize.query(
           `INSERT INTO purchase_order_documents
             (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
@@ -12219,11 +12515,11 @@ exports.insertRequisition = async (req, res) => {
               pr_no: newCode,
               po_no: po_no || null,
               facilityId,
-              document_name: customName || file.originalname,
-              file_path: file.filename,
-              original_name: file.originalname,
-              file_size: file.size,
-              mime_type: file.mimetype,
+              document_name: doc.document_name,
+              file_path: doc.file_path,
+              original_name: doc.original_name,
+              file_size: doc.file_size,
+              mime_type: doc.mime_type,
               doc_type: "delivery",
               uploaded_by: user_id || requisitor || null,
             },
@@ -12248,7 +12544,7 @@ exports.insertRequisition = async (req, res) => {
         total,
         reason,
         line_count: expenses?.length || 0,
-        document_count: po_documents.length,
+        document_count: docsToSave.length,
       },
       remark: reason || "Purchase requisition created",
     });
@@ -12258,7 +12554,7 @@ exports.insertRequisition = async (req, res) => {
       results: requisitionResult,
       pr_no: newCode,
       message: "Requisition created successfully",
-      documents_saved: po_documents.length,
+      documents_saved: docsToSave.length,
     });
   } catch (error) {
     await transaction.rollback();
@@ -12305,8 +12601,7 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
     if (pr_no) {
       where.push("pr_no = :pr_no");
       replacements.pr_no = pr_no;
-    }
-    if (po_no) {
+    } else if (po_no) {
       where.push("po_no = :po_no");
       replacements.po_no = po_no;
     }
@@ -12320,12 +12615,83 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
       { replacements },
     );
 
-    return res.json({ success: true, results: rows || [] });
+    const results = (rows || []).map((row) => ({
+      ...row,
+      url: viewablePoDocumentUrl(row.file_path),
+      download_url: downloadablePoDocumentUrl(
+        row.file_path,
+        row.document_name || row.original_name,
+      ),
+    }));
+
+    return res.json({ success: true, results });
   } catch (error) {
     console.error("Error fetching PO documents:", error);
     return res.status(500).json({
       success: false,
       message: "Failed to load purchase order documents",
+      error: error.message,
+    });
+  }
+};
+
+/** Cloudinary URL only — never a local disk path. */
+function storedPoDocumentPath(file) {
+  if (!file) return "";
+  if (typeof file.path === "string" && /^https?:\/\//i.test(file.path)) {
+    return file.path;
+  }
+  if (
+    typeof file.secure_url === "string" &&
+    /^https?:\/\//i.test(file.secure_url)
+  ) {
+    return file.secure_url;
+  }
+  return "";
+}
+
+/** Save files to Cloudinary immediately and return URLs so the form can link them on submit. */
+exports.stagePurchaseOrderDocuments = async (req, res) => {
+  try {
+    const po_documents = req?.files?.po_documents || [];
+    if (!po_documents.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No documents uploaded",
+      });
+    }
+
+    const results = [];
+    for (const file of po_documents) {
+      const file_path = storedPoDocumentPath(file);
+      if (!file_path) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
+        });
+      }
+      results.push({
+        original_name: file.originalname,
+        document_name: file.originalname,
+        file_path,
+        file_size: file.size,
+        mime_type: file.mimetype,
+        url: viewablePoDocumentUrl(file_path),
+        download_url: downloadablePoDocumentUrl(file_path, file.originalname),
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `${results.length} document(s) uploaded`,
+      results,
+    });
+  } catch (error) {
+    console.error("Error staging PO documents:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to upload documents to Cloudinary",
       error: error.message,
     });
   }
@@ -12372,6 +12738,14 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
 
     const saved = [];
     for (const file of po_documents) {
+      const file_path = storedPoDocumentPath(file);
+      if (!file_path) {
+        return res.status(503).json({
+          success: false,
+          message:
+            "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
+        });
+      }
       await db.sequelize.query(
         `INSERT INTO purchase_order_documents
           (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
@@ -12383,7 +12757,7 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
             po_no: po_no || null,
             facilityId,
             document_name: file.originalname,
-            file_path: file.filename,
+            file_path,
             original_name: file.originalname,
             file_size: file.size,
             mime_type: file.mimetype,
@@ -12394,7 +12768,9 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
       );
       saved.push({
         document_name: file.originalname,
-        file_path: file.filename,
+        file_path,
+        url: viewablePoDocumentUrl(file_path),
+        download_url: downloadablePoDocumentUrl(file_path, file.originalname),
       });
     }
 
@@ -13303,7 +13679,7 @@ exports.directPurchaseConsumables = async (req, res) => {
       if (!inventoryAccount) throw new Error(`Inventory account not found`);
 
       // Check if item is taxable
-      const isTaxable = product.taxable === "Taxable";
+      const isTaxable = isProductTaxable(product.taxable);
       if (isTaxable) {
         totalTaxableAmount += itemTotal;
       }
@@ -13988,7 +14364,7 @@ exports.getExpenseBill = async (req, res) => {
           parseFloat(item.cost || item.product_cost_price || 0),
         unit_measure: item.product_unit_of_measure || "pcs",
         item_type: item.product_item_type || "N/A",
-        taxable: item.product_taxable || "Not Taxable",
+        taxable: item.product_taxable || "Non-Taxable",
         vat_amount: parseFloat(item.vat_amount || 0) || 0,
         product: item.product_id
           ? {
@@ -14042,6 +14418,131 @@ exports.getExpenseBill = async (req, res) => {
   }
 };
 
+function isCashTransferSplitPaymentMode(mode) {
+  const m = String(mode || "")
+    .toLowerCase()
+    .trim();
+  return m === "cash+transfer" || m === "split" || m === "cash_transfer";
+}
+
+/**
+ * Resolve payment_splits (cash + bank) into GL credit legs.
+ * Returns null when not a split payment (caller uses single-mode path).
+ */
+async function resolveSupplierPaymentSplits({
+  payment_splits,
+  mode_of_payment,
+  accountHead,
+  bankAccount,
+  facilityId,
+  transaction,
+  expectedTotal,
+}) {
+  const rawFromBody = Array.isArray(payment_splits)
+    ? payment_splits.filter((s) => s && Number(s.amount) > 0)
+    : [];
+  const isSplit =
+    isCashTransferSplitPaymentMode(mode_of_payment) || rawFromBody.length > 0;
+  if (!isSplit) return null;
+
+  if (rawFromBody.length === 0) {
+    throw new Error(
+      "payment_splits with amounts are required for Cash + Transfer",
+    );
+  }
+
+  const resolved = [];
+  for (const split of rawFromBody) {
+    const mode = String(split.mode || "")
+      .toLowerCase()
+      .trim();
+    const amount = parseFloat(Number(split.amount).toFixed(2));
+    if (!(amount > 0)) continue;
+
+    if (mode === "cash") {
+      const head =
+        split.accountHead?.head ||
+        split.account_head ||
+        accountHead?.head;
+      if (!head) {
+        throw new Error("Cash account is required for the cash portion");
+      }
+      const paymentAccount = await db.AccountCategory.findOne({
+        where: { code: head, facility_id: facilityId },
+        transaction,
+      });
+      if (!paymentAccount) {
+        throw new Error(`Cash account not found: ${head}`);
+      }
+      resolved.push({
+        mode: "cash",
+        amount,
+        paymentAccount,
+        paymentName: paymentAccount.description || "Cash in Hand",
+        bankAccountId: head,
+        bankAcc: null,
+      });
+    } else if (
+      mode === "bank" ||
+      mode === "transfer" ||
+      mode === "bank transfer"
+    ) {
+      const bankId = split.bankAccount?.id || bankAccount?.id;
+      if (!bankId) {
+        throw new Error("Bank account is required for the transfer portion");
+      }
+      const bankAcc = await db.bank_account.findOne({
+        where: { id: bankId, facilityId, status: "active" },
+        transaction,
+      });
+      if (!bankAcc) throw new Error("Bank account not found or inactive");
+      if (!bankAcc.head) {
+        throw new Error(
+          `Bank account '${bankAcc.account_name}' has no GL head assigned`,
+        );
+      }
+      const paymentAccount = await db.AccountCategory.findOne({
+        where: { code: bankAcc.head, facility_id: facilityId },
+        transaction,
+      });
+      if (!paymentAccount) {
+        throw new Error(`GL account not found for bank head: ${bankAcc.head}`);
+      }
+      resolved.push({
+        mode: "bank",
+        amount,
+        paymentAccount,
+        paymentName: bankAcc.account_name || paymentAccount.description,
+        bankAccountId: bankAcc.id,
+        bankAcc,
+      });
+    } else {
+      throw new Error(`Unsupported payment split mode: ${mode || "(empty)"}`);
+    }
+  }
+
+  if (resolved.length === 0) {
+    throw new Error("Cash + Transfer requires at least one payment split");
+  }
+
+  const sum = parseFloat(
+    resolved.reduce((s, x) => s + x.amount, 0).toFixed(2),
+  );
+  if (
+    expectedTotal != null &&
+    Number.isFinite(Number(expectedTotal)) &&
+    Math.abs(sum - Number(expectedTotal)) > 0.02
+  ) {
+    throw new Error(
+      `Cash + Transfer amounts (${sum.toFixed(2)}) must equal total (${Number(
+        expectedTotal,
+      ).toFixed(2)})`,
+    );
+  }
+
+  return resolved;
+}
+
 exports.directPurchaseExpenses = async (req, res) => {
   const {
     data = [],
@@ -14055,13 +14556,19 @@ exports.directPurchaseExpenses = async (req, res) => {
     tax_amount = 0,
     taxes = [],
     apply_prepayment = false,
-    mode_of_payment = "credit", // credit | cash | bank | cheque
+    mode_of_payment = "credit", // credit | cash | bank | cheque | cash+transfer
     bankAccount = {},
     accountHead = {},
     cheque_number,
+    payment_splits = [],
   } = req.body;
 
-  const isCashLike = ["cash", "bank", "cheque"].includes(mode_of_payment);
+  const isSplitPayment =
+    isCashTransferSplitPaymentMode(mode_of_payment) ||
+    (Array.isArray(payment_splits) &&
+      payment_splits.some((s) => s && Number(s.amount) > 0));
+  const isCashLike =
+    ["cash", "bank", "cheque"].includes(mode_of_payment) || isSplitPayment;
 
   // === VALIDATIONS ===
   if (!facilityId)
@@ -14145,8 +14652,11 @@ exports.directPurchaseExpenses = async (req, res) => {
     let paymentAccount = null;
     let paymentName = "";
     let bankAcc = null;
+    let resolvedPaymentSplits = null;
     if (isCashLike) {
-      if (mode_of_payment === "cash") {
+      if (isSplitPayment) {
+        // Resolved after grandTotal is known (below)
+      } else if (mode_of_payment === "cash") {
         if (!accountHead?.head) {
           throw new Error("accountHead.head is required for cash payment");
         }
@@ -14294,7 +14804,7 @@ exports.directPurchaseExpenses = async (req, res) => {
         account_description: expenseAccount.description,
         transaction_description: description,
         type: "expenses",
-        _taxable: item.taxable === "Taxable",
+        _taxable: isProductTaxable(item.taxable),
       });
 
       // === 3. If advance was used → Credit Payable (consume advance) ===
@@ -14337,7 +14847,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     // === PARSE TAX AMOUNT & TAXABLE ITEMS ===
     const totalTaxAmount = parseFloat(tax_amount || 0);
     const taxArray = Array.isArray(taxes) ? taxes : [];
-    const taxableItems = data.filter((item) => item.taxable === "Taxable");
+    const taxableItems = data.filter((item) => isProductTaxable(item.taxable));
     const totalTaxableAmount = taxableItems.reduce((sum, item) => {
       const qty = parseFloat(item.quantity || item.qty || 1);
       const cost = parseFloat(item.cost || 0);
@@ -14517,7 +15027,38 @@ exports.directPurchaseExpenses = async (req, res) => {
       .filter(Boolean)
       .join(", ");
 
-    if (isCashLike && paymentAccount) {
+    if (isCashLike && isSplitPayment) {
+      resolvedPaymentSplits = await resolveSupplierPaymentSplits({
+        payment_splits,
+        mode_of_payment,
+        accountHead,
+        bankAccount,
+        facilityId,
+        transaction,
+        expectedTotal: grandTotal,
+      });
+      for (const split of resolvedPaymentSplits) {
+        ledgerEntries.push({
+          account_code: split.paymentAccount.code,
+          account_subhead: split.paymentAccount.parent_code || 0,
+          dr: 0,
+          cr: split.amount,
+          account_description:
+            split.paymentAccount.description || split.paymentName,
+          transaction_description: expenseLineNamesList
+            ? `Direct Expense - Paid via ${String(split.mode).toUpperCase()} (${split.paymentName}) - ${pvCode}: ${expenseLineNamesList}`
+            : `Direct Expense - Paid via ${String(split.mode).toUpperCase()} (${split.paymentName}) - ${pvCode}`,
+          type: "payment",
+          bank_account_id: split.bankAccountId || null,
+          mode_of_payment: split.mode,
+          cheque_no: null,
+          transaction_ref: supplier_no,
+        });
+      }
+      paymentName = resolvedPaymentSplits
+        .map((s) => `${s.mode}:${s.amount}`)
+        .join(" + ");
+    } else if (isCashLike && paymentAccount) {
       // Immediate payment: Cr Cash/Bank for the bill total (expense + exclusive VAT).
       ledgerEntries.push({
         account_code: paymentAccount.code,
@@ -14852,7 +15393,7 @@ exports.directExpenses = async (req, res) => {
       }
 
       const legacyTaxable =
-        item.taxable === "Taxable" ||
+        isProductTaxable(item.taxable) ||
         item.taxable === true ||
         String(item.taxable || "").toLowerCase() === "taxable";
 
@@ -15270,30 +15811,38 @@ function normalizeImpressJsonFields(plain) {
 /** List imprest / direct-expense history (impress table). */
 exports.listImpress = async (req, res) => {
   try {
-    const { facilityId, limit = 50, offset = 0 } = req.query;
+    const { facilityId, limit = 10, offset, page = 1 } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
         message: "facilityId is required",
       });
     }
-    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
-    const off = Math.max(parseInt(offset, 10) || 0, 0);
+    const pageSize = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
+    const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
+    const off =
+      offset !== undefined && String(offset).trim() !== ""
+        ? Math.max(parseInt(offset, 10) || 0, 0)
+        : (pageNumber - 1) * pageSize;
     const { count, rows } = await db.Impress.findAndCountAll({
       where: { facility_id: facilityId },
       order: [["created_at", "DESC"]],
-      limit: lim,
+      limit: pageSize,
       offset: off,
     });
+    const total = Number(count) || 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
     const results = rows.map((r) =>
       normalizeImpressJsonFields(r.get ? r.get({ plain: true }) : r),
     );
     return res.json({
       success: true,
       results,
-      total: count,
-      limit: lim,
+      total,
+      limit: pageSize,
       offset: off,
+      page: Math.floor(off / pageSize) + 1,
+      totalPages,
     });
   } catch (err) {
     console.error("listImpress:", err);
@@ -15893,9 +16442,14 @@ exports.directConsumables = async (req, res) => {
     transaction_date,
     bankAccount = {}, // { id, account_name, ... }
     accountHead = {}, // { head: "104" } for cash
-    mode_of_payment, // "cash" | "bank" | "cheque"
+    mode_of_payment, // "cash" | "bank" | "cheque" | "cash+transfer"
+    payment_splits = [],
   } = req.body;
   console.log(req.body);
+  const isSplitPayment =
+    isCashTransferSplitPaymentMode(mode_of_payment) ||
+    (Array.isArray(payment_splits) &&
+      payment_splits.some((s) => s && Number(s.amount) > 0));
   // === VALIDATIONS ===
   if (!facilityId)
     return res
@@ -15909,10 +16463,13 @@ exports.directConsumables = async (req, res) => {
     return res
       .status(400)
       .json({ success: false, message: "data must be a non-empty array" });
-  if (!["cash", "bank", "cheque"].includes(mode_of_payment))
+  if (
+    !["cash", "bank", "cheque"].includes(mode_of_payment) &&
+    !isSplitPayment
+  )
     return res.status(400).json({
       success: false,
-      message: "mode_of_payment must be cash, bank, or cheque",
+      message: "mode_of_payment must be cash, bank, cheque, or cash+transfer",
     });
 
   const userId = user_id || req.user?.id;
@@ -16058,8 +16615,39 @@ exports.directConsumables = async (req, res) => {
     let paymentAccount = null;
     let paymentHead = null;
     let paymentName = "Cash/Bank";
+    let resolvedPaymentSplits = null;
 
-    if (mode_of_payment === "cash") {
+    if (isSplitPayment) {
+      resolvedPaymentSplits = await resolveSupplierPaymentSplits({
+        payment_splits,
+        mode_of_payment,
+        accountHead,
+        bankAccount,
+        facilityId,
+        transaction,
+        expectedTotal: totalAmount,
+      });
+      for (const split of resolvedPaymentSplits) {
+        ledgerEntries.push({
+          account_code: split.paymentAccount.code,
+          account_subhead: split.paymentAccount.parent_code || 0,
+          dr: 0,
+          cr: split.amount,
+          account_description:
+            split.paymentAccount.description || split.paymentName,
+          transaction_description: `${narration} - Paid via ${String(
+            split.mode,
+          ).toUpperCase()}`,
+          type: "bank",
+        });
+      }
+      paymentName = resolvedPaymentSplits
+        .map((s) => `${s.mode}:${s.amount}`)
+        .join(" + ");
+      paymentHead = resolvedPaymentSplits
+        .map((s) => s.paymentAccount.code)
+        .join(",");
+    } else if (mode_of_payment === "cash") {
       if (!accountHead?.head)
         throw new Error("accountHead.head required for cash payment");
       paymentHead = accountHead.head;
@@ -16096,16 +16684,18 @@ exports.directConsumables = async (req, res) => {
         throw new Error(`GL account not found for head: ${bankAcc.head}`);
     }
 
-    // === Credit Cash/Bank (Instant Payment) ===
-    ledgerEntries.push({
-      account_code: paymentAccount.code,
-      account_subhead: paymentAccount.parent_code || 0,
-      dr: 0,
-      cr: totalAmount,
-      account_description: paymentAccount.description || paymentName,
-      transaction_description: `${narration} - Paid via ${mode_of_payment.toUpperCase()}`,
-      type: "bank",
-    });
+    // === Credit Cash/Bank (Instant Payment) — single mode only ===
+    if (!isSplitPayment) {
+      ledgerEntries.push({
+        account_code: paymentAccount.code,
+        account_subhead: paymentAccount.parent_code || 0,
+        dr: 0,
+        cr: totalAmount,
+        account_description: paymentAccount.description || paymentName,
+        transaction_description: `${narration} - Paid via ${mode_of_payment.toUpperCase()}`,
+        type: "bank",
+      });
+    }
 
     // === SAVE TO GENERAL LEDGER ===
     for (const entry of ledgerEntries) {

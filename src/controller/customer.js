@@ -3136,7 +3136,7 @@ export const createCustomerAdvancePayment = async (req, res) => {
       const splitResult = await db.sequelize.transaction(async (t) => {
         const narrationText =
           narration ||
-          `Collection Points advance (Cash + Transfer) from ${customerName}`;
+          `Verification Points advance (Cash + Transfer) from ${customerName}`;
 
         for (const split of resolvedSplits) {
           await GeneralLedger.create(

@@ -50,7 +50,8 @@ exports.getInventoryFromStoreEntries = async (req, res) => {
 // Get detailed inventory item with transaction history
 exports.getInventoryItemDetails = async (req, res) => {
   try {
-    const { productId, facilityId, salesType } = req.query;
+    const { productId, facilityId, salesType, fromDate, toDate, branchId } =
+      req.query;
 
     if (!productId || !facilityId) {
       return res.status(400).json({
@@ -59,7 +60,14 @@ exports.getInventoryItemDetails = async (req, res) => {
       });
     }
 
-    // Get product details
+    const parsedBranchId = parseInt(branchId, 10);
+    const hasBranchFilter =
+      Number.isInteger(parsedBranchId) && parsedBranchId > 0;
+    const stockBranchJoin = hasBranchFilter
+      ? " AND se.branchId = :branchId"
+      : "";
+
+    // Get product details (stock scoped to the warehouse you opened from)
     const productQuery = `
       SELECT
         p.*,
@@ -67,7 +75,7 @@ exports.getInventoryItemDetails = async (req, res) => {
         -- Calculate total value based on current stock and cost price
         (COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0)) * p.cost_price as total_value
       FROM products p
-      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId
+      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId${stockBranchJoin}
       WHERE p.sku = :productId AND p.facility_id = :facilityId
       GROUP BY
         p.id, p.sku, p.name, p.facility_id, p.category, p.item_type, p.unit_of_measure,
@@ -78,8 +86,11 @@ exports.getInventoryItemDetails = async (req, res) => {
         p.taxable, p.online_enabled, p.tags, p.notes, p.line_of_business, p.group_id
     `;
 
+    const productReplacements = { productId, facilityId };
+    if (hasBranchFilter) productReplacements.branchId = parsedBranchId;
+
     const productResult = await db.sequelize.query(productQuery, {
-      replacements: { productId, facilityId, salesType },
+      replacements: productReplacements,
       type: db.sequelize.QueryTypes.SELECT,
     });
 
@@ -94,11 +105,29 @@ exports.getInventoryItemDetails = async (req, res) => {
 
     // Build WHERE clause for type filtering
     let salesTypeCondition = "";
+    let dateCondition = "";
+    let branchCondition = "";
     let replacements = { productId, facilityId };
 
     if (salesType && salesType !== "all" && salesType !== "null" && salesType !== "undefined") {
       salesTypeCondition = "AND se.type = :salesType";
       replacements.salesType = salesType;
+    }
+
+    const from = String(fromDate || "").trim();
+    const to = String(toDate || "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      dateCondition += " AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) >= :fromDate";
+      replacements.fromDate = from;
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      dateCondition += " AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) <= :toDate";
+      replacements.toDate = to;
+    }
+
+    if (hasBranchFilter) {
+      branchCondition = " AND se.branchId = :branchId";
+      replacements.branchId = parsedBranchId;
     }
 
     // Get detailed transaction history with enhanced information
@@ -134,11 +163,15 @@ exports.getInventoryItemDetails = async (req, res) => {
           WHEN 'OUT' THEN 'Goods Issued'
           WHEN 'TRANSFER' THEN 'Stock Transfer'
           ELSE se.type
-        END as transaction_description
+        END as transaction_description,
+        COALESCE(br.branch_name, se.branch_name, se.location, '') AS warehouse_name
       FROM store_entries se
-      WHERE se.product_id = :productId AND se.facilityId = :facilityId ${salesTypeCondition}
+      LEFT JOIN branches br
+        ON br.id = se.branchId
+        AND br.facilityId = se.facilityId
+      WHERE se.product_id = :productId AND se.facilityId = :facilityId ${salesTypeCondition}${dateCondition}${branchCondition}
       ORDER BY se.createdAt DESC
-      LIMIT 100
+      LIMIT 500
     `;
 
     const transactionHistory = await db.sequelize.query(historyQuery, {

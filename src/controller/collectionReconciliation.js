@@ -9,6 +9,7 @@ const COLLECTION_ENTRY_FILTER = `
     OR ce.description LIKE '%advance%'
     OR ce.description LIKE '%Advance%'
     OR ce.description LIKE '%Collection Points advance%'
+    OR ce.description LIKE '%Verification Points advance%'
   )
 `;
 
@@ -69,6 +70,55 @@ async function resolveUserNames(userIds) {
     /* ignore */
   }
   return map;
+}
+
+/**
+ * All business members whose role is Cashier / Cashier 1 / Cashier 2, etc.
+ */
+async function loadCashierRoleUsers(facilityId) {
+  if (!facilityId) return [];
+  try {
+    const rows = await db.sequelize.query(
+      `SELECT
+         m.user_id,
+         m.role,
+         u.firstname,
+         u.lastname,
+         u.username,
+         u.status
+       FROM membership m
+       LEFT JOIN users u ON CAST(u.id AS CHAR) = CAST(m.user_id AS CHAR)
+       WHERE m.business_id = :facilityId
+         AND LOWER(COALESCE(m.role, '')) LIKE '%cashier%'
+         AND (
+           u.id IS NULL
+           OR LOWER(COALESCE(u.status, '')) NOT IN ('deleted', 'suspended', 'inactive')
+         )
+       ORDER BY COALESCE(u.firstname, u.username, m.user_id), COALESCE(u.lastname, '')`,
+      {
+        replacements: { facilityId: String(facilityId) },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const seen = new Set();
+    const list = [];
+    for (const row of rows || []) {
+      const id = String(row.user_id || "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      list.push({
+        cashier_user_id: id,
+        cashier_name:
+          displayName(row) || String(row.username || id),
+        role: row.role || "Cashier",
+      });
+    }
+    return list;
+  } catch (err) {
+    console.error("loadCashierRoleUsers error:", err.message);
+    return [];
+  }
 }
 
 async function loadExpectedByCashier(facilityId, reconDate, branchId) {
@@ -165,7 +215,18 @@ exports.getSummary = async (req, res) => {
       savedByCashier[String(row.cashier_user_id)] = row.toJSON();
     });
 
+    // Always include every Cashier-role user for the business (dropdown + list)
+    const cashierRoleUsers = await loadCashierRoleUsers(facilityId);
+    const cashierRoleIds = new Set(
+      cashierRoleUsers.map((c) => String(c.cashier_user_id)),
+    );
+    const cashierRoleNameMap = {};
+    cashierRoleUsers.forEach((c) => {
+      cashierRoleNameMap[String(c.cashier_user_id)] = c.cashier_name;
+    });
+
     const cashierIds = new Set([
+      ...cashierRoleIds,
       ...Object.keys(expectedMap),
       ...Object.keys(savedByCashier),
     ]);
@@ -181,7 +242,11 @@ exports.getSummary = async (req, res) => {
         };
         const recon = savedByCashier[id] || null;
         const cashierName =
-          recon?.cashier_name || nameMap[id] || expected.cashier_name || id;
+          recon?.cashier_name ||
+          cashierRoleNameMap[id] ||
+          nameMap[id] ||
+          expected.cashier_name ||
+          id;
         return {
           cashier_user_id: id,
           cashier_name: cashierName,
@@ -200,12 +265,27 @@ exports.getSummary = async (req, res) => {
           confirmed_by_name: recon?.confirmed_by_name || null,
           confirmed_at: recon?.confirmed_at || null,
           reconciliation_id: recon?.id || null,
+          is_cashier_role: cashierRoleIds.has(id),
         };
       })
-      .filter((c) => c.expected_total > 0 || c.status === "confirmed" || c.status === "variance")
+      // Keep Cashier-role users even with 0 collections; still include anyone
+      // who collected or already has a confirmation for the day.
+      .filter(
+        (c) =>
+          c.is_cashier_role ||
+          c.expected_total > 0 ||
+          c.status === "confirmed" ||
+          c.status === "variance",
+      )
       .sort((a, b) =>
         String(a.cashier_name || "").localeCompare(String(b.cashier_name || "")),
       );
+
+    const cashier_options = cashiers.map((c) => ({
+      cashier_user_id: c.cashier_user_id,
+      cashier_name: c.cashier_name,
+      is_cashier_role: !!c.is_cashier_role,
+    }));
 
     const totals = cashiers.reduce(
       (acc, c) => {
@@ -242,8 +322,9 @@ exports.getSummary = async (req, res) => {
       success: true,
       date: reconDate,
       branch_id: branchId || null,
-      summary: totals,
       cashiers,
+      cashier_options,
+      summary: totals,
     });
   } catch (error) {
     console.error("collectionReconciliation.getSummary:", error);

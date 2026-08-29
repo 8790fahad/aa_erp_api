@@ -15,11 +15,29 @@ const config = {
   database: process.env.DB_NAME,
   host: process.env.DB_HOST,
   dialect: process.env.DB_DIALECT || "mysql",
+  dialectOptions: {
+    charset: "utf8mb4",
+  },
+  define: {
+    charset: "utf8mb4",
+    collate: "utf8mb4_unicode_ci",
+  },
   pool: {
     max: 5,
     min: 0,
     acquire: 30000,
     idle: 10000,
+  },
+  hooks: {
+    afterConnect: async (connection) => {
+      // Align session collation with number_generator / mixed utf8mb4 tables
+      await new Promise((resolve, reject) => {
+        connection.query(
+          "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
+          (err) => (err ? reject(err) : resolve()),
+        );
+      });
+    },
   },
 };
 const db = {};

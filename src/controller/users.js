@@ -73,33 +73,69 @@ async function syncUserBranches(
   ];
 
   const opts = transaction ? { transaction } : {};
+  const QueryTypes = db.Sequelize.QueryTypes;
+  const uid = String(userId);
+  const fid = String(facilityId);
 
   if (!db.UserBranch) return ids;
 
-  await db.UserBranch.destroy({
-    where: { user_id: userId, facility_id: facilityId },
-    ...opts,
-  });
-
-  const userWhere = { id: userId };
-  if (facilityId) userWhere.facilityId = facilityId;
-  if (email) userWhere.email = email;
+  // Always use explicit query types — mysql2 OkPacket is not a row array.
+  // Using type SELECT/model on UPDATE/DELETE causes: valueSets.map is not a function.
+  await db.sequelize.query(
+    `DELETE FROM user_branches
+     WHERE BINARY user_id = BINARY :userId
+       AND BINARY facility_id = BINARY :facilityId`,
+    {
+      replacements: { userId: uid, facilityId: fid },
+      ...opts,
+      type: QueryTypes.RAW,
+    },
+  );
 
   if (ids.length === 0) {
-    await User.update({ branchId: null }, { where: userWhere, ...opts });
+    await db.sequelize.query(
+      `UPDATE users SET branchId = NULL
+       WHERE BINARY id = BINARY :userId`,
+      {
+        replacements: { userId: uid },
+        ...opts,
+        type: QueryTypes.UPDATE,
+      },
+    );
     return [];
   }
 
-  const rows = ids.map((branchId, index) => ({
-    user_id: userId,
-    branch_id: branchId,
-    facility_id: facilityId,
-    is_primary: index === 0,
-  }));
+  const valueSql = ids
+    .map(
+      (_, i) =>
+        `(:userId, :branchId${i}, :facilityId, ${i === 0 ? "1" : "0"}, NOW(), NOW())`,
+    )
+    .join(", ");
+  const replacements = { userId: uid, facilityId: fid };
+  ids.forEach((branchId, i) => {
+    replacements[`branchId${i}`] = branchId;
+  });
 
-  await db.UserBranch.bulkCreate(rows, opts);
+  await db.sequelize.query(
+    `INSERT INTO user_branches
+       (user_id, branch_id, facility_id, is_primary, created_at, updated_at)
+     VALUES ${valueSql}`,
+    {
+      replacements,
+      ...opts,
+      type: QueryTypes.INSERT,
+    },
+  );
 
-  await User.update({ branchId: ids[0] }, { where: userWhere, ...opts });
+  await db.sequelize.query(
+    `UPDATE users SET branchId = :branchId
+     WHERE BINARY id = BINARY :userId`,
+    {
+      replacements: { branchId: ids[0], userId: uid },
+      ...opts,
+      type: QueryTypes.UPDATE,
+    },
+  );
 
   return ids;
 }
@@ -695,10 +731,14 @@ exports.bulkCreateStaff = async (req, res) => {
   try {
     const Branch = db.branches || db.Branch;
     const branchRows = Branch
-      ? await Branch.findAll({
-          where: { facilityId },
-          attributes: ["id", "branch_name", "branch_id"],
-        })
+      ? await db.sequelize.query(
+          `SELECT id, branch_name, branch_id FROM branches
+           WHERE BINARY facilityId = BINARY :facilityId`,
+          {
+            replacements: { facilityId },
+            type: db.Sequelize.QueryTypes.SELECT,
+          },
+        )
       : [];
 
     const branchByName = new Map(
@@ -721,18 +761,44 @@ exports.bulkCreateStaff = async (req, res) => {
     // Cache facility roles by lowercase name → canonical Role record
     const roleByName = new Map();
     if (db.Role) {
-      const existingRoles = await db.Role.findAll({
-        where: { facilityId },
-        attributes: ["id", "name", "status"],
-      });
-      existingRoles.forEach((r) => {
+      const existingRoles = await db.sequelize.query(
+        `SELECT id, name, status FROM roles
+         WHERE BINARY facilityId = BINARY :facilityId`,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      (existingRoles || []).forEach((r) => {
         roleByName.set(String(r.name || "").trim().toLowerCase(), r);
       });
     }
 
     /**
-     * Find role by name (case-insensitive). If missing, create it and connect
-     * subsequent staff to the same canonical name.
+     * Collation-safe email / phone existence check.
+     * Avoids "Illegal mix of collations" when connection charset differs
+     * from users.email / users.phone column collations.
+     */
+    const userExistsByField = async (field, value) => {
+      if (field !== "email" && field !== "phone") {
+        throw new Error("Invalid user lookup field");
+      }
+      const rows = await db.sequelize.query(
+        `SELECT id FROM users
+         WHERE BINARY \`${field}\` = BINARY :value
+         LIMIT 1`,
+        {
+          replacements: { value: String(value || "").trim() },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      return rows?.[0] || null;
+    };
+
+    /**
+     * Find role by name (case-insensitive). If missing, create it.
+     * Matching is done in JS from the in-memory cache — never SQL string '='
+     * on role name (avoids utf8mb4 collation clashes).
      */
     const resolveOrCreateRole = async (roleName, transaction) => {
       const key = String(roleName || "")
@@ -752,35 +818,28 @@ exports.bulkCreateStaff = async (req, res) => {
       }
 
       if (!db.Role) {
-        // No roles table — fall back to free-text role string
         return { id: null, name: roleName.trim(), created: false };
       }
 
-      // Race-safe: another concurrent create may exist
-      let role = await db.Role.findOne({
-        where: {
-          facilityId,
-          name: roleName.trim(),
-        },
-        transaction,
-      });
-
-      if (!role) {
-        // Case-insensitive match in case DB collation differs
-        const allForFacility = await db.Role.findAll({
-          where: { facilityId },
-          attributes: ["id", "name", "status"],
+      // Re-scan facility roles in JS (collation-safe facility filter)
+      const allForFacility = await db.sequelize.query(
+        `SELECT id, name, status FROM roles
+         WHERE BINARY facilityId = BINARY :facilityId`,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
           transaction,
-        });
-        role =
-          allForFacility.find(
-            (r) =>
-              String(r.name || "")
-                .trim()
-                .toLowerCase() === key,
-          ) || null;
-      }
+        },
+      );
+      let role =
+        (allForFacility || []).find(
+          (r) =>
+            String(r.name || "")
+              .trim()
+              .toLowerCase() === key,
+        ) || null;
 
+      let createdRole = false;
       if (!role) {
         role = await db.Role.create(
           {
@@ -791,16 +850,16 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
-        rolesCreated += 1;
+        createdRole = true;
       }
 
       roleByName.set(key, role);
-      return { id: role.id, name: role.name, created: true };
+      return { id: role.id, name: role.name, created: createdRole };
     };
 
     /**
-     * Find branch by name or code (case-insensitive). If missing, create it
-     * so subsequent staff rows can reuse the same branch.
+     * Find branch by name or code (case-insensitive). If missing, create it.
+     * Matching is done in JS — never SQL string '=' on branch_name.
      */
     const resolveOrCreateBranch = async (branchLabel, transaction) => {
       const key = String(branchLabel || "")
@@ -820,33 +879,32 @@ exports.bulkCreateStaff = async (req, res) => {
         throw new Error(`Branch/warehouse not found: ${branchLabel}`);
       }
 
-      let branch = await Branch.findOne({
-        where: { facilityId, branch_name: branchLabel.trim() },
-        attributes: ["id", "branch_name", "branch_id"],
-        transaction,
-      });
-
-      if (!branch) {
-        const allForFacility = await Branch.findAll({
-          where: { facilityId },
-          attributes: ["id", "branch_name", "branch_id"],
+      const allForFacility = await db.sequelize.query(
+        `SELECT id, branch_name, branch_id FROM branches
+         WHERE BINARY facilityId = BINARY :facilityId`,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
           transaction,
-        });
-        branch =
-          allForFacility.find((b) => {
-            const nameKey = String(b.branch_name || "")
-              .trim()
-              .toLowerCase();
-            const codeKey = String(b.branch_id || "")
-              .trim()
-              .toLowerCase();
-            return nameKey === key || codeKey === key;
-          }) || null;
-      }
+        },
+      );
+      let branch =
+        (allForFacility || []).find((b) => {
+          const nameKey = String(b.branch_name || "")
+            .trim()
+            .toLowerCase();
+          const codeKey = String(b.branch_id || "")
+            .trim()
+            .toLowerCase();
+          return nameKey === key || codeKey === key;
+        }) || null;
 
+      let createdBranch = false;
       if (!branch) {
         const [{ branch_count } = {}] = await db.sequelize.query(
-          `SELECT COUNT(*) AS branch_count FROM branches WHERE facilityId = :facilityId`,
+          `SELECT COUNT(*) AS branch_count
+           FROM branches
+           WHERE BINARY facilityId = BINARY :facilityId`,
           {
             replacements: { facilityId },
             type: db.Sequelize.QueryTypes.SELECT,
@@ -877,7 +935,7 @@ exports.bulkCreateStaff = async (req, res) => {
           },
           { transaction },
         );
-        branchesCreated += 1;
+        createdBranch = true;
       }
 
       const plain = {
@@ -897,7 +955,7 @@ exports.bulkCreateStaff = async (req, res) => {
           plain,
         );
       }
-      return { branch: plain, created: true };
+      return { branch: plain, created: createdBranch };
     };
 
     const seenEmails = new Set();
@@ -921,6 +979,18 @@ exports.bulkCreateStaff = async (req, res) => {
         .trim()
         .toLowerCase() || "verified";
 
+      // Skip blank Excel rows (trailing empties from sheet export)
+      if (
+        !firstname &&
+        !lastname &&
+        !email &&
+        !phone &&
+        !roleInput &&
+        !branchLabel
+      ) {
+        continue;
+      }
+
       if (
         !firstname ||
         !lastname ||
@@ -932,7 +1002,7 @@ exports.bulkCreateStaff = async (req, res) => {
         errors.push({
           row: rowNum,
           message:
-            "First name, last name, email, phone, role, and branch are required",
+            "First name, last name, email, phone, role, and warehouse are required",
         });
         continue;
       }
@@ -959,13 +1029,13 @@ exports.bulkCreateStaff = async (req, res) => {
       seenEmails.add(email);
       seenPhones.add(phone);
 
-      const existingEmail = await User.findOne({ where: { email } });
+      const existingEmail = await userExistsByField("email", email);
       if (existingEmail) {
         errors.push({ row: rowNum, message: `Email already exists: ${email}` });
         continue;
       }
 
-      const existingPhone = await User.findOne({ where: { phone } });
+      const existingPhone = await userExistsByField("phone", phone);
       if (existingPhone) {
         errors.push({
           row: rowNum,
@@ -981,39 +1051,27 @@ exports.bulkCreateStaff = async (req, res) => {
 
       const transaction = await db.sequelize.transaction();
       try {
+        // Align connection collation with number_generator / mixed tables
+        await db.sequelize.query(
+          `SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci`,
+          { transaction },
+        );
+
         const resolvedRole = await resolveOrCreateRole(roleInput, transaction);
         const role = resolvedRole.name;
-        const { branch } = await resolveOrCreateBranch(
-          branchLabel,
+        const { branch, created: branchWasCreated } =
+          await resolveOrCreateBranch(branchLabel, transaction);
+
+        const entryInCode = await getAndUpdateNumber(
+          "user",
+          facilityId,
           transaction,
         );
-
-        const [genResult] = await db.sequelize.query(
-          `CALL nurmber_generator1(:in_query_type,:facilityId)`,
-          {
-            replacements: { in_query_type: "user", facilityId },
-            transaction,
-          },
-        );
-
-        const entryInCode = extractNurmberCode(genResult, "user");
         if (entryInCode == null || entryInCode === "") {
           throw new Error(
             "Failed to generate user code — check number_generator prefix `user` for this facility.",
           );
         }
-
-        await db.sequelize.query(
-          `CALL update_number_generator(:query_type, :in_number,:facilityId)`,
-          {
-            replacements: {
-              query_type: "user",
-              in_number: entryInCode,
-              facilityId,
-            },
-            transaction,
-          },
-        );
 
         const entry_id_in = `USER-${entryInCode}`;
         const branchId = parseInt(branch.id, 10);
@@ -1047,6 +1105,7 @@ exports.bulkCreateStaff = async (req, res) => {
               accessTo: "",
               functionalities: "",
             },
+            type: db.Sequelize.QueryTypes.INSERT,
             transaction,
           },
         );
@@ -1061,6 +1120,8 @@ exports.bulkCreateStaff = async (req, res) => {
 
         await transaction.commit();
         created += 1;
+        if (resolvedRole.created) rolesCreated += 1;
+        if (branchWasCreated) branchesCreated += 1;
       } catch (rowErr) {
         await transaction.rollback();
         errors.push({
@@ -2280,7 +2341,7 @@ exports.acceptInvite = async (req, res) => {
     userId,
     businessId,
     functionalities = "",
-    access_to = "Dashboard",
+    access_to = "",
   } = req.body;
 
   try {

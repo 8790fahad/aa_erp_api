@@ -461,10 +461,31 @@ exports.createSupplierAdvancePayment = async (req, res) => {
     mod_account_code,
     bank_account_id,
     line_of_business = "General",
+    payment_splits: paymentSplitsFromBody,
   } = req.body;
 
   const facility = facilityId || facilityID;
   const supplierNoResolved = supplier_number || supplierNo;
+
+  const paymentSplits = Array.isArray(paymentSplitsFromBody)
+    ? paymentSplitsFromBody
+        .map((s) => ({
+          mode: String(s?.mode || "")
+            .toLowerCase()
+            .trim(),
+          amount: parseFloat(s?.amount) || 0,
+          accountHead: s?.accountHead || null,
+          bankAccount: s?.bankAccount || null,
+        }))
+        .filter((s) => s.amount > 0)
+    : [];
+  const isSplitPayment =
+    paymentSplits.length > 0 ||
+    ["cash+transfer", "split", "cash_transfer"].includes(
+      String(mode_of_payment || "")
+        .toLowerCase()
+        .trim(),
+    );
 
   let invoices = Array.isArray(invoicesFromBody) ? invoicesFromBody : [];
   invoices = invoices.filter(
@@ -476,8 +497,41 @@ exports.createSupplierAdvancePayment = async (req, res) => {
   if (!supplierNoResolved) {
     return res.status(400).json({ error: "supplier_number is required" });
   }
-  if (!amount_paid || isNaN(amount_paid) || parseFloat(amount_paid) <= 0) {
+  const amountPaidNum =
+    isSplitPayment && paymentSplits.length > 0
+      ? paymentSplits.reduce((s, x) => s + x.amount, 0)
+      : parseFloat(amount_paid);
+  if (!amountPaidNum || isNaN(amountPaidNum) || amountPaidNum <= 0) {
     return res.status(400).json({ error: "Valid amount_paid is required" });
+  }
+  if (isSplitPayment) {
+    if (paymentSplits.length === 0) {
+      return res.status(400).json({
+        error: "payment_splits with amounts are required for Cash + Transfer",
+      });
+    }
+    const hasCash = paymentSplits.some((s) => s.mode === "cash");
+    const hasBank = paymentSplits.some(
+      (s) =>
+        s.mode === "bank" ||
+        s.mode === "transfer" ||
+        s.mode === "bank transfer",
+    );
+    if (!hasCash || !hasBank) {
+      return res.status(400).json({
+        error:
+          "Cash + Transfer requires both a cash and a transfer amount",
+      });
+    }
+    if (
+      amount_paid != null &&
+      Math.abs(parseFloat(amount_paid) - amountPaidNum) > 0.02
+    ) {
+      return res.status(400).json({
+        error: "payment_splits total must equal amount_paid",
+      });
+    }
+    mode_of_payment = "cash+transfer";
   }
   if (!facility) {
     return res.status(400).json({ error: "facilityId is required" });
@@ -486,7 +540,6 @@ exports.createSupplierAdvancePayment = async (req, res) => {
     return res.status(400).json({ error: "userId is required" });
   }
 
-  const amountPaidNum = parseFloat(amount_paid);
   const transactionDate = transaction_date
     ? new Date(transaction_date)
     : new Date();
@@ -506,34 +559,97 @@ exports.createSupplierAdvancePayment = async (req, res) => {
       bank_account_id ||
       bankAccount?.id ||
       (accountHead?.head ? accountHead.head : null);
-
-    if (!resolvedBankAccountId) {
-      return res.status(400).json({
-        error: "bank_account_id or bankAccount.id / accountHead.head is required",
-      });
-    }
-
     let modCode = mod_account_code;
-    if (!modCode && accountHead?.head) {
-      modCode = accountHead.head;
-    }
-    if (!modCode && bankAccount?.id) {
-      const bankRow = await db.bank_account.findOne({
-        where: { id: bankAccount.id, facilityId: facility, status: "active" },
-      });
-      modCode = bankRow?.head;
-    }
-    if (!modCode) {
-      return res.status(400).json({
-        error: "Could not resolve payment account (mod_account_code / accountHead / bankAccount)",
-      });
-    }
+    let bankAccountRow = null;
+    let resolvedSplits = [];
 
-    const bankAccountRow = await resolvePostingAccountHead(facility, modCode);
-    if (!bankAccountRow) {
-      return res.status(404).json({
-        error: `Bank/Cash account not found for code: ${modCode} (add to Chart of Accounts or legacy account table)`,
-      });
+    if (isSplitPayment) {
+      for (const split of paymentSplits) {
+        const isCash = split.mode === "cash";
+        let headCode = null;
+        let bankId = null;
+        let accountDesc = "";
+        if (isCash) {
+          headCode = split.accountHead?.head || accountHead?.head;
+          if (!headCode) {
+            return res.status(400).json({
+              error: "Cash account is required for the cash portion",
+            });
+          }
+          bankId = headCode;
+          accountDesc = split.accountHead?.description || "";
+        } else {
+          const bankIdRaw = split.bankAccount?.id || bankAccount?.id;
+          if (!bankIdRaw) {
+            return res.status(400).json({
+              error: "Bank account is required for the transfer portion",
+            });
+          }
+          const ba = await db.bank_account.findOne({
+            where: { id: bankIdRaw, facilityId: facility, status: "active" },
+          });
+          if (!ba) {
+            return res
+              .status(404)
+              .json({ error: "Bank account not found or inactive" });
+          }
+          headCode = ba.head;
+          bankId = ba.id;
+          accountDesc = ba.account_name || ba.bank_name || "";
+        }
+        const acct = await resolvePostingAccountHead(facility, headCode);
+        if (!acct) {
+          return res.status(404).json({
+            error: `Cash/Bank account not found for code: ${headCode}`,
+          });
+        }
+        resolvedSplits.push({
+          mode: isCash ? "cash" : "bank",
+          amount: split.amount,
+          account: acct,
+          bankId,
+          accountDesc,
+          headCode,
+        });
+      }
+      // Primary ids used on payable/advance legs (first split)
+      resolvedBankAccountId = resolvedSplits[0]?.bankId || null;
+      modCode = resolvedSplits[0]?.headCode || null;
+      bankAccountRow = resolvedSplits[0]?.account || null;
+    } else {
+      if (!resolvedBankAccountId) {
+        return res.status(400).json({
+          error:
+            "bank_account_id or bankAccount.id / accountHead.head is required",
+        });
+      }
+
+      if (!modCode && accountHead?.head) {
+        modCode = accountHead.head;
+      }
+      if (!modCode && bankAccount?.id) {
+        const bankRow = await db.bank_account.findOne({
+          where: {
+            id: bankAccount.id,
+            facilityId: facility,
+            status: "active",
+          },
+        });
+        modCode = bankRow?.head;
+      }
+      if (!modCode) {
+        return res.status(400).json({
+          error:
+            "Could not resolve payment account (mod_account_code / accountHead / bankAccount)",
+        });
+      }
+
+      bankAccountRow = await resolvePostingAccountHead(facility, modCode);
+      if (!bankAccountRow) {
+        return res.status(404).json({
+          error: `Bank/Cash account not found for code: ${modCode} (add to Chart of Accounts or legacy account table)`,
+        });
+      }
     }
 
     const payableCodeUse =
@@ -644,18 +760,40 @@ exports.createSupplierAdvancePayment = async (req, res) => {
     let remainingAmount = amountPaidNum;
 
     const result = await db.sequelize.transaction(async (t) => {
-      // Credit bank (money out) — total payment
-      ledgerEntries.push({
-        account_code: modCode,
-        account_subhead: bankAccountRow.subhead || modCode.substring(0, 6),
-        dr: 0,
-        cr: amountPaidNum,
-        account_description: bankAccountRow.description || "Bank",
-        transaction_description: `${narration || "Supplier advance payment"} — ${supplierName}`,
-        type: "bank",
-        reference_number: referenceNumber,
-        bank_account_id: resolvedBankAccountId,
-      });
+      // Credit bank/cash (money out) — one leg per split, or single total
+      if (resolvedSplits.length > 0) {
+        for (const split of resolvedSplits) {
+          ledgerEntries.push({
+            account_code: split.headCode,
+            account_subhead:
+              split.account.subhead ||
+              split.account.parent_code ||
+              String(split.headCode).substring(0, 6),
+            dr: 0,
+            cr: split.amount,
+            account_description:
+              split.accountDesc || split.account.description || "Bank/Cash",
+            transaction_description: `${narration || "Supplier advance payment"} (${split.mode}) — ${supplierName}`,
+            type: "bank",
+            reference_number: referenceNumber,
+            bank_account_id: split.bankId,
+            mode_of_payment: split.mode,
+          });
+        }
+      } else {
+        ledgerEntries.push({
+          account_code: modCode,
+          account_subhead: bankAccountRow.subhead || modCode.substring(0, 6),
+          dr: 0,
+          cr: amountPaidNum,
+          account_description: bankAccountRow.description || "Bank",
+          transaction_description: `${narration || "Supplier advance payment"} — ${supplierName}`,
+          type: "bank",
+          reference_number: referenceNumber,
+          bank_account_id: resolvedBankAccountId,
+          mode_of_payment: mode_of_payment || "cash",
+        });
+      }
 
       if (invoices.length > 0) {
         for (const inv of invoices) {
@@ -747,7 +885,7 @@ exports.createSupplierAdvancePayment = async (req, res) => {
             payee: supplierName,
             bank_account_id: entry.bank_account_id,
             cheque_no: cheque_number || null,
-            mode_of_payment: mode_of_payment || "cash",
+            mode_of_payment: entry.mode_of_payment || mode_of_payment || "cash",
             created_by: userId,
             facility_id: facility,
             status: "paid",

@@ -9,9 +9,10 @@ const UUIDV4 = require("uuid").v4;
 const { Op } = require("sequelize");
 const { sellingApi } = require("./api/transactionsApi");
 const { getAndUpdateNumber } = require("../services/numberGen");
-const { getSellableQtyAtBranch } = require("../services/sellableStock");
+const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
+const { isProductTaxable } = require("../constants/taxableStatus");
 // getBalance function - inline implementation to avoid ES6/CommonJS import issues
 const getBalance = async (customerNo, facilityId) => {
   const result = await db.sequelize.query(
@@ -1527,17 +1528,32 @@ exports.getSaleByCode = async (req, res) => {
 
     let workflowPaymentType = null;
     let workflowAmount = null;
+    let workflowHistory = [];
+    let creditPaidFromWorkflow = 0;
+    let originalInvoiceFromWorkflow = null;
     try {
       if (db.SaleWorkflow) {
         const wf = await db.SaleWorkflow.findOne({
           where: { facility_id: facilityId, sale_code: saleCode },
-          attributes: ["payment_type", "amount", "status"],
+          attributes: ["payment_type", "amount", "status", "history"],
           raw: true,
         });
         if (wf) {
           workflowPaymentType = wf.payment_type || null;
           workflowAmount =
             wf.amount != null ? Number(wf.amount) : null;
+          workflowHistory = Array.isArray(wf.history) ? wf.history : [];
+          // Prefer latest credit_remainder from Credit + Cash + Transfer flow
+          for (let i = workflowHistory.length - 1; i >= 0; i -= 1) {
+            const cr = workflowHistory[i]?.credit_remainder;
+            if (cr && Number(cr.remainder) > 0) {
+              creditPaidFromWorkflow = Number(cr.remainder) || 0;
+              if (cr.original_amount != null) {
+                originalInvoiceFromWorkflow = Number(cr.original_amount);
+              }
+              break;
+            }
+          }
         }
       }
     } catch (wfErr) {
@@ -1555,23 +1571,63 @@ exports.getSaleByCode = async (req, res) => {
       baseEntry?.mode_of_payment ||
       "CREDIT";
 
+    const invoiceTotalAmount = Number(totalAmount) || 0;
+    // Credit portion: explicit remainder, or unpaid balance on credit / credit_split
+    let creditPaid = creditPaidFromWorkflow;
+    if (creditPaid <= 0.05) {
+      const unpaid = Number(
+        (invoiceTotalAmount - cashPaid - transferPaid).toFixed(2),
+      );
+      const pt = String(modeOfPayment || "").toLowerCase();
+      if (
+        unpaid > 0.05 &&
+        (pt === "credit" ||
+          pt === "credit_split" ||
+          pt.includes("credit") ||
+          String(workflowPaymentType || "")
+            .toLowerCase()
+            .includes("credit"))
+      ) {
+        creditPaid = unpaid;
+      }
+    }
+
     // Prefer derived label when we have concrete payment lines
-    if (cashPaid > 0 && transferPaid > 0) {
+    if (cashPaid > 0.05 && transferPaid > 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (cashPaid > 0.05 && transferPaid > 0.05) {
       modeOfPayment = "split";
-    } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length) {
+    } else if (cashPaid > 0.05 && transferPaid <= 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (transferPaid > 0.05 && cashPaid <= 0.05 && creditPaid > 0.05) {
+      modeOfPayment = "credit_split";
+    } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length && creditPaid <= 0.05) {
       modeOfPayment = "cash";
-    } else if (transferPaid > 0 && cashPaid <= 0) {
+    } else if (transferPaid > 0 && cashPaid <= 0 && creditPaid <= 0.05) {
       modeOfPayment = "transfer";
+    } else if (creditPaid > 0.05 && cashPaid <= 0.05 && transferPaid <= 0.05) {
+      modeOfPayment = "credit";
     }
 
     const amountPaid =
       amountPaidFromEntries > 0
         ? amountPaidFromEntries
-        : String(modeOfPayment).toUpperCase() === "CREDIT"
-          ? 0
+        : String(modeOfPayment).toUpperCase() === "CREDIT" ||
+            String(modeOfPayment).toLowerCase() === "credit_split"
+          ? cashPaid + transferPaid
           : workflowAmount != null && Number.isFinite(workflowAmount)
             ? workflowAmount
             : 0;
+
+    if (creditPaid > 0.05) {
+      paymentBreakdown.push({
+        mode: "credit",
+        amount: creditPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Credit",
+      });
+    }
 
     const transaction = {
       id: saleCode,
@@ -1581,8 +1637,14 @@ exports.getSaleByCode = async (req, res) => {
       payment_type: modeOfPayment,
       cash_paid: cashPaid,
       transfer_paid: transferPaid,
+      credit_paid: creditPaid,
       transfer_banks: transferBanks,
       payment_breakdown: paymentBreakdown,
+      invoice_total_amount:
+        originalInvoiceFromWorkflow != null &&
+        Number.isFinite(originalInvoiceFromWorkflow)
+          ? originalInvoiceFromWorkflow
+          : invoiceTotalAmount,
       created_by: baseEntry?.created_by,
     };
 
@@ -1612,8 +1674,10 @@ exports.getSaleByCode = async (req, res) => {
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
+        credit_paid: creditPaid,
         transfer_banks: transferBanks,
         payment_breakdown: paymentBreakdown,
+        invoice_total_amount: transaction.invoice_total_amount,
         transaction,
         date: createdAt,
         customer: customer
@@ -2862,11 +2926,31 @@ exports.createSale = async (req, res) => {
         .json({ success: false, message: "Customer not found" });
     }
 
-    // Enforce credit limit for credit sales when limit is configured
+    // ===================================================================
+    // CREDIT LIMIT (Credit / deposit / credit-split invoices)
+    // ===================================================================
+    const paymentModeNorm = String(modeOfPayment || "")
+      .toLowerCase()
+      .trim();
+    const needsCreditLimitCheck =
+      isCreditSale ||
+      paymentModeNorm === "credit" ||
+      paymentModeNorm === "deposit" ||
+      paymentModeNorm === "credit_split" ||
+      paymentModeNorm.includes("credit");
+
     const creditLimit = parseFloat(customer.credit_limit || 0);
-    if (isCreditSale && creditLimit > 0) {
-      const outstanding =
-        parseFloat(customer.balance || customer.amount || 0) || 0;
+    if (needsCreditLimitCheck && creditLimit > 0) {
+      const glBalance =
+        parseFloat(await getBalance(customer_id, facilityId)) || 0;
+      // getBalance = SUM(cr)-SUM(dr); negative ⇒ customer owes A/R
+      const outstandingFromGl = Math.max(0, -glBalance);
+      const outstandingFromCustomer =
+        Math.max(
+          0,
+          parseFloat(customer.balance || customer.amount || 0) || 0,
+        );
+      const outstanding = Math.max(outstandingFromGl, outstandingFromCustomer);
       const thisSale =
         parseFloat(total_amount) ||
         (Array.isArray(items)
@@ -2882,8 +2966,72 @@ exports.createSale = async (req, res) => {
         await t.rollback();
         return res.status(400).json({
           success: false,
-          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(2)}, Outstanding: ${outstanding.toFixed(2)}, This sale: ${thisSale.toFixed(2)}`,
+          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(
+            2,
+          )}, Outstanding: ${outstanding.toFixed(
+            2,
+          )}, This sale: ${thisSale.toFixed(2)}`,
         });
+      }
+    }
+
+    // ===================================================================
+    // STOP SALES + SALES TARGET (early, before ledger / stock work)
+    // Aggregates qty by SKU + warehouse so multi-line carts cannot bypass limits.
+    // ===================================================================
+    {
+      const earlyQtyByKey = new Map();
+      for (const itm of items) {
+        const sku = itm.product_id || itm.sku;
+        const qty = Number(itm.quantity || itm.qty || 0);
+        if (!sku || !(qty > 0)) continue;
+        const bid =
+          parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+          saleBranchId ||
+          0;
+        const key = `${sku}|${bid}`;
+        earlyQtyByKey.set(key, (earlyQtyByKey.get(key) || 0) + qty);
+      }
+      for (const [key, qty] of earlyQtyByKey.entries()) {
+        const [sku, branchPart] = key.split("|");
+        const branchId = parseInt(branchPart, 10) || 0;
+        const product = await db.Product.findOne({
+          where: { sku, facility_id: facilityId },
+          attributes: [
+            "id",
+            "sku",
+            "name",
+            "daily_sales_limit",
+            "weekly_sales_limit",
+            "monthly_sales_limit",
+            "sales_stopped",
+          ],
+          transaction: t,
+        });
+        if (!product) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Product not found: ${sku}`,
+          });
+        }
+        try {
+          await assertProductSalesLimits({
+            product,
+            sku,
+            facilityId,
+            qty,
+            saleDate,
+            transaction: t,
+            branchId,
+          });
+        } catch (limitErr) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message: limitErr.message || "Sales limit exceeded",
+          });
+        }
       }
     }
 
@@ -3570,14 +3718,22 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     // FIRST PASS: CALCULATE SUBTOTAL AND VALIDATE ITEMS
     // ===================================================================
-    // Aggregate qty by SKU so multi-line same-SKU carts cannot bypass limits
+    // Aggregate qty by SKU + warehouse so multi-line carts cannot bypass limits
     const qtyBySku = new Map();
+    const qtyBySkuBranch = new Map();
     const remainingSellableByKey = new Map();
+    const assertedLimitKeys = new Set();
     for (const itm of items) {
       const sku = itm.product_id;
       const qty = Number(itm.quantity);
       if (!sku || !(qty > 0)) continue;
       qtyBySku.set(sku, (qtyBySku.get(sku) || 0) + qty);
+      const bid =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+      const key = `${sku}|${bid}`;
+      qtyBySkuBranch.set(key, (qtyBySkuBranch.get(key) || 0) + qty);
     }
     const productBySku = new Map();
 
@@ -3618,15 +3774,24 @@ exports.createSale = async (req, res) => {
         });
         if (!product) throw new Error(`Product not found: ${sku}`);
         productBySku.set(sku, product);
+      }
 
+      const lineLimitBranchId =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+      const limitKey = `${sku}|${lineLimitBranchId}`;
+      if (!assertedLimitKeys.has(limitKey)) {
+        assertedLimitKeys.add(limitKey);
         // Sales target / limit / stop — block even when stock remains (aggregated qty)
         await assertProductSalesLimits({
           product,
           sku,
           facilityId,
-          qty: qtyBySku.get(sku) || qty,
+          qty: qtyBySkuBranch.get(limitKey) || qty,
           saleDate,
           transaction: t,
+          branchId: lineLimitBranchId,
         });
       }
 
@@ -3635,32 +3800,92 @@ exports.createSale = async (req, res) => {
         const allowSalesWithoutStock =
           business?.allow_sales_without_stock || false;
 
-        const stockBranchId =
-          parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
-          saleBranchId ||
-          0;
+        const rawLineBranch = itm.branchId ?? itm.branch_id;
+        const hasExplicitLineBranch =
+          rawLineBranch != null &&
+          String(rawLineBranch).trim() !== "" &&
+          Number.isFinite(parseInt(String(rawLineBranch), 10)) &&
+          parseInt(String(rawLineBranch), 10) > 0;
+
+        let stockBranchId = hasExplicitLineBranch
+          ? parseInt(String(rawLineBranch), 10)
+          : parseInt(saleBranchId, 10) || 0;
+
         const stockKey = `${sku}|${stockBranchId}`;
 
         if (!remainingSellableByKey.has(stockKey)) {
-          const currentBalance = await getSellableQtyAtBranch({
+          let currentBalance = await getSellableQtyAtBranch({
             sku,
             facilityId,
             branchId: stockBranchId,
             transaction: t,
           });
-          remainingSellableByKey.set(stockKey, currentBalance);
+
+          // Wrong warehouse on the line (often the cashier's assigned branch)
+          // while Make Sale showed stock at another warehouse — re-home the line.
+          const mayRetarget =
+            !hasExplicitLineBranch ||
+            (saleBranchId > 0 && stockBranchId === saleBranchId);
+
+          if (
+            !allowSalesWithoutStock &&
+            currentBalance < qty &&
+            mayRetarget
+          ) {
+            const alts = await listSellableBranchesForSku({
+              sku,
+              facilityId,
+              transaction: t,
+            });
+            const fit = alts.find((a) => a.balance >= qty);
+            if (fit && fit.branchId > 0) {
+              stockBranchId = fit.branchId;
+              currentBalance = fit.balance;
+              itm.branchId = fit.branchId;
+              itm.branch_id = fit.branchId;
+            }
+          }
+
+          remainingSellableByKey.set(
+            `${sku}|${stockBranchId}`,
+            currentBalance,
+          );
         }
 
-        const available = remainingSellableByKey.get(stockKey) || 0;
+        stockBranchId =
+          parseInt(itm.branchId ?? itm.branch_id ?? stockBranchId, 10) ||
+          stockBranchId;
+        const resolvedKey = `${sku}|${stockBranchId}`;
+        const available = remainingSellableByKey.get(resolvedKey) ?? 0;
+
         if (!allowSalesWithoutStock && available < qty) {
           const productLabel = (product.name || sku).trim();
-          const branchHint =
+          let branchHint =
             stockBranchId > 0 ? ` (branch id ${stockBranchId})` : "";
+          try {
+            const alts = await listSellableBranchesForSku({
+              sku,
+              facilityId,
+              transaction: t,
+            });
+            if (alts.length) {
+              const where = alts
+                .slice(0, 3)
+                .map(
+                  (a) =>
+                    `${a.branch_name || `branch ${a.branchId}`}: ${a.balance}`,
+                )
+                .join("; ");
+              branchHint += `. Stock is at: ${where}`;
+            }
+          } catch (_) {
+            /* ignore */
+          }
           throw new Error(
             `Insufficient quantity for ${productLabel}${branchHint}. Available: ${available}, Requested: ${qty}`,
           );
         }
-        remainingSellableByKey.set(stockKey, available - qty);
+        remainingSellableByKey.set(resolvedKey, available - qty);
       }
 
       const lineTotal = qty * price;
@@ -3729,7 +3954,7 @@ exports.createSale = async (req, res) => {
 
       const discountedGross = lineTotal - itemDiscount;
 
-      const isTaxable = product.taxable === "Taxable";
+      const isTaxable = isProductTaxable(product.taxable);
 
       let revenueAmount, itemVAT, itemTaxBreakdown;
 
@@ -4715,7 +4940,7 @@ exports.createSale = async (req, res) => {
     await t.rollback();
     console.error("createSale error:", err.message, err.stack);
     const isClientError =
-      /Insufficient quantity|Invalid item|not found|required|limit reached|sales .+ limit/i.test(
+      /Insufficient quantity|Invalid item|not found|required|limit reached|sales .+ limit|sales are stopped|credit limit|cannot be sold/i.test(
         String(err.message || ""),
       );
     return res.status(isClientError ? 400 : 500).json({

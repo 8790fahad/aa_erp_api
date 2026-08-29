@@ -218,7 +218,7 @@ async function main() {
           cost: 75000,
           quantity: 1,
           qty: 1,
-          taxable: "Not Taxable",
+          taxable: "Non-Taxable",
         },
       ],
     });

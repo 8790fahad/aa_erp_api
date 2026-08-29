@@ -1,5 +1,6 @@
 const db = require("../models");
 const { Op } = require("sequelize");
+const moment = require("moment");
 const {
   SALE_WORKFLOW_STAGES,
   nextStageFor,
@@ -241,6 +242,16 @@ async function applyPaymentTypeToWorkflow(
   return { changed: true, skipped: false };
 }
 
+/** Latest credit remainder payload from Credit + Cash + Transfer flow. */
+function getCreditRemainderFromHistory(history) {
+  const list = normalizeHistory(history);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const cr = list[i]?.credit_remainder;
+    if (cr && Number(cr.remainder) > 0) return cr;
+  }
+  return null;
+}
+
 /** Track partial Cash + Transfer collections on split invoices. */
 function getSplitCollectionProgress(history) {
   const list = normalizeHistory(history);
@@ -274,6 +285,9 @@ function getSplitCollectionProgress(history) {
     }
   }
   const collected_total = Number((cash + transfer).toFixed(2));
+  const creditRem = getCreditRemainderFromHistory(history);
+  const creditFromHistory =
+    creditRem != null ? Number(creditRem.remainder) || 0 : null;
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
@@ -286,7 +300,54 @@ function getSplitCollectionProgress(history) {
     cash_at,
     transfer_at,
     collected_total,
+    credit:
+      creditFromHistory != null
+        ? Number(creditFromHistory.toFixed(2))
+        : null,
+    original_amount:
+      creditRem?.original_amount != null
+        ? Number(creditRem.original_amount)
+        : null,
   };
+}
+
+/** Attach split/credit progress for credit_split and credit-remainder rows. */
+function buildSplitProgressForRow(plain) {
+  const pt = String(plain?.payment_type || "").toLowerCase();
+  const progress = getSplitCollectionProgress(plain?.history);
+  const creditRem = getCreditRemainderFromHistory(plain?.history);
+  const amountDue = Number(plain?.amount) || 0;
+  if (pt === "credit_split") {
+    const credit = Number(
+      (amountDue - (progress.collected_total || 0)).toFixed(2),
+    );
+    return {
+      ...progress,
+      credit: credit > 0.05 ? credit : 0,
+      original_amount: amountDue,
+    };
+  }
+  if (pt === "credit" && (creditRem || progress.collected_total > 0.05)) {
+    return {
+      ...progress,
+      credit:
+        progress.credit != null
+          ? progress.credit
+          : Number(amountDue.toFixed(2)),
+      original_amount:
+        progress.original_amount != null
+          ? progress.original_amount
+          : Number(
+              (
+                (progress.collected_total || 0) + amountDue
+              ).toFixed(2),
+            ),
+    };
+  }
+  if (isSplitPaymentType(pt)) {
+    return progress;
+  }
+  return null;
 }
 
 /** Persist workflow history JSON (Sequelize may miss nested mutations). */
@@ -660,7 +721,7 @@ async function createSaleWorkflowRecord(
       ? String(assignedCashierName).trim()
       : null;
 
-  // Discounted invoices must be approved before Collection Points / credit path
+  // Discounted invoices must be approved before Verification Points / credit path
   let initialStatus;
   let statusNote;
   if (hasDiscount && paymentType !== "deposit") {
@@ -915,7 +976,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         .toLowerCase()
         .trim() === "credit";
 
-    // Approve / reject payment mode switch (Collection Points)
+    // Approve / reject payment mode switch (Verification Points)
     if (
       row.status === "awaiting_payment_mode_approval" &&
       (!action || action === "advance" || action === "reject_payment_mode")
@@ -1050,7 +1111,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit invoices must be approved on the Credit tab at Collection Points before Invoice Separation",
+          "Credit invoices must be approved on the Credit tab at Verification Points before Invoice Separation",
       });
     }
 
@@ -1065,7 +1126,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
           ? advanceNote ||
             "Discount approved — awaiting credit approval"
           : advanceNote ||
-            "Discount approved — ready for Collection Points";
+            "Discount approved — ready for Verification Points";
     }
 
     if (!next) {
@@ -1153,7 +1214,17 @@ exports.advanceSaleWorkflow = async (req, res) => {
  */
 exports.getCashierDashboard = async (req, res) => {
   try {
-    const { facilityId, cashierType, branchId, userId, role } = req.query;
+    const {
+      facilityId,
+      cashierType,
+      branchId,
+      userId,
+      role,
+      historyFrom,
+      historyTo,
+      fromDate,
+      toDate,
+    } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
@@ -1165,6 +1236,21 @@ exports.getCashierDashboard = async (req, res) => {
         success: false,
         message: "SaleWorkflow model not loaded",
       });
+    }
+
+    const todayYmd = moment().format("YYYY-MM-DD");
+    const parseYmd = (v) => {
+      const s = String(v || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+      return s;
+    };
+    let histFrom =
+      parseYmd(historyFrom) || parseYmd(fromDate) || todayYmd;
+    let histTo = parseYmd(historyTo) || parseYmd(toDate) || histFrom;
+    if (histFrom > histTo) {
+      const tmp = histFrom;
+      histFrom = histTo;
+      histTo = tmp;
     }
 
     const where = {
@@ -1221,9 +1307,7 @@ exports.getCashierDashboard = async (req, res) => {
     const pendingRows = pending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
-      const split_progress = isSplitPaymentType(plain.payment_type)
-          ? getSplitCollectionProgress(plain.history)
-          : null;
+      const split_progress = buildSplitProgressForRow(plain);
       return {
         ...plain,
         history: normalizeHistory(plain.history),
@@ -1241,36 +1325,8 @@ exports.getCashierDashboard = async (req, res) => {
       if (r.split_progress?.transfer_by)
         collectorIds.add(String(r.split_progress.transfer_by));
     });
-    if (collectorIds.size && db.users) {
-      try {
-        const users = await db.users.findAll({
-          where: { id: [...collectorIds] },
-          attributes: ["id", "firstname", "lastname", "username"],
-        });
-        const nameById = {};
-        users.forEach((u) => {
-          nameById[String(u.id)] =
-            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
-            u.username ||
-            String(u.id);
-        });
-        pendingRows.forEach((r) => {
-          if (!r.split_progress) return;
-          if (!r.split_progress.cash_by_name && r.split_progress.cash_by) {
-            r.split_progress.cash_by_name =
-              nameById[String(r.split_progress.cash_by)] || null;
-          }
-          if (!r.split_progress.transfer_by_name && r.split_progress.transfer_by) {
-            r.split_progress.transfer_by_name =
-              nameById[String(r.split_progress.transfer_by)] || null;
-          }
-        });
-      } catch (_) {
-        /* ignore name lookup failures */
-      }
-    }
 
-    // Credit sales awaiting approval (Collection Points → Credit tab)
+    // Credit sales awaiting approval (Verification Points → Credit tab)
     // Fresh Apply Deposit invoices use awaiting_payment — only deposit remainders land here
     const creditWhere = {
       facility_id: facilityId,
@@ -1296,15 +1352,58 @@ exports.getCashierDashboard = async (req, res) => {
     const creditRows = creditPending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
+      const split_progress = buildSplitProgressForRow(plain);
       return {
         ...plain,
+        history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "rose",
         amount: Number(plain.amount) || 0,
+        split_progress,
       };
     });
+    creditRows.forEach((r) => {
+      if (r.split_progress?.cash_by)
+        collectorIds.add(String(r.split_progress.cash_by));
+      if (r.split_progress?.transfer_by)
+        collectorIds.add(String(r.split_progress.transfer_by));
+    });
 
-    // Discounted invoices awaiting approval before Collection Points
+    if (collectorIds.size && db.users) {
+      try {
+        const users = await db.users.findAll({
+          where: { id: [...collectorIds] },
+          attributes: ["id", "firstname", "lastname", "username"],
+        });
+        const nameById = {};
+        users.forEach((u) => {
+          nameById[String(u.id)] =
+            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
+            u.username ||
+            String(u.id);
+        });
+        const applyNames = (r) => {
+          if (!r.split_progress) return;
+          if (!r.split_progress.cash_by_name && r.split_progress.cash_by) {
+            r.split_progress.cash_by_name =
+              nameById[String(r.split_progress.cash_by)] || null;
+          }
+          if (
+            !r.split_progress.transfer_by_name &&
+            r.split_progress.transfer_by
+          ) {
+            r.split_progress.transfer_by_name =
+              nameById[String(r.split_progress.transfer_by)] || null;
+          }
+        };
+        pendingRows.forEach(applyNames);
+        creditRows.forEach(applyNames);
+      } catch (_) {
+        /* ignore name lookup failures */
+      }
+    }
+
+    // Discounted invoices awaiting approval before Verification Points
     const discountWhere = {
       facility_id: facilityId,
       status: "awaiting_discount_approval",
@@ -1414,7 +1513,12 @@ exports.getCashierDashboard = async (req, res) => {
     }
 
     // Today's confirmed payments from customer_entries (invoice collections + advances)
-    const todayReplacements = { facilityId };
+    // Use history date range so summary cards match History fetch
+    const todayReplacements = {
+      facilityId,
+      histFrom,
+      histTo,
+    };
     let branchClause = "";
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -1432,7 +1536,7 @@ exports.getCashierDashboard = async (req, res) => {
        WHERE ce.facilityId = :facilityId
          AND ce.type = 'deposit'
          AND ce.cost > 0
-         AND DATE(ce.created_at) = CURDATE()
+         AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
          AND (
            ce.description LIKE 'Sale payment%'
            OR ce.link_id LIKE 'INV-%'
@@ -1440,7 +1544,7 @@ exports.getCashierDashboard = async (req, res) => {
            OR ce.receiptNo LIKE 'AD-%'
            OR ce.description LIKE '%advance%'
            OR ce.description LIKE '%Advance%'
-           OR ce.description LIKE '%Collection Points advance%'
+           OR ce.description LIKE '%Verification Points advance%' OR ce.description LIKE '%Collection Points advance%'
          )
          ${branchClause}
        GROUP BY LOWER(TRIM(ce.mode_of_payment))`,
@@ -1472,7 +1576,41 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
-    // Recent customer advances for Collection Points history (Cash / Transfer tabs)
+    // Credit invoices approved today (left awaiting_credit_approval)
+    const approvedCreditTodayRows = await db.sequelize.query(
+      `SELECT
+         COALESCE(SUM(sw.amount), 0) AS total,
+         COUNT(*) AS cnt
+       FROM sale_workflows sw
+       WHERE sw.facility_id = :facilityId
+         AND sw.payment_type IN ('credit', 'deposit')
+         AND sw.status IN (
+           'credit_approved',
+           'invoice_separation',
+           'final_invoice',
+           'warehouse_picking',
+           'dual_signature',
+           'goods_released',
+           'completed'
+         )
+         AND sw.amount > 0
+         AND DATE(sw.updated_at) BETWEEN :histFrom AND :histTo
+         ${
+           branchId && branchId !== "all" && Number.isFinite(parseInt(branchId, 10))
+             ? "AND sw.branch_id = :branchId"
+             : ""
+         }`,
+      {
+        replacements: todayReplacements,
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const approved_credit_today =
+      Number(approvedCreditTodayRows?.[0]?.total) || 0;
+    const approved_credit_count_today =
+      Number(approvedCreditTodayRows?.[0]?.cnt) || 0;
+
+    // Recent customer advances for Verification Points history (Cash / Transfer tabs)
     const advanceRows = await db.sequelize.query(
       `SELECT
          ce.entry_id,
@@ -1495,13 +1633,15 @@ exports.getCashierDashboard = async (req, res) => {
            ce.receiptNo LIKE 'AD-%'
            OR LOWER(ce.description) LIKE '%advance%'
            OR LOWER(ce.description) LIKE '%collection points advance%'
+           OR LOWER(ce.description) LIKE '%verification points advance%'
          )
          AND (
            ce.description NOT LIKE 'Sale payment%'
          )
+         AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
          ${branchClause}
        ORDER BY ce.created_at DESC
-       LIMIT 80`,
+       LIMIT 300`,
       {
         replacements: todayReplacements,
         type: db.Sequelize.QueryTypes.SELECT,
@@ -1568,10 +1708,18 @@ exports.getCashierDashboard = async (req, res) => {
     else if (ct === "split") historyWhere.payment_type = ["split", "credit_split"];
     else if (ct === "credit") historyWhere.payment_type = ["credit", "deposit"];
 
+    // History is always date-scoped (default: today)
+    historyWhere.updated_at = {
+      [Op.between]: [
+        new Date(`${histFrom}T00:00:00.000`),
+        new Date(`${histTo}T23:59:59.999`),
+      ],
+    };
+
     const history = await db.SaleWorkflow.findAll({
       where: historyWhere,
       order: [["updated_at", "DESC"]],
-      limit: 100,
+      limit: 500,
     });
 
     const workflowHistory = history.map((r) => {
@@ -1608,6 +1756,10 @@ exports.getCashierDashboard = async (req, res) => {
           collected_cash_today: collected_cash,
           collected_transfer_today: collected_transfer,
           collected_today: collected_cash + collected_transfer,
+          approved_credit_today,
+          approved_credit_count_today,
+          history_from: histFrom,
+          history_to: histTo,
         },
       },
     });
@@ -1819,7 +1971,7 @@ exports.cashierConfirmPayment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit invoices must be approved on the Credit tab at Collection Points — they cannot be collected as cash/transfer",
+          "Credit invoices must be approved on the Credit tab at Verification Points — they cannot be collected as cash/transfer",
       });
     }
     if (paymentType === "deposit") {
@@ -2244,7 +2396,7 @@ exports.cashierConfirmPayment = async (req, res) => {
           body: row.customer_name
             ? `${row.customer_name} — ready for separation`
             : "Ready for invoice separation",
-          link: "/app/payments/collection-points",
+          link: "/app/payments/verification-points",
           entityType: "invoice",
           entityId: saleRef,
         });
@@ -2293,7 +2445,7 @@ exports.cashierConfirmPayment = async (req, res) => {
         body: `Remaining ₦${rem.toFixed(2)}${
           row.customer_name ? ` — ${row.customer_name}` : ""
         }`,
-        link: "/app/payments/collection-points",
+        link: "/app/payments/verification-points",
         entityType: "invoice",
         entityId: saleRef,
       });
@@ -2404,20 +2556,27 @@ exports.sendCreditRemainder = async (req, res) => {
     row.payment_type = "credit";
     row.status = "awaiting_credit_approval";
     row.updated_by = updated_by || row.updated_by;
+    const cashCollected = progress.cash || 0;
+    const transferCollected = progress.transfer || 0;
+    const noteText =
+      cashCollected <= 0.05 && transferCollected <= 0.05
+        ? `Full amount ₦${remaining.toFixed(2)} confirmed as Credit — awaiting Credit Approval`
+        : `Cash ₦${cashCollected.toFixed(2)} + Transfer ₦${transferCollected.toFixed(2)} collected; Credit ₦${remaining.toFixed(2)} sent to Credit Approval`;
     setWorkflowHistory(
       row,
       pushHistory(
         row.history,
         "awaiting_credit_approval",
         updated_by,
-        note ||
-          `Cash/transfer collected ₦${Number(progress.collected_total || 0).toFixed(2)}; remainder ₦${remaining.toFixed(2)} sent to Credit Approval`,
+        note || noteText,
         {
           credit_remainder: {
             from: "credit_split",
-            cash_collected: progress.cash || 0,
-            transfer_collected: progress.transfer || 0,
+            original_amount: amountDue,
+            cash_collected: cashCollected,
+            transfer_collected: transferCollected,
             remainder: remaining,
+            credit: remaining,
           },
         },
       ),
@@ -2427,12 +2586,19 @@ exports.sendCreditRemainder = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Remainder ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
+      message:
+        cashCollected <= 0.05 && transferCollected <= 0.05
+          ? `₦${remaining.toFixed(2)} confirmed as Credit for ${saleCode} — approve on Credit tab`
+          : `Credit ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
-        split_progress: progress,
+        split_progress: {
+          ...progress,
+          credit: remaining,
+          original_amount: amountDue,
+        },
       },
     });
   } catch (err) {
@@ -2610,7 +2776,7 @@ exports.completeSeparation = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Credit approval is required at Collection Points before Invoice Separation",
+          "Credit approval is required at Verification Points before Invoice Separation",
       });
     }
 
@@ -2950,7 +3116,7 @@ const SPECIAL_TREATMENT_TYPES = [
 ];
 
 /**
- * Switch payment mode on a sale (Collection Points / special treatment).
+ * Switch payment mode on a sale (Verification Points / special treatment).
  * When requireApproval is true, queues awaiting_payment_mode_approval instead of applying.
  */
 exports.applySpecialInvoiceTreatment = async (req, res) => {

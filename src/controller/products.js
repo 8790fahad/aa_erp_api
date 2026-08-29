@@ -4,6 +4,74 @@ const { v4: uuidv4 } = require("uuid");
 const { persistProductImages } = require("../utils/productImageStorage");
 const Product = db.products;
 const ProductMultiplier = db.product_multipliers;
+const {
+  normalizeTaxableStatus,
+  isValidTaxableStatus,
+  TAXABLE_STATUS_VALUES,
+} = require("../constants/taxableStatus");
+
+async function branchNameByIds(branchIds) {
+  const ids = [...new Set((branchIds || []).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const branches = await db.Branch.findAll({
+    where: { id: ids },
+    attributes: ["id", "branch_name"],
+    raw: true,
+  });
+  return new Map((branches || []).map((b) => [Number(b.id), b.branch_name]));
+}
+
+async function salesTargetsForFacility(facilityId, skus = null) {
+  if (!db.ProductSalesLimit) return [];
+  const where = { facility_id: facilityId };
+  if (Array.isArray(skus) && skus.length) where.sku = skus;
+  try {
+    const rows = await db.ProductSalesLimit.findAll({
+      where,
+      raw: true,
+    });
+    if (!rows.length) return [];
+    const nameById = await branchNameByIds(
+      rows.map((r) => r.branch_id).filter(Boolean),
+    );
+    return rows.map((r) => ({
+      sku: r.sku,
+      branch_id: r.branch_id,
+      branch_name:
+        nameById.get(Number(r.branch_id)) || `Warehouse ${r.branch_id}`,
+      period: r.period,
+      quantity: r.quantity,
+    }));
+  } catch (err) {
+    console.warn("salesTargetsForFacility:", err.message);
+    return [];
+  }
+}
+
+async function salesStopsForFacility(facilityId, skus = null) {
+  if (!db.ProductSalesStop) return [];
+  const where = { facility_id: facilityId };
+  if (Array.isArray(skus) && skus.length) where.sku = skus;
+  try {
+    const rows = await db.ProductSalesStop.findAll({
+      where,
+      raw: true,
+    });
+    if (!rows.length) return [];
+    const nameById = await branchNameByIds(
+      rows.map((r) => r.branch_id).filter(Boolean),
+    );
+    return rows.map((r) => ({
+      sku: r.sku,
+      branch_id: r.branch_id,
+      branch_name:
+        nameById.get(Number(r.branch_id)) || `Warehouse ${r.branch_id}`,
+    }));
+  } catch (err) {
+    console.warn("salesStopsForFacility:", err.message);
+    return [];
+  }
+}
 
 const ONLINE_ELIGIBLE_ITEM_TYPES = [
   "Finished Good",
@@ -23,7 +91,7 @@ async function numberGenerator({ query_type = "", facilityId = "" }) {
           facilityId,
         },
         type: db.sequelize.QueryTypes.RAW,
-      }
+      },
     );
     return result;
   } catch (err) {
@@ -54,6 +122,30 @@ exports.createProduct = async (req, res) => {
         success: false,
         message: "Missing required fields: name, itemType, facilityId",
       });
+    }
+
+    try {
+      const existing = await db.Product.findOne({
+        where: {
+          facility_id: facilityId,
+          [db.Sequelize.Op.and]: db.sequelize.where(
+            db.sequelize.fn(
+              "LOWER",
+              db.sequelize.fn("TRIM", db.sequelize.col("name")),
+            ),
+            String(name).trim().toLowerCase(),
+          ),
+        },
+        attributes: ["id"],
+      });
+      if (existing) {
+        return res.status(400).json({
+          success: false,
+          message: `Product name "${String(name).trim()}" already exists. Product name must be unique.`,
+        });
+      }
+    } catch (dupErr) {
+      console.error("createProduct name check:", dupErr);
     }
 
     // Generate product ID using numberGenerator
@@ -87,7 +179,7 @@ exports.createProduct = async (req, res) => {
             warehouse_id: inventory?.warehouseId || null,
             unit_of_measure: inventory?.unitOfMeasure || "pcs",
             status: settings?.status || "Active",
-            taxable: taxable || "Taxable",
+            taxable: normalizeTaxableStatus(taxable, "Taxable"),
             tags: settings?.tags || [],
             notes: settings?.notes || null,
           });
@@ -115,7 +207,7 @@ exports.createProduct = async (req, res) => {
           message: "Error generating product ID",
           error: error.message,
         });
-      }
+      },
     );
   } catch (error) {
     console.error("Error in createProduct:", error);
@@ -174,9 +266,35 @@ exports.getProducts = async (req, res) => {
       order: [["name", "ASC"]],
     });
 
+    const [targets, stops] = await Promise.all([
+      salesTargetsForFacility(facilityId),
+      salesStopsForFacility(facilityId),
+    ]);
+    const targetsBySku = new Map();
+    for (const t of targets) {
+      const sku = String(t.sku);
+      if (!targetsBySku.has(sku)) targetsBySku.set(sku, []);
+      targetsBySku.get(sku).push(t);
+    }
+    const stopsBySku = new Map();
+    for (const s of stops) {
+      const sku = String(s.sku);
+      if (!stopsBySku.has(sku)) stopsBySku.set(sku, []);
+      stopsBySku.get(sku).push(s);
+    }
+
+    const data = products.map((p) => {
+      const json = typeof p.toJSON === "function" ? p.toJSON() : p;
+      return {
+        ...json,
+        sales_targets: targetsBySku.get(String(json.sku)) || [],
+        sales_stops: stopsBySku.get(String(json.sku)) || [],
+      };
+    });
+
     res.json({
       success: true,
-      data: products,
+      data,
     });
   } catch (error) {
     console.error("Error fetching products:", error);
@@ -273,8 +391,10 @@ exports.updateProduct = async (req, res) => {
       warehouse_id: inventory?.warehouseId || null,
       unit_of_measure: inventory?.unitOfMeasure || "pcs",
       status: settings?.status || "Active",
-      taxable:
+      taxable: normalizeTaxableStatus(
         settings?.taxable !== undefined ? settings.taxable : product.taxable,
+        product.taxable || "Taxable",
+      ),
       tags: settings?.tags || [],
       notes: settings?.notes || null,
     });
@@ -358,10 +478,10 @@ exports.updateProductTaxable = async (req, res) => {
       });
     }
 
-    if (!taxable || !["Taxable", "Not Taxable"].includes(taxable)) {
+    if (!taxable || !isValidTaxableStatus(taxable)) {
       return res.status(400).json({
         success: false,
-        message: "taxable must be either 'Taxable' or 'Not Taxable'",
+        message: `taxable must be one of: ${TAXABLE_STATUS_VALUES.join(", ")}`,
       });
     }
 
@@ -379,15 +499,16 @@ exports.updateProductTaxable = async (req, res) => {
       });
     }
 
+    const resolved = normalizeTaxableStatus(taxable, "Taxable");
     await product.update({
-      taxable: taxable,
+      taxable: resolved,
     });
 
     res.json({
       success: true,
       data: {
         productId: id,
-        taxable: taxable,
+        taxable: resolved,
         message: "Product taxable status updated successfully",
       },
     });
@@ -476,7 +597,9 @@ exports.updateProductStatus = async (req, res) => {
     const { facilityId } = req.body;
 
     if (!facilityId) {
-      return res.status(400).json({ success: false, message: "facilityId is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "facilityId is required" });
     }
 
     const product = await db.Product.findOne({
@@ -484,7 +607,9 @@ exports.updateProductStatus = async (req, res) => {
     });
 
     if (!product) {
-      return res.status(404).json({ success: false, message: "Product not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Product not found" });
     }
 
     const newStatus = product.status === "Active" ? "Inactive" : "Active";
@@ -496,7 +621,13 @@ exports.updateProductStatus = async (req, res) => {
     });
   } catch (error) {
     console.error("Error toggling product status:", error);
-    res.status(500).json({ success: false, message: "Error toggling product status", error: error.message });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Error toggling product status",
+        error: error.message,
+      });
   }
 };
 
@@ -538,7 +669,8 @@ exports.updateProductSellingPrice = async (req, res) => {
     if (!Number.isFinite(price) || price < 0) {
       return res.status(400).json({
         success: false,
-        message: "selling_price must be a valid number greater than or equal to 0",
+        message:
+          "selling_price must be a valid number greater than or equal to 0",
       });
     }
 
@@ -573,11 +705,18 @@ exports.updateProductSellingPrice = async (req, res) => {
   }
 };
 
-// Set / clear sales target (daily | weekly | monthly) from product list
+// Set / clear sales target (daily | weekly | monthly) per warehouse
 exports.updateProductSalesTarget = async (req, res) => {
   try {
     const { id } = req.params;
-    const { facilityId, period, quantity } = req.body;
+    const {
+      facilityId,
+      period,
+      quantity,
+      branchId,
+      branchIds: rawBranchIds,
+      targets: rawTargets,
+    } = req.body;
 
     if (!facilityId) {
       return res.status(400).json({
@@ -595,15 +734,59 @@ exports.updateProductSalesTarget = async (req, res) => {
       });
     }
 
-    let qty = null;
-    if (periodNorm !== "none") {
-      qty = parseInt(String(quantity).replace(/,/g, ""), 10);
-      if (!Number.isFinite(qty) || qty <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: "quantity must be a positive whole number",
-        });
-      }
+    const parseQty = (value) => {
+      const n = parseInt(String(value ?? "").replace(/,/g, ""), 10);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    const parsePeriod = (value, fallback) => {
+      const p = String(value || fallback || "").toLowerCase();
+      return allowed.includes(p) ? p : null;
+    };
+
+    let items = [];
+    if (Array.isArray(rawTargets)) {
+      items = rawTargets
+        .map((t) => ({
+          branchId: parseInt(t?.branchId ?? t?.branch_id, 10),
+          quantity: parseQty(t?.quantity),
+          period: parsePeriod(t?.period, periodNorm),
+        }))
+        .filter((t) => Number.isInteger(t.branchId) && t.branchId > 0);
+    } else {
+      const branchIds = [
+        ...new Set(
+          (Array.isArray(rawBranchIds)
+            ? rawBranchIds
+            : rawBranchIds != null
+              ? [rawBranchIds]
+              : branchId != null
+                ? [branchId]
+                : []
+          )
+            .map((wid) => parseInt(wid, 10))
+            .filter((wid) => Number.isInteger(wid) && wid > 0),
+        ),
+      ];
+      const sharedQty = parseQty(quantity);
+      items = branchIds.map((parsedBranchId) => ({
+        branchId: parsedBranchId,
+        quantity: sharedQty,
+        period: periodNorm,
+      }));
+    }
+
+    const toSave = items.filter(
+      (t) => t.period && t.period !== "none" && t.quantity != null,
+    );
+
+    if (periodNorm !== "none" && Array.isArray(rawTargets) && !rawTargets.length) {
+      // explicit clear
+    } else if (periodNorm !== "none" && !toSave.length && items.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid period and quantity for each selected warehouse",
+      });
     }
 
     const product = await db.Product.findOne({
@@ -617,22 +800,39 @@ exports.updateProductSalesTarget = async (req, res) => {
       });
     }
 
-    const payload = {
-      daily_sales_limit: null,
-      weekly_sales_limit: null,
-      monthly_sales_limit: null,
-    };
-    if (periodNorm === "daily") payload.daily_sales_limit = qty;
-    if (periodNorm === "weekly") payload.weekly_sales_limit = qty;
-    if (periodNorm === "monthly") payload.monthly_sales_limit = qty;
+    if (!db.ProductSalesLimit) {
+      return res.status(500).json({
+        success: false,
+        message: "Sales target storage is not available",
+      });
+    }
 
-    await product.update(payload);
+    const whereBase = {
+      facility_id: facilityId,
+      sku: product.sku,
+    };
+
+    await db.ProductSalesLimit.destroy({ where: whereBase });
+    for (const item of toSave) {
+      await db.ProductSalesLimit.create({
+        ...whereBase,
+        branch_id: item.branchId,
+        period: item.period,
+        quantity: item.quantity,
+      });
+    }
+
+    const sales_targets = await salesTargetsForFacility(facilityId, [
+      product.sku,
+    ]);
 
     res.json({
       success: true,
       data: {
         productId: id,
-        ...payload,
+        sku: product.sku,
+        branchIds: toSave.map((item) => item.branchId),
+        sales_targets,
         message: "Sales target updated successfully",
       },
     });
@@ -646,11 +846,11 @@ exports.updateProductSalesTarget = async (req, res) => {
   }
 };
 
-// Toggle stop-sales flag from product list
+// Stop / resume sales per warehouse from product list
 exports.updateProductStopSales = async (req, res) => {
   try {
     const { id } = req.params;
-    const { facilityId, sales_stopped } = req.body;
+    const { facilityId, branchIds: rawBranchIds, branchId } = req.body;
 
     if (!facilityId) {
       return res.status(400).json({
@@ -659,12 +859,20 @@ exports.updateProductStopSales = async (req, res) => {
       });
     }
 
-    if (typeof sales_stopped !== "boolean") {
-      return res.status(400).json({
-        success: false,
-        message: "sales_stopped must be a boolean",
-      });
-    }
+    const branchIds = [
+      ...new Set(
+        (Array.isArray(rawBranchIds)
+          ? rawBranchIds
+          : rawBranchIds != null
+            ? [rawBranchIds]
+            : branchId != null
+              ? [branchId]
+              : []
+        )
+          .map((wid) => parseInt(wid, 10))
+          .filter((wid) => Number.isInteger(wid) && wid > 0),
+      ),
+    ];
 
     const product = await db.Product.findOne({
       where: { id, facility_id: facilityId },
@@ -677,16 +885,44 @@ exports.updateProductStopSales = async (req, res) => {
       });
     }
 
-    await product.update({ sales_stopped });
+    if (!db.ProductSalesStop) {
+      return res.status(500).json({
+        success: false,
+        message: "Stop-sales storage is not available. Restart the API after migrating.",
+      });
+    }
+
+    const whereBase = {
+      facility_id: facilityId,
+      sku: product.sku,
+    };
+
+    await db.ProductSalesStop.destroy({ where: whereBase });
+    if (branchIds.length) {
+      await db.ProductSalesStop.bulkCreate(
+        branchIds.map((parsedBranchId) => ({
+          ...whereBase,
+          branch_id: parsedBranchId,
+        })),
+      );
+    }
+
+    // Warehouse rows own the stop; clear the legacy product-wide flag.
+    await product.update({ sales_stopped: false });
+
+    const sales_stops = await salesStopsForFacility(facilityId, [product.sku]);
 
     res.json({
       success: true,
       data: {
         productId: id,
-        sales_stopped,
-        message: sales_stopped
-          ? "Sales stopped for this product"
-          : "Sales resumed for this product",
+        sku: product.sku,
+        branchIds,
+        sales_stops,
+        sales_stopped: false,
+        message: branchIds.length
+          ? "Sales stopped for the selected warehouses"
+          : "Sales resumed at all warehouses",
       },
     });
   } catch (error) {
@@ -754,8 +990,9 @@ exports.updateProductImages = async (req, res) => {
     });
   } catch (error) {
     console.error("Error updating product images:", error);
-    const statusCode =
-      /invalid|exceeds|limit/i.test(error.message || "") ? 400 : 500;
+    const statusCode = /invalid|exceeds|limit/i.test(error.message || "")
+      ? 400
+      : 500;
     res.status(statusCode).json({
       success: false,
       message: error.message || "Error updating product images",
@@ -817,7 +1054,9 @@ exports.deleteProduct = async (req, res) => {
     const { facilityId } = req.query;
 
     if (!facilityId) {
-      return res.status(400).json({ success: false, message: "facilityId is required" });
+      return res
+        .status(400)
+        .json({ success: false, message: "facilityId is required" });
     }
 
     const product = await db.Product.findOne({
@@ -825,7 +1064,9 @@ exports.deleteProduct = async (req, res) => {
     });
 
     if (!product) {
-      return res.status(404).json({ success: false, message: "Product not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Product not found" });
     }
 
     // Block deletion if the product still has stock on hand
@@ -855,7 +1096,13 @@ exports.deleteProduct = async (req, res) => {
     });
   } catch (error) {
     console.error("Error deleting product:", error);
-    res.status(500).json({ success: false, message: "Error deleting product", error: error.message });
+    res
+      .status(500)
+      .json({
+        success: false,
+        message: "Error deleting product",
+        error: error.message,
+      });
   }
 };
 
@@ -1153,7 +1400,7 @@ exports.bulkImport = async (req, res) => {
               error: error.message,
               status: "error",
             });
-          }
+          },
         );
       } catch (error) {
         errors.push({
@@ -1318,7 +1565,7 @@ exports.getProductMultipliers = async (req, res) => {
       {
         replacements: { facilityId },
         type: db.Sequelize.QueryTypes.SELECT,
-      }
+      },
     );
     res.json({
       success: true,

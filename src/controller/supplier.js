@@ -1164,7 +1164,7 @@ const getSupplierBills = async (req, res) => {
 
     // Normalise pagination values
     const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
-    const pageSize = Math.max(parseInt(limit, 10) || 10, 1);
+    const pageSize = Math.min(100, Math.max(parseInt(limit, 10) || 10, 1));
     const offset = (pageNumber - 1) * pageSize;
 
     // Build WHERE clause for search
@@ -1175,9 +1175,8 @@ const getSupplierBills = async (req, res) => {
     const searchTerm = (search || invoice_ref || "").trim();
 
     if (searchTerm) {
-      // Search by invoice ref, ref number, or supplier name
       whereClause +=
-        " AND (i.invoice_ref LIKE :search OR i.ref_number LIKE :search OR COALESCE(s.supplier_name, '') LIKE :search)";
+        " AND (i.invoice_ref LIKE :search OR i.ref_number LIKE :search OR COALESCE(s.supplier_name, '') LIKE :search OR COALESCE(i.description, '') LIKE :search)";
       replacements.search = `%${searchTerm}%`;
     }
 
@@ -1245,6 +1244,15 @@ const getSupplierBills = async (req, res) => {
 
     const onlyUnpaidBills = onlyUnpaid === "1" || onlyUnpaid === "true";
 
+    const statusLabelMap = {
+      paid: "Paid",
+      unpaid: "Unpaid",
+      partially_paid: "Partially Paid",
+      Paid: "Paid",
+      Unpaid: "Unpaid",
+      "Partially Paid": "Partially Paid",
+    };
+
     // Allowed status filter when onlyUnpaid: Unpaid, Partially Paid
     const allowedStatuses = ["Unpaid", "Partially Paid"];
     let statusList = allowedStatuses;
@@ -1252,9 +1260,14 @@ const getSupplierBills = async (req, res) => {
       const requested = String(status)
         .split(",")
         .map((s) => s.trim())
-        .filter((s) => allowedStatuses.includes(s));
-      if (requested.length > 0) statusList = requested;
+        .filter((s) => allowedStatuses.includes(s) || allowedStatuses.includes(statusLabelMap[s]));
+      const mapped = requested.map((s) => statusLabelMap[s] || s);
+      if (mapped.length > 0) statusList = mapped;
     }
+
+    const generalStatus = !onlyUnpaidBills
+      ? statusLabelMap[String(status || "").trim()] || ""
+      : "";
 
     const statusInClause = "IN ('" + statusList.join("','") + "')";
 
@@ -1280,11 +1293,16 @@ const getSupplierBills = async (req, res) => {
       ${baseQuery}
     `;
 
-    // Query to get paginated bills (filter by status when onlyUnpaid)
-    const dataQuery = onlyUnpaidBills
+    const useStatusSubquery = onlyUnpaidBills || Boolean(generalStatus);
+
+    const dataQuery = useStatusSubquery
       ? `
       SELECT * FROM (${innerSelect}) AS sub
-      WHERE sub.status ${statusInClause}
+      WHERE ${
+        onlyUnpaidBills
+          ? `sub.status ${statusInClause}`
+          : "sub.status = :billStatus"
+      }
       ORDER BY sub.transaction_date DESC
       LIMIT :limit OFFSET :offset;
     `
@@ -1294,11 +1312,14 @@ const getSupplierBills = async (req, res) => {
       LIMIT :limit OFFSET :offset;
     `;
 
-    // Query to get total count for pagination
-    const countQuery = onlyUnpaidBills
+    const countQuery = useStatusSubquery
       ? `
       SELECT COUNT(*) AS total FROM (${innerSelect}) AS sub
-      WHERE sub.status ${statusInClause};
+      WHERE ${
+        onlyUnpaidBills
+          ? `sub.status ${statusInClause}`
+          : "sub.status = :billStatus"
+      };
     `
       : `
       SELECT COUNT(*) AS total
@@ -1309,6 +1330,12 @@ const getSupplierBills = async (req, res) => {
       ...replacements,
       limit: pageSize,
       offset,
+      ...(generalStatus ? { billStatus: generalStatus } : {}),
+    };
+
+    const countReplacements = {
+      ...replacements,
+      ...(generalStatus ? { billStatus: generalStatus } : {}),
     };
 
     const [bills, countResult] = await Promise.all([
@@ -1317,12 +1344,12 @@ const getSupplierBills = async (req, res) => {
         type: db.Sequelize.QueryTypes.SELECT,
       }),
       db.sequelize.query(countQuery, {
-        replacements,
+        replacements: countReplacements,
         type: db.Sequelize.QueryTypes.SELECT,
       }),
     ]);
 
-    const total = countResult?.[0]?.total || 0;
+    const total = Number(countResult?.[0]?.total) || 0;
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
     return res.status(200).json({

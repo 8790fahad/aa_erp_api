@@ -226,12 +226,19 @@ exports.createLoan = async (req, res) => {
     }
 
     const loanStartDate = parseLoanStartDate(startMonth, startDate);
-    if (!loanStartDate) {
+    const isSelfRepayment = repaymentMethod === "Self";
+    if (!isSelfRepayment && !loanStartDate) {
       return res.status(400).json({
         success: false,
         message: "Select the month when the loan starts applying",
       });
     }
+    const resolvedStartDate =
+      loanStartDate ||
+      (() => {
+        const now = new Date();
+        return new Date(now.getFullYear(), now.getMonth(), 1);
+      })();
 
     const resolvedFacilityId = facilityId || req.user?.facilityId;
     const resolvedUserId = userId || req.user?.id;
@@ -322,7 +329,7 @@ exports.createLoan = async (req, res) => {
         monthlyDeductionAmount || loanAmount / months,
       createdBy: resolvedUserId,
       status: shouldPost ? "Approved" : "Pending",
-      startDate: loanStartDate,
+      startDate: resolvedStartDate,
       receivableHead: setupReceivable,
       paymentMode: mode,
       bankHead: resolvedBankHead,
@@ -497,14 +504,19 @@ exports.updateLoan = async (req, res) => {
     }
 
     if (startMonth !== undefined || startDate !== undefined) {
-      const parsed = parseLoanStartDate(startMonth, startDate);
-      if (!parsed) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid start month for loan deductions",
-        });
+      // Self repayment does not use salary deduction start month
+      if (loan.repaymentMethod === "Self" && !startMonth && !startDate) {
+        // no-op: leave existing startDate
+      } else {
+        const parsed = parseLoanStartDate(startMonth, startDate);
+        if (!parsed && loan.repaymentMethod !== "Self") {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid start month for loan deductions",
+          });
+        }
+        if (parsed) loan.startDate = parsed;
       }
-      loan.startDate = parsed;
     }
 
     if (loan.status === "Pending") {

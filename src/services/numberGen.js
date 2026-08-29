@@ -1,45 +1,58 @@
 const db = require("../models");
 
 /**
- * CALL results arrive as { code_no }, [{ code_no }] or [[{ code_no }]] depending
- * on the driver and whether Sequelize unwraps the result set.
+ * Collation-safe equality for MySQL string columns.
+ * Avoids "Illegal mix of collations (utf8mb4_unicode_ci … utf8mb4_0900_ai_ci)".
  */
-function extractReservedNumber(result) {
-  if (result == null) return null;
-
-  if (Array.isArray(result)) {
-    for (const entry of result) {
-      const found = extractReservedNumber(entry);
-      if (found != null) return found;
-    }
-    return null;
-  }
-
-  if (typeof result !== "object") return null;
-
-  const value = Number(result.code_no);
-  return Number.isFinite(value) ? value : null;
+function binEq(columnSql, paramName) {
+  return `BINARY ${columnSql} = BINARY :${paramName}`;
 }
 
-/**
- * Reserve the next number in a facility's series and return it.
- *
- * The reservation happens inside nurmber_generator1 as a single locking
- * statement, so two concurrent callers can never receive the same number.
- * Callers must not separately advance the counter afterwards.
- */
-exports.getAndUpdateNumber = async (prefix, facilityId) => {
-  const result = await db.sequelize.query(
-    `CALL nurmber_generator1(:prefix, :facilityId)`,
-    { replacements: { prefix, facilityId } },
-  );
+// controllers/numberGeneratorController.js
+exports.getAndUpdateNumber = async (prefix, facilityId, transaction = null) => {
+  const opts = transaction ? { transaction } : {};
 
-  const reserved = extractReservedNumber(result);
-  if (reserved == null) {
-    throw new Error(
-      `Failed to reserve a number for prefix "${prefix}" (facility ${facilityId}).`,
+  try {
+    const results = await db.sequelize.query(
+      `SELECT code_no
+       FROM number_generator
+       WHERE ${binEq("prefix", "prefix")}
+         AND ${binEq("facilityId", "facilityId")}`,
+      {
+        replacements: { prefix, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+        ...opts,
+      },
     );
-  }
 
-  return reserved;
+    if (!results || results.length === 0) {
+      await db.sequelize.query(
+        `INSERT INTO number_generator (description, prefix, code_no, facilityId)
+         VALUES (:description, :prefix, 2, :facilityId)`,
+        {
+          replacements: { description: prefix, prefix, facilityId },
+          type: db.Sequelize.QueryTypes.INSERT,
+          ...opts,
+        },
+      );
+      return 1;
+    }
+
+    const currentNumber = results[0].code_no;
+    await db.sequelize.query(
+      `UPDATE number_generator
+       SET code_no = code_no + 1
+       WHERE ${binEq("prefix", "prefix")}
+         AND ${binEq("facilityId", "facilityId")}`,
+      {
+        replacements: { prefix, facilityId },
+        type: db.Sequelize.QueryTypes.UPDATE,
+        ...opts,
+      },
+    );
+    return currentNumber;
+  } catch (error) {
+    console.error("Error getting/updating number:", error);
+    throw error;
+  }
 };

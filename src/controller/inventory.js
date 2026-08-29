@@ -5,6 +5,7 @@ const { Op } = require("sequelize");
 const { getAndUpdateNumber } = require("../services/numberGen");
 const { resolveBranchId, resolveBranchIds, validateBranchIdById } = require("../services/branchResolver");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { isProductTaxable } = require("../constants/taxableStatus");
 async function numberGenerator(
   { query_type = "", facilityId = "" },
   callback = (f) => f,
@@ -3566,7 +3567,7 @@ const createProductionProductEntry = async (
     }
 
     if (
-      taxable === "Taxable" &&
+      isProductTaxable(taxable) &&
       (vat_policy === "vat_inclusive" || vat_policy === "all")
     ) {
       const vatAmount = sellingPrice * (parseFloat(vat_rate) / 100);
@@ -3684,7 +3685,7 @@ const createProductionProductEntry = async (
         markUp: markupValue,
         markupMode: markup_mode,
         vatIncluded:
-          taxable === "Taxable" &&
+          isProductTaxable(taxable) &&
           (vat_policy === "vat_inclusive" || vat_policy === "all"),
       },
     });

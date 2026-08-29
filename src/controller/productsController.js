@@ -8,6 +8,10 @@ const {
   verifyProductAccountsAndBranch,
 } = require("../services/productAccountValidation");
 const { getAndUpdateNumber } = require("../services/numberGen");
+const {
+  normalizeTaxableStatus,
+  isValidTaxableStatus,
+} = require("../constants/taxableStatus");
 
 function mapValuationMethodKey(invEvM) {
   const raw = String(invEvM || "Weighted Average Cost").trim();
@@ -25,6 +29,27 @@ function valuationMethodLabel(key, invEvM) {
   if (k === "FIFO") return "First In, First Out (FIFO)";
   if (k === "LIFO") return "Last In, First Out (LIFO)";
   return String(invEvM || key || "Weighted Average Cost");
+}
+
+/** Case-insensitive product name match within a facility (optional exclude id for edits). */
+async function findProductByName(facilityId, name, excludeId = null, transaction = null) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed || !facilityId) return null;
+  const where = {
+    facility_id: facilityId,
+    [Op.and]: db.sequelize.where(
+      db.sequelize.fn("LOWER", db.sequelize.fn("TRIM", db.sequelize.col("name"))),
+      trimmed.toLowerCase(),
+    ),
+  };
+  if (excludeId != null && excludeId !== "") {
+    where.id = { [Op.ne]: excludeId };
+  }
+  return db.Product.findOne({
+    where,
+    attributes: ["id", "name", "sku"],
+    transaction: transaction || undefined,
+  });
 }
 
 /**
@@ -756,6 +781,15 @@ exports.createProductWithStoreEntry = async (req, res) => {
       as_of_date = moment().format("YYYY-MM-DD"),
     } = req.body;
 
+    const resolvedTaxable = normalizeTaxableStatus(taxable, "Taxable");
+    if (taxable != null && String(taxable).trim() !== "" && !isValidTaxableStatus(taxable)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "taxable must be Taxable, Non-Taxable, Exempted, or Zero Rated",
+      });
+    }
+
     const parsedBranchId =
       branch_id == null || branch_id === "" || branch_id === "all"
         ? null
@@ -786,6 +820,14 @@ exports.createProductWithStoreEntry = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Missing required fields: name, item_type, facility_id",
+      });
+    }
+
+    const duplicateName = await findProductByName(facility_id, name);
+    if (duplicateName) {
+      return res.status(400).json({
+        success: false,
+        message: `Product name "${String(name).trim()}" already exists. Product name must be unique.`,
       });
     }
 
@@ -898,7 +940,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
           deposit_liability_account,
           tags: tags,
           notes,
-          taxable: taxable || "Taxable",
+          taxable: resolvedTaxable,
           line_of_business: line_of_business ? 1 : 0,
         },
         { transaction }
@@ -1131,6 +1173,39 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
         });
       }
 
+      const nameKey = String(name).trim().toLowerCase();
+      const dupInBatch = products
+        .slice(0, i)
+        .some(
+          (p) =>
+            String(p.item_name || p.name || "")
+              .trim()
+              .toLowerCase() === nameKey,
+        );
+      if (dupInBatch) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Item #${index} (${name}): Duplicate product name in this import. Product name must be unique.`,
+          failedAt: index,
+        });
+      }
+
+      const duplicateName = await findProductByName(
+        facility_id,
+        name,
+        null,
+        transaction,
+      );
+      if (duplicateName) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Item #${index} (${name}): Product name already exists. Product name must be unique.`,
+          failedAt: index,
+        });
+      }
+
       if (!allowedTypes.some((type) => item_type.includes(type))) {
         await transaction.rollback();
         return res.status(400).json({
@@ -1244,7 +1319,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
           supplier_id,
           reorder_level,
           warehouse_id,
-          taxable,
+          taxable: normalizeTaxableStatus(taxable, "Taxable"),
           category,
           inventory_account,
           unit_of_measure: unit,
@@ -1457,6 +1532,33 @@ exports.updateProduct = async (req, res) => {
         safeUpdate[key] = updateData[key];
       }
     }
+    if (safeUpdate.taxable != null) {
+      if (!isValidTaxableStatus(safeUpdate.taxable)) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "taxable must be Taxable, Non-Taxable, Exempted, or Zero Rated",
+        });
+      }
+      safeUpdate.taxable = normalizeTaxableStatus(safeUpdate.taxable, "Taxable");
+    }
+
+    if (safeUpdate.name != null && String(safeUpdate.name).trim()) {
+      const duplicateName = await findProductByName(
+        facilityId,
+        safeUpdate.name,
+        productId,
+        transaction,
+      );
+      if (duplicateName) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Product name "${String(safeUpdate.name).trim()}" already exists. Product name must be unique.`,
+        });
+      }
+    }
 
     await product.update(safeUpdate, { transaction });
 
@@ -1654,6 +1756,43 @@ exports.updateProduct = async (req, res) => {
       success: false,
       message: error.message || "Error updating product",
       error: error.message,
+    });
+  }
+};
+
+/** Check whether a product name is already used in this facility. */
+exports.checkProductName = async (req, res) => {
+  try {
+    const { facilityId } = req.params;
+    const name = req.query.name || req.query.item_name || "";
+    const excludeId = req.query.excludeId || req.query.exclude_id || null;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!String(name).trim()) {
+      return res.json({
+        success: true,
+        exists: false,
+        available: true,
+      });
+    }
+    const existing = await findProductByName(facilityId, name, excludeId);
+    return res.json({
+      success: true,
+      exists: !!existing,
+      available: !existing,
+      product: existing
+        ? { id: existing.id, name: existing.name, sku: existing.sku }
+        : null,
+    });
+  } catch (error) {
+    console.error("checkProductName:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to check product name",
     });
   }
 };

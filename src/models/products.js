@@ -201,7 +201,12 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: "Active",
       },
       taxable: {
-        type: DataTypes.ENUM("Taxable", "Not Taxable"),
+        type: DataTypes.ENUM(
+          "Taxable",
+          "Non-Taxable",
+          "Exempted",
+          "Zero Rated",
+        ),
         allowNull: false,
         validate: {
           notEmpty: true,
@@ -261,6 +266,11 @@ module.exports = (sequelize, DataTypes) => {
         {
           unique: true,
           fields: ["sku", "facility_id"], // Composite unique key
+        },
+        {
+          unique: true,
+          name: "products_facility_name_uq",
+          fields: ["facility_id", "name"],
         },
         { fields: ["facility_id"] },
         { fields: ["item_type"] },

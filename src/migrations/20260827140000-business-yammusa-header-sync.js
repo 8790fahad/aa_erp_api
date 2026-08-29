@@ -3,15 +3,17 @@
 const fs = require("fs");
 const path = require("path");
 
+/**
+ * Sync ALH ALI MUHAMMAD YAMMUSA document header settings so online
+ * matches local (name, address, phones, logo header).
+ *
+ * Business: 094c6e1e-dd07-48c4-a344-6e9d58cd7861
+ */
 const BUSINESS_ID = "094c6e1e-dd07-48c4-a344-6e9d58cd7861";
-const NEW_NAME = "ALH ALI MUHAMMAD YAMMUSA";
-const NEW_ADDRESS = "#52E Ado Bayero Road Singer Market, Kano.";
-const NEW_PHONE =
+const BUSINESS_NAME = "ALH ALI MUHAMMAD YAMMUSA";
+const BUSINESS_ADDRESS = "#52E Ado Bayero Road Singer Market, Kano.";
+const BUSINESS_PHONE =
   "08036032541, 07032144609, 07077222277, 08081634455";
-const OLD_NAME = "YAMMUSA GLOBAL FARMS & AGRO ALLIED SERVICES";
-const OLD_ADDRESS =
-  "NO. 9 SHEHU NA ALLAH STREET, YANKABA, NASARAWA LGA, KANO, KANO STATE";
-const OLD_PHONE = "0814 444 4220";
 
 function resolveLogoPath() {
   const candidates = [
@@ -43,25 +45,17 @@ function resolveLogoPath() {
 
 function loadLogoDataUri() {
   const logoPath = resolveLogoPath();
-  if (!logoPath) {
-    throw new Error(
-      "yammusa-logo.png not found — expected under migrations/assets/",
-    );
-  }
+  if (!logoPath) return null;
   const buf = fs.readFileSync(logoPath);
   return `data:image/png;base64,${buf.toString("base64")}`;
 }
 
-/**
- * Rebrand YAMMUSA business:
- * - Name: ALH ALI MUHAMMAD YAMMUSA
- * - Address: #52E Ado Bayero Road Singer Market, Kano.
- * - Phones: 08036032541, 07032144609, 07077222277, 08081634455
- * - Logo: circular Salt/Rice emblem (migrations/assets/yammusa-logo.png)
- */
 module.exports = {
   async up(queryInterface) {
     const logo = loadLogoDataUri();
+    const setLogo = logo
+      ? ", business_logo = :logo"
+      : "";
 
     await queryInterface.sequelize.query(
       `
@@ -70,8 +64,8 @@ module.exports = {
         business_name = :name,
         business_address = :address,
         business_phone = :phone,
-        business_logo = :logo,
         document_header_style = 'logo'
+        ${setLogo}
       WHERE id = :id
          OR UPPER(business_name) LIKE '%YAMMUSA%'
          OR UPPER(business_name) LIKE '%YAMUSA%'
@@ -80,36 +74,16 @@ module.exports = {
       {
         replacements: {
           id: BUSINESS_ID,
-          name: NEW_NAME,
-          address: NEW_ADDRESS,
-          phone: NEW_PHONE,
-          logo,
+          name: BUSINESS_NAME,
+          address: BUSINESS_ADDRESS,
+          phone: BUSINESS_PHONE,
+          ...(logo ? { logo } : {}),
         },
       },
     );
   },
 
-  async down(queryInterface) {
-    await queryInterface.sequelize.query(
-      `
-      UPDATE business
-      SET
-        business_name = :name,
-        business_address = :address,
-        business_phone = :phone,
-        business_logo = NULL
-      WHERE id = :id
-         OR business_name = :newName
-      `,
-      {
-        replacements: {
-          id: BUSINESS_ID,
-          name: OLD_NAME,
-          address: OLD_ADDRESS,
-          phone: OLD_PHONE,
-          newName: NEW_NAME,
-        },
-      },
-    );
+  async down() {
+    // Keep current branding — earlier migrations own the prior values.
   },
 };
