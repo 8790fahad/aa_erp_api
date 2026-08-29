@@ -8,6 +8,10 @@ const {
   verifyProductAccountsAndBranch,
 } = require("../services/productAccountValidation");
 const { getAndUpdateNumber } = require("../services/numberGen");
+const {
+  normalizeTaxableStatus,
+  isValidTaxableStatus,
+} = require("../constants/taxableStatus");
 
 function mapValuationMethodKey(invEvM) {
   const raw = String(invEvM || "Weighted Average Cost").trim();
@@ -777,6 +781,15 @@ exports.createProductWithStoreEntry = async (req, res) => {
       as_of_date = moment().format("YYYY-MM-DD"),
     } = req.body;
 
+    const resolvedTaxable = normalizeTaxableStatus(taxable, "Taxable");
+    if (taxable != null && String(taxable).trim() !== "" && !isValidTaxableStatus(taxable)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "taxable must be Taxable, Non-Taxable, Exempted, or Zero Rated",
+      });
+    }
+
     const parsedBranchId =
       branch_id == null || branch_id === "" || branch_id === "all"
         ? null
@@ -927,7 +940,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
           deposit_liability_account,
           tags: tags,
           notes,
-          taxable: taxable || "Taxable",
+          taxable: resolvedTaxable,
           line_of_business: line_of_business ? 1 : 0,
         },
         { transaction }
@@ -1306,7 +1319,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
           supplier_id,
           reorder_level,
           warehouse_id,
-          taxable,
+          taxable: normalizeTaxableStatus(taxable, "Taxable"),
           category,
           inventory_account,
           unit_of_measure: unit,
@@ -1518,6 +1531,17 @@ exports.updateProduct = async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(updateData, key)) {
         safeUpdate[key] = updateData[key];
       }
+    }
+    if (safeUpdate.taxable != null) {
+      if (!isValidTaxableStatus(safeUpdate.taxable)) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "taxable must be Taxable, Non-Taxable, Exempted, or Zero Rated",
+        });
+      }
+      safeUpdate.taxable = normalizeTaxableStatus(safeUpdate.taxable, "Taxable");
     }
 
     if (safeUpdate.name != null && String(safeUpdate.name).trim()) {

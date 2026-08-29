@@ -2341,7 +2341,7 @@ exports.acceptInvite = async (req, res) => {
     userId,
     businessId,
     functionalities = "",
-    access_to = "Dashboard",
+    access_to = "",
   } = req.body;
 
   try {

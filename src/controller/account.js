@@ -44,6 +44,7 @@ const {
   recordActivity,
   pickActor,
 } = require("../services/activityAuditService");
+const { isProductTaxable } = require("../constants/taxableStatus");
 
 exports.getAccountByCategory = (req, res) => {
   const { category } = req.params;
@@ -8519,7 +8520,10 @@ WHERE se.branch_name in ("Finished Good","Resalable") and p.item_type in ("Finis
 exports.getReadyForSalesItems = async (req, res) => {
   try {
     const { facilityId } = req.params;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8599,7 +8603,10 @@ exports.getReadyForSalesItems = async (req, res) => {
 
     await attachSalesLimitInfo(results, facilityId);
 
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.error("Error fetching ready for sales items:", err);
     res.status(500).json({ success: false, err: err.message });
@@ -8610,7 +8617,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
   try {
     const { facilityId } = req.params;
     const { branchId } = req.query;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     // Get business setting for allow_sales_without_stock
     const business = await db.business.findOne({
@@ -8693,7 +8703,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 
     await attachSalesLimitInfo(results, facilityId);
 
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.error("Error fetching ready for sales items by branch:", err);
     res.status(500).json({ success: false, err: err.message });
@@ -8704,7 +8717,10 @@ exports.getReadyForSalesByBranch = async (req, res) => {
 exports.getServiceProducts = async (req, res) => {
   try {
     const { facilityId } = req.params;
-    const { attachSalesLimitInfo } = require("../services/salesLimits");
+    const {
+      attachSalesLimitInfo,
+      omitStoppedUnlessIncluded,
+    } = require("../services/salesLimits");
 
     const includeStopped = ["1", "true", "yes"].includes(
       String(req.query.includeStopped || "").toLowerCase(),
@@ -8748,7 +8764,10 @@ ORDER BY p.name ASC;`,
       },
     );
     await attachSalesLimitInfo(results, facilityId);
-    res.json({ success: true, results });
+    res.json({
+      success: true,
+      results: omitStoppedUnlessIncluded(results, includeStopped),
+    });
   } catch (err) {
     console.log(err);
     res.status(500).json({ err: err.message || err });
@@ -10067,6 +10086,124 @@ exports.updateInvoiceClosingSettings = async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating invoice closing settings:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
+/**
+ * POST /account/update-session-lock/:facilityId/:user_id
+ * body: { session_lock_enabled, session_lock_idle_minutes }
+ * Business-wide idle lock — applies to every user of this facility.
+ */
+exports.updateSessionLockSettings = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const body = req.body || {};
+
+    const updatePayload = {};
+
+    if (body.session_lock_enabled !== undefined) {
+      updatePayload.session_lock_enabled =
+        body.session_lock_enabled === true ||
+        body.session_lock_enabled === "true" ||
+        body.session_lock_enabled === 1 ||
+        body.session_lock_enabled === "1";
+    }
+
+    if (body.session_lock_idle_minutes !== undefined) {
+      const minutes = Math.round(Number(body.session_lock_idle_minutes));
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 240) {
+        return res.status(400).json({
+          success: false,
+          message: "session_lock_idle_minutes must be between 1 and 240",
+        });
+      }
+      updatePayload.session_lock_idle_minutes = minutes;
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No session lock settings provided",
+      });
+    }
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+    });
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.id,
+        b.business_name,
+        b.business_type,
+        b.business_logo,
+        b.primary_color,
+        b.secondary_color,
+        b.business_phone,
+        b.prefix,
+        b.payable_code,
+        b.receivable_code,
+        b.cost_of_sale,
+        b.payable_accural_code,
+        b.receivable_accural_code,
+        b.sale_revenue_code,
+        b.inv_ev_m,
+        b.costing_method,
+        b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
+        b.invoice_closing_enabled,
+        b.invoice_closing_time,
+        b.invoice_closing_timezone,
+        b.invoice_closing_last_run,
+        b.session_lock_enabled,
+        b.session_lock_idle_minutes,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Session lock",
+      after: updatePayload,
+      remark: "Business session lock settings updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: "Session lock settings updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating session lock settings:", err);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -12137,6 +12274,15 @@ exports.insertRequisition = async (req, res) => {
 
   const po_documents = req?.files?.po_documents || [];
   const document_names = body.document_names;
+  let linked_documents = body.linked_documents || [];
+  if (typeof linked_documents === "string") {
+    try {
+      linked_documents = JSON.parse(linked_documents);
+    } catch (_) {
+      linked_documents = [];
+    }
+  }
+  if (!Array.isArray(linked_documents)) linked_documents = [];
   const transaction = await db.sequelize.transaction();
 
   try {
@@ -12189,7 +12335,34 @@ exports.insertRequisition = async (req, res) => {
       }
     }
 
-    if (po_documents.length > 0) {
+    const docsToSave = [];
+    for (let i = 0; i < po_documents.length; i++) {
+      const file = po_documents[i];
+      const customName = Array.isArray(document_names)
+        ? document_names[i]
+        : typeof document_names === "string"
+          ? document_names
+          : null;
+      docsToSave.push({
+        document_name: customName || file.originalname,
+        file_path: file.filename,
+        original_name: file.originalname,
+        file_size: file.size,
+        mime_type: file.mimetype,
+      });
+    }
+    for (const doc of linked_documents) {
+      if (!doc?.file_path) continue;
+      docsToSave.push({
+        document_name: doc.document_name || doc.original_name || doc.file_path,
+        file_path: doc.file_path,
+        original_name: doc.original_name || doc.document_name || null,
+        file_size: doc.file_size || null,
+        mime_type: doc.mime_type || null,
+      });
+    }
+
+    if (docsToSave.length > 0) {
       await db.sequelize.query(
         `CREATE TABLE IF NOT EXISTS purchase_order_documents (
           id INT AUTO_INCREMENT PRIMARY KEY,
@@ -12210,14 +12383,7 @@ exports.insertRequisition = async (req, res) => {
         { transaction },
       );
 
-      for (let i = 0; i < po_documents.length; i++) {
-        const file = po_documents[i];
-        const customName = Array.isArray(document_names)
-          ? document_names[i]
-          : typeof document_names === "string"
-            ? document_names
-            : null;
-
+      for (const doc of docsToSave) {
         await db.sequelize.query(
           `INSERT INTO purchase_order_documents
             (pr_no, po_no, facilityId, document_name, file_path, original_name, file_size, mime_type, doc_type, uploaded_by)
@@ -12228,11 +12394,11 @@ exports.insertRequisition = async (req, res) => {
               pr_no: newCode,
               po_no: po_no || null,
               facilityId,
-              document_name: customName || file.originalname,
-              file_path: file.filename,
-              original_name: file.originalname,
-              file_size: file.size,
-              mime_type: file.mimetype,
+              document_name: doc.document_name,
+              file_path: doc.file_path,
+              original_name: doc.original_name,
+              file_size: doc.file_size,
+              mime_type: doc.mime_type,
               doc_type: "delivery",
               uploaded_by: user_id || requisitor || null,
             },
@@ -12257,7 +12423,7 @@ exports.insertRequisition = async (req, res) => {
         total,
         reason,
         line_count: expenses?.length || 0,
-        document_count: po_documents.length,
+        document_count: docsToSave.length,
       },
       remark: reason || "Purchase requisition created",
     });
@@ -12267,7 +12433,7 @@ exports.insertRequisition = async (req, res) => {
       results: requisitionResult,
       pr_no: newCode,
       message: "Requisition created successfully",
-      documents_saved: po_documents.length,
+      documents_saved: docsToSave.length,
     });
   } catch (error) {
     await transaction.rollback();
@@ -12335,6 +12501,41 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to load purchase order documents",
+      error: error.message,
+    });
+  }
+};
+
+/** Save files to disk immediately and return paths so the form can link them on submit. */
+exports.stagePurchaseOrderDocuments = async (req, res) => {
+  try {
+    const po_documents = req?.files?.po_documents || [];
+    if (!po_documents.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No documents uploaded",
+      });
+    }
+
+    const results = po_documents.map((file) => ({
+      original_name: file.originalname,
+      document_name: file.originalname,
+      file_path: file.filename,
+      file_size: file.size,
+      mime_type: file.mimetype,
+      url: `/public/uploads/${file.filename}`,
+    }));
+
+    return res.json({
+      success: true,
+      message: `${results.length} document(s) uploaded`,
+      results,
+    });
+  } catch (error) {
+    console.error("Error staging PO documents:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to upload documents",
       error: error.message,
     });
   }
@@ -13312,7 +13513,7 @@ exports.directPurchaseConsumables = async (req, res) => {
       if (!inventoryAccount) throw new Error(`Inventory account not found`);
 
       // Check if item is taxable
-      const isTaxable = product.taxable === "Taxable";
+      const isTaxable = isProductTaxable(product.taxable);
       if (isTaxable) {
         totalTaxableAmount += itemTotal;
       }
@@ -13997,7 +14198,7 @@ exports.getExpenseBill = async (req, res) => {
           parseFloat(item.cost || item.product_cost_price || 0),
         unit_measure: item.product_unit_of_measure || "pcs",
         item_type: item.product_item_type || "N/A",
-        taxable: item.product_taxable || "Not Taxable",
+        taxable: item.product_taxable || "Non-Taxable",
         vat_amount: parseFloat(item.vat_amount || 0) || 0,
         product: item.product_id
           ? {
@@ -14437,7 +14638,7 @@ exports.directPurchaseExpenses = async (req, res) => {
         account_description: expenseAccount.description,
         transaction_description: description,
         type: "expenses",
-        _taxable: item.taxable === "Taxable",
+        _taxable: isProductTaxable(item.taxable),
       });
 
       // === 3. If advance was used → Credit Payable (consume advance) ===
@@ -14480,7 +14681,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     // === PARSE TAX AMOUNT & TAXABLE ITEMS ===
     const totalTaxAmount = parseFloat(tax_amount || 0);
     const taxArray = Array.isArray(taxes) ? taxes : [];
-    const taxableItems = data.filter((item) => item.taxable === "Taxable");
+    const taxableItems = data.filter((item) => isProductTaxable(item.taxable));
     const totalTaxableAmount = taxableItems.reduce((sum, item) => {
       const qty = parseFloat(item.quantity || item.qty || 1);
       const cost = parseFloat(item.cost || 0);
@@ -15026,7 +15227,7 @@ exports.directExpenses = async (req, res) => {
       }
 
       const legacyTaxable =
-        item.taxable === "Taxable" ||
+        isProductTaxable(item.taxable) ||
         item.taxable === true ||
         String(item.taxable || "").toLowerCase() === "taxable";
 

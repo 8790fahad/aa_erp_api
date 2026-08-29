@@ -201,7 +201,12 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: "Active",
       },
       taxable: {
-        type: DataTypes.ENUM("Taxable", "Not Taxable"),
+        type: DataTypes.ENUM(
+          "Taxable",
+          "Non-Taxable",
+          "Exempted",
+          "Zero Rated",
+        ),
         allowNull: false,
         validate: {
           notEmpty: true,

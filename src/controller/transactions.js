@@ -12,6 +12,7 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
+const { isProductTaxable } = require("../constants/taxableStatus");
 // getBalance function - inline implementation to avoid ES6/CommonJS import issues
 const getBalance = async (customerNo, facilityId) => {
   const result = await db.sequelize.query(
@@ -2976,17 +2977,24 @@ exports.createSale = async (req, res) => {
 
     // ===================================================================
     // STOP SALES + SALES TARGET (early, before ledger / stock work)
-    // Aggregates qty by SKU so multi-line carts cannot bypass limits.
+    // Aggregates qty by SKU + warehouse so multi-line carts cannot bypass limits.
     // ===================================================================
     {
-      const earlyQtyBySku = new Map();
+      const earlyQtyByKey = new Map();
       for (const itm of items) {
         const sku = itm.product_id || itm.sku;
         const qty = Number(itm.quantity || itm.qty || 0);
         if (!sku || !(qty > 0)) continue;
-        earlyQtyBySku.set(String(sku), (earlyQtyBySku.get(String(sku)) || 0) + qty);
+        const bid =
+          parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+          saleBranchId ||
+          0;
+        const key = `${sku}|${bid}`;
+        earlyQtyByKey.set(key, (earlyQtyByKey.get(key) || 0) + qty);
       }
-      for (const [sku, qty] of earlyQtyBySku.entries()) {
+      for (const [key, qty] of earlyQtyByKey.entries()) {
+        const [sku, branchPart] = key.split("|");
+        const branchId = parseInt(branchPart, 10) || 0;
         const product = await db.Product.findOne({
           where: { sku, facility_id: facilityId },
           attributes: [
@@ -3015,6 +3023,7 @@ exports.createSale = async (req, res) => {
             qty,
             saleDate,
             transaction: t,
+            branchId,
           });
         } catch (limitErr) {
           await t.rollback();
@@ -3709,14 +3718,22 @@ exports.createSale = async (req, res) => {
     // ===================================================================
     // FIRST PASS: CALCULATE SUBTOTAL AND VALIDATE ITEMS
     // ===================================================================
-    // Aggregate qty by SKU so multi-line same-SKU carts cannot bypass limits
+    // Aggregate qty by SKU + warehouse so multi-line carts cannot bypass limits
     const qtyBySku = new Map();
+    const qtyBySkuBranch = new Map();
     const remainingSellableByKey = new Map();
+    const assertedLimitKeys = new Set();
     for (const itm of items) {
       const sku = itm.product_id;
       const qty = Number(itm.quantity);
       if (!sku || !(qty > 0)) continue;
       qtyBySku.set(sku, (qtyBySku.get(sku) || 0) + qty);
+      const bid =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+      const key = `${sku}|${bid}`;
+      qtyBySkuBranch.set(key, (qtyBySkuBranch.get(key) || 0) + qty);
     }
     const productBySku = new Map();
 
@@ -3757,15 +3774,24 @@ exports.createSale = async (req, res) => {
         });
         if (!product) throw new Error(`Product not found: ${sku}`);
         productBySku.set(sku, product);
+      }
 
+      const lineLimitBranchId =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+      const limitKey = `${sku}|${lineLimitBranchId}`;
+      if (!assertedLimitKeys.has(limitKey)) {
+        assertedLimitKeys.add(limitKey);
         // Sales target / limit / stop — block even when stock remains (aggregated qty)
         await assertProductSalesLimits({
           product,
           sku,
           facilityId,
-          qty: qtyBySku.get(sku) || qty,
+          qty: qtyBySkuBranch.get(limitKey) || qty,
           saleDate,
           transaction: t,
+          branchId: lineLimitBranchId,
         });
       }
 
@@ -3928,7 +3954,7 @@ exports.createSale = async (req, res) => {
 
       const discountedGross = lineTotal - itemDiscount;
 
-      const isTaxable = product.taxable === "Taxable";
+      const isTaxable = isProductTaxable(product.taxable);
 
       let revenueAmount, itemVAT, itemTaxBreakdown;
 

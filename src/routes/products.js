@@ -36,6 +36,6 @@ module.exports = (app) => {
   app.delete("/api/product-multipliers/:id", products.deleteProductMultiplier);
   app.put(
     "/api/product-multipliers/:id/toggle-status",
-    products.toggleProductMultiplierStatus
+    products.toggleProductMultiplierStatus,
   );
 };

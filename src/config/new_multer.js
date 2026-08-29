@@ -7,6 +7,7 @@ const allowedMimeTypes = [
   'application/pdf',
   'image/png',
   'image/jpeg',
+  'image/jpg',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
 ];
 

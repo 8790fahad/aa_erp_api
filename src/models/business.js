@@ -70,6 +70,19 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         comment: "Last date daily invoice auto-reverse ran",
       },
+      session_lock_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment:
+          "When true, all users of this business auto-lock after idle minutes",
+      },
+      session_lock_idle_minutes: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 10,
+        comment: "Idle minutes before session lock (1–240) for this business",
+      },
       pro_bono_code: {
         type: DataTypes.STRING(50),
         allowNull: true,

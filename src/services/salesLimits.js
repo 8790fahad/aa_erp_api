@@ -2,8 +2,9 @@
 
 /**
  * Product sales target / limit helpers.
- * null / undefined / <=0 limit = unlimited.
- * When a limit is reached, further sales are blocked even if stock remains.
+ * Limits are per warehouse (product_sales_limits). Product-level
+ * daily/weekly/monthly columns remain as fallback when no warehouse
+ * rows exist yet. null / <=0 = unlimited.
  */
 
 const moment = require("moment");
@@ -15,6 +16,86 @@ function parseLimit(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return Math.floor(n);
+}
+
+function parseBranchId(value) {
+  const n = parseInt(value, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function limitKey(sku, branchId) {
+  const b = parseBranchId(branchId);
+  return `${sku}|${b || 0}`;
+}
+
+function emptyLimits(sales_stopped) {
+  return {
+    daily_sales_limit: null,
+    weekly_sales_limit: null,
+    monthly_sales_limit: null,
+    sales_stopped,
+  };
+}
+
+function limitsFromWarehouseRow(row, sales_stopped) {
+  const period = String(row?.period || "").toLowerCase();
+  const qty = parseLimit(row?.quantity);
+  const base = emptyLimits(sales_stopped);
+  if (!period || qty == null) return base;
+  if (period === "daily") base.daily_sales_limit = qty;
+  if (period === "weekly") base.weekly_sales_limit = qty;
+  if (period === "monthly") base.monthly_sales_limit = qty;
+  return base;
+}
+
+async function loadWarehouseLimitRows({ facilityId, skus, transaction }) {
+  if (!db.ProductSalesLimit || !facilityId) return [];
+  const unique = [...new Set((skus || []).filter(Boolean).map(String))];
+  if (!unique.length) return [];
+  try {
+    return await db.ProductSalesLimit.findAll({
+      where: {
+        facility_id: facilityId,
+        sku: unique,
+      },
+      raw: true,
+      transaction,
+    });
+  } catch (err) {
+    console.warn("product_sales_limits lookup skipped:", err.message);
+    return [];
+  }
+}
+
+async function loadWarehouseStopRows({ facilityId, skus, transaction }) {
+  if (!db.ProductSalesStop || !facilityId) return [];
+  const unique = [...new Set((skus || []).filter(Boolean).map(String))];
+  if (!unique.length) return [];
+  try {
+    return await db.ProductSalesStop.findAll({
+      where: {
+        facility_id: facilityId,
+        sku: unique,
+      },
+      raw: true,
+      transaction,
+    });
+  } catch (err) {
+    console.warn("product_sales_stops lookup skipped:", err.message);
+    return [];
+  }
+}
+
+function isStoppedForWarehouse({ product, sku, branchId, stopRows }) {
+  const skuStops = (stopRows || []).filter(
+    (r) => String(r.sku) === String(sku),
+  );
+  if (skuStops.length) {
+    const bid = parseBranchId(branchId);
+    if (!bid) return false;
+    return skuStops.some((r) => parseBranchId(r.branch_id) === bid);
+  }
+  return isSalesStopped(product?.sales_stopped);
 }
 
 function limitChecksForProduct(product, saleDate) {
@@ -59,15 +140,19 @@ function limitChecksForProduct(product, saleDate) {
 }
 
 /**
- * Sum qty_out for sales-type store entries of a product in [fromDate, toDate] (inclusive, YYYY-MM-DD).
+ * Sum qty_out for sales-type store entries of a product in [fromDate, toDate].
+ * When branchId is set, only that warehouse is counted.
  */
 async function getSoldQtyInRange({
   sku,
   facilityId,
   fromDate,
   toDate,
+  branchId,
   transaction,
 }) {
+  const parsedBranch = parseBranchId(branchId);
+  const branchSql = parsedBranch ? " AND branchId = :branchId" : "";
   const rows = await db.sequelize.query(
     `SELECT COALESCE(SUM(qty_out), 0) AS sold
      FROM store_entries
@@ -75,6 +160,7 @@ async function getSoldQtyInRange({
        AND facilityId = :facilityId
        AND qty_out > 0
        AND type IN (${salesTypesSqlList()})
+       ${branchSql}
        AND DATE(
          CASE
            WHEN receive_date IS NOT NULL AND TRIM(receive_date) <> ''
@@ -83,7 +169,13 @@ async function getSoldQtyInRange({
          END
        ) BETWEEN :fromDate AND :toDate`,
     {
-      replacements: { sku, facilityId, fromDate, toDate },
+      replacements: {
+        sku,
+        facilityId,
+        fromDate,
+        toDate,
+        ...(parsedBranch ? { branchId: parsedBranch } : {}),
+      },
       type: db.sequelize.QueryTypes.SELECT,
       transaction,
     },
@@ -93,7 +185,7 @@ async function getSoldQtyInRange({
 
 /**
  * Batch sold qty for many SKUs in one date window.
- * @returns {Map<string, number>}
+ * @returns {{ bySku: Map<string, number>, bySkuBranch: Map<string, number> }}
  */
 async function getSoldQtyInRangeBatch({
   skus,
@@ -103,11 +195,12 @@ async function getSoldQtyInRangeBatch({
   transaction,
 }) {
   const unique = [...new Set((skus || []).filter(Boolean).map(String))];
-  const map = new Map(unique.map((s) => [s, 0]));
-  if (!unique.length) return map;
+  const bySku = new Map(unique.map((s) => [s, 0]));
+  const bySkuBranch = new Map();
+  if (!unique.length) return { bySku, bySkuBranch };
 
   const rows = await db.sequelize.query(
-    `SELECT product_id AS sku, COALESCE(SUM(qty_out), 0) AS sold
+    `SELECT product_id AS sku, branchId, COALESCE(SUM(qty_out), 0) AS sold
      FROM store_entries
      WHERE product_id IN (:skus)
        AND facilityId = :facilityId
@@ -120,7 +213,7 @@ async function getSoldQtyInRangeBatch({
            ELSE createdAt
          END
        ) BETWEEN :fromDate AND :toDate
-     GROUP BY product_id`,
+     GROUP BY product_id, branchId`,
     {
       replacements: { skus: unique, facilityId, fromDate, toDate },
       type: db.sequelize.QueryTypes.SELECT,
@@ -128,9 +221,28 @@ async function getSoldQtyInRangeBatch({
     },
   );
   for (const row of rows || []) {
-    map.set(String(row.sku), parseFloat(row.sold || 0) || 0);
+    const sku = String(row.sku);
+    const sold = parseFloat(row.sold || 0) || 0;
+    bySku.set(sku, (bySku.get(sku) || 0) + sold);
+    bySkuBranch.set(limitKey(sku, row.branchId), sold);
   }
-  return map;
+  return { bySku, bySkuBranch };
+}
+
+function resolveLimitProduct({
+  product,
+  sku,
+  branchId,
+  warehouseRows,
+}) {
+  const rows = warehouseRows || [];
+  const skuRows = rows.filter((r) => String(r.sku) === String(sku));
+  if (!skuRows.length) return product;
+  const match = skuRows.find(
+    (r) => parseBranchId(r.branch_id) === parseBranchId(branchId),
+  );
+  if (!match) return emptyLimits(product?.sales_stopped);
+  return limitsFromWarehouseRow(match, product?.sales_stopped);
 }
 
 /**
@@ -142,10 +254,27 @@ async function getProductSalesLimitSnapshot({
   sku,
   facilityId,
   saleDate,
+  branchId,
   transaction,
 }) {
-  const checks = limitChecksForProduct(product, saleDate);
+  const warehouseRows = await loadWarehouseLimitRows({
+    facilityId,
+    skus: [sku],
+    transaction,
+  });
+  const limitProduct = resolveLimitProduct({
+    product,
+    sku,
+    branchId,
+    warehouseRows,
+  });
+  const checks = limitChecksForProduct(limitProduct, saleDate);
   if (!checks.length) return null;
+
+  const countByBranch = warehouseRows.some(
+    (r) => String(r.sku) === String(sku),
+  );
+  const soldBranchId = countByBranch ? parseBranchId(branchId) : null;
 
   let tightest = null;
   for (const check of checks) {
@@ -154,6 +283,7 @@ async function getProductSalesLimitSnapshot({
       facilityId,
       fromDate: check.from,
       toDate: check.to,
+      branchId: soldBranchId,
       transaction,
     });
     const remaining = Math.max(0, check.limit - sold);
@@ -175,7 +305,6 @@ function isSalesStopped(value) {
     return false;
   }
   if (value === true || value === 1 || value === "1") return true;
-  // mysql2 sometimes returns TINYINT/BOOLEAN as Buffer
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
     return value.length > 0 && value[0] !== 0;
   }
@@ -184,7 +313,7 @@ function isSalesStopped(value) {
 }
 
 /**
- * Attach sales_limit_* fields + remaining onto sellable rows (by product_id/sku).
+ * Attach sales_limit_* fields + remaining onto sellable rows (by product_id/sku + warehouse).
  * Mutates and returns the same array.
  */
 async function attachSalesLimitInfo(rows, facilityId, saleDate) {
@@ -208,7 +337,6 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
     }
   }
 
-  // Prefer product master if limits / stop flag were not joined onto the row
   const missing = [...bySku.entries()].filter(
     ([, p]) =>
       p.sales_stopped == null &&
@@ -251,21 +379,56 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
     }
   }
 
-  const limitedSkus = [];
-  const checksBySku = new Map();
-  for (const [sku, product] of bySku.entries()) {
-    const checks = limitChecksForProduct(product, when);
-    if (!checks.length) continue;
-    limitedSkus.push(sku);
-    checksBySku.set(sku, { product, checks });
+  const allSkus = [...bySku.keys()];
+  const [warehouseRows, stopRows] = await Promise.all([
+    loadWarehouseLimitRows({
+      facilityId,
+      skus: allSkus,
+    }),
+    loadWarehouseStopRows({
+      facilityId,
+      skus: allSkus,
+    }),
+  ]);
+  const warehouseBySku = new Map();
+  for (const row of warehouseRows) {
+    const sku = String(row.sku);
+    if (!warehouseBySku.has(sku)) warehouseBySku.set(sku, []);
+    warehouseBySku.get(sku).push(row);
   }
 
-  const soldCache = new Map(); // key: period|from|to -> Map(sku->sold)
+  const limitedKeys = [];
+  const checksByKey = new Map();
+  for (const row of list) {
+    const sku = String(row.product_id || row.sku || "");
+    if (!sku) continue;
+    const branchId = row.branchId ?? row.branch_id;
+    const key = limitKey(sku, branchId);
+    if (checksByKey.has(key)) continue;
+    const product = resolveLimitProduct({
+      product: bySku.get(sku) || {},
+      sku,
+      branchId,
+      warehouseRows,
+    });
+    const checks = limitChecksForProduct(product, when);
+    if (!checks.length) continue;
+    limitedKeys.push(key);
+    checksByKey.set(key, {
+      sku,
+      branchId: parseBranchId(branchId),
+      product,
+      checks,
+      countByBranch: (warehouseBySku.get(sku) || []).length > 0,
+    });
+  }
+
+  const soldCache = new Map();
   async function soldFor(check, skus) {
-    const key = `${check.name}|${check.from}|${check.to}`;
-    if (!soldCache.has(key)) {
+    const cacheKey = `${check.name}|${check.from}|${check.to}`;
+    if (!soldCache.has(cacheKey)) {
       soldCache.set(
-        key,
+        cacheKey,
         await getSoldQtyInRangeBatch({
           skus,
           facilityId,
@@ -274,23 +437,21 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
         }),
       );
     }
-    return soldCache.get(key);
+    return soldCache.get(cacheKey);
   }
 
-  const snapBySku = new Map();
-  for (const sku of limitedSkus) {
-    const { checks } = checksBySku.get(sku);
+  const snapByKey = new Map();
+  const limitedSkus = [
+    ...new Set([...checksByKey.values()].map((v) => v.sku)),
+  ];
+  for (const key of limitedKeys) {
+    const { sku, branchId, checks, countByBranch } = checksByKey.get(key);
     let tightest = null;
     for (const check of checks) {
-      const soldMap = await soldFor(
-        check,
-        limitedSkus.filter((s) =>
-          checksBySku.get(s).checks.some(
-            (c) => c.name === check.name && c.from === check.from,
-          ),
-        ),
-      );
-      const sold = soldMap.get(sku) || 0;
+      const maps = await soldFor(check, limitedSkus);
+      const sold = countByBranch
+        ? maps.bySkuBranch.get(limitKey(sku, branchId)) || 0
+        : maps.bySku.get(sku) || 0;
       const remaining = Math.max(0, check.limit - sold);
       const snap = {
         period: check.name,
@@ -300,21 +461,31 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
       };
       if (!tightest || snap.remaining < tightest.remaining) tightest = snap;
     }
-    snapBySku.set(sku, tightest);
+    snapByKey.set(key, tightest);
   }
 
   for (const row of list) {
     const sku = String(row.product_id || row.sku || "");
-    const product = bySku.get(sku) || {};
-    row.daily_sales_limit = product.daily_sales_limit ?? row.daily_sales_limit ?? null;
-    row.weekly_sales_limit =
-      product.weekly_sales_limit ?? row.weekly_sales_limit ?? null;
-    row.monthly_sales_limit =
-      product.monthly_sales_limit ?? row.monthly_sales_limit ?? null;
-    row.sales_stopped = isSalesStopped(
-      product.sales_stopped ?? row.sales_stopped,
-    );
-    const snap = snapBySku.get(sku) || null;
+    const branchId = row.branchId ?? row.branch_id;
+    const product = resolveLimitProduct({
+      product: bySku.get(sku) || {},
+      sku,
+      branchId,
+      warehouseRows,
+    });
+    row.daily_sales_limit = product.daily_sales_limit ?? null;
+    row.weekly_sales_limit = product.weekly_sales_limit ?? null;
+    row.monthly_sales_limit = product.monthly_sales_limit ?? null;
+    row.sales_stopped = isStoppedForWarehouse({
+      product: {
+        ...product,
+        sales_stopped: product.sales_stopped ?? row.sales_stopped,
+      },
+      sku,
+      branchId,
+      stopRows,
+    });
+    const snap = snapByKey.get(limitKey(sku, branchId)) || null;
     row.sales_limit_period = snap?.period || null;
     row.sales_limit = snap?.limit ?? null;
     row.sales_limit_sold = snap?.sold ?? null;
@@ -336,17 +507,48 @@ async function assertProductSalesLimits({
   qty,
   saleDate,
   transaction,
+  branchId,
 }) {
   const label = (product?.name || sku || "product").trim();
 
-  if (isSalesStopped(product?.sales_stopped)) {
+  const [warehouseRows, stopRows] = await Promise.all([
+    loadWarehouseLimitRows({
+      facilityId,
+      skus: [sku],
+      transaction,
+    }),
+    loadWarehouseStopRows({
+      facilityId,
+      skus: [sku],
+      transaction,
+    }),
+  ]);
+
+  if (
+    isStoppedForWarehouse({
+      product,
+      sku,
+      branchId,
+      stopRows,
+    })
+  ) {
     throw new Error(
-      `Sales are stopped for ${label}. This product cannot be sold on invoices.`,
+      `Sales are stopped for ${label} at this warehouse. This product cannot be sold on invoices.`,
     );
   }
-
-  const checks = limitChecksForProduct(product, saleDate);
+  const limitProduct = resolveLimitProduct({
+    product,
+    sku,
+    branchId,
+    warehouseRows,
+  });
+  const checks = limitChecksForProduct(limitProduct, saleDate);
   if (!checks.length) return;
+
+  const countByBranch = warehouseRows.some(
+    (r) => String(r.sku) === String(sku),
+  );
+  const soldBranchId = countByBranch ? parseBranchId(branchId) : null;
 
   for (const check of checks) {
     const sold = await getSoldQtyInRange({
@@ -354,16 +556,23 @@ async function assertProductSalesLimits({
       facilityId,
       fromDate: check.from,
       toDate: check.to,
+      branchId: soldBranchId,
       transaction,
     });
     const remaining = check.limit - sold;
     if (qty > remaining) {
       throw new Error(
-        `Sales ${check.name} limit reached for ${label}. ` +
-          `Limit: ${check.limit}, already sold: ${sold}, remaining: ${Math.max(0, remaining)}, requested: ${qty}`,
+        `Sales ${check.name} limit reached for ${label}` +
+          (soldBranchId ? " at this warehouse" : "") +
+          `. Limit: ${check.limit}, already sold: ${sold}, remaining: ${Math.max(0, remaining)}, requested: ${qty}`,
       );
     }
   }
+}
+
+function omitStoppedUnlessIncluded(rows, includeStopped) {
+  if (includeStopped) return rows || [];
+  return (rows || []).filter((r) => !isSalesStopped(r.sales_stopped));
 }
 
 module.exports = {
@@ -374,4 +583,7 @@ module.exports = {
   getProductSalesLimitSnapshot,
   attachSalesLimitInfo,
   assertProductSalesLimits,
+  loadWarehouseLimitRows,
+  loadWarehouseStopRows,
+  omitStoppedUnlessIncluded,
 };

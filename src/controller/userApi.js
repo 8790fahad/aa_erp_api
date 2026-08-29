@@ -57,6 +57,8 @@ const _getBusinessProfile = async (
         "invoice_closing_time",
         "invoice_closing_timezone",
         "invoice_closing_last_run",
+        "session_lock_enabled",
+        "session_lock_idle_minutes",
         "auto_depreciation_frequency",
         "auto_depreciation_day",
         "auto_depreciation_last_run",

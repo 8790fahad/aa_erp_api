@@ -2,6 +2,7 @@ const db = require("../models");
 const { Op } = require("sequelize");
 const { resolvePublicAssetUrl } = require("../utils/productImageStorage");
 const { SELLABLE_ZONES } = require("../services/sellableStock");
+const { isProductTaxable } = require("../constants/taxableStatus");
 
 const getBusinessModel = () => db.business || db.Business;
 
@@ -79,7 +80,7 @@ const formatCatalogProduct = (product, stockInfo = 0, req) => {
     sku: product.sku,
     selling_price: parseFloat(product.selling_price) || 0,
     price: parseFloat(product.selling_price) || 0,
-    vat: product.taxable === "Taxable",
+    vat: isProductTaxable(product.taxable),
     taxable: product.taxable,
     /** Services are always orderable; goods use sellable store balance. */
     stock: isService ? null : qtyOnHand,

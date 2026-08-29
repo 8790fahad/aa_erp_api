@@ -322,7 +322,7 @@ module.exports = (app) => {
   app.post("/account/get-purchase-requisition", account.getRequisition);
   app.post(
     "/account/purchase-requisition",
-    upload.fields([{ name: "po_documents", maxCount: 5 }]),
+    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
     account.insertRequisition,
   );
   app.get(
@@ -330,8 +330,13 @@ module.exports = (app) => {
     account.getPurchaseOrderDocuments,
   );
   app.post(
+    "/account/purchase-order-documents/stage",
+    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
+    account.stagePurchaseOrderDocuments,
+  );
+  app.post(
     "/account/purchase-order-documents",
-    upload.fields([{ name: "po_documents", maxCount: 5 }]),
+    upload.fields([{ name: "po_documents", maxCount: 1000 }]),
     account.uploadPurchaseOrderDocuments,
   );
   app.post("/account/update-purchase-requisition", account.updateRequisition);
@@ -355,6 +360,10 @@ module.exports = (app) => {
   app.post(
     "/account/update-invoice-closing/:facilityId/:user_id",
     account.updateInvoiceClosingSettings,
+  );
+  app.post(
+    "/account/update-session-lock/:facilityId/:user_id",
+    account.updateSessionLockSettings,
   );
   app.post(
     "/account/run-invoice-closing/:facilityId",
