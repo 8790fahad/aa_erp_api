@@ -15811,30 +15811,38 @@ function normalizeImpressJsonFields(plain) {
 /** List imprest / direct-expense history (impress table). */
 exports.listImpress = async (req, res) => {
   try {
-    const { facilityId, limit = 50, offset = 0 } = req.query;
+    const { facilityId, limit = 10, offset, page = 1 } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
         message: "facilityId is required",
       });
     }
-    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
-    const off = Math.max(parseInt(offset, 10) || 0, 0);
+    const pageSize = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
+    const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
+    const off =
+      offset !== undefined && String(offset).trim() !== ""
+        ? Math.max(parseInt(offset, 10) || 0, 0)
+        : (pageNumber - 1) * pageSize;
     const { count, rows } = await db.Impress.findAndCountAll({
       where: { facility_id: facilityId },
       order: [["created_at", "DESC"]],
-      limit: lim,
+      limit: pageSize,
       offset: off,
     });
+    const total = Number(count) || 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
     const results = rows.map((r) =>
       normalizeImpressJsonFields(r.get ? r.get({ plain: true }) : r),
     );
     return res.json({
       success: true,
       results,
-      total: count,
-      limit: lim,
+      total,
+      limit: pageSize,
       offset: off,
+      page: Math.floor(off / pageSize) + 1,
+      totalPages,
     });
   } catch (err) {
     console.error("listImpress:", err);
