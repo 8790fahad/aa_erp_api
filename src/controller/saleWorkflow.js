@@ -66,6 +66,98 @@ function inferCollectionSideFromSplits(splits) {
   return "";
 }
 
+function toMoney(value) {
+  if (value && typeof value === "object") return 0;
+  const n = Number(String(value ?? "").replace(/,/g, "").trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+function historyHasDiscountApproved(history) {
+  return normalizeHistory(history).some((h) =>
+    String(h?.note || "")
+      .toLowerCase()
+      .includes("discount approved"),
+  );
+}
+
+async function loadDiscountBySaleCode(facilityId, saleCodes) {
+  const map = new Map();
+  const codes = [...new Set((saleCodes || []).map((c) => String(c || "").trim()).filter(Boolean))];
+  if (!facilityId || !codes.length) return map;
+
+  if (db.CustomerEntry) {
+    const rows = await db.CustomerEntry.findAll({
+      where: {
+        facilityId,
+        type: "discount",
+        receiptNo: { [Op.in]: codes },
+      },
+      attributes: ["receiptNo", "cost", "description"],
+    });
+    for (const r of rows) {
+      const code = String(r.receiptNo || "").trim();
+      if (!code) continue;
+      const prev = map.get(code) || {
+        discount_amount: 0,
+        discount_label: "",
+        has_discount: false,
+      };
+      prev.discount_amount += toMoney(r.cost);
+      if (!prev.discount_label && r.description) {
+        prev.discount_label = r.description;
+      }
+      prev.has_discount = prev.discount_amount > 0.009;
+      map.set(code, prev);
+    }
+  }
+
+  const missing = codes.filter((c) => !map.has(c));
+  if (missing.length && db.Invoice) {
+    try {
+      const invoices = await db.sequelize.query(
+        `SELECT invoice_ref, description
+         FROM invoices
+         WHERE facility_id = :facilityId
+           AND invoice_ref IN (:codes)
+           AND description LIKE '%Discount%'`,
+        {
+          replacements: { facilityId, codes: missing },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      for (const inv of invoices || []) {
+        const code = String(inv.invoice_ref || "").trim();
+        if (!code || map.has(code)) continue;
+        const desc = String(inv.description || "");
+        const parsed =
+          desc.match(/Discount:[^()]*\(([\d,.]+)\)/i) ||
+          desc.match(/Discount:\s*([\d,.]+)/i);
+        const amt = parsed ? toMoney(parsed[1]) : 0;
+        map.set(code, {
+          discount_amount: amt,
+          discount_label: desc,
+          has_discount: true,
+        });
+      }
+    } catch (_) {
+      /* invoices table may not have description on all rows */
+    }
+  }
+  return map;
+}
+
+function applyDiscountMeta(row, discountMap) {
+  const info = discountMap.get(String(row.sale_code || "").trim()) || {};
+  const discount_amount = toMoney(info.discount_amount);
+  row.discount_amount = discount_amount;
+  row.discount_label = info.discount_label || "";
+  row.has_discount =
+    Boolean(info.has_discount) ||
+    discount_amount > 0.009 ||
+    historyHasDiscountApproved(row.history);
+  return row;
+}
+
 function normalizeHistory(history) {
   if (Array.isArray(history)) return history;
   if (typeof history === "string" && history.trim()) {
@@ -806,7 +898,7 @@ async function createSaleWorkflowRecord(
     paymentType !== "credit" &&
     paymentType !== "warehouse" &&
     paymentType !== "deposit";
-  const hasDiscount = Number(discountAmount) > 0;
+  const hasDiscount = toMoney(discountAmount) > 0;
   const depositFullyApplied =
     paymentType === "deposit" && Number(amount) <= 0;
   const cashierId =
@@ -864,7 +956,7 @@ async function createSaleWorkflowRecord(
     );
   }
 
-  const [row] = await db.SaleWorkflow.findOrCreate({
+  const [row, created] = await db.SaleWorkflow.findOrCreate({
     where: { facility_id: facilityId, sale_code: saleCode },
     defaults: {
       facility_id: facilityId,
@@ -884,6 +976,28 @@ async function createSaleWorkflowRecord(
     },
     transaction,
   });
+
+  // Existing row may have skipped discount approval (created before discount was posted).
+  if (
+    !created &&
+    hasDiscount &&
+    paymentType !== "deposit" &&
+    [
+      "awaiting_credit_approval",
+      "awaiting_cashier_confirm",
+      "awaiting_payment",
+    ].includes(row.status)
+  ) {
+    row.status = "awaiting_discount_approval";
+    row.history = pushHistory(
+      row.history,
+      "awaiting_discount_approval",
+      createdBy,
+      "Awaiting discount approval before collection",
+    );
+    row.updated_by = createdBy || row.updated_by;
+    await row.save({ transaction });
+  }
 
   // Packs for warehouse treatment / separation; credit packs created after approval
   if (initialStatus === "invoice_separation") {
@@ -1229,8 +1343,8 @@ exports.advanceSaleWorkflow = async (req, res) => {
 
     // Discount approval → release to cashier (or credit approval for credit sales)
     if (
-      (!action || action === "advance") &&
-      row.status === "awaiting_discount_approval"
+      row.status === "awaiting_discount_approval" &&
+      (!action || action === "advance" || action === "approve_discount")
     ) {
       next = nextStageFor("awaiting_discount_approval", row.payment_type);
       advanceNote =
@@ -1239,6 +1353,21 @@ exports.advanceSaleWorkflow = async (req, res) => {
             "Discount approved — awaiting credit approval"
           : advanceNote ||
             "Discount approved — ready for Verification Points";
+    } else if (action === "approve_discount") {
+      row.history = pushHistory(
+        row.history,
+        row.status,
+        updated_by,
+        advanceNote || "Discount approved",
+      );
+      row.updated_by = updated_by || row.updated_by;
+      await row.save({ transaction });
+      await transaction.commit();
+      return res.json({
+        success: true,
+        message: "Discount approved",
+        results: row,
+      });
     }
 
     if (!next) {
@@ -1597,7 +1726,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(discountWhere),
+            where: discountWhere,
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -1606,6 +1735,7 @@ exports.getCashierDashboard = async (req, res) => {
       const meta = stageMeta(plain.status);
       return {
         ...plain,
+        history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "orange",
         amount: Number(plain.amount) || 0,
@@ -1648,6 +1778,115 @@ exports.getCashierDashboard = async (req, res) => {
         proposed_payment_type: pending_mode?.to || null,
       };
     });
+
+    // Tag queues with posted discounts; pull skipped discounted invoices into Discount tab
+    const queueCodes = [
+      ...pendingRows,
+      ...creditRows,
+      ...depositRows,
+      ...discountRows,
+    ]
+      .map((r) => r.sale_code)
+      .filter(Boolean);
+    let todayDiscountCodes = [];
+    if (db.CustomerEntry) {
+      const todayDiscounts = await db.CustomerEntry.findAll({
+        where: {
+          facilityId,
+          type: "discount",
+          [Op.and]: [
+            db.sequelize.where(
+              db.sequelize.fn("DATE", db.sequelize.col("created_at")),
+              todayYmd,
+            ),
+          ],
+        },
+        attributes: ["receiptNo", "cost", "description"],
+      });
+      todayDiscountCodes = todayDiscounts
+        .map((r) => String(r.receiptNo || "").trim())
+        .filter(Boolean);
+    }
+    const discountMap = await loadDiscountBySaleCode(facilityId, [
+      ...queueCodes,
+      ...todayDiscountCodes,
+    ]);
+    [...pendingRows, ...creditRows, ...depositRows, ...discountRows].forEach(
+      (row) => applyDiscountMeta(row, discountMap),
+    );
+
+    const extraDiscountCodes = todayDiscountCodes.filter(
+      (code) => !queueCodes.includes(code),
+    );
+    if (extraDiscountCodes.length) {
+      const extraWhere = {
+        facility_id: facilityId,
+        sale_code: extraDiscountCodes,
+        status: [
+          "awaiting_discount_approval",
+          "awaiting_credit_approval",
+          "awaiting_cashier_confirm",
+          "awaiting_payment",
+        ],
+      };
+      if (branchId && branchId !== "all") {
+        const bid = parseInt(branchId, 10);
+        if (Number.isFinite(bid) && bid > 0) extraWhere.branch_id = bid;
+      }
+      const extraRows = await db.SaleWorkflow.findAll({
+        where: extraWhere,
+        order: [["created_at", "DESC"]],
+        limit: 200,
+      });
+      for (const r of extraRows) {
+        const code = String(r.sale_code || "").trim();
+        if (discountRows.some((d) => String(d.sale_code) === code)) continue;
+        const plain = r.toJSON();
+        const meta = stageMeta(plain.status);
+        discountRows.push(
+          applyDiscountMeta(
+            {
+              ...plain,
+              history: normalizeHistory(plain.history),
+              status_label: meta?.label || plain.status,
+              status_color: meta?.color || "orange",
+              amount: Number(plain.amount) || 0,
+            },
+            discountMap,
+          ),
+        );
+      }
+    }
+
+    const HOLD_FOR_DISCOUNT = new Set([
+      "awaiting_discount_approval",
+      "awaiting_credit_approval",
+      "awaiting_cashier_confirm",
+      "awaiting_payment",
+    ]);
+    const shouldHoldForDiscount = (row) =>
+      row.status === "awaiting_discount_approval" ||
+      (row.has_discount &&
+        !historyHasDiscountApproved(row.history) &&
+        HOLD_FOR_DISCOUNT.has(row.status));
+
+    const pullIntoDiscount = (list) => {
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const row = list[i];
+        if (!shouldHoldForDiscount(row)) continue;
+        if (
+          !discountRows.some((d) => String(d.sale_code) === String(row.sale_code))
+        ) {
+          discountRows.push(row);
+        }
+        if (row.status !== "awaiting_discount_approval") {
+          list.splice(i, 1);
+        }
+      }
+    };
+    pullIntoDiscount(pendingRows);
+    pullIntoDiscount(creditRows);
+    pullIntoDiscount(depositRows);
 
     const summary = {
       pending_cash: 0,
@@ -1978,6 +2217,12 @@ exports.getCashierDashboard = async (req, res) => {
         }
       }
     }
+
+    const histDiscountMap = await loadDiscountBySaleCode(
+      facilityId,
+      workflowHistory.map((r) => r.sale_code).filter(Boolean),
+    );
+    workflowHistory.forEach((row) => applyDiscountMeta(row, histDiscountMap));
 
     const workflowSaleCodes = new Set(
       workflowHistory.map((r) => String(r.sale_code || "")).filter(Boolean),

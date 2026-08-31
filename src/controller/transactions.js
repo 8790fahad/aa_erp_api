@@ -2578,7 +2578,7 @@ exports.createSale = async (req, res) => {
     const {
       customer_id,
       items = [],
-      discount_amount = 0,
+      discount_amount: discountAmountRaw = 0,
       discount_info = {},
       pro_bono_code,
       tax_amount = 0,
@@ -2610,6 +2610,13 @@ exports.createSale = async (req, res) => {
       cashier_user_id = null,
       cashier_name = null,
     } = req.body;
+
+    const discount_amount =
+      Number(String(discountAmountRaw ?? "").replace(/,/g, "")) ||
+      (typeof req.body.discount === "number" ||
+      typeof req.body.discount === "string"
+        ? Number(String(req.body.discount).replace(/,/g, "")) || 0
+        : 0);
 
     console.log(req.body, "=============> req.body");
 
@@ -3894,6 +3901,14 @@ exports.createSale = async (req, res) => {
         subtotal += lineTotal;
       }
 
+      const isTaxable =
+        !isProBono &&
+        isProductTaxable(
+          itm?.taxable != null && String(itm.taxable).trim() !== ""
+            ? itm.taxable
+            : product?.taxable,
+        );
+
       itemDetails.push({
         item: itm,
         product,
@@ -3902,8 +3917,20 @@ exports.createSale = async (req, res) => {
         price,
         sku,
         isProBono,
+        isTaxable,
       });
     }
+
+    const goodsTaxableSubtotal = itemDetails.reduce(
+      (sum, d) => sum + (d.isTaxable ? d.lineTotal : 0),
+      0,
+    );
+    const taxableDiscountShare =
+      subtotal > 0 && discount_amount > 0
+        ? Number(
+            ((discount_amount * goodsTaxableSubtotal) / subtotal).toFixed(2),
+          )
+        : 0;
 
     // ===================================================================
     // DETERMINE TAX TYPE FROM BUSINESS VAT POLICY
@@ -3944,6 +3971,7 @@ exports.createSale = async (req, res) => {
         qty,
         sku,
         isProBono,
+        isTaxable: itemIsTaxable,
       } = itemDetail;
 
       let itemDiscount = 0;
@@ -3953,7 +3981,7 @@ exports.createSale = async (req, res) => {
 
       const discountedGross = lineTotal - itemDiscount;
 
-      const isTaxable = isProductTaxable(product.taxable);
+      const isTaxable = itemIsTaxable;
 
       let revenueAmount, itemVAT, itemTaxBreakdown;
 
@@ -4150,12 +4178,11 @@ exports.createSale = async (req, res) => {
       }
     }
 
-    // VAT for invoice: use Taxable Amount (subtotal - discount) and apply inclusive/exclusive per tax
-    // Inclusive: VAT = taxableAmount - taxableAmount/(1+rate) e.g. 37,000 → 2,581.40
-    // Same base (subtotal - discount) for vat_policy "all", vat_inclusive, vat_exclusive
+    // VAT for invoice: taxable lines only (not the full subtotal).
+    // Exclusive 7.5% on ₦210,000 taxable ≠ 7.5% on ₦330,000 invoice total.
     totalCalculatedVAT = calculateInvoiceVAT(
-      subtotal,
-      discount_amount,
+      goodsTaxableSubtotal,
+      taxableDiscountShare,
       taxes,
       vatPolicy
     );
@@ -4200,26 +4227,32 @@ exports.createSale = async (req, res) => {
                  (tax.inclusive_type === undefined && tax.tax_type === "exclusive");
         });
 
-        // Calculate inclusive VAT from subtotal
+        // Calculate inclusive VAT from taxable lines only
         let inclusiveVAT = 0;
         if (inclusiveTaxes.length > 0) {
-          const taxableSubtotal = subtotal - discount_amount;
+          const taxableNet = Math.max(
+            goodsTaxableSubtotal - taxableDiscountShare,
+            0,
+          );
           let totalInclusiveRate = 0;
           for (const tax of inclusiveTaxes) {
             const taxRate = (tax.rate || 0) / 100;
             if (taxRate > 0) totalInclusiveRate += taxRate;
           }
           if (totalInclusiveRate > 0) {
-            const netAmount = taxableSubtotal / (1 + totalInclusiveRate);
-            inclusiveVAT = taxableSubtotal - netAmount;
+            const netOfInclusive = taxableNet / (1 + totalInclusiveRate);
+            inclusiveVAT = taxableNet - netOfInclusive;
           }
         }
 
-        // Calculate exclusive VAT on net amount (after extracting inclusive VAT)
+        // Calculate exclusive VAT on taxable net (after extracting inclusive VAT)
         let exclusiveVAT = 0;
         if (exclusiveTaxes.length > 0) {
-          const taxableSubtotal = subtotal - discount_amount;
-          const netAfterInclusive = taxableSubtotal - inclusiveVAT;
+          const taxableNet = Math.max(
+            goodsTaxableSubtotal - taxableDiscountShare,
+            0,
+          );
+          const netAfterInclusive = taxableNet - inclusiveVAT;
           for (const tax of exclusiveTaxes) {
             const taxRate = (tax.rate || 0) / 100;
             if (taxRate > 0) {
@@ -4249,8 +4282,8 @@ exports.createSale = async (req, res) => {
 
     // Invoice-level VAT (after discount) — reused for A/R and tax CRs
     const invoiceVATBreakdown = getInvoiceVATBreakdown(
-      subtotal,
-      discount_amount,
+      goodsTaxableSubtotal,
+      taxableDiscountShare,
       taxes,
       vatPolicy
     );
@@ -4729,6 +4762,52 @@ exports.createSale = async (req, res) => {
         },
         { transaction: t }
       );
+    }
+
+    // If A/R includes exclusive VAT but no tax CR was posted (e.g. Input VAT
+    // selected on the invoice, or taxes omitted), credit VAT payable so the
+    // ledger still balances.
+    {
+      const taxCredits = ledgerEntries.reduce((sum, entry) => {
+        const desc = String(entry.transaction_description || "").toLowerCase();
+        if (
+          desc.includes("output vat") ||
+          desc.includes("input vat") ||
+          desc.includes("vat @") ||
+          desc.includes("value added")
+        ) {
+          return sum + Number(entry.cr || 0);
+        }
+        return sum;
+      }, 0);
+      const impliedExclusiveVat = Number(
+        (
+          Number(arDebitAmount || netAmount || 0) -
+          (subtotal - discount_amount)
+        ).toFixed(2),
+      );
+      const vatGap = Number((impliedExclusiveVat - taxCredits).toFixed(2));
+      if (impliedExclusiveVat > 0.05 && vatGap > 0.05) {
+        let vatAcc = taxAccounts[0]?.account || null;
+        const vatHead = String(business?.vat_account_code || "").trim();
+        if (!vatAcc && vatHead) {
+          vatAcc = await db.AccountCategory.findOne({
+            where: { code: vatHead, facility_id: facilityId },
+            transaction: t,
+          });
+        }
+        if (vatAcc) {
+          ledgerEntries.push(
+            createLedgerEntry(
+              vatAcc,
+              0,
+              vatGap,
+              "tax",
+              `Output VAT (${vatGap.toFixed(2)})`,
+            ),
+          );
+        }
+      }
     }
 
     // ===================================================================
