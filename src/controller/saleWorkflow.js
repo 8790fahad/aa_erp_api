@@ -1365,6 +1365,22 @@ exports.getCashierDashboard = async (req, res) => {
       histTo = tmp;
     }
 
+    const createdToday = db.sequelize.where(
+      db.sequelize.fn("DATE", db.sequelize.col("created_at")),
+      todayYmd,
+    );
+    const withCreatedToday = (clause) => ({
+      ...clause,
+      [Op.and]: [
+        ...(Array.isArray(clause[Op.and])
+          ? clause[Op.and]
+          : clause[Op.and]
+            ? [clause[Op.and]]
+            : []),
+        createdToday,
+      ],
+    });
+
     const where = {
       facility_id: facilityId,
       status: ["awaiting_cashier_confirm", "awaiting_payment"],
@@ -1413,7 +1429,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "credit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where,
+            where: withCreatedToday(where),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -1460,7 +1476,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: creditWhere,
+            where: withCreatedToday(creditWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -1547,7 +1563,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "mode"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: depositWhere,
+            where: withCreatedToday(depositWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -1581,7 +1597,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: discountWhere,
+            where: withCreatedToday(discountWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -1614,7 +1630,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: modeWhere,
+            where: withCreatedToday(modeWhere),
             order: [["updated_at", "DESC"], ["created_at", "DESC"]],
             limit: 200,
           });
@@ -1753,7 +1769,7 @@ exports.getCashierDashboard = async (req, res) => {
          COUNT(*) AS cnt
        FROM sale_workflows sw
        WHERE sw.facility_id = :facilityId
-         AND sw.payment_type IN ('credit', 'deposit')
+         AND sw.payment_type IN ('credit')
          AND sw.status IN (
            'credit_approved',
            'invoice_separation',
@@ -1785,6 +1801,7 @@ exports.getCashierDashboard = async (req, res) => {
       `SELECT
          ce.entry_id,
          ce.receiptNo AS sale_code,
+         ce.link_id AS link_id,
          ce.customerNo AS customer_no,
          COALESCE(c.fullname, ce.customerNo) AS customer_name,
          ce.mode_of_payment AS payment_type,
@@ -1819,9 +1836,14 @@ exports.getCashierDashboard = async (req, res) => {
     );
 
     const advance_history = (advanceRows || []).map((r) => {
-      const mode = String(r.payment_type || "").toLowerCase();
+      const mode = String(r.payment_type || "").toLowerCase().trim();
+      const desc = String(r.description || "");
+      const isDepositApply =
+        mode === "advance" || /^advance applied/i.test(desc);
       let payment_type = "cash";
-      if (
+      if (isDepositApply) {
+        payment_type = "deposit";
+      } else if (
         mode === "bank" ||
         mode === "transfer" ||
         mode === "bank transfer" ||
@@ -1837,21 +1859,33 @@ exports.getCashierDashboard = async (req, res) => {
       } else if (mode === "cash") {
         payment_type = "cash";
       }
+      const invoiceRef = String(r.link_id || "").trim();
       return {
         id: `adv-${r.entry_id}`,
-        sale_code: r.sale_code || `AD-${r.entry_id}`,
+        sale_code: isDepositApply
+          ? invoiceRef || r.sale_code || `AA-${r.entry_id}`
+          : r.sale_code || `AD-${r.entry_id}`,
         customer_no: r.customer_no || "",
         customer_name: r.customer_name || "",
         payment_type,
         amount: Number(r.amount) || 0,
-        status: "customer_advance",
-        status_label: "Customer Deposit",
-        kind: "customer_advance",
-        description: r.description || "",
+        status: isDepositApply ? "deposit_applied" : "customer_advance",
+        status_label: isDepositApply ? "Deposit applied" : "Customer Deposit",
+        kind: isDepositApply ? "deposit_applied" : "customer_advance",
+        description: desc,
         updated_at: r.updated_at,
         createdAt: r.createdAt,
       };
     });
+
+    let applied_deposit_today = 0;
+    let applied_deposit_count_today = 0;
+    for (const row of advance_history) {
+      if (row.kind === "deposit_applied") {
+        applied_deposit_today += Number(row.amount) || 0;
+        applied_deposit_count_today += 1;
+      }
+    }
 
     // Confirmed workflow history (recent)
     const historyWhere = {
@@ -1906,8 +1940,55 @@ exports.getCashierDashboard = async (req, res) => {
       };
     });
 
+    // Fully applied deposits store remaining due as 0 — show invoice total instead
+    const depositZeroCodes = [
+      ...new Set(
+        workflowHistory
+          .filter(
+            (r) =>
+              String(r.payment_type || "").toLowerCase() === "deposit" &&
+              !(Number(r.amount) > 0.009) &&
+              r.sale_code,
+          )
+          .map((r) => r.sale_code),
+      ),
+    ];
+    if (depositZeroCodes.length) {
+      const invRows = await db.sequelize.query(
+        `SELECT invoice_ref, amount
+         FROM invoices
+         WHERE facility_id = :facilityId
+           AND invoice_ref IN (:depositZeroCodes)`,
+        {
+          replacements: { facilityId, depositZeroCodes },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      const amtByRef = {};
+      for (const row of invRows || []) {
+        amtByRef[String(row.invoice_ref)] = Number(row.amount) || 0;
+      }
+      for (const row of workflowHistory) {
+        if (
+          String(row.payment_type || "").toLowerCase() === "deposit" &&
+          !(Number(row.amount) > 0.009)
+        ) {
+          const invAmt = amtByRef[String(row.sale_code)] || 0;
+          if (invAmt > 0) row.amount = invAmt;
+        }
+      }
+    }
+
+    const workflowSaleCodes = new Set(
+      workflowHistory.map((r) => String(r.sale_code || "")).filter(Boolean),
+    );
+    const advanceHistoryDeduped = advance_history.filter((r) => {
+      if (r.kind !== "deposit_applied") return true;
+      return !workflowSaleCodes.has(String(r.sale_code || ""));
+    });
+
     // Merge advances into history (newest first)
-    const mergedHistory = [...workflowHistory, ...advance_history].sort(
+    const mergedHistory = [...workflowHistory, ...advanceHistoryDeduped].sort(
       (a, b) =>
         new Date(b.updated_at || b.createdAt || 0) -
         new Date(a.updated_at || a.createdAt || 0),
@@ -1930,6 +2011,8 @@ exports.getCashierDashboard = async (req, res) => {
           collected_today: collected_cash + collected_transfer,
           approved_credit_today,
           approved_credit_count_today,
+          applied_deposit_today,
+          applied_deposit_count_today,
           history_from: histFrom,
           history_to: histTo,
         },
