@@ -157,6 +157,19 @@ async function resolveDefaultBranchId(facilityId, transaction) {
   return rows.length ? rows[0].id : 0;
 }
 
+/**
+ * Use the given warehouse if it belongs to the facility; otherwise the default
+ * warehouse (is_default), then any warehouse. Returns 0 when none exist.
+ */
+async function resolveRequiredBranchId(facilityId, branch_id, transaction) {
+  const parsed = parseInt(branch_id, 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    const ok = await validateBranchIdById(facilityId, parsed, transaction);
+    if (ok) return parsed;
+  }
+  return resolveDefaultBranchId(facilityId, transaction);
+}
+
 /** Clear the in-process cache (useful in tests). */
 function clearBranchCache() {
   _cache.clear();
@@ -167,5 +180,6 @@ module.exports = {
   resolveBranchIds,
   validateBranchIdById,
   resolveDefaultBranchId,
+  resolveRequiredBranchId,
   clearBranchCache,
 };

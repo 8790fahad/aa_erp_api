@@ -22,7 +22,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
       period: {
-        type: DataTypes.ENUM("daily", "weekly", "monthly"),
+        type: DataTypes.ENUM("daily", "weekly", "monthly", "yearly"),
         allowNull: false,
       },
       quantity: {

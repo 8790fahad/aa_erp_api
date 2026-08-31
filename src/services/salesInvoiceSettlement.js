@@ -47,6 +47,15 @@ const SALES_INVOICE_GL_SETTLEMENT_SUBQUERY = `
           GREATEST(
             SUM(
               CASE
+                WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr
+                ELSE 0
+              END
+            ),
+            0
+          ) AS ar_invoiced,
+          GREATEST(
+            SUM(
+              CASE
                 WHEN LOWER(type) IN ('bank', 'deposit') THEN dr - cr
                 ELSE 0
               END
@@ -69,21 +78,11 @@ const SALES_INVOICE_GL_SETTLEMENT_SUBQUERY = `
           AND reference_number != ''
         GROUP BY reference_number, facility_id`;
 
-const SALES_INVOICE_AMOUNT_DUE_SQL = `
-        CASE
-          WHEN COALESCE(se_tot.ar_outstanding, 0) > 0.001
-            THEN LEAST(COALESCE(se_tot.ar_outstanding, 0), i.amount)
-          WHEN COALESCE(se_tot.has_receivable_activity, 0) = 1
-            THEN 0
-          ELSE GREATEST(
-            i.amount - LEAST(COALESCE(se_tot.cash_settled, 0), i.amount),
-            0
-          )
-        END`;
+const SALES_INVOICE_AMOUNT_DUE_SQL = `GREATEST(COALESCE(se_tot.ar_outstanding, 0), 0)`;
 
 const SALES_INVOICE_TOTAL_PAID_SQL = `
         GREATEST(
-          i.amount - (${SALES_INVOICE_AMOUNT_DUE_SQL}),
+          COALESCE(se_tot.ar_invoiced, 0) - COALESCE(se_tot.ar_outstanding, 0),
           0
         )`;
 

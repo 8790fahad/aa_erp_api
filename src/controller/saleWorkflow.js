@@ -1,6 +1,7 @@
 const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
+const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const {
   SALE_WORKFLOW_STAGES,
   nextStageFor,
@@ -95,6 +96,92 @@ function pushHistory(history, status, userId, note, extra = null) {
   }
   list.push(entry);
   return list;
+}
+
+/** AR outstanding vs customer.credit_limit. Limit 0 = not enforced. */
+async function invoiceReceivableOnLedger(facilityId, invoiceRef) {
+  if (!invoiceRef) return 0;
+  const rows = await db.sequelize.query(
+    `SELECT COALESCE(SUM(CASE
+        WHEN LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')
+        THEN dr - cr ELSE 0 END), 0) AS ar
+     FROM general_ledger
+     WHERE facility_id = :facilityId
+       AND reference_number = :invoiceRef`,
+    {
+      replacements: { facilityId, invoiceRef },
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+  return Math.max(0, parseFloat(rows[0]?.ar) || 0);
+}
+
+async function getCreditLimitCheck(
+  facilityId,
+  customerNo,
+  { extraAmount = 0, excludeInvoiceRef = null } = {},
+) {
+  const empty = {
+    creditLimit: 0,
+    outstanding: 0,
+    extra: 0,
+    projected: 0,
+    available: null,
+    unlimited: true,
+    overLimit: false,
+  };
+  if (!facilityId || !customerNo) return empty;
+
+  const customer = await db.Customer.findOne({
+    where: { customerNo, facilityId },
+    attributes: ["credit_limit"],
+    raw: true,
+  });
+  const creditLimit = parseFloat(customer?.credit_limit || 0) || 0;
+  const { receivables } = await getCustomerLedgerBalances(
+    facilityId,
+    customerNo,
+  );
+  let outstanding = receivables;
+  if (excludeInvoiceRef) {
+    const thisAr = await invoiceReceivableOnLedger(
+      facilityId,
+      excludeInvoiceRef,
+    );
+    outstanding = Math.max(0, Number((outstanding - thisAr).toFixed(2)));
+  }
+  const extra = Math.max(0, Number(extraAmount) || 0);
+  const projected = Number((outstanding + extra).toFixed(2));
+  const unlimited = !(creditLimit > 0);
+  const available = unlimited
+    ? null
+    : Math.max(0, Number((creditLimit - outstanding).toFixed(2)));
+  const overLimit = !unlimited && projected > creditLimit + 0.01;
+  return {
+    creditLimit,
+    outstanding,
+    extra,
+    projected,
+    available,
+    unlimited,
+    overLimit,
+  };
+}
+
+async function assertCreditLimitMessage(
+  facilityId,
+  customerNo,
+  opts = {},
+) {
+  const check = await getCreditLimitCheck(facilityId, customerNo, opts);
+  if (!check.overLimit) return null;
+  const thisBit =
+    check.extra > 0.009 ? `, This invoice: ${check.extra.toFixed(2)}` : "";
+  return `Credit limit exceeded. Limit: ${check.creditLimit.toFixed(
+    2,
+  )}, Other outstanding: ${check.outstanding.toFixed(
+    2,
+  )}${thisBit}, Projected: ${check.projected.toFixed(2)}`;
 }
 
 /** Latest unresolved payment-mode switch request from history. */
@@ -214,6 +301,16 @@ async function applyPaymentTypeToWorkflow(
       "awaiting_credit_approval",
       updated_by,
       "Switched to credit — must be approved on Credit tab before Invoice Separation",
+    );
+  }
+
+  if (paymentType === "deposit" && earlyCashier.has(row.status)) {
+    row.status = "awaiting_payment";
+    row.history = pushHistory(
+      row.history,
+      "awaiting_payment",
+      updated_by,
+      "Switched to Apply Deposit — apply customer deposit before collection or credit approval",
     );
   }
 
@@ -1077,6 +1174,21 @@ exports.advanceSaleWorkflow = async (req, res) => {
       row.status === "awaiting_credit_approval" &&
       next === "credit_approved"
     ) {
+      const limitErr = await assertCreditLimitMessage(
+        facilityId,
+        row.customer_no,
+        {
+          extraAmount: Number(row.amount) || 0,
+          excludeInvoiceRef: row.sale_code,
+        },
+      );
+      if (limitErr) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: limitErr,
+        });
+      }
       row.history = pushHistory(
         row.history,
         "credit_approved",
@@ -1291,6 +1403,8 @@ exports.getCashierDashboard = async (req, res) => {
       where.payment_type = ["__none__"];
     } else if (ct === "split") {
       where.payment_type = ["split", "credit_split"];
+    } else if (ct === "deposit") {
+      where.payment_type = ["__none__"];
     } else {
       where.payment_type = ["cash", "transfer", "bank", "split", "credit_split"];
     }
@@ -1342,26 +1456,38 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "transfer" ||
       ct === "split" ||
       ct === "discount" ||
-      ct === "mode"
+      ct === "mode" ||
+      ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
             where: creditWhere,
             order: [["created_at", "DESC"]],
             limit: 200,
           });
-    const creditRows = creditPending.map((r) => {
+    const creditRows = [];
+    for (const r of creditPending) {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
       const split_progress = buildSplitProgressForRow(plain);
-      return {
+      const check = await getCreditLimitCheck(facilityId, plain.customer_no, {
+        extraAmount: Number(plain.amount) || 0,
+        excludeInvoiceRef: plain.sale_code,
+      });
+      creditRows.push({
         ...plain,
         history: normalizeHistory(plain.history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "rose",
         amount: Number(plain.amount) || 0,
         split_progress,
-      };
-    });
+        credit_limit: check.creditLimit,
+        credit_outstanding: check.outstanding,
+        credit_available: check.available,
+        credit_projected: check.projected,
+        credit_unlimited: check.unlimited,
+        credit_over_limit: check.overLimit,
+      });
+    }
     creditRows.forEach((r) => {
       if (r.split_progress?.cash_by)
         collectorIds.add(String(r.split_progress.cash_by));
@@ -1403,6 +1529,40 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
+    const depositWhere = {
+      facility_id: facilityId,
+      status: ["awaiting_payment", "awaiting_cashier_confirm"],
+      payment_type: ["deposit", "apply_deposit"],
+    };
+    if (branchId && branchId !== "all") {
+      const bid = parseInt(branchId, 10);
+      if (Number.isFinite(bid) && bid > 0) depositWhere.branch_id = bid;
+    }
+    const depositPending =
+      ct === "cash" ||
+      ct === "transfer" ||
+      ct === "split" ||
+      ct === "credit" ||
+      ct === "discount" ||
+      ct === "mode"
+        ? []
+        : await db.SaleWorkflow.findAll({
+            where: depositWhere,
+            order: [["created_at", "DESC"]],
+            limit: 200,
+          });
+    const depositRows = depositPending.map((r) => {
+      const plain = r.toJSON();
+      const meta = stageMeta(plain.status);
+      return {
+        ...plain,
+        history: normalizeHistory(plain.history),
+        status_label: meta?.label || plain.status,
+        status_color: meta?.color || "teal",
+        amount: Number(plain.amount) || 0,
+      };
+    });
+
     // Discounted invoices awaiting approval before Verification Points
     const discountWhere = {
       facility_id: facilityId,
@@ -1417,7 +1577,8 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "transfer" ||
       ct === "split" ||
       ct === "credit" ||
-      ct === "mode"
+      ct === "mode" ||
+      ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
             where: discountWhere,
@@ -1449,7 +1610,8 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "transfer" ||
       ct === "split" ||
       ct === "credit" ||
-      ct === "discount"
+      ct === "discount" ||
+      ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
             where: modeWhere,
@@ -1476,6 +1638,7 @@ exports.getCashierDashboard = async (req, res) => {
       pending_transfer: 0,
       pending_split: 0,
       pending_credit: 0,
+      pending_deposit: 0,
       pending_discount: 0,
       pending_mode: 0,
       pending_count: pendingRows.length,
@@ -1494,6 +1657,11 @@ exports.getCashierDashboard = async (req, res) => {
       summary.pending_credit += amt;
       if (ct === "credit" || !ct) summary.pending_total += amt;
     }
+    for (const row of depositRows) {
+      const amt = Number(row.amount) || 0;
+      summary.pending_deposit += amt;
+      if (ct === "deposit" || !ct) summary.pending_total += amt;
+    }
     for (const row of discountRows) {
       const amt = Number(row.amount) || 0;
       summary.pending_discount += amt;
@@ -1506,6 +1674,8 @@ exports.getCashierDashboard = async (req, res) => {
     }
     if (ct === "credit") {
       summary.pending_count = creditRows.length;
+    } else if (ct === "deposit") {
+      summary.pending_count = depositRows.length;
     } else if (ct === "discount") {
       summary.pending_count = discountRows.length;
     } else if (ct === "mode") {
@@ -1706,7 +1876,8 @@ exports.getCashierDashboard = async (req, res) => {
     else if (ct === "transfer")
       historyWhere.payment_type = ["transfer", "bank", "split", "credit_split"];
     else if (ct === "split") historyWhere.payment_type = ["split", "credit_split"];
-    else if (ct === "credit") historyWhere.payment_type = ["credit", "deposit"];
+    else if (ct === "credit") historyWhere.payment_type = ["credit"];
+    else if (ct === "deposit") historyWhere.payment_type = ["deposit"];
 
     // History is always date-scoped (default: today)
     historyWhere.updated_at = {
@@ -1747,6 +1918,7 @@ exports.getCashierDashboard = async (req, res) => {
       results: {
         pending: pendingRows,
         credit_pending: creditRows,
+        deposit_pending: depositRows,
         discount_pending: discountRows,
         mode_pending: modeRows,
         history: mergedHistory.slice(0, 120),
@@ -2552,6 +2724,22 @@ exports.sendCreditRemainder = async (req, res) => {
       });
     }
 
+    const limitErr = await assertCreditLimitMessage(
+      facilityId,
+      row.customer_no,
+      {
+        extraAmount: remaining,
+        excludeInvoiceRef: row.sale_code,
+      },
+    );
+    if (limitErr) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: limitErr,
+      });
+    }
+
     row.amount = remaining;
     row.payment_type = "credit";
     row.status = "awaiting_credit_approval";
@@ -3112,6 +3300,7 @@ const SPECIAL_TREATMENT_TYPES = [
   "split",
   "credit",
   "credit_split",
+  "deposit",
   "warehouse",
 ];
 
@@ -3149,7 +3338,7 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "paymentType must be cash, transfer, split, credit, credit_split, or warehouse",
+          "paymentType must be cash, transfer, split, credit, credit_split, deposit, or warehouse",
       });
     }
     if (!db.SaleWorkflow) {

@@ -10,7 +10,7 @@ const {
   NIGERIAN_PHONE_HINT,
 } = require("../utils/nigerianPhone");
 const moment = require("moment");
-const { resolveDefaultBranchId } = require("../services/branchResolver");
+const { resolveDefaultBranchId, resolveRequiredBranchId } = require("../services/branchResolver");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 let today = moment().format("YYYY-MM-DD");
 const {
@@ -21,6 +21,7 @@ const {
   CustomerEntry,
   Business,
 } = require("../models");
+const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 
 // Get customer entries by receiptNo
 exports.getCustomerEntriesByReceiptNo = async (req, res) => {
@@ -132,7 +133,10 @@ exports.getCustomerAdvanceHistory = async (req, res) => {
        FROM general_ledger
        WHERE LOWER(type) = 'deposit'
          AND facility_id = :facilityId
-         AND transaction_ref = :customerNo`,
+         AND (
+           transaction_ref = :customerNo
+           OR transaction_ref LIKE CONCAT(:customerNo, '-%')
+         )`,
       {
         replacements: { facilityId, customerNo: customerKey },
         type: db.sequelize.QueryTypes.SELECT,
@@ -675,10 +679,11 @@ exports.CreateCustomer = async (req, res) => {
       shipping_address,
       contact_persons = [],
     } = req.body;
-    const parsedBranchId =
-      branch_id == null || branch_id === "" || branch_id === "all"
-        ? null
-        : parseInt(branch_id, 10) || null;
+    const parsedBranchId = await resolveRequiredBranchId(
+      facilityId,
+      branch_id,
+      transaction,
+    );
     console.log(req.body, "====");
     const userId = created_by || req.user?.id;
     const displayName = (fullname || name || company_name || "").trim();
@@ -686,6 +691,15 @@ exports.CreateCustomer = async (req, res) => {
     const shipping = shipping_address || null;
     const addressLine =
       address || (billing ? buildAddressLine(billing) : null) || "";
+
+    if (!parsedBranchId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "A warehouse is required. Set a default warehouse under Admin → Manage Warehouses, or select one on the customer.",
+      });
+    }
 
     // === VALIDATION ===
     if (
@@ -825,6 +839,15 @@ exports.CreateCustomer = async (req, res) => {
           .json({ success: false, message: "Customer not found" });
       }
 
+      if (!(parsedBranchId || customer.branch_id)) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "A warehouse is required. Set a default warehouse under Admin → Manage Warehouses, or select one on the customer.",
+        });
+      }
+
       await customer.update(
         {
           account_head: head || customer.account_head,
@@ -840,8 +863,7 @@ exports.CreateCustomer = async (req, res) => {
           credit_limit: parseFloat(credit_limit) || customer.credit_limit,
           customer_type: customer_type || customer.customer_type,
           tin: tin !== undefined ? tin : customer.tin,
-          branch_id:
-            parsedBranchId != null ? parsedBranchId : customer.branch_id,
+          branch_id: parsedBranchId || customer.branch_id,
           ...profileFields,
         },
         { transaction },
@@ -1208,10 +1230,16 @@ exports.CreateCustomerUpload = async (req, res) => {
         head, // Account head (receivable_code)
         branch_id = null,
       } = customer;
-      const parsedBranchId =
-        branch_id == null || branch_id === "" || branch_id === "all"
-          ? null
-          : parseInt(branch_id, 10) || null;
+      const parsedBranchId = await resolveRequiredBranchId(
+        facilityId,
+        branch_id,
+        transaction,
+      );
+      if (!parsedBranchId) {
+        throw new Error(
+          `A warehouse is required for customer "${fullname || "Unknown"}". Set a default warehouse or include branch_id.`,
+        );
+      }
 
       // === REQUIRED VALIDATIONS ===
       if (
@@ -2230,18 +2258,11 @@ exports.getCustomerPayment = (req, res) => {
 // controllers/depositController.ts
 // ✅ Reusable balance function
 export const getBalance = async (customerNo, facilityId) => {
-  const result = await db.sequelize.query(
-    `
-    SELECT SUM(dr)-SUM(cr) as balance FROM general_ledger where
-      transaction_ref = :customerNo and facility_id = :facilityId
-    `,
-    {
-      replacements: { customerNo, facilityId },
-      type: db.Sequelize.QueryTypes.SELECT,
-    },
+  const { receivables } = await getCustomerLedgerBalances(
+    facilityId,
+    customerNo,
   );
-  console.log(result, "=====================>result");
-  return parseFloat(result[0]?.balance || 0);
+  return receivables;
 };
 
 export const createDeposit = async (req, res) => {
@@ -2705,6 +2726,15 @@ const SALES_INVOICE_GL_SETTLEMENT_SUBQUERY = `
           GREATEST(
             SUM(
               CASE
+                WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr
+                ELSE 0
+              END
+            ),
+            0
+          ) AS ar_invoiced,
+          GREATEST(
+            SUM(
+              CASE
                 WHEN LOWER(type) IN ('bank', 'deposit') THEN dr - cr
                 ELSE 0
               END
@@ -2728,21 +2758,11 @@ const SALES_INVOICE_GL_SETTLEMENT_SUBQUERY = `
         GROUP BY reference_number, facility_id`;
 
 /** Shared amount_due expression — alias se_tot, i must exist in outer query. */
-const SALES_INVOICE_AMOUNT_DUE_SQL = `
-        CASE
-          WHEN COALESCE(se_tot.ar_outstanding, 0) > 0.001
-            THEN LEAST(COALESCE(se_tot.ar_outstanding, 0), i.amount)
-          WHEN COALESCE(se_tot.has_receivable_activity, 0) = 1
-            THEN 0
-          ELSE GREATEST(
-            i.amount - LEAST(COALESCE(se_tot.cash_settled, 0), i.amount),
-            0
-          )
-        END`;
+const SALES_INVOICE_AMOUNT_DUE_SQL = `GREATEST(COALESCE(se_tot.ar_outstanding, 0), 0)`;
 
 const SALES_INVOICE_TOTAL_PAID_SQL = `
         GREATEST(
-          i.amount - (${SALES_INVOICE_AMOUNT_DUE_SQL}),
+          COALESCE(se_tot.ar_invoiced, 0) - COALESCE(se_tot.ar_outstanding, 0),
           0
         )`;
 
@@ -3590,8 +3610,12 @@ exports.getCustomerDeposit = async (req, res) => {
 export const getCustomerBalance = async (req, res) => {
   const { customerNo, facilityId } = req.params;
   try {
-    const balance = await getBalance(customerNo, facilityId);
-    res.json({ success: true, balance: balance });
+    const bals = await getCustomerLedgerBalances(facilityId, customerNo);
+    res.json({
+      success: true,
+      ...bals,
+      balance: bals.receivables,
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -3730,11 +3754,15 @@ exports.getCustomersList = async (req, res) => {
       });
     }
 
-    // Get all customers for the facility
+    const customerWhere = { facilityId: String(facilityId) };
+    const rawBranch = req.query?.branchId ?? req.query?.branch_id;
+    const filterBranchId = parseInt(rawBranch, 10);
+    if (Number.isFinite(filterBranchId) && filterBranchId > 0) {
+      customerWhere.branch_id = filterBranchId;
+    }
+
     const customers = await Customer.findAll({
-      where: {
-        facilityId: facilityId,
-      },
+      where: customerWhere,
       order: [["createdAt", "DESC"]],
       attributes: [
         "customerNo",
@@ -3756,36 +3784,81 @@ exports.getCustomersList = async (req, res) => {
       ],
     });
 
-    // Net ledger balance per customer: dr - cr (>0 owed to you, <0 unused credit)
-    const balanceRows = await db.sequelize.query(
-      `SELECT transaction_ref AS customerNo,
-              COALESCE(SUM(dr) - SUM(cr), 0) AS net_balance
-         FROM general_ledger
-        WHERE facility_id = :facilityId
-          AND transaction_ref IS NOT NULL
-          AND transaction_ref <> ''
-          AND LOWER(COALESCE(type, '')) IN ('receivable', 'recevable', 'deposit', 'sales', 'service', 'opening_balance')
-        GROUP BY transaction_ref`,
-      {
-        replacements: { facilityId },
-        type: db.Sequelize.QueryTypes.SELECT,
-      }
+    const customerNos = customers.map((c) =>
+      String((c.get ? c.get({ plain: true }) : c).customerNo),
     );
 
     const balanceByCustomer = {};
-    for (const row of balanceRows) {
-      if (!row.customerNo) continue;
-      balanceByCustomer[String(row.customerNo)] =
-        parseFloat(row.net_balance) || 0;
+    if (customerNos.length) {
+      const balanceRows = await db.sequelize.query(
+        `SELECT c.customerNo AS customerNo,
+                COALESCE(SUM(CASE
+                  WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
+                  THEN gl.dr - gl.cr ELSE 0 END), 0) AS receivables,
+                COALESCE(SUM(CASE
+                  WHEN LOWER(COALESCE(gl.type, '')) = 'deposit'
+                  THEN gl.cr - gl.dr ELSE 0 END), 0) AS deposit
+           FROM customers c
+           LEFT JOIN general_ledger gl
+             ON gl.facility_id = :facilityId
+            AND (
+              gl.transaction_ref = c.customerNo
+              OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
+            )
+          WHERE c.facilityId = :facilityId
+            AND c.customerNo IN (:customerNos)
+          GROUP BY c.customerNo`,
+        {
+          replacements: { facilityId, customerNos },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      for (const row of balanceRows) {
+        if (!row.customerNo) continue;
+        balanceByCustomer[String(row.customerNo)] = {
+          receivables: Math.max(0, parseFloat(row.receivables) || 0),
+          deposit: Math.max(0, parseFloat(row.deposit) || 0),
+        };
+      }
+    }
+
+    const warehouseRows = await db.sequelize.query(
+      `SELECT id, branch_name, branch_id AS warehouse_code, is_default
+         FROM branches
+        WHERE facilityId = :facilityId`,
+      {
+        replacements: { facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const warehouseById = {};
+    for (const row of warehouseRows) {
+      warehouseById[String(row.id)] = row;
     }
 
     const results = customers.map((c) => {
       const plain = c.get ? c.get({ plain: true }) : c;
-      const net = balanceByCustomer[String(plain.customerNo)] || 0;
+      const bals = balanceByCustomer[String(plain.customerNo)] || {
+        receivables: 0,
+        deposit: 0,
+      };
+      const limit = parseFloat(plain.credit_limit) || 0;
+      const receivables = bals.receivables;
+      const deposit = bals.deposit;
+      const credit_used_percent =
+        limit > 0
+          ? Number(((receivables / limit) * 100).toFixed(1))
+          : null;
+      const wh = warehouseById[String(plain.branch_id)] || null;
       return {
         ...plain,
-        receivables: net > 0 ? net : 0,
-        unused_credits: net < 0 ? Math.abs(net) : 0,
+        receivables,
+        unused_credits: deposit,
+        deposit,
+        unearned_deposit: deposit,
+        credit_used_percent,
+        warehouse_name: wh?.branch_name || null,
+        warehouse_code: wh?.warehouse_code || null,
       };
     });
 
@@ -5138,7 +5211,10 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
        FROM general_ledger
        WHERE LOWER(type) = 'deposit'
          AND facility_id = :facilityId
-         AND transaction_ref = :customerNo`,
+         AND (
+           transaction_ref = :customerNo
+           OR transaction_ref LIKE CONCAT(:customerNo, '-%')
+         )`,
       {
         replacements: { facilityId, customerNo: customer_no },
         type: db.Sequelize.QueryTypes.SELECT,

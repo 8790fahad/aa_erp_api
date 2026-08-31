@@ -28,6 +28,7 @@ const {
   downloadablePoDocumentUrl,
 } = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const {
   fetchEnrichedSalesInvoices,
   aggregateReceivableMetrics,
@@ -3318,25 +3319,12 @@ exports.getCustomerBalanceFromLedger = async (req, res) => {
       });
     }
 
-    const result = await db.sequelize.query(
-      `SELECT
-        SUM(cr) - SUM(dr) AS balance
-      FROM general_ledger
-      WHERE LOWER(type) IN ('receivable', 'recevable', 'deposit')
-        AND facility_id = :facilityId
-        AND transaction_ref = :customerNo
-      GROUP BY transaction_ref`,
-      {
-        replacements: { customerNo, facilityId },
-        type: db.sequelize.QueryTypes.SELECT,
-      },
-    );
-
-    const balance = result.length > 0 ? parseFloat(result[0].balance || 0) : 0;
+    const bals = await getCustomerLedgerBalances(facilityId, customerNo);
 
     return res.status(200).json({
       success: true,
-      balance: balance,
+      ...bals,
+      balance: bals.receivables,
       customer_number: customerNo,
     });
   } catch (error) {
@@ -17973,20 +17961,27 @@ exports.getReceivableLedger = async (req, res) => {
       });
     }
 
-    // Build where clause for transaction_ref
-    // transaction_ref can be in format "customerId" or "customerId-xxx"
+    // A/R only — bank/cash/deposit/tax/revenue on the same customer ref
+    // must not inflate this report (customers list uses the same rule).
+    const receivableTypeLiteral = db.sequelize.literal(
+      `LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')`,
+    );
+    const customerRefMatch = customerId
+      ? {
+          [Op.or]: [
+            { transaction_ref: customerId },
+            { transaction_ref: { [Op.like]: `${customerId}-%` } },
+          ],
+        }
+      : null;
+
     const whereClause = {
       facility_id: facilityId,
       transaction_date: {
         [Op.between]: [fromDate, toDate],
       },
+      [Op.and]: [receivableTypeLiteral, ...(customerRefMatch ? [customerRefMatch] : [])],
     };
-    if (customerId) {
-      whereClause[Op.or] = [
-        { transaction_ref: customerId },
-        { transaction_ref: { [Op.like]: `${customerId}-%` } },
-      ];
-    }
 
     // Fetch transactions
     const transactions = await GeneralLedger.findAll({
@@ -18002,13 +17997,8 @@ exports.getReceivableLedger = async (req, res) => {
     const openingBalanceWhere = {
       facility_id: facilityId,
       transaction_date: { [Op.lt]: fromDate },
+      [Op.and]: [receivableTypeLiteral, ...(customerRefMatch ? [customerRefMatch] : [])],
     };
-    if (customerId) {
-      openingBalanceWhere[Op.or] = [
-        { transaction_ref: customerId },
-        { transaction_ref: { [Op.like]: `${customerId}-%` } },
-      ];
-    }
     const openingBalanceTxns = await GeneralLedger.findAll({
       where: openingBalanceWhere,
       order: [
@@ -18035,9 +18025,8 @@ exports.getReceivableLedger = async (req, res) => {
       const credit = parseFloat(t.cr || 0);
       runningBalance += debit - credit;
       const txRef = String(t.transaction_ref || "").trim();
-      const parsedCustomerId = txRef.includes("-")
-        ? txRef.split("-")[0]
-        : txRef;
+      const parsedCustomerId = customerId
+        || (txRef.match(/^CUS-\d+/i) || [txRef])[0];
 
       return {
         date: moment(t.transaction_date).format("YYYY-MM-DD"),
@@ -18096,7 +18085,9 @@ exports.getReceivableLedger = async (req, res) => {
 
 /**
  * Party balances for customers + suppliers from general_ledger.
- * Balance = SUM(dr) - SUM(cr); matches receivable/payable ledgers (incl. ref suffixes).
+ * Customer A/R = SUM(dr)-SUM(cr) on type receivable (same as customers list).
+ * Supplier A/P = SUM(dr)-SUM(cr) on type payable.
+ * Party keys match exact ref or suffix (CUS-1795 / CUS-1795-*).
  * DR (balance > 0) → receivables/debtors; CR (balance < 0) → payables/creditors.
  */
 async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
@@ -18128,6 +18119,7 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
           FROM general_ledger gl
           WHERE gl.facility_id = :facilityId
             AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+            AND LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
             AND (
               gl.transaction_ref = c.customerNo
               OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
@@ -18150,6 +18142,7 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
           FROM general_ledger gl
           WHERE gl.facility_id = :facilityId
             AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+            AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables')
             AND (
               gl.transaction_ref = s.supplier_number
               OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')

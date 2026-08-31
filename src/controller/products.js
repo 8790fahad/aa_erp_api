@@ -725,12 +725,12 @@ exports.updateProductSalesTarget = async (req, res) => {
       });
     }
 
-    const allowed = ["none", "daily", "weekly", "monthly"];
+    const allowed = ["none", "daily", "weekly", "monthly", "yearly"];
     const periodNorm = String(period || "none").toLowerCase();
     if (!allowed.includes(periodNorm)) {
       return res.status(400).json({
         success: false,
-        message: "period must be none, daily, weekly, or monthly",
+        message: "period must be none, daily, weekly, monthly, or yearly",
       });
     }
 

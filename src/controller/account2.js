@@ -76,22 +76,33 @@ exports.getCustomerDetails = async (req, res) => {
           SELECT
   c.customerNo,
   c.fullname,
+  c.company_name,
   c.address,
   c.phone,
   c.email,
-  COALESCE(gl.balance, 0) AS balance
+  c.credit_limit,
+  c.receivable_code,
+  GREATEST(COALESCE(SUM(CASE
+    WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
+    THEN gl.dr - gl.cr ELSE 0 END), 0), 0) AS receivables,
+  GREATEST(COALESCE(SUM(CASE
+    WHEN LOWER(COALESCE(gl.type, '')) = 'deposit'
+    THEN gl.cr - gl.dr ELSE 0 END), 0), 0) AS deposit,
+  GREATEST(COALESCE(SUM(CASE
+    WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
+    THEN gl.dr - gl.cr ELSE 0 END), 0), 0) AS balance
 FROM customers c
-LEFT JOIN (
-  SELECT
-    transaction_ref AS customerNo,
-    COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-  FROM general_ledger
-  WHERE facility_id = :facilityId
-  GROUP BY transaction_ref
-) gl ON c.customerNo = gl.customerNo
+LEFT JOIN general_ledger gl
+  ON gl.facility_id = :facilityId
+ AND (
+   gl.transaction_ref = c.customerNo
+   OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
+ )
 WHERE c.facilityId = :facilityId
+GROUP BY
+  c.customerNo, c.fullname, c.company_name, c.address,
+  c.phone, c.email, c.credit_limit, c.receivable_code
 ORDER BY c.fullname ASC;
-
         `;
 
         results = await db.sequelize.query(customerBalanceQuery, {

@@ -33,6 +33,7 @@ function emptyLimits(sales_stopped) {
     daily_sales_limit: null,
     weekly_sales_limit: null,
     monthly_sales_limit: null,
+    yearly_sales_limit: null,
     sales_stopped,
   };
 }
@@ -45,6 +46,7 @@ function limitsFromWarehouseRow(row, sales_stopped) {
   if (period === "daily") base.daily_sales_limit = qty;
   if (period === "weekly") base.weekly_sales_limit = qty;
   if (period === "monthly") base.monthly_sales_limit = qty;
+  if (period === "yearly") base.yearly_sales_limit = qty;
   return base;
 }
 
@@ -102,7 +104,14 @@ function limitChecksForProduct(product, saleDate) {
   const dayLimit = parseLimit(product?.daily_sales_limit);
   const weekLimit = parseLimit(product?.weekly_sales_limit);
   const monthLimit = parseLimit(product?.monthly_sales_limit);
-  if (dayLimit == null && weekLimit == null && monthLimit == null) return [];
+  const yearLimit = parseLimit(product?.yearly_sales_limit);
+  if (
+    dayLimit == null &&
+    weekLimit == null &&
+    monthLimit == null &&
+    yearLimit == null
+  )
+    return [];
 
   const when = moment(saleDate || undefined);
   if (!when.isValid()) {
@@ -134,6 +143,14 @@ function limitChecksForProduct(product, saleDate) {
       limit: monthLimit,
       from: when.clone().startOf("month").format("YYYY-MM-DD"),
       to: when.clone().endOf("month").format("YYYY-MM-DD"),
+    });
+  }
+  if (yearLimit != null) {
+    checks.push({
+      name: "yearly",
+      limit: yearLimit,
+      from: when.clone().startOf("year").format("YYYY-MM-DD"),
+      to: when.clone().endOf("year").format("YYYY-MM-DD"),
     });
   }
   return checks;
@@ -332,6 +349,7 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
         daily_sales_limit: row.daily_sales_limit,
         weekly_sales_limit: row.weekly_sales_limit,
         monthly_sales_limit: row.monthly_sales_limit,
+        yearly_sales_limit: row.yearly_sales_limit,
         sales_stopped: row.sales_stopped,
       });
     }
@@ -342,7 +360,8 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
       p.sales_stopped == null &&
       parseLimit(p.daily_sales_limit) == null &&
       parseLimit(p.weekly_sales_limit) == null &&
-      parseLimit(p.monthly_sales_limit) == null,
+      parseLimit(p.monthly_sales_limit) == null &&
+      parseLimit(p.yearly_sales_limit) == null,
   );
   const needsStopFlag = [...bySku.entries()].filter(
     ([, p]) => p.sales_stopped == null,
@@ -374,6 +393,7 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
         daily_sales_limit: p.daily_sales_limit ?? prev.daily_sales_limit,
         weekly_sales_limit: p.weekly_sales_limit ?? prev.weekly_sales_limit,
         monthly_sales_limit: p.monthly_sales_limit ?? prev.monthly_sales_limit,
+        yearly_sales_limit: prev.yearly_sales_limit,
         sales_stopped: p.sales_stopped,
       });
     }
@@ -476,6 +496,7 @@ async function attachSalesLimitInfo(rows, facilityId, saleDate) {
     row.daily_sales_limit = product.daily_sales_limit ?? null;
     row.weekly_sales_limit = product.weekly_sales_limit ?? null;
     row.monthly_sales_limit = product.monthly_sales_limit ?? null;
+    row.yearly_sales_limit = product.yearly_sales_limit ?? null;
     row.sales_stopped = isStoppedForWarehouse({
       product: {
         ...product,

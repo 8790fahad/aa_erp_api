@@ -77,7 +77,6 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(255),
         allowNull: true,
         primaryKey: true,
-        unique: true,
         field: "memo_id",
       },
       amount: {
@@ -169,31 +168,14 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         field: "supplier_number",
       },
-      created_at: {
-        type: DataTypes.DATE,
-        allowNull: true,
-        defaultValue: DataTypes.NOW,
-        field: "created_at",
-      },
-      updated_at: {
-        type: DataTypes.DATE,
-        allowNull: true,
-        field: "updated_at",
-      },
     },
     {
       sequelize,
       modelName: "Memo",
       tableName: "memo",
-      timestamps: false,
-      indexes: [
-        { fields: ["memo_id"] },
-        { fields: ["facilityId"] },
-        { fields: ["status"] },
-        { fields: ["user_id"] },
-        { fields: ["raise_by"] },
-        { fields: ["pr_no"] },
-      ],
+      timestamps: true,
+      createdAt: "createdAt",
+      updatedAt: "updatedAt",
     }
   );
 

@@ -13,21 +13,10 @@ const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../servi
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
-// getBalance function - inline implementation to avoid ES6/CommonJS import issues
+const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const getBalance = async (customerNo, facilityId) => {
-  const result = await db.sequelize.query(
-    `SELECT SUM(cr) - SUM(dr) AS balance
-     FROM general_ledger
-     WHERE LOWER(type) IN ('receivable', 'recevable', 'deposit')
-       AND facility_id = :facilityId
-       AND transaction_ref = :customerNo
-     GROUP BY transaction_ref`,
-    {
-      replacements: { customerNo, facilityId },
-      type: db.sequelize.QueryTypes.SELECT,
-    }
-  );
-  return parseFloat(result[0]?.balance || 0);
+  const { deposit } = await getCustomerLedgerBalances(facilityId, customerNo);
+  return deposit;
 };
 const { CustomerEntry, Discount, Tax, Customer, CustomerCopy } = db;
 // const getTxnVersionId = require('./helpers').getTxnVersionId
@@ -2596,6 +2585,7 @@ exports.createSale = async (req, res) => {
       total_amount = null,
       txn_type = "Credit Sale",
       modeOfPayment,
+      payment_modes = [],
       accountHead,
       bankAccount,
       cheque_number,
@@ -2926,52 +2916,64 @@ exports.createSale = async (req, res) => {
         .json({ success: false, message: "Customer not found" });
     }
 
-    // ===================================================================
-    // CREDIT LIMIT (Credit / deposit / credit-split invoices)
-    // ===================================================================
-    const paymentModeNorm = String(modeOfPayment || "")
-      .toLowerCase()
-      .trim();
-    const needsCreditLimitCheck =
-      isCreditSale ||
-      paymentModeNorm === "credit" ||
-      paymentModeNorm === "deposit" ||
-      paymentModeNorm === "credit_split" ||
-      paymentModeNorm.includes("credit");
+    // Credit / deposit coverage on create — skipped when cash or transfer is also selected.
+    {
+      const modes = (
+        Array.isArray(payment_modes) ? payment_modes : []
+      ).map((m) => String(m || "").toLowerCase().trim());
+      const rawMode = String(modeOfPayment || "").toLowerCase();
+      const hasCash =
+        modes.includes("cash") ||
+        rawMode === "cash" ||
+        rawMode === "split" ||
+        rawMode === "credit_split";
+      const hasTransfer =
+        modes.includes("transfer") ||
+        rawMode === "transfer" ||
+        rawMode === "bank" ||
+        rawMode === "split" ||
+        rawMode === "credit_split";
+      const hasCredit =
+        modes.includes("credit") ||
+        rawMode === "credit" ||
+        rawMode === "credit_split";
+      const hasDeposit =
+        modes.includes("deposit") ||
+        apply_prepayment === true ||
+        apply_prepayment === "true" ||
+        rawMode === "deposit";
 
-    const creditLimit = parseFloat(customer.credit_limit || 0);
-    if (needsCreditLimitCheck && creditLimit > 0) {
-      const glBalance =
-        parseFloat(await getBalance(customer_id, facilityId)) || 0;
-      // getBalance = SUM(cr)-SUM(dr); negative ⇒ customer owes A/R
-      const outstandingFromGl = Math.max(0, -glBalance);
-      const outstandingFromCustomer =
-        Math.max(
-          0,
-          parseFloat(customer.balance || customer.amount || 0) || 0,
-        );
-      const outstanding = Math.max(outstandingFromGl, outstandingFromCustomer);
-      const thisSale =
-        parseFloat(total_amount) ||
-        (Array.isArray(items)
-          ? items.reduce(
-              (s, it) =>
-                s +
-                parseFloat(it.quantity || it.qty || 0) *
-                  parseFloat(it.price || it.selling_price || 0),
-              0,
-            )
-          : 0);
-      if (outstanding + thisSale > creditLimit + 0.01) {
-        await t.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Credit limit exceeded. Limit: ${creditLimit.toFixed(
-            2,
-          )}, Outstanding: ${outstanding.toFixed(
-            2,
-          )}, This sale: ${thisSale.toFixed(2)}`,
-        });
+      if ((hasCredit || hasDeposit) && !hasCash && !hasTransfer) {
+        const bals = await getCustomerLedgerBalances(facilityId, customer_id);
+        const invoiceTotal = Number(total_amount);
+        const due = Number.isFinite(invoiceTotal) && invoiceTotal > 0
+          ? invoiceTotal
+          : 0;
+        const limit = parseFloat(customer.credit_limit) || 0;
+        const unlimitedCredit = !(limit > 0);
+        const creditLeft = unlimitedCredit
+          ? Infinity
+          : Math.max(0, limit - bals.receivables);
+        const deposit = bals.deposit;
+        const over = (cap) => due > cap + 0.009;
+
+        let coverageMessage = null;
+        if (hasCredit && hasDeposit) {
+          if (!unlimitedCredit && over(creditLeft + deposit)) {
+            coverageMessage = `Invoice (${due.toFixed(2)}) exceeds credit available (${creditLeft.toFixed(2)}) plus deposit (${deposit.toFixed(2)}).`;
+          }
+        } else if (hasCredit && !unlimitedCredit && over(creditLeft)) {
+          coverageMessage = `Invoice (${due.toFixed(2)}) exceeds credit available (${creditLeft.toFixed(2)}).`;
+        } else if (hasDeposit && !hasCredit && over(deposit)) {
+          coverageMessage = `Invoice (${due.toFixed(2)}) exceeds deposit available (${deposit.toFixed(2)}).`;
+        }
+        if (coverageMessage) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message: coverageMessage,
+          });
+        }
       }
     }
 
@@ -3821,11 +3823,8 @@ exports.createSale = async (req, res) => {
             transaction: t,
           });
 
-          // Wrong warehouse on the line (often the cashier's assigned branch)
-          // while Make Sale showed stock at another warehouse — re-home the line.
-          const mayRetarget =
-            !hasExplicitLineBranch ||
-            (saleBranchId > 0 && stockBranchId === saleBranchId);
+          // Sales are warehouse-bound: never pull stock from another store.
+          const mayRetarget = false;
 
           if (
             !allowSalesWithoutStock &&
@@ -4248,12 +4247,58 @@ exports.createSale = async (req, res) => {
       throw new Error("Net amount cannot be negative");
     }
 
+    // Invoice-level VAT (after discount) — reused for A/R and tax CRs
+    const invoiceVATBreakdown = getInvoiceVATBreakdown(
+      subtotal,
+      discount_amount,
+      taxes,
+      vatPolicy
+    );
+
+    const exclusiveVatToPost = Number(
+      (
+        invoiceVATBreakdown.breakdown || []
+      )
+        .reduce((sum, { tax, amount }) => {
+          const taxType =
+            tax.inclusive_type === "inclusive"
+              ? "Inclusive"
+              : tax.inclusive_type === "exclusive"
+                ? "Exclusive"
+                : tax.tax_type === "inclusive"
+                  ? "Inclusive"
+                  : "Exclusive";
+          return taxType === "Exclusive" ? sum + Number(amount || 0) : sum;
+        }, 0)
+        .toFixed(2)
+    );
+
     // Prefer Invoice Total from the UI (Total NGN) so Cashier Point /
-    // A/R due matches what was shown on New Invoice.
+    // A/R due matches what was shown on New Invoice — but never drop
+    // exclusive output VAT from A/R. Exclusive VAT is posted as a
+    // separate CR; A/R must include it or the ledger will not balance.
     const clientTotal = Number(total_amount);
     if (Number.isFinite(clientTotal) && clientTotal > 0) {
       netAmount = clientTotal;
       arDebitAmount = clientTotal;
+    }
+
+    if (exclusiveVatToPost > 0.004) {
+      const expectedWithExclusiveVat = Number(
+        (totalRevenue + exclusiveVatToPost).toFixed(2)
+      );
+      const expectedFromSubtotal = Number(
+        (subtotal - discount_amount + exclusiveVatToPost).toFixed(2)
+      );
+      const roundedNet = Number(Number(netAmount).toFixed(2));
+      const alreadyIncludesExclusiveVat =
+        Math.abs(roundedNet - expectedWithExclusiveVat) <= 0.05 ||
+        Math.abs(roundedNet - expectedFromSubtotal) <= 0.05;
+
+      if (!alreadyIncludesExclusiveVat) {
+        netAmount = Number((roundedNet + exclusiveVatToPost).toFixed(2));
+        arDebitAmount = netAmount;
+      }
     }
 
     console.log("\n=== NET AMOUNT CALCULATION ===");
@@ -4474,7 +4519,6 @@ exports.createSale = async (req, res) => {
     // CR TAX PAYABLE (invoice-level: remove discount then apply tax)
     // ===================================================================
     const taxCustomerEntries = [];
-    const invoiceVATBreakdown = getInvoiceVATBreakdown(subtotal, discount_amount, taxes, vatPolicy);
 
     if (totalCalculatedVAT > 0 && invoiceVATBreakdown.breakdown.length > 0) {
       console.log("=== PROCESSING TAX ENTRIES (after discount) ===");

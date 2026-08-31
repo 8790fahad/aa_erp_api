@@ -362,11 +362,15 @@ app.use(passport.initialize());
 require("./config/passport")(passport);
 // force: true will drop the table if it already exits
 models.sequelize
-  .sync
-  // { alter: true }
-  ()
+  .sync()
   .then(() => {
     console.log("Sequelize sync completed (no force — tables ensured only).");
+  })
+  .catch((err) => {
+    console.error("Sequelize sync failed:", err.message);
+    if (err?.parent?.sqlMessage) {
+      console.error("Sequelize sync SQL:", err.parent.sqlMessage);
+    }
   });
 
 require("./routes/users")(app);
