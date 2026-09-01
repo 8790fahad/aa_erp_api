@@ -1,7 +1,51 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
 const nodemailer = require("nodemailer");
 const { MailtrapTransport } = require("mailtrap");
+
+const VERIFIED_FROM = "noreply@ashiru-ali.com";
+
+function resolveEnvPath() {
+  const candidates = [
+    path.join(__dirname, "..", "..", ".env"),
+    path.join(process.cwd(), ".env"),
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
+}
+
+/**
+ * PM2/systemd env wins over dotenv by default. Re-apply mail keys from the
+ * on-disk .env so password reset uses the Sending token and verified From.
+ */
+function applyMailEnvFromFile() {
+  const envPath = resolveEnvPath();
+  try {
+    const parsed = dotenv.parse(fs.readFileSync(envPath));
+    if (parsed.MAILTRAP_TOKEN) {
+      process.env.MAILTRAP_TOKEN = String(parsed.MAILTRAP_TOKEN).trim();
+    }
+    if (parsed.MAIL_FROM) {
+      process.env.MAIL_FROM = String(parsed.MAIL_FROM).trim();
+    }
+  } catch (err) {
+    console.warn("[mail] could not read", envPath, err.message);
+  }
+}
+
+function fromEmail() {
+  const raw = String(process.env.MAIL_FROM || VERIFIED_FROM);
+  const angle = raw.match(/<([^>]+)>/);
+  const email = (angle ? angle[1] : raw)
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .toLowerCase();
+  const domain = email.split("@")[1] || "";
+  if (domain !== "ashiru-ali.com") return VERIFIED_FROM;
+  return email;
+}
 
 function getSmtpFromEnv() {
   const host = process.env.SMTP_HOST || process.env.MAIL_HOST;
@@ -18,11 +62,8 @@ function getSmtpFromEnv() {
   });
 }
 
-/**
- * Live inbox delivery (password reset, KYC, CRM outreach).
- * Prefer Mailtrap Sending API when MAILTRAP_TOKEN is set.
- */
 function getLiveMailTransport() {
+  applyMailEnvFromFile();
   const token = String(process.env.MAILTRAP_TOKEN || "").trim();
   if (token) {
     return {
@@ -37,7 +78,53 @@ function getLiveMailTransport() {
   );
 }
 
+async function sendLiveEmail({ to, subject, html, text, category }) {
+  applyMailEnvFromFile();
+  const token = String(process.env.MAILTRAP_TOKEN || "").trim();
+  const email = fromEmail();
+  const name = process.env.COMPANY_NAME || "AA ERP";
+  if (!token) {
+    throw new Error("MAILTRAP_TOKEN is not set in .env");
+  }
+
+  console.log("[mail] send.api.mailtrap.io", {
+    from: email,
+    to,
+    token_len: token.length,
+    token_prefix: token.slice(0, 4),
+  });
+
+  const res = await fetch("https://send.api.mailtrap.io/api/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: { email, name },
+      to: [{ email: to }],
+      subject,
+      html,
+      text: text || undefined,
+      category: category || undefined,
+    }),
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    const err = new Error(`Mailtrap ${res.status}: ${body}`);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    return { raw: body };
+  }
+}
+
 function describeMailSendError(err) {
+  if (err?.body) return String(err.body);
   const msg = String(err?.message || err || "");
   if (/unauthorized/i.test(msg)) {
     return (
@@ -51,7 +138,9 @@ function describeMailSendError(err) {
 }
 
 module.exports = {
+  applyMailEnvFromFile,
   getSmtpFromEnv,
   getLiveMailTransport,
+  sendLiveEmail,
   describeMailSendError,
 };

@@ -1,8 +1,8 @@
 const express = require("express");
 const passport = require("passport");
-require("dotenv").config();
-const port = process.env.PORT || 3000;
 const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+const port = process.env.PORT || 3000;
 const fs = require("fs");
 const logger = require("morgan");
 const cors = require("cors");

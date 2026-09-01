@@ -28,6 +28,7 @@ const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
 const {
   getLiveMailTransport,
+  sendLiveEmail,
   describeMailSendError,
 } = require("../config/mailTransport");
 const { getPublicFrontendUrl } = require("../config/frontendUrl");
@@ -2077,13 +2078,7 @@ exports.checkEmail = async (req, res) => {
       process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
     const companyLogoUrl =
       process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
-    const transport = getMailtrapTransport();
-    const mailOptions = {
-      from: mailFrom("AA ERP"),
-      to: email,
-      subject: "AA ERP - Password Reset Verification Link",
-      category: "Password Reset Link",
-      html: `
+    const html = `
         <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
           <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,0.06);overflow:hidden;">
             <div style="padding:20px 24px 0 24px;">
@@ -2160,10 +2155,14 @@ exports.checkEmail = async (req, res) => {
             </div>
           </div>
         </div>
-      `,
-    };
+      `;
 
-    await transport.sendMail(mailOptions);
+    await sendLiveEmail({
+      to: email,
+      subject: "AA ERP - Password Reset Verification Link",
+      category: "Password Reset Link",
+      html,
+    });
     return res.status(200).json({
       success: true,
       message: `Password reset email sent to ${email}!`,
