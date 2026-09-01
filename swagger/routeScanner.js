@@ -6,6 +6,9 @@ const SKIP_SCAN_FILES = new Set([]);
 const ROUTE_METHOD_REGEX =
   /app\.(get|post|put|delete|patch)\s*\(\s*[`'"]([^`'"]+)[`'"]/gi;
 
+
+
+  
 /** Routes that do not require JWT (login, signup, health, etc.). */
 const PUBLIC_ROUTE_PREFIXES = [
   "/api/auth/login",
