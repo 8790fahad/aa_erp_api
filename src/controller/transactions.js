@@ -4957,7 +4957,9 @@ exports.createSale = async (req, res) => {
               ? "deposit"
               : "CREDIT",
           isCashSale,
+          payment_modes,
         ),
+        paymentModes: Array.isArray(payment_modes) ? payment_modes : [],
         amount:
           String(modeOfPayment || "").toLowerCase().includes("deposit")
             ? amountToAR

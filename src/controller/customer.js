@@ -5366,7 +5366,7 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
               // Remainder goes to Credit Approval (not Separation yet)
               wf.status = "awaiting_credit_approval";
               wf.amount = remaining;
-              wf.payment_type = wf.payment_type || "deposit";
+              wf.payment_type = "credit";
               history.push({
                 status: "awaiting_credit_approval",
                 at: new Date().toISOString(),

@@ -91,7 +91,8 @@ function nextStageFor(current, paymentType) {
     paymentType === "credit_split" ||
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
-  const isDeposit = paymentType === "deposit";
+  const isDeposit =
+    paymentType === "deposit" || paymentType === "apply_deposit";
 
   const map = {
     sales_order: "invoice_generated",
@@ -134,7 +135,8 @@ function stagesForPaymentType(paymentType) {
     paymentType === "credit_split" ||
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
-  const isDeposit = paymentType === "deposit";
+  const isDeposit =
+    paymentType === "deposit" || paymentType === "apply_deposit";
 
   // Cash/transfer: Invoice → Cashier → Separation → Warehouse → Done
   // Warehouse: Invoice → Separation → Warehouse → Done (no cashier)

@@ -8579,6 +8579,7 @@ exports.getReadyForSalesItems = async (req, res) => {
         AND (b.\`facilityId\` = sd.\`facilityId\` OR b.\`facilityId\` IS NULL)
       ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
+        AND sd.\`branchId\` > 0
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
         ${salesStoppedCondition}
       ORDER BY
@@ -8675,6 +8676,7 @@ exports.getReadyForSalesByBranch = async (req, res) => {
         AND (b.\`facilityId\` = sd.\`facilityId\` OR b.\`facilityId\` IS NULL)
       ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
+        AND sd.\`branchId\` > 0
         AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
         ${salesStoppedCondition}
     `;

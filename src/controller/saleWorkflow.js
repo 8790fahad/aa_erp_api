@@ -8,20 +8,43 @@ const {
   stagesForPaymentType,
 } = require("../models/sale_workflows");
 
-function normalizePaymentType(modeOfPayment, isCashSale) {
+function parseModeList(paymentModes) {
+  return (Array.isArray(paymentModes) ? paymentModes : [])
+    .map((m) => String(m || "").toLowerCase().trim())
+    .filter(Boolean);
+}
+
+function isDepositPaymentType(paymentType) {
+  const t = String(paymentType || "").toLowerCase().trim();
+  return t === "deposit" || t === "apply_deposit" || t === "apply deposit";
+}
+
+function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
+  const modes = parseModeList(paymentModes);
+  const m = String(modeOfPayment || "").toLowerCase().trim();
+  const hasDeposit =
+    modes.includes("deposit") ||
+    m === "deposit" ||
+    m === "apply_deposit" ||
+    m === "apply deposit" ||
+    m.includes("deposit");
+  const hasCash = modes.includes("cash") || m === "cash";
+  const hasTransfer =
+    modes.includes("transfer") || m === "transfer" || m === "bank";
+
+  // Credit + Apply Deposit (no cash/transfer): apply deposit first
+  if (hasDeposit && !hasCash && !hasTransfer) return "deposit";
+
   if (!isCashSale) {
-    const m = String(modeOfPayment || "").toLowerCase().trim();
-    if (m === "deposit" || m === "apply_deposit" || m === "apply deposit") {
-      return "deposit";
-    }
+    if (hasDeposit) return "deposit";
     return "credit";
   }
-  const m = String(modeOfPayment || "").toLowerCase().trim();
   if (
     m === "credit_split" ||
     m === "credit+cash+transfer" ||
     m === "credit + cash + transfer" ||
-    m === "credit_cash_transfer"
+    m === "credit_cash_transfer" ||
+    (modes.includes("credit") && (hasCash || hasTransfer))
   ) {
     return "credit_split";
   }
@@ -78,6 +101,20 @@ function historyHasDiscountApproved(history) {
       .toLowerCase()
       .includes("discount approved"),
   );
+}
+
+function historyHasDepositApplied(history) {
+  return normalizeHistory(history).some((h) =>
+    /deposit applied/i.test(String(h?.note || "")),
+  );
+}
+
+function historyHasCreditAfterDeposit(history) {
+  return normalizeHistory(history).some((h) => {
+    if (h?.credit_after_deposit === true) return true;
+    const modes = parseModeList(h?.payment_modes);
+    return modes.includes("credit") && modes.includes("deposit");
+  });
 }
 
 async function loadDiscountBySaleCode(facilityId, saleCodes) {
@@ -889,18 +926,23 @@ async function createSaleWorkflowRecord(
     discountAmount = 0,
     assignedCashierId = null,
     assignedCashierName = null,
+    paymentModes = [],
   },
   transaction,
 ) {
   if (!db.SaleWorkflow || !facilityId || !saleCode) return null;
 
+  const modes = parseModeList(paymentModes);
+  let resolvedPaymentType = paymentType;
+  const creditAfterDeposit =
+    isDepositPaymentType(resolvedPaymentType) && modes.includes("credit");
   const isPaid =
-    paymentType !== "credit" &&
-    paymentType !== "warehouse" &&
-    paymentType !== "deposit";
+    resolvedPaymentType !== "credit" &&
+    resolvedPaymentType !== "warehouse" &&
+    !isDepositPaymentType(resolvedPaymentType);
   const hasDiscount = toMoney(discountAmount) > 0;
   const depositFullyApplied =
-    paymentType === "deposit" && Number(amount) <= 0;
+    isDepositPaymentType(resolvedPaymentType) && Number(amount) <= 0;
   const cashierId =
     assignedCashierId != null && String(assignedCashierId).trim()
       ? String(assignedCashierId).trim()
@@ -910,21 +952,38 @@ async function createSaleWorkflowRecord(
       ? String(assignedCashierName).trim()
       : null;
 
+  let availableDeposit = 0;
+  if (isDepositPaymentType(resolvedPaymentType) && customerNo) {
+    try {
+      const bals = await getCustomerLedgerBalances(facilityId, customerNo);
+      availableDeposit = Number(bals?.deposit) || 0;
+    } catch (_) {
+      availableDeposit = 0;
+    }
+  }
+
   // Discounted invoices must be approved before Verification Points / credit path
   let initialStatus;
   let statusNote;
-  if (hasDiscount && paymentType !== "deposit") {
+  if (hasDiscount && !isDepositPaymentType(resolvedPaymentType)) {
     initialStatus = "awaiting_discount_approval";
     statusNote = "Awaiting discount approval before collection";
-  } else if (paymentType === "deposit") {
+  } else if (isDepositPaymentType(resolvedPaymentType)) {
     if (depositFullyApplied || Number(amount) === 0) {
       initialStatus = "invoice_separation";
       statusNote = "Deposit applied — ready for separation";
+    } else if (creditAfterDeposit && availableDeposit <= 0.05) {
+      // Credit + Apply Deposit with nothing to apply — go to Credit, not a cashier queue
+      resolvedPaymentType = "credit";
+      initialStatus = "awaiting_credit_approval";
+      statusNote =
+        "No customer deposit available — awaiting credit approval";
     } else {
       // Do not send to Credit Approval yet — user applies deposit first
       initialStatus = "awaiting_payment";
-      statusNote =
-        "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
+      statusNote = creditAfterDeposit
+        ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
+        : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
     }
   } else if (isPaid) {
     initialStatus = "awaiting_cashier_confirm";
@@ -943,10 +1002,20 @@ async function createSaleWorkflowRecord(
   }
 
   let history = [];
+  const historyExtra = {
+    ...(modes.length ? { payment_modes: modes } : {}),
+    ...(creditAfterDeposit ? { credit_after_deposit: true } : {}),
+  };
   history = pushHistory(history, "sales_order", createdBy, "Order created");
   history = pushHistory(history, "invoice_generated", createdBy, "Invoice generated");
   history = pushHistory(history, "submitted", createdBy, "Submitted for processing");
-  history = pushHistory(history, initialStatus, createdBy, statusNote);
+  history = pushHistory(
+    history,
+    initialStatus,
+    createdBy,
+    statusNote,
+    Object.keys(historyExtra).length ? historyExtra : null,
+  );
   if (cashierId && isPaid) {
     history = pushHistory(
       history,
@@ -963,7 +1032,7 @@ async function createSaleWorkflowRecord(
       sale_code: saleCode,
       customer_no: customerNo || null,
       customer_name: customerName || null,
-      payment_type: paymentType,
+      payment_type: resolvedPaymentType,
       status: initialStatus,
       amount: amount != null ? Number(amount) : null,
       branch_id: branchId || null,
@@ -981,7 +1050,7 @@ async function createSaleWorkflowRecord(
   if (
     !created &&
     hasDiscount &&
-    paymentType !== "deposit" &&
+    !isDepositPaymentType(resolvedPaymentType) &&
     [
       "awaiting_credit_approval",
       "awaiting_cashier_confirm",
@@ -1155,6 +1224,42 @@ exports.advanceSaleWorkflow = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Workflow not found",
+      });
+    }
+
+    if (action === "send_remainder_to_credit") {
+      const pt = String(row.payment_type || "")
+        .toLowerCase()
+        .trim();
+      if (
+        !isDepositPaymentType(pt) ||
+        !["awaiting_payment", "awaiting_cashier_confirm"].includes(
+          String(row.status || ""),
+        )
+      ) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Invoice is not waiting for a deposit application",
+        });
+      }
+      row.payment_type = "credit";
+      row.status = "awaiting_credit_approval";
+      row.history = pushHistory(
+        row.history,
+        "awaiting_credit_approval",
+        updated_by,
+        note ||
+          "Remainder sent to Credit approval (Apply Deposit skipped or none available)",
+        { credit_after_deposit: true },
+      );
+      row.updated_by = updated_by || row.updated_by;
+      await row.save({ transaction });
+      await transaction.commit();
+      return res.json({
+        success: true,
+        message: "Remainder sent to Credit approval",
+        results: row,
       });
     }
 
@@ -1692,21 +1797,48 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "mode"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(depositWhere),
+            where: depositWhere,
             order: [["created_at", "DESC"]],
             limit: 200,
           });
     const depositRows = depositPending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
+      const history = normalizeHistory(plain.history);
       return {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "teal",
         amount: Number(plain.amount) || 0,
+        credit_after_deposit: historyHasCreditAfterDeposit(history),
       };
     });
+
+    const depositCustomerNos = [
+      ...new Set(depositRows.map((r) => r.customer_no).filter(Boolean)),
+    ];
+    const depositBalByCustomer = new Map();
+    await Promise.all(
+      depositCustomerNos.map(async (cno) => {
+        try {
+          const bals = await getCustomerLedgerBalances(facilityId, cno);
+          depositBalByCustomer.set(String(cno), Number(bals?.deposit) || 0);
+        } catch (_) {
+          depositBalByCustomer.set(String(cno), 0);
+        }
+      }),
+    );
+    for (const row of depositRows) {
+      row.deposit_available =
+        depositBalByCustomer.get(String(row.customer_no || "")) || 0;
+      row.credit_remainder = Number(
+        Math.max(
+          0,
+          (Number(row.amount) || 0) - (Number(row.deposit_available) || 0),
+        ).toFixed(2),
+      );
+    }
 
     // Discounted invoices awaiting approval before Verification Points
     const discountWhere = {
@@ -1873,6 +2005,8 @@ exports.getCashierDashboard = async (req, res) => {
     const pullIntoDiscount = (list) => {
       for (let i = list.length - 1; i >= 0; i -= 1) {
         const row = list[i];
+        const pt = String(row.payment_type || "").toLowerCase();
+        if (pt === "deposit" || pt === "apply_deposit") continue;
         if (!shouldHoldForDiscount(row)) continue;
         if (
           !discountRows.some((d) => String(d.sale_code) === String(row.sale_code))
@@ -1887,6 +2021,54 @@ exports.getCashierDashboard = async (req, res) => {
     pullIntoDiscount(pendingRows);
     pullIntoDiscount(creditRows);
     pullIntoDiscount(depositRows);
+
+    // Credit + Apply Deposit stays on Apply Deposit until applied, and also
+    // lists on Credit so the credit remainder is visible immediately.
+    const listOnCreditTab = (row) =>
+      Boolean(row.credit_after_deposit) ||
+      Number(row.credit_remainder) > 0.05;
+    if (
+      ct !== "cash" &&
+      ct !== "transfer" &&
+      ct !== "split" &&
+      ct !== "discount" &&
+      ct !== "mode" &&
+      ct !== "deposit"
+    ) {
+      for (const row of depositRows) {
+        if (!listOnCreditTab(row)) continue;
+        if (
+          creditRows.some(
+            (c) => String(c.sale_code) === String(row.sale_code),
+          )
+        ) {
+          continue;
+        }
+        const remainder = Number(row.credit_remainder) || 0;
+        const extraAmount =
+          remainder > 0.05 ? remainder : Number(row.amount) || 0;
+        const check = await getCreditLimitCheck(facilityId, row.customer_no, {
+          extraAmount,
+          excludeInvoiceRef: row.sale_code,
+        });
+        creditRows.push({
+          ...row,
+          deposit_pending: true,
+          credit_after_deposit: true,
+          status_label:
+            remainder > 0.05
+              ? "Credit after deposit"
+              : "Covered by deposit",
+          status_color: remainder > 0.05 ? "rose" : "teal",
+          credit_limit: check.creditLimit,
+          credit_outstanding: check.outstanding,
+          credit_available: check.available,
+          credit_projected: check.projected,
+          credit_unlimited: check.unlimited,
+          credit_over_limit: check.overLimit,
+        });
+      }
+    }
 
     const summary = {
       pending_cash: 0,
