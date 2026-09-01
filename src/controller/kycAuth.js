@@ -12,6 +12,7 @@ const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
 const { getLiveMailTransport } = require("../config/mailTransport");
 const { getPublicFrontendUrl } = require("../config/frontendUrl");
+const { getEmailBranding } = require("../config/emailBranding");
 const SMS = require("../services/smsApi");
 const { verifyRecaptchaToken } = require("../utils/recaptcha");
 
@@ -105,21 +106,19 @@ function createMailTransport() {
 }
 
 function getCompanyMailBranding() {
+  const branding = getEmailBranding();
   return {
-    companyLogoUrl:
-      process.env.COMPANY_LOGO_URL ||
-      "https://res.cloudinary.com/drxkp1erj/image/upload/aa_erp-blue_utcqmg.png",
-    companyWebsite: process.env.COMPANY_WEBSITE || "https://aa_erp.org",
-    companyEmail: process.env.COMPANY_EMAIL || "hello@aa_erp.org",
-    companyPhone: process.env.COMPANY_PHONE || "+2348067643479",
-    companyTwitter: process.env.COMPANY_TWITTER || "https://x.com/aa_erpng",
-    companyInstagram:
-      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/aa_erpng",
-    companyLinkedIn:
-      process.env.COMPANY_LINKEDIN ||
-      "https://www.linkedin.com/company/aa_erpng",
-    companyFacebook:
-      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng",
+    companyLogoUrl: /flowbooks/i.test(String(process.env.COMPANY_LOGO_URL || ""))
+      ? ""
+      : process.env.COMPANY_LOGO_URL ||
+        "https://res.cloudinary.com/drxkp1erj/image/upload/aa_erp-blue_utcqmg.png",
+    companyWebsite: branding.companyWebsite,
+    companyEmail: branding.companyEmail,
+    companyPhone: branding.companyPhone,
+    companyTwitter: branding.companyTwitter,
+    companyInstagram: branding.companyInstagram,
+    companyLinkedIn: branding.companyLinkedIn,
+    companyFacebook: branding.companyFacebook,
   };
 }
 

@@ -24,14 +24,28 @@ function applyMailEnvFromFile() {
   const envPath = resolveEnvPath();
   try {
     const parsed = dotenv.parse(fs.readFileSync(envPath));
-    if (parsed.MAILTRAP_TOKEN) {
-      process.env.MAILTRAP_TOKEN = String(parsed.MAILTRAP_TOKEN).trim();
-    }
-    if (parsed.MAIL_FROM) {
-      process.env.MAIL_FROM = String(parsed.MAIL_FROM).trim();
-    }
-    if (parsed.MAIL_FROM_NAME) {
-      process.env.MAIL_FROM_NAME = String(parsed.MAIL_FROM_NAME).trim();
+    const keys = [
+      "MAILTRAP_TOKEN",
+      "MAIL_FROM",
+      "MAIL_FROM_NAME",
+      "PUBLIC_FRONTEND_URL",
+      "KYC_FRONTEND_URL",
+      "KYC_FRONTEND_URL_PROD",
+      "KYC_FRONTEND_URL_DEV",
+      "COMPANY_NAME",
+      "COMPANY_WEBSITE",
+      "COMPANY_EMAIL",
+      "COMPANY_PHONE",
+      "COMPANY_TWITTER",
+      "COMPANY_INSTAGRAM",
+      "COMPANY_LINKEDIN",
+      "COMPANY_FACEBOOK",
+      "COMPANY_FACESBOOK",
+    ];
+    for (const key of keys) {
+      if (parsed[key] != null && String(parsed[key]).trim()) {
+        process.env[key] = String(parsed[key]).trim();
+      }
     }
   } catch (err) {
     console.warn("[mail] could not read", envPath, err.message);

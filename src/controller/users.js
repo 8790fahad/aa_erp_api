@@ -32,6 +32,15 @@ const {
   describeMailSendError,
 } = require("../config/mailTransport");
 const { getPublicFrontendUrl } = require("../config/frontendUrl");
+const {
+  getEmailBranding,
+  buildCompanyMailFooter,
+} = require("../config/emailBranding");
+const {
+  RESET_TOKEN_TTL_MINUTES,
+  mysqlAddMinutesLiteral,
+  isMysqlVerificationExpired,
+} = require("../config/tokenExpiry");
 const User = db.users;
 const Contact = db.contact;
 const Referral = db.referral;
@@ -2051,31 +2060,25 @@ exports.checkEmail = async (req, res) => {
     }
 
     const resetToken = crypto.randomBytes(32).toString("hex");
-    const verificationExpires = new Date(Date.now() + 10 * 60 * 1000);
 
     await User.update(
       {
         verificationToken: resetToken,
-        verificationExpires,
+        verificationExpires: mysqlAddMinutesLiteral(
+          db.sequelize,
+          RESET_TOKEN_TTL_MINUTES,
+        ),
       },
       { where: { id: user.id, facilityId: user.facilityId } },
     );
 
-    const resetUrl = buildEmailVerificationUrl(resetToken, email, "reset");
+    const resetUrl = buildEmailVerificationUrl(
+      resetToken,
+      user.email || normalizedEmail,
+      "reset",
+    );
 
-    const companyWebsite =
-      process.env.COMPANY_WEBSITE || "https://aa_erp.org";
-    const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
-    const companyPhone = process.env.COMPANY_PHONE || "+2348067643479";
-    const companyTwitter =
-      process.env.COMPANY_TWITTER || "https://x.com/aa_erpng";
-    const companyInstagram =
-      process.env.COMPANY_INSTAGRAM || "https://www.instagram.com/aa_erpng";
-    const companyLinkedIn =
-      process.env.COMPANY_LINKEDIN ||
-      "https://www.linkedin.com/company/aa_erpng";
-    const companyFacebook =
-      process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
+    const branding = getEmailBranding();
     const html = `
         <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
           <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,0.06);overflow:hidden;">
@@ -2090,7 +2093,7 @@ exports.checkEmail = async (req, res) => {
 
               <div style="border:1px solid #f3b3c0;background:#fff4f6;border-radius:12px;padding:16px 18px;margin-bottom:20px;text-align:center;">
                 <p style="margin:0 0 12px 0;font-size:14px;color:#b0194a;line-height:1.6;">
-                  This password reset link will expire in 10 minutes for your security.
+                  This password reset link will expire in 1 hour for your security.
                 </p>
                 <a href="${resetUrl}" style="display:inline-block;background-color:#4267B2;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">
                   Reset Password
@@ -2107,48 +2110,13 @@ exports.checkEmail = async (req, res) => {
               </p>
             </div>
 
-            <div style="border-top:1px solid #eee;padding:16px 24px 20px 24px;font-size:12px;color:#666;line-height:1.6;">
-              <div style="margin-bottom:8px;">
-                Website:
-                <a href="${companyWebsite}" style="color:#4267B2;text-decoration:none;">
-                  ${companyWebsite}
-                </a>
-              </div>
-              <div style="margin-bottom:8px;">
-                Email:
-                <a href="mailto:${companyEmail}" style="color:#4267B2;text-decoration:none;">
-                  ${companyEmail}
-                </a>
-              </div>
-              <div style="margin-bottom:8px;">
-                Phone: ${companyPhone}
-              </div>
-              <div>
-                <p style="margin:0 0 8px 0;font-size:12px;color:#666;">Follow us:</p>
-                <a href="${companyTwitter}" style="display:inline-block;margin-right:12px;">
-                  <img src="https://img.icons8.com/color/48/twitterx--v1.png"
-                       width="28" height="28" alt="Twitter" style="display:block;" />
-                </a>
-                <a href="${companyInstagram}" style="display:inline-block;margin-right:12px;">
-                  <img src="https://img.icons8.com/color/48/instagram-new.png"
-                       width="28" height="28" alt="Instagram" style="display:block;" />
-                </a>
-                <a href="${companyLinkedIn}" style="display:inline-block;margin-right:12px;">
-                  <img src="https://img.icons8.com/color/48/linkedin.png"
-                       width="28" height="28" alt="LinkedIn" style="display:block;" />
-                </a>
-                <a href="${companyFacebook}" style="display:inline-block;">
-                  <img src="https://img.icons8.com/color/48/facebook.png"
-                       width="28" height="28" alt="Facebook" style="display:block;" />
-                </a>
-              </div>
-            </div>
+            ${buildCompanyMailFooter(branding)}
           </div>
         </div>
       `;
 
     await sendLiveEmail({
-      to: email,
+      to: normalizedEmail,
       subject: "AA ERP - Password Reset Verification Link",
       category: "Password Reset Link",
       html,
@@ -2396,7 +2364,10 @@ exports.verifyEmail = async (req, res) => {
     if (type === "reset") {
       if (email) {
         user = await User.findOne({
-          where: { verificationToken: token, email },
+          where: {
+            verificationToken: token,
+            email: { [Op.like]: String(email).trim() },
+          },
         });
       } else if (token) {
         user = await User.findOne({
@@ -2418,11 +2389,11 @@ exports.verifyEmail = async (req, res) => {
       return res.status(400).json({ message: "Invalid or expired token" });
     }
 
-    if (
-      user.verificationExpires &&
-      new Date(user.verificationExpires).getTime() < Date.now()
-    ) {
-      return res.status(400).json({ message: "Token has expired" });
+    if (await isMysqlVerificationExpired(db.sequelize, user)) {
+      return res.status(400).json({
+        success: false,
+        message: "Token has expired",
+      });
     }
 
     if (type === "reset") {
@@ -2487,12 +2458,10 @@ exports.verifyUser = async (req, res) => {
     }
 
     const verificationToken = crypto.randomBytes(32).toString("hex");
-    // const verificationExpires = new Date(Date.now() + 10 * 60 * 1000);
-    const verificationExpires = new Date(Date.now() + 60 * 60 * 1000);
     await User.update(
       {
         verificationToken,
-        verificationExpires,
+        verificationExpires: mysqlAddMinutesLiteral(db.sequelize, 60),
       },
       { where: { id: user.id, facilityId: user.facilityId } },
     );
@@ -2710,10 +2679,7 @@ exports.resetPassword = async (req, res) => {
       });
     }
 
-    if (
-      user.verificationExpires &&
-      new Date(user.verificationExpires).getTime() < Date.now()
-    ) {
+    if (await isMysqlVerificationExpired(db.sequelize, user)) {
       return res.status(400).json({
         success: false,
         message: "Invalid or expired reset token",

@@ -114,6 +114,18 @@ jobs:
             cd /var/www/html/flowbooks/
             set -e
 
+            # rsync already uploaded this GitHub commit (and excludes .git/).
+            # git pull keeps the VPS clone on origin/main when possible.
+            # Do not fail the deploy if the tree is dirty or the remote differs —
+            # rsync remains the source of truth for this run.
+            if [ -d .git ]; then
+              git remote -v || true
+              git pull --ff-only origin main \
+                || echo "git pull skipped; continuing with rsync'd files from this Actions run."
+            else
+              echo "No .git on VPS — deploy is rsync only to /var/www/html/flowbooks/"
+            fi
+
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
