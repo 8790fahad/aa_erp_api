@@ -6,6 +6,7 @@ const db = require("../../models");
 const { CUSTOMER_NAME_SQL } = require("./classification");
 const { CRM_MAX_RECIPIENTS } = require("../../middleware/crmAuth");
 const { mailFrom } = require("../../config/mailFrom");
+const { getLiveMailTransport } = require("../../config/mailTransport");
 
 function facilityFrom(req) {
   return (
@@ -23,37 +24,10 @@ function renderTemplate(body, vars = {}) {
   });
 }
 
-function getSmtpFromEnv() {
-  const host = process.env.SMTP_HOST || process.env.MAIL_HOST;
-  const user = process.env.SMTP_USER || process.env.MAIL_USER;
-  const pass = process.env.SMTP_PASS || process.env.MAIL_PASS;
-  if (!host || !user || !pass) return null;
-  const port = Number(process.env.SMTP_PORT || process.env.MAIL_PORT || 587);
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-    tls: { rejectUnauthorized: false },
-  });
-}
-
 function getMailtrapTransport({ forLiveSend = false } = {}) {
   // Live Outreach must deliver to real inboxes. Mailtrap sandbox never does.
   if (forLiveSend) {
-    const smtp = getSmtpFromEnv();
-    if (smtp) return { transport: smtp, mode: "smtp" };
-    if (process.env.MAILTRAP_TOKEN) {
-      return {
-        transport: nodemailer.createTransport(
-          MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
-        ),
-        mode: "api",
-      };
-    }
-    throw new Error(
-      "Live email is not configured. Set SMTP_HOST / SMTP_USER / SMTP_PASS (for Gmail use an App Password) or a Mailtrap sending-domain token.",
-    );
+    return getLiveMailTransport();
   }
 
   if (process.env.MAILTRAP_USER && process.env.MAILTRAP_PASS) {

@@ -8,10 +8,9 @@
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
-const { MailtrapTransport } = require("mailtrap");
 const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
+const { getLiveMailTransport } = require("../config/mailTransport");
 const { getPublicFrontendUrl } = require("../config/frontendUrl");
 const SMS = require("../services/smsApi");
 const { verifyRecaptchaToken } = require("../utils/recaptcha");
@@ -102,11 +101,7 @@ const LOGIN_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 function createMailTransport() {
-  return nodemailer.createTransport(
-    MailtrapTransport({
-      token: process.env.MAILTRAP_TOKEN,
-    }),
-  );
+  return getLiveMailTransport().transport;
 }
 
 function getCompanyMailBranding() {

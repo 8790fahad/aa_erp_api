@@ -26,6 +26,10 @@ const { Op } = require("sequelize");
 
 const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
+const {
+  getLiveMailTransport,
+  describeMailSendError,
+} = require("../config/mailTransport");
 const { getPublicFrontendUrl } = require("../config/frontendUrl");
 const User = db.users;
 const Contact = db.contact;
@@ -175,22 +179,8 @@ async function getBranchesForUsers(userIds) {
   }, {});
 }
 
-/** Create nodemailer transport for Mailtrap. Prefers SMTP (user/pass) to avoid token Unauthorized errors. */
 function getMailtrapTransport() {
-  if (process.env.MAILTRAP_USER && process.env.MAILTRAP_PASS) {
-    return nodemailer.createTransport({
-      host: "sandbox.smtp.mailtrap.io",
-      port: 2525,
-      secure: false,
-      auth: {
-        user: process.env.MAILTRAP_USER,
-        pass: process.env.MAILTRAP_PASS,
-      },
-    });
-  }
-  return nodemailer.createTransport(
-    MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
-  );
+  return getLiveMailTransport().transport;
 }
 
 function generatePrefixSubstrings(name) {
@@ -1845,11 +1835,7 @@ exports.create = async (req, res) => {
         email,
         "login",
       );
-      const transport = nodemailer.createTransport(
-        MailtrapTransport({
-          token: process.env.MAILTRAP_TOKEN,
-        }),
-      );
+      const transport = getMailtrapTransport();
       const companyWebsite =
         process.env.COMPANY_WEBSITE || "https://aa_erp.org";
       const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
@@ -2091,11 +2077,7 @@ exports.checkEmail = async (req, res) => {
       process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
     const companyLogoUrl =
       process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
-    const transport = nodemailer.createTransport(
-      MailtrapTransport({
-        token: process.env.MAILTRAP_TOKEN,
-      }),
-    );
+    const transport = getMailtrapTransport();
     const mailOptions = {
       from: mailFrom("AA ERP"),
       to: email,
@@ -2188,6 +2170,7 @@ exports.checkEmail = async (req, res) => {
     });
   } catch (err) {
     console.error("Password reset error:", err);
+    console.error("Password reset mail:", describeMailSendError(err));
     res
       .status(500)
       .json({ success: false, message: "Server error during verification" });
@@ -2200,11 +2183,7 @@ exports.inviteStaff = async (req, res) => {
   try {
     const user = await User.findOne({ where: { email } });
 
-    const transport = nodemailer.createTransport(
-      MailtrapTransport({
-        token: process.env.MAILTRAP_TOKEN,
-      }),
-    );
+    const transport = getMailtrapTransport();
     const companyWebsite =
       process.env.COMPANY_WEBSITE || "https://app.aa_erp.org";
     const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
@@ -2535,11 +2514,7 @@ exports.verifyUser = async (req, res) => {
     );
 
     try {
-      const transport = nodemailer.createTransport(
-        MailtrapTransport({
-          token: process.env.MAILTRAP_TOKEN,
-        }),
-      );
+      const transport = getMailtrapTransport();
       const companyWebsite =
         process.env.COMPANY_WEBSITE || "https://aa_erp.org";
       const companyEmail = process.env.COMPANY_EMAIL || "hello@aa_erp.org";
