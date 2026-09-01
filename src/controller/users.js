@@ -2076,19 +2076,9 @@ exports.checkEmail = async (req, res) => {
       "https://www.linkedin.com/company/aa_erpng";
     const companyFacebook =
       process.env.COMPANY_FACEBOOK || "https://www.facebook.com/aa_erpng";
-    const companyLogoUrl =
-      process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
     const html = `
         <div style="background-color:#f5f5f7;padding:24px 0;font-family: Arial, sans-serif;">
           <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,0.06);overflow:hidden;">
-            <div style="padding:20px 24px 0 24px;">
-              <img
-                src="${companyLogoUrl}"
-                alt="AA ERP"
-                style="display:block;height:32px;width:auto;object-fit:contain;"
-              />
-            </div>
-
             <div style="padding:24px 24px 16px 24px;">
               <h2 style="margin:0 0 16px 0;font-size:22px;color:#111;">Hi ${user.firstname}!</h2>
               <p style="margin:0 0 12px 0;font-size:14px;color:#333;line-height:1.6;">
@@ -2113,7 +2103,7 @@ exports.checkEmail = async (req, res) => {
 
               <p style="margin:0 0 8px 0;font-size:13px;color:#555;">
                 With respect,<br/>
-                <strong>AA ERP Team</strong>
+                <strong>Nexifour LLC</strong>
               </p>
             </div>
 

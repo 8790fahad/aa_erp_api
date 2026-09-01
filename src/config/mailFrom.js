@@ -13,7 +13,8 @@ function extractEmail(raw) {
 
 /** Mailtrap only delivers when From is on a verified sending domain. */
 function mailFrom(displayName) {
-  const name = displayName || process.env.COMPANY_NAME || "AA ERP";
+  const raw = displayName || process.env.MAIL_FROM_NAME || process.env.COMPANY_NAME || "Nexifour LLC";
+  const name = /flowbooks/i.test(String(raw)) ? "Nexifour LLC" : String(raw).trim() || "Nexifour LLC";
   let email = extractEmail(process.env.MAIL_FROM || DEFAULT_FROM);
   const domain = email.split("@")[1] || "";
   if (domain !== VERIFIED_DOMAIN) {

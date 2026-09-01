@@ -30,6 +30,9 @@ function applyMailEnvFromFile() {
     if (parsed.MAIL_FROM) {
       process.env.MAIL_FROM = String(parsed.MAIL_FROM).trim();
     }
+    if (parsed.MAIL_FROM_NAME) {
+      process.env.MAIL_FROM_NAME = String(parsed.MAIL_FROM_NAME).trim();
+    }
   } catch (err) {
     console.warn("[mail] could not read", envPath, err.message);
   }
@@ -82,7 +85,11 @@ async function sendLiveEmail({ to, subject, html, text, category }) {
   applyMailEnvFromFile();
   const token = String(process.env.MAILTRAP_TOKEN || "").trim();
   const email = fromEmail();
-  const name = process.env.COMPANY_NAME || "AA ERP";
+  const rawName =
+    process.env.MAIL_FROM_NAME || process.env.COMPANY_NAME || "Nexifour LLC";
+  const name = /flowbooks/i.test(String(rawName))
+    ? "Nexifour LLC"
+    : String(rawName).trim() || "Nexifour LLC";
   if (!token) {
     throw new Error("MAILTRAP_TOKEN is not set in .env");
   }
