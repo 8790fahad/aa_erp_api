@@ -26,6 +26,7 @@ const { Op } = require("sequelize");
 
 const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
+const { getPublicFrontendUrl } = require("../config/frontendUrl");
 const User = db.users;
 const Contact = db.contact;
 const Referral = db.referral;
@@ -204,25 +205,13 @@ function generatePrefixSubstrings(name) {
 const verificationToken = crypto.randomBytes(32).toString("hex");
 const verificationExpires = new Date(Date.now() + 10 * 60 * 1000);
 
-/** Public KYC / auth frontend base used in email verification links. */
-function getKycFrontendBaseUrl() {
-  // Dev emails → local Connect app; production emails → live Connect.
-  const isProd = process.env.NODE_ENV === "production";
-  const raw = isProd
-    ? process.env.KYC_FRONTEND_URL_PROD ||
-      process.env.KYC_FRONTEND_URL ||
-      "https://connect.aa_erp.org"
-    : process.env.KYC_FRONTEND_URL_DEV || "http://localhost:5173";
-  return String(raw).replace(/\/$/, "");
-}
-
 function buildEmailVerificationUrl(token, email, type = "login") {
   const params = new URLSearchParams({
     token: String(token),
     type: String(type),
     email: String(email),
   });
-  return `${getKycFrontendBaseUrl()}/verify-email?${params.toString()}`;
+  return `${getPublicFrontendUrl()}/token-verify?${params.toString()}`;
 }
 
 // Role to Designation mapping function

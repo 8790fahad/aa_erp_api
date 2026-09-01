@@ -12,6 +12,7 @@ const nodemailer = require("nodemailer");
 const { MailtrapTransport } = require("mailtrap");
 const db = require("../models");
 const { mailFrom } = require("../config/mailFrom");
+const { getPublicFrontendUrl } = require("../config/frontendUrl");
 const SMS = require("../services/smsApi");
 const { verifyRecaptchaToken } = require("../utils/recaptcha");
 
@@ -85,14 +86,7 @@ const KYC_ADMIN_API_KEY = process.env.KYC_ADMIN_API_KEY || "";
 let kycAdminKeyWarned = false;
 
 function getKycFrontendBaseUrl() {
-  // Dev emails → local Connect app; production emails → live Connect.
-  const isProd = process.env.NODE_ENV === "production";
-  const raw = isProd
-    ? process.env.KYC_FRONTEND_URL_PROD ||
-      process.env.KYC_FRONTEND_URL ||
-      "https://connect.aa_erp.org"
-    : process.env.KYC_FRONTEND_URL_DEV || "http://localhost:5173";
-  return String(raw).replace(/\/$/, "");
+  return getPublicFrontendUrl();
 }
 
 function buildVerificationUrl(token, email) {
@@ -101,7 +95,7 @@ function buildVerificationUrl(token, email) {
     type: "login",
     email: String(email),
   });
-  return `${getKycFrontendBaseUrl()}/verify-email?${params.toString()}`;
+  return `${getKycFrontendBaseUrl()}/token-verify?${params.toString()}`;
 }
 
 const LOGIN_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
