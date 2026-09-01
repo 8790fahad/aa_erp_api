@@ -25,6 +25,7 @@ const transport = require("../config/nodemailer");
 const { Op } = require("sequelize");
 
 const db = require("../models");
+const { mailFrom } = require("../config/mailFrom");
 const User = db.users;
 const Contact = db.contact;
 const Referral = db.referral;
@@ -1878,7 +1879,7 @@ exports.create = async (req, res) => {
         process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
 
       const mailOptions = {
-        from: '"AA ERP" <no-reply@aa_erp.org>',
+        from: mailFrom("AA ERP"),
         to: email,
         subject: "AA ERP - Email Verification Link",
         category: "Email Verification Link",
@@ -2049,9 +2050,20 @@ exports.create = async (req, res) => {
 // ========================================
 exports.checkEmail = async (req, res) => {
   const { email, facilityId } = req.body;
+  const normalizedEmail = String(email || "")
+    .trim()
+    .toLowerCase();
 
   try {
-    const where = { email };
+    if (!normalizedEmail || !normalizedEmail.includes("@")) {
+      return res
+        .status(400)
+        .json({ success: false, message: "A valid email is required" });
+    }
+
+    const where = {
+      email: { [Op.like]: normalizedEmail },
+    };
     if (facilityId) where.facilityId = facilityId;
 
     const user = await User.findOne({ where });
@@ -2096,7 +2108,7 @@ exports.checkEmail = async (req, res) => {
       }),
     );
     const mailOptions = {
-      from: '"AA ERP" <no-reply@aa_erp.org>',
+      from: mailFrom("AA ERP"),
       to: email,
       subject: "AA ERP - Password Reset Verification Link",
       category: "Password Reset Link",
@@ -2225,7 +2237,7 @@ exports.inviteStaff = async (req, res) => {
       const actionLink = `https://app.aa_erp.org/accept-invite?userId=${user.id}&businessId=${businessId}`;
 
       const mailOptions = {
-        from: '"AA ERP" <no-reply@aa_erp.org>',
+        from: mailFrom("AA ERP"),
         to: email,
         subject: "You've Been Invited to Join AA ERP as Staff",
         html: `
@@ -2557,7 +2569,7 @@ exports.verifyUser = async (req, res) => {
         process.env.COMPANY_LOGO_URL || "https://app.aa_erp.org/logo.png";
 
       const mailOptions = {
-        from: '"AA ERP" <no-reply@aa_erp.org>',
+        from: mailFrom("AA ERP"),
         to: email,
         subject: "AA ERP - Email Verification Link",
         category: "Email Verification Link",

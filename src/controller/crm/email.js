@@ -5,6 +5,7 @@ const { MailtrapTransport } = require("mailtrap");
 const db = require("../../models");
 const { CUSTOMER_NAME_SQL } = require("./classification");
 const { CRM_MAX_RECIPIENTS } = require("../../middleware/crmAuth");
+const { mailFrom } = require("../../config/mailFrom");
 
 function facilityFrom(req) {
   return (
@@ -22,24 +23,40 @@ function renderTemplate(body, vars = {}) {
   });
 }
 
+function getSmtpFromEnv() {
+  const host = process.env.SMTP_HOST || process.env.MAIL_HOST;
+  const user = process.env.SMTP_USER || process.env.MAIL_USER;
+  const pass = process.env.SMTP_PASS || process.env.MAIL_PASS;
+  if (!host || !user || !pass) return null;
+  const port = Number(process.env.SMTP_PORT || process.env.MAIL_PORT || 587);
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+    tls: { rejectUnauthorized: false },
+  });
+}
+
 function getMailtrapTransport({ forLiveSend = false } = {}) {
-  // Prefer sandbox SMTP when configured — avoids Mailtrap Sending API "Unauthorized"
-  // when MAILTRAP_TOKEN is an Email Testing / inbox token rather than a Sending domain token.
-  if (process.env.MAILTRAP_USER && process.env.MAILTRAP_PASS) {
-    if (forLiveSend && process.env.MAILTRAP_ALLOW_SANDBOX !== "true") {
-      // Live customer email needs Sending API token unless sandbox is explicitly allowed.
-      if (process.env.MAILTRAP_TOKEN) {
-        return {
-          transport: nodemailer.createTransport(
-            MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
-          ),
-          mode: "api",
-        };
-      }
-      throw new Error(
-        "Mailtrap sandbox SMTP cannot deliver live customer email. Set MAILTRAP_TOKEN (sending domain) or MAILTRAP_ALLOW_SANDBOX=true for intentional sandbox tests.",
-      );
+  // Live Outreach must deliver to real inboxes. Mailtrap sandbox never does.
+  if (forLiveSend) {
+    const smtp = getSmtpFromEnv();
+    if (smtp) return { transport: smtp, mode: "smtp" };
+    if (process.env.MAILTRAP_TOKEN) {
+      return {
+        transport: nodemailer.createTransport(
+          MailtrapTransport({ token: process.env.MAILTRAP_TOKEN }),
+        ),
+        mode: "api",
+      };
     }
+    throw new Error(
+      "Live email is not configured. Set SMTP_HOST / SMTP_USER / SMTP_PASS (for Gmail use an App Password) or a Mailtrap sending-domain token.",
+    );
+  }
+
+  if (process.env.MAILTRAP_USER && process.env.MAILTRAP_PASS) {
     return {
       transport: nodemailer.createTransport({
         host: "sandbox.smtp.mailtrap.io",
@@ -67,12 +84,7 @@ function getMailtrapTransport({ forLiveSend = false } = {}) {
 }
 
 function fromAddress() {
-  const name = process.env.COMPANY_NAME || "AA ERP";
-  const email =
-    process.env.COMPANY_EMAIL ||
-    process.env.MAIL_FROM ||
-    "no-reply@aa_erp.org";
-  return `"${name}" <${email}>`;
+  return mailFrom();
 }
 
 function parseJsonField(value, fallback) {

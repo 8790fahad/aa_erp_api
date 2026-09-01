@@ -11,6 +11,7 @@ const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const { MailtrapTransport } = require("mailtrap");
 const db = require("../models");
+const { mailFrom } = require("../config/mailFrom");
 const SMS = require("../services/smsApi");
 const { verifyRecaptchaToken } = require("../utils/recaptcha");
 
@@ -279,7 +280,7 @@ async function sendVerificationEmail({ email, firstName, token }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"AA ERP KYC" <hello@aa_erp.org>',
+    from: mailFrom("AA ERP KYC"),
     to: email,
     subject: "AA ERP KYC - Verify your email",
     category: "KYC Email Verification",
@@ -324,7 +325,7 @@ async function sendLoginOtpEmail({ email, firstName, otp }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"AA ERP KYC" <hello@aa_erp.org>',
+    from: mailFrom("AA ERP KYC"),
     to: email,
     subject: "Your AA ERP KYC login code",
     category: "KYC Login OTP",
@@ -808,7 +809,7 @@ async function sendPasswordResetEmail({ email, firstName, token }) {
   const { companyLogoUrl } = branding;
 
   await transport.sendMail({
-    from: '"AA ERP KYC" <hello@aa_erp.org>',
+    from: mailFrom("AA ERP KYC"),
     to: email,
     subject: "Reset your AA ERP KYC password",
     category: "KYC Password Reset",
