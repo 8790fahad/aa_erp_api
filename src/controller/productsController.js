@@ -13,6 +13,20 @@ const {
   isValidTaxableStatus,
 } = require("../constants/taxableStatus");
 
+/** Sellable goods (Resalable / FG / by-product) stock in the sales-floor zone. */
+const SALES_FLOOR_ITEM_TYPES = new Set([
+  "Resalable",
+  "Finished Good",
+  "By-Product",
+]);
+
+function storeZoneForItemType(itemType) {
+  const t = String(itemType || "").trim();
+  if (SALES_FLOOR_ITEM_TYPES.has(t)) return "for sales";
+  if (t === "Raw Material" || t === "Semi Finished") return "Raw Material";
+  return t || "for sales";
+}
+
 function mapValuationMethodKey(invEvM) {
   const raw = String(invEvM || "Weighted Average Cost").trim();
   if (raw === "Weighted Average Cost" || raw.toUpperCase() === "WAC") {
@@ -967,7 +981,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
             cost_price: cost_price || 0,
             selling_price: selling_price || 0,
             supplier_code: supplier_code || "",
-            branch_name: item_type,
+            branch_name: storeZoneForItemType(item_type),
             branchId: parsedBranchId,
             source: source,
             destination: destination,
@@ -1351,7 +1365,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
             cost_price: cost_price || 0,
             selling_price: selling_price || 0,
             supplier_code: "",
-            branch_name: item_type,
+            branch_name: storeZoneForItemType(item_type),
             branchId: branchIdValue,
             source: "Initial Stock",
             destination,
@@ -1654,7 +1668,7 @@ exports.updateProduct = async (req, res) => {
           cost_price: cost_price || 0,
           selling_price: selling_price || 0,
           supplier_code: "",
-          branch_name: item_type,
+          branch_name: storeZoneForItemType(item_type),
           branchId: parsedBranchId,
           source: "Initial Stock",
           destination,
