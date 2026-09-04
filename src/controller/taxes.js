@@ -193,7 +193,7 @@ const createTax = async (req, res) => {
       description,
       rate_type,
       rate,
-      tax_category,
+      tax_category: normalizeTaxCategoryForQuery(tax_category) || tax_category,
       account_sub_head,
       head,
       facilityId,
@@ -276,7 +276,9 @@ const updateTax = async (req, res) => {
       description: description || tax.description,
       rate_type: rate_type || tax.rate_type,
       rate: rate || tax.rate,
-      tax_category: tax_category || tax.tax_category,
+      tax_category: tax_category
+        ? normalizeTaxCategoryForQuery(tax_category) || tax_category
+        : tax.tax_category,
       account_sub_head:
         account_sub_head !== undefined
           ? account_sub_head

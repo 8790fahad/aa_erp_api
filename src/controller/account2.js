@@ -82,6 +82,7 @@ exports.getCustomerDetails = async (req, res) => {
   c.email,
   c.credit_limit,
   c.receivable_code,
+  c.customer_type,
   GREATEST(COALESCE(SUM(CASE
     WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
     THEN gl.dr - gl.cr ELSE 0 END), 0), 0) AS receivables,
@@ -101,7 +102,7 @@ LEFT JOIN general_ledger gl
 WHERE c.facilityId = :facilityId
 GROUP BY
   c.customerNo, c.fullname, c.company_name, c.address,
-  c.phone, c.email, c.credit_limit, c.receivable_code
+  c.phone, c.email, c.credit_limit, c.receivable_code, c.customer_type
 ORDER BY c.fullname ASC;
         `;
 

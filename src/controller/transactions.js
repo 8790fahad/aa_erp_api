@@ -14,6 +14,7 @@ const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const { isWalkInCustomer } = require("../utils/customerKind");
 const getBalance = async (customerNo, facilityId) => {
   const { deposit } = await getCustomerLedgerBalances(facilityId, customerNo);
   return deposit;
@@ -2949,6 +2950,14 @@ exports.createSale = async (req, res) => {
         apply_prepayment === true ||
         apply_prepayment === "true" ||
         rawMode === "deposit";
+
+      if (isWalkInCustomer(customer) && hasCredit) {
+        await t.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Walk-in customers cannot be invoiced on credit.",
+        });
+      }
 
       if ((hasCredit || hasDeposit) && !hasCash && !hasTransfer) {
         const bals = await getCustomerLedgerBalances(facilityId, customer_id);

@@ -22,6 +22,10 @@ const {
   Business,
 } = require("../models");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const {
+  isWalkInCustomer,
+  normalizeCustomerKind,
+} = require("../utils/customerKind");
 
 // Get customer entries by receiptNo
 exports.getCustomerEntriesByReceiptNo = async (req, res) => {
@@ -656,7 +660,7 @@ exports.CreateCustomer = async (req, res) => {
       obdate = new Date(),
       credit_limit = 0,
       facilityId = "",
-      customer_type = "customers",
+      customer_type = "customer",
       created_by,
       opening_balance_equity = "", // Usually "Opening Balance Equity" account
 
@@ -799,9 +803,21 @@ exports.CreateCustomer = async (req, res) => {
       });
     }
 
+    const kindFromBody = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      "customer_type",
+    )
+      ? normalizeCustomerKind(customer_type)
+      : null;
+    const kind = kindFromBody || "customer";
+    const resolvedCreditLimit =
+      kind === "walk-in" ? 0 : parseFloat(credit_limit) || 0;
+
     const profileFields = {
       entity_type:
-        entity_type === "individual" ? "individual" : "business",
+        kind === "walk-in" || entity_type === "individual"
+          ? "individual"
+          : "business",
       company_name: company_name || displayName || null,
       salutation: salutation || null,
       first_name: first_name || null,
@@ -848,6 +864,11 @@ exports.CreateCustomer = async (req, res) => {
         });
       }
 
+      const updateKind =
+        kindFromBody || normalizeCustomerKind(customer.customer_type);
+      const updateCreditLimit =
+        updateKind === "walk-in" ? 0 : parseFloat(credit_limit) || 0;
+
       await customer.update(
         {
           account_head: head || customer.account_head,
@@ -860,11 +881,13 @@ exports.CreateCustomer = async (req, res) => {
           receivable_code: receivable_code || customer.receivable_code,
           receivable_accural_code:
             deposit_code || customer.receivable_accural_code,
-          credit_limit: parseFloat(credit_limit) || customer.credit_limit,
-          customer_type: customer_type || customer.customer_type,
+          credit_limit: updateCreditLimit,
+          customer_type: updateKind,
           tin: tin !== undefined ? tin : customer.tin,
           branch_id: parsedBranchId || customer.branch_id,
           ...profileFields,
+          entity_type:
+            updateKind === "walk-in" ? "individual" : profileFields.entity_type,
         },
         { transaction },
       );
@@ -927,8 +950,8 @@ exports.CreateCustomer = async (req, res) => {
         receivable_accural_code: deposit_code,
         status: status || "active",
         balance: opening_balance, // We'll set real balance via ledger — not directly
-        credit_limit: parseFloat(credit_limit) || 0,
-        customer_type: customer_type || "customers",
+        credit_limit: resolvedCreditLimit,
+        customer_type: kind,
         branch_id: parsedBranchId,
         created_by: userId,
         ...profileFields,
@@ -1221,7 +1244,7 @@ exports.CreateCustomerUpload = async (req, res) => {
         email = "",
         status = "active",
         credit_limit = 0,
-        customer_type = "customers",
+        customer_type = "customer",
         opening_balance = 0, // Can be positive (owed to you) or negative (advance received)
         obdate, // Optional date
         receivable_code, // e.g., "1205100" - Accounts Receivable subhead
@@ -1304,8 +1327,13 @@ exports.CreateCustomerUpload = async (req, res) => {
           receivable_accural_code: deposit_code,
           status,
           balance: opening_balance, // We'll set real balance via ledger — not directly
-          credit_limit: !isNaN(Number(credit_limit)) ? Number(credit_limit) : 0,
-          customer_type,
+          credit_limit:
+            normalizeCustomerKind(customer_type) === "walk-in"
+              ? 0
+              : !isNaN(Number(credit_limit))
+                ? Number(credit_limit)
+                : 0,
+          customer_type: normalizeCustomerKind(customer_type),
           branch_id: parsedBranchId,
           created_by: userId,
         },

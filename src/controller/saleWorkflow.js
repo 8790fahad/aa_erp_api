@@ -2,6 +2,7 @@ const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const { isWalkInCustomer } = require("../utils/customerKind");
 const {
   SALE_WORKFLOW_STAGES,
   nextStageFor,
@@ -263,9 +264,21 @@ async function getCreditLimitCheck(
 
   const customer = await db.Customer.findOne({
     where: { customerNo, facilityId },
-    attributes: ["credit_limit"],
+    attributes: ["credit_limit", "customer_type"],
     raw: true,
   });
+  if (isWalkInCustomer(customer)) {
+    const extra = Math.max(0, Number(extraAmount) || 0);
+    return {
+      creditLimit: 0,
+      outstanding: 0,
+      extra,
+      projected: extra,
+      available: 0,
+      unlimited: false,
+      overLimit: extra > 0.009,
+    };
+  }
   const creditLimit = parseFloat(customer?.credit_limit || 0) || 0;
   const { receivables } = await getCustomerLedgerBalances(
     facilityId,
