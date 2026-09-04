@@ -2612,7 +2612,7 @@ exports.createSale = async (req, res) => {
       cashier_name = null,
     } = req.body;
 
-    const discount_amount =
+    let discount_amount =
       Number(String(discountAmountRaw ?? "").replace(/,/g, "")) ||
       (typeof req.body.discount === "number" ||
       typeof req.body.discount === "string"
@@ -3927,6 +3927,30 @@ exports.createSale = async (req, res) => {
         sku,
         isProBono,
         isTaxable,
+      });
+    }
+
+    if (discount_amount < 0) discount_amount = 0;
+    if (discount_amount > subtotal + 0.009) {
+      await t.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Discount cannot be more than the invoice total.",
+      });
+    }
+    const discountTypeHint = String(
+      discount_info?.discount_type || discount_info?.type || "",
+    ).toLowerCase();
+    const catalogDiscountValue = parseFloat(discount_info?.value);
+    if (
+      (discountTypeHint.includes("percent") || discountTypeHint === "%") &&
+      Number.isFinite(catalogDiscountValue) &&
+      catalogDiscountValue > 100.009
+    ) {
+      await t.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Discount cannot be more than 100%.",
       });
     }
 
