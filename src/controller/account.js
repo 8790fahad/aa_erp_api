@@ -16708,6 +16708,7 @@ exports.directConsumables = async (req, res) => {
           status: "paid",
           type: entry.type,
           transaction_ref: supplier_no,
+          mode_of_payment: mode_of_payment || null,
         },
         { transaction },
       );

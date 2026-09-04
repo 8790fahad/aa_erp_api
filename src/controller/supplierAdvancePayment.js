@@ -273,6 +273,11 @@ const OUTSTANDING_PURCHASE_INVOICES_SQL = `
     i.description,
     COALESCE(payments.total_paid, 0) AS total_paid,
     GREATEST(i.amount - COALESCE(payments.total_paid, 0), 0) AS amount_due,
+    COALESCE(
+      NULLIF(se_mode.mode_of_payment, ''),
+      NULLIF(gl_mode.mode_of_payment, ''),
+      'credit'
+    ) AS mode_of_payment,
     CASE
       WHEN COALESCE(payments.total_paid, 0) >= i.amount THEN 'Paid'
       WHEN COALESCE(payments.total_paid, 0) > 0 THEN 'Partially Paid'
@@ -299,6 +304,47 @@ const OUTSTANDING_PURCHASE_INVOICES_SQL = `
   ) payments
     ON payments.transaction_ref = i.invoice_ref
     AND payments.facility_id = i.facility_id
+  LEFT JOIN (
+    SELECT
+      ref_key,
+      facilityId,
+      COALESCE(
+        MAX(CASE
+          WHEN type = 'purchase' AND NULLIF(mode_of_payment, '') IS NOT NULL
+          THEN mode_of_payment
+        END),
+        MAX(NULLIF(mode_of_payment, ''))
+      ) AS mode_of_payment
+    FROM (
+      SELECT receiptNo AS ref_key, facilityId, type, mode_of_payment
+      FROM supplier_entries
+      WHERE facilityId = :facilityId
+        AND receiptNo IS NOT NULL
+        AND receiptNo != ''
+      UNION ALL
+      SELECT link_id AS ref_key, facilityId, type, mode_of_payment
+      FROM supplier_entries
+      WHERE facilityId = :facilityId
+        AND link_id IS NOT NULL
+        AND link_id != ''
+    ) se_src
+    GROUP BY ref_key, facilityId
+  ) se_mode
+    ON se_mode.ref_key = i.invoice_ref
+    AND se_mode.facilityId = i.facility_id
+  LEFT JOIN (
+    SELECT
+      reference_number AS transaction_ref,
+      facility_id,
+      MAX(NULLIF(mode_of_payment, '')) AS mode_of_payment
+    FROM general_ledger
+    WHERE facility_id = :facilityId
+      AND reference_number IS NOT NULL
+      AND reference_number != ''
+    GROUP BY reference_number, facility_id
+  ) gl_mode
+    ON gl_mode.transaction_ref = i.invoice_ref
+    AND gl_mode.facility_id = i.facility_id
   WHERE i.type = 'purchase'
     AND i.ref_number = :supplierNo
     AND i.facility_id = :facilityId
@@ -415,6 +461,7 @@ exports.getOutstandingSupplierPurchaseInvoices = async (req, res) => {
         total_paid: inv.total_paid,
         amount_due: inv.amount_due,
         balance_due: inv.amount_due,
+        mode_of_payment: inv.mode_of_payment || "credit",
         status: inv.status,
       })),
       count: outstanding.length,
