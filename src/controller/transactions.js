@@ -15,6 +15,7 @@ const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { isWalkInCustomer } = require("../utils/customerKind");
+const { inferTaxInclusiveType } = require("../utils/saleVat");
 const getBalance = async (customerNo, facilityId) => {
   const { deposit } = await getCustomerLedgerBalances(facilityId, customerNo);
   return deposit;
@@ -1274,11 +1275,26 @@ exports.getSaleByCode = async (req, res) => {
       (sum, discount) => sum + Number(discount.amount || 0),
       0
     );
-    const totalTax = taxes.reduce(
+    const vatPolicy = String(business?.vat_policy || "vat_exclusive").toLowerCase();
+    const taxableBase = Math.max(subtotal - totalDiscount, 0);
+    const taxesNormalized = taxes.map((tax) => {
+      const inclusive_type = inferTaxInclusiveType(
+        tax,
+        taxableBase || subtotal,
+        vatPolicy,
+      );
+      return { ...tax, inclusive_type };
+    });
+    const totalTax = taxesNormalized.reduce(
       (sum, tax) => sum + Number(tax.amount || 0),
       0
     );
-    const totalAmount = subtotal + totalTax - totalDiscount;
+    const exclusiveTaxTotal = taxesNormalized.reduce((sum, tax) => {
+      if (String(tax.inclusive_type).toLowerCase() === "inclusive") return sum;
+      return sum + Number(tax.amount || tax.cost || 0);
+    }, 0);
+    // Inclusive VAT is already inside line prices — do not add it again.
+    const totalAmount = subtotal + exclusiveTaxTotal - totalDiscount;
 
     const invoiceDiscount =
       discounts.length > 0
@@ -1650,7 +1666,7 @@ exports.getSaleByCode = async (req, res) => {
         },
         customerCopy: JSON.stringify(customerCopyItems),
         customerCopyItems,
-        taxes,
+        taxes: taxesNormalized,
         discounts,
         discount: invoiceDiscount,
         subtotal,
