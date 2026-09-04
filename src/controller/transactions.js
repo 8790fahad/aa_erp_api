@@ -14,7 +14,7 @@ const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
-const { isWalkInCustomer } = require("../utils/customerKind");
+const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const { inferTaxInclusiveType } = require("../utils/saleVat");
 const getBalance = async (customerNo, facilityId) => {
   const { deposit } = await getCustomerLedgerBalances(facilityId, customerNo);
@@ -2981,8 +2981,9 @@ exports.createSale = async (req, res) => {
         const due = Number.isFinite(invoiceTotal) && invoiceTotal > 0
           ? invoiceTotal
           : 0;
-        const limit = parseFloat(customer.credit_limit) || 0;
-        const unlimitedCredit = !(limit > 0);
+        const parsedLimit = parseCreditLimitValue(customer.credit_limit);
+        const limit = parsedLimit ?? 0;
+        const unlimitedCredit = parsedLimit == null;
         const creditLeft = unlimitedCredit
           ? Infinity
           : Math.max(0, limit - bals.receivables);
@@ -5010,7 +5011,9 @@ exports.createSale = async (req, res) => {
         ),
         paymentModes: Array.isArray(payment_modes) ? payment_modes : [],
         amount:
-          String(modeOfPayment || "").toLowerCase().includes("deposit")
+          String(modeOfPayment || "").toLowerCase().includes("deposit") ||
+          (Array.isArray(payment_modes) &&
+            payment_modes.map((m) => String(m).toLowerCase()).includes("deposit"))
             ? amountToAR
             : netAmount,
         branchId: saleBranchId,

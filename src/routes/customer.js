@@ -98,6 +98,7 @@ module.exports = (app) => {
   );
   app.post("/api/customer-security-deposit", customer.createSecurityDeposit);
   app.get("/api/v1/get-customers-list/:facilityId", customer.getCustomersList);
+  app.get("/api/v1/customer-one", customer.getCustomerOne);
   app.get(
     "/api/v1/get-suppliers-and-customers/:facilityId",
     customer.getCombinedSuppliersAndCustomers

@@ -2,7 +2,7 @@ const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
-const { isWalkInCustomer } = require("../utils/customerKind");
+const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const {
   SALE_WORKFLOW_STAGES,
   nextStageFor,
@@ -33,11 +33,10 @@ function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
   const hasTransfer =
     modes.includes("transfer") || m === "transfer" || m === "bank";
 
-  // Credit + Apply Deposit (no cash/transfer): apply deposit first
-  if (hasDeposit && !hasCash && !hasTransfer) return "deposit";
+  // Apply Deposit first whenever it is selected (including Cash / Transfer remainder).
+  if (hasDeposit) return "deposit";
 
   if (!isCashSale) {
-    if (hasDeposit) return "deposit";
     return "credit";
   }
   if (
@@ -108,6 +107,28 @@ function historyHasDepositApplied(history) {
   return normalizeHistory(history).some((h) =>
     /deposit applied/i.test(String(h?.note || "")),
   );
+}
+
+function paymentModesFromHistory(history) {
+  const list = normalizeHistory(history);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const modes = parseModeList(list[i]?.payment_modes);
+    if (modes.length) return modes;
+  }
+  return [];
+}
+
+function remainderTypeAfterDeposit(modes) {
+  const hasCash = modes.includes("cash");
+  const hasTransfer = modes.includes("transfer");
+  const hasCredit = modes.includes("credit");
+  if (hasCredit && (hasCash || hasTransfer)) return "credit_split";
+  if (hasCash && hasTransfer) return "split";
+  if (hasTransfer) return "transfer";
+  if (hasCash) return "cash";
+  if (hasCredit) return "credit";
+  // Deposit-only (or no modes recorded): remainder is collected as cash.
+  return "cash";
 }
 
 function historyHasCreditAfterDeposit(history) {
@@ -228,7 +249,7 @@ function pushHistory(history, status, userId, note, extra = null) {
   return list;
 }
 
-/** AR outstanding vs customer.credit_limit. Limit 0 = not enforced. */
+/** AR outstanding vs customer.credit_limit. Null = not enforced. 0 = no credit. */
 async function invoiceReceivableOnLedger(facilityId, invoiceRef) {
   if (!invoiceRef) return 0;
   const rows = await db.sequelize.query(
@@ -279,7 +300,9 @@ async function getCreditLimitCheck(
       overLimit: extra > 0.009,
     };
   }
-  const creditLimit = parseFloat(customer?.credit_limit || 0) || 0;
+  const parsedLimit = parseCreditLimitValue(customer?.credit_limit);
+  const unlimited = parsedLimit == null;
+  const creditLimit = parsedLimit ?? 0;
   const { receivables } = await getCustomerLedgerBalances(
     facilityId,
     customerNo,
@@ -294,7 +317,6 @@ async function getCreditLimitCheck(
   }
   const extra = Math.max(0, Number(extraAmount) || 0);
   const projected = Number((outstanding + extra).toFixed(2));
-  const unlimited = !(creditLimit > 0);
   const available = unlimited
     ? null
     : Math.max(0, Number((creditLimit - outstanding).toFixed(2)));
@@ -527,6 +549,12 @@ function getSplitCollectionProgress(history) {
   const creditRem = getCreditRemainderFromHistory(history);
   const creditFromHistory =
     creditRem != null ? Number(creditRem.remainder) || 0 : null;
+  let creditAllocated = 0;
+  for (const h of list) {
+    if (h?.credit_allocation?.amount != null) {
+      creditAllocated = Number(h.credit_allocation.amount) || 0;
+    }
+  }
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
@@ -539,10 +567,13 @@ function getSplitCollectionProgress(history) {
     cash_at,
     transfer_at,
     collected_total,
+    credit_allocated: Number(creditAllocated.toFixed(2)),
     credit:
       creditFromHistory != null
         ? Number(creditFromHistory.toFixed(2))
-        : null,
+        : creditAllocated > 0.05
+          ? Number(creditAllocated.toFixed(2))
+          : null,
     original_amount:
       creditRem?.original_amount != null
         ? Number(creditRem.original_amount)
@@ -557,12 +588,14 @@ function buildSplitProgressForRow(plain) {
   const creditRem = getCreditRemainderFromHistory(plain?.history);
   const amountDue = Number(plain?.amount) || 0;
   if (pt === "credit_split") {
-    const credit = Number(
+    const unpaid = Number(
       (amountDue - (progress.collected_total || 0)).toFixed(2),
     );
+    const allocated = Number(progress.credit_allocated) || 0;
+    const credit = allocated > 0.05 ? allocated : unpaid > 0.05 ? unpaid : 0;
     return {
       ...progress,
-      credit: credit > 0.05 ? credit : 0,
+      credit,
       original_amount: amountDue,
     };
   }
@@ -714,7 +747,15 @@ async function ensureSaleFulfillments(
     }
   }
 
-  if (!byBranch.size) return [];
+  if (!byBranch.size) {
+    const existing = await db.SaleFulfillment.findAll({
+      where: { facility_id: facilityId, sale_code: saleCode },
+      include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+      transaction,
+    });
+    if (existing.length) return existing;
+    return [];
+  }
 
   return createFulfillmentsFromGroups({
     facilityId,
@@ -820,6 +861,68 @@ async function createFulfillmentsFromGroups({
     (a, b) => Number(a.branch_id || 0) - Number(b.branch_id || 0),
   );
   return results;
+}
+
+function parseBranchIdParam(value) {
+  return [
+    ...new Set(
+      (Array.isArray(value) ? value : [value])
+        .filter((v) => v != null && String(v).trim() && String(v) !== "all")
+        .flatMap((v) => String(v).split(","))
+        .map((v) => parseInt(String(v).trim(), 10))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  ];
+}
+
+async function assignedWarehouseIds(userId, facilityId) {
+  if (!userId) return [];
+  try {
+    const rows = await db.sequelize.query(
+      `SELECT branch_id
+         FROM user_branches
+        WHERE user_id = :userId
+          AND (facility_id = :facilityId OR facility_id IS NULL)`,
+      {
+        replacements: {
+          userId: String(userId),
+          facilityId: facilityId || null,
+        },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const ids = (rows || [])
+      .map((r) => parseInt(r.branch_id, 10))
+      .filter((id) => Number.isFinite(id) && id > 0);
+    if (ids.length) return [...new Set(ids)];
+  } catch (err) {
+    console.warn("assignedWarehouseIds user_branches:", err.message);
+  }
+  try {
+    const rows = await db.sequelize.query(
+      `SELECT branchId FROM users WHERE id = :userId LIMIT 1`,
+      {
+        replacements: { userId: String(userId) },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const bid = parseInt(rows?.[0]?.branchId, 10);
+    if (Number.isFinite(bid) && bid > 0) return [bid];
+  } catch (err) {
+    console.warn("assignedWarehouseIds users.branchId:", err.message);
+  }
+  return [];
+}
+
+/** Warehouses this user may see. Assigned staff are locked to theirs. */
+async function warehouseScopeBranchIds({ facilityId, userId, branchIdQuery }) {
+  const assigned = await assignedWarehouseIds(userId, facilityId);
+  const requested = parseBranchIdParam(branchIdQuery);
+  if (assigned.length) {
+    if (!requested.length) return assigned;
+    return requested.filter((id) => assigned.includes(id));
+  }
+  return requested;
 }
 
 async function enrichFulfillments(rows) {
@@ -949,6 +1052,9 @@ async function createSaleWorkflowRecord(
   let resolvedPaymentType = paymentType;
   const creditAfterDeposit =
     isDepositPaymentType(resolvedPaymentType) && modes.includes("credit");
+  const collectAfterDeposit =
+    isDepositPaymentType(resolvedPaymentType) &&
+    (modes.includes("cash") || modes.includes("transfer"));
   const isPaid =
     resolvedPaymentType !== "credit" &&
     resolvedPaymentType !== "warehouse" &&
@@ -996,7 +1102,9 @@ async function createSaleWorkflowRecord(
       initialStatus = "awaiting_payment";
       statusNote = creditAfterDeposit
         ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
-        : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
+        : collectAfterDeposit
+          ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer"
+          : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
     }
   } else if (isPaid) {
     initialStatus = "awaiting_cashier_confirm";
@@ -1272,6 +1380,58 @@ exports.advanceSaleWorkflow = async (req, res) => {
       return res.json({
         success: true,
         message: "Remainder sent to Credit approval",
+        results: row,
+      });
+    }
+
+    if (action === "send_remainder_to_collection") {
+      const pt = String(row.payment_type || "")
+        .toLowerCase()
+        .trim();
+      if (
+        !isDepositPaymentType(pt) ||
+        !["awaiting_payment", "awaiting_cashier_confirm"].includes(
+          String(row.status || ""),
+        )
+      ) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Invoice is not waiting for a deposit application",
+        });
+      }
+      const modes = paymentModesFromHistory(row.history);
+      const nextType = remainderTypeAfterDeposit(modes);
+      if (nextType === "credit") {
+        row.payment_type = "credit";
+        row.status = "awaiting_credit_approval";
+        row.history = pushHistory(
+          row.history,
+          "awaiting_credit_approval",
+          updated_by,
+          note || "No deposit applied — remainder sent to Credit approval",
+          { payment_modes: modes },
+        );
+      } else {
+        row.payment_type = nextType;
+        row.status = "awaiting_cashier_confirm";
+        row.history = pushHistory(
+          row.history,
+          "awaiting_cashier_confirm",
+          updated_by,
+          note || `No deposit applied — remainder to collect as ${nextType}`,
+          { payment_modes: modes },
+        );
+      }
+      row.updated_by = updated_by || row.updated_by;
+      await row.save({ transaction });
+      await transaction.commit();
+      return res.json({
+        success: true,
+        message:
+          nextType === "credit"
+            ? "Remainder sent to Credit approval"
+            : `Remainder ready to collect as ${nextType}`,
         results: row,
       });
     }
@@ -1694,6 +1854,24 @@ exports.getCashierDashboard = async (req, res) => {
         split_progress,
       };
     });
+    for (const row of pendingRows) {
+      const pt = String(row.payment_type || "").toLowerCase();
+      if (pt !== "credit_split") continue;
+      const extraAmount =
+        Number(row.split_progress?.credit) > 0.05
+          ? Number(row.split_progress.credit)
+          : Number(row.amount) || 0;
+      const check = await getCreditLimitCheck(facilityId, row.customer_no, {
+        extraAmount,
+        excludeInvoiceRef: row.sale_code,
+      });
+      row.credit_limit = check.creditLimit;
+      row.credit_outstanding = check.outstanding;
+      row.credit_available = check.available;
+      row.credit_projected = check.projected;
+      row.credit_unlimited = check.unlimited;
+      row.credit_over_limit = check.overLimit;
+    }
 
     // Resolve collector display names for split progress (when only user id stored)
     const collectorIds = new Set();
@@ -2101,6 +2279,7 @@ exports.getCashierDashboard = async (req, res) => {
       if (pt === "cash") summary.pending_cash += amt;
       else if (pt === "transfer" || pt === "bank") summary.pending_transfer += amt;
       else if (pt === "split") summary.pending_split += amt;
+      else if (pt === "credit_split") summary.pending_credit += amt;
     }
     for (const row of creditRows) {
       const amt = Number(row.amount) || 0;
@@ -3235,10 +3414,10 @@ exports.sendCreditRemainder = async (req, res) => {
 
     const amountDue = Number(row.amount) || 0;
     const progress = getSplitCollectionProgress(row.history);
-    const remaining = Number(
+    const unpaid = Number(
       (amountDue - (progress.collected_total || 0)).toFixed(2),
     );
-    if (remaining <= 0.05) {
+    if (unpaid <= 0.05) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
@@ -3247,11 +3426,25 @@ exports.sendCreditRemainder = async (req, res) => {
       });
     }
 
+    const requested = toMoney(req.body?.credit_amount ?? req.body?.amount);
+    const allocated = Number(progress.credit_allocated) || 0;
+    let creditAmount =
+      requested > 0.05 ? requested : allocated > 0.05 ? allocated : unpaid;
+    creditAmount = Number(Math.min(Math.max(creditAmount, 0), unpaid).toFixed(2));
+    if (creditAmount <= 0.05) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter a credit amount greater than zero",
+      });
+    }
+    const leftover = Number((unpaid - creditAmount).toFixed(2));
+
     const limitErr = await assertCreditLimitMessage(
       facilityId,
       row.customer_no,
       {
-        extraAmount: remaining,
+        extraAmount: creditAmount,
         excludeInvoiceRef: row.sale_code,
       },
     );
@@ -3263,16 +3456,46 @@ exports.sendCreditRemainder = async (req, res) => {
       });
     }
 
-    row.amount = remaining;
-    row.payment_type = "credit";
-    row.status = "awaiting_credit_approval";
-    row.updated_by = updated_by || row.updated_by;
     const cashCollected = progress.cash || 0;
     const transferCollected = progress.transfer || 0;
+    row.updated_by = updated_by || row.updated_by;
+
+    if (leftover > 0.05) {
+      setWorkflowHistory(
+        row,
+        pushHistory(
+          row.history,
+          row.status,
+          updated_by,
+          note ||
+            `Credit ₦${creditAmount.toFixed(2)} set — ₦${leftover.toFixed(2)} still to collect as cash/transfer`,
+          { credit_allocation: { amount: creditAmount } },
+        ),
+      );
+      await row.save({ transaction });
+      await transaction.commit();
+      return res.json({
+        success: true,
+        allocated: true,
+        message: `Credit ₦${creditAmount.toFixed(2)} saved. Collect ₦${leftover.toFixed(2)} as cash/transfer, then approve credit.`,
+        results: {
+          ...row.toJSON(),
+          status_color: stageMeta(row.status)?.color || "amber",
+          next_status: nextStageFor(row.status, row.payment_type),
+          split_progress: buildSplitProgressForRow(row.toJSON()),
+          credit_amount: creditAmount,
+          leftover,
+        },
+      });
+    }
+
+    row.amount = creditAmount;
+    row.payment_type = "credit";
+    row.status = "awaiting_credit_approval";
     const noteText =
       cashCollected <= 0.05 && transferCollected <= 0.05
-        ? `Full amount ₦${remaining.toFixed(2)} confirmed as Credit — awaiting Credit Approval`
-        : `Cash ₦${cashCollected.toFixed(2)} + Transfer ₦${transferCollected.toFixed(2)} collected; Credit ₦${remaining.toFixed(2)} sent to Credit Approval`;
+        ? `₦${creditAmount.toFixed(2)} confirmed as Credit — awaiting Credit Approval`
+        : `Cash ₦${cashCollected.toFixed(2)} + Transfer ₦${transferCollected.toFixed(2)} collected; Credit ₦${creditAmount.toFixed(2)} sent to Credit Approval`;
     setWorkflowHistory(
       row,
       pushHistory(
@@ -3286,8 +3509,8 @@ exports.sendCreditRemainder = async (req, res) => {
             original_amount: amountDue,
             cash_collected: cashCollected,
             transfer_collected: transferCollected,
-            remainder: remaining,
-            credit: remaining,
+            remainder: creditAmount,
+            credit: creditAmount,
           },
         },
       ),
@@ -3299,15 +3522,15 @@ exports.sendCreditRemainder = async (req, res) => {
       success: true,
       message:
         cashCollected <= 0.05 && transferCollected <= 0.05
-          ? `₦${remaining.toFixed(2)} confirmed as Credit for ${saleCode} — approve on Credit tab`
-          : `Credit ₦${remaining.toFixed(2)} sent to Credit Approval for ${saleCode}`,
+          ? `₦${creditAmount.toFixed(2)} confirmed as Credit for ${saleCode} — approve on Credit tab`
+          : `Credit ₦${creditAmount.toFixed(2)} sent to Credit Approval for ${saleCode}`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
         split_progress: {
           ...progress,
-          credit: remaining,
+          credit: creditAmount,
           original_amount: amountDue,
         },
       },
@@ -3501,7 +3724,7 @@ exports.completeSeparation = async (req, res) => {
       );
     }
 
-    const fulfillments = await ensureSaleFulfillments(
+    let fulfillments = await ensureSaleFulfillments(
       {
         facilityId,
         saleCode,
@@ -3509,6 +3732,14 @@ exports.completeSeparation = async (req, res) => {
       },
       transaction,
     );
+
+    if (!fulfillments.length && db.SaleFulfillment) {
+      fulfillments = await db.SaleFulfillment.findAll({
+        where: { facility_id: facilityId, sale_code: saleCode },
+        include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+        transaction,
+      });
+    }
 
     if (!fulfillments.length) {
       await transaction.rollback();
@@ -3657,6 +3888,19 @@ exports.markFulfillmentCollected = async (req, res) => {
       });
     }
 
+    const collectorId = updated_by || req.user?.id || req.query?.userId;
+    const assigned = await assignedWarehouseIds(collectorId, facilityId);
+    if (
+      assigned.length &&
+      !assigned.includes(parseInt(row.branch_id, 10))
+    ) {
+      await transaction.rollback();
+      return res.status(403).json({
+        success: false,
+        message: "You do not have access to this warehouse",
+      });
+    }
+
     const lines = row.lines || [];
     const targetIds = Array.isArray(lineIds)
       ? lineIds.map((x) => Number(x))
@@ -3734,7 +3978,7 @@ exports.markFulfillmentCollected = async (req, res) => {
 
 exports.listWarehouseRequests = async (req, res) => {
   try {
-    const { facilityId, branchId } = req.query;
+    const { facilityId, branchId, userId } = req.query;
     if (!facilityId) {
       return res.status(400).json({
         success: false,
@@ -3742,65 +3986,91 @@ exports.listWarehouseRequests = async (req, res) => {
       });
     }
 
+    const scopedBranchIds = await warehouseScopeBranchIds({
+      facilityId,
+      userId: userId || req.user?.id,
+      branchIdQuery: branchId,
+    });
+    const assigned = await assignedWarehouseIds(
+      userId || req.user?.id,
+      facilityId,
+    );
+    if (assigned.length && !scopedBranchIds.length) {
+      return res.json({ success: true, results: [], count: 0 });
+    }
+
     const workflowWhere = {
       facility_id: facilityId,
       status: {
-        [Op.in]: ["warehouse_picking", "dual_signature"],
+        [Op.in]: [
+          "warehouse_picking",
+          "dual_signature",
+          "goods_released",
+          "completed",
+        ],
       },
     };
 
     const workflows = await db.SaleWorkflow.findAll({
       where: workflowWhere,
       order: [["updated_at", "DESC"]],
-      limit: 200,
+      limit: 400,
     });
 
-    const saleCodes = workflows.map((w) => w.sale_code);
-    if (!saleCodes.length) {
-      return res.json({ success: true, results: [], count: 0 });
+    const pickingCodes = workflows
+      .filter((w) => String(w.status) === "warehouse_picking")
+      .map((w) => w.sale_code);
+    for (const code of pickingCodes) {
+      await ensureSaleFulfillments({
+        facilityId,
+        saleCode: code,
+      });
     }
 
-    // Ensure packs for warehouse-ready sales
-    for (const code of saleCodes) {
-      const wf = workflows.find((w) => w.sale_code === code);
-      if (wf && ["warehouse_picking"].includes(wf.status)) {
-        await ensureSaleFulfillments({
-          facilityId,
-          saleCode: code,
-        });
-      }
+    const fulBase = { facility_id: facilityId };
+    if (scopedBranchIds.length === 1) {
+      fulBase.branch_id = scopedBranchIds[0];
+    } else if (scopedBranchIds.length > 1) {
+      fulBase.branch_id = { [Op.in]: scopedBranchIds };
     }
 
-    const fulWhere = {
-      facility_id: facilityId,
-      sale_code: { [Op.in]: saleCodes },
-      status: { [Op.ne]: "collected" },
-    };
-    if (branchId && branchId !== "all") {
-      const bid = parseInt(branchId, 10);
-      if (Number.isFinite(bid)) fulWhere.branch_id = bid;
-    }
-
-    const packs = await db.SaleFulfillment.findAll({
-      where: fulWhere,
+    const pendingPacks = await db.SaleFulfillment.findAll({
+      where: { ...fulBase, status: { [Op.ne]: "collected" } },
       include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
       order: [["updated_at", "DESC"]],
+      limit: 200,
+    });
+    const collectedPacks = await db.SaleFulfillment.findAll({
+      where: { ...fulBase, status: "collected" },
+      include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+      order: [
+        ["collected_at", "DESC"],
+        ["updated_at", "DESC"],
+      ],
+      limit: 150,
     });
 
-    const enriched = await enrichFulfillments(packs);
-    const wfByCode = new Map(
-      workflows.map((w) => {
-        const plain = w.toJSON();
-        return [
-          plain.sale_code,
-          {
-            ...plain,
-            status_label: stageMeta(plain.status)?.label || plain.status,
-            status_color: stageMeta(plain.status)?.color || "slate",
-          },
-        ];
-      }),
-    );
+    const packs = [...pendingPacks, ...collectedPacks];
+    const saleCodes = [
+      ...new Set(packs.map((p) => p.sale_code).filter(Boolean)),
+    ];
+    let extraWorkflows = [];
+    if (saleCodes.length) {
+      extraWorkflows = await db.SaleWorkflow.findAll({
+        where: { facility_id: facilityId, sale_code: { [Op.in]: saleCodes } },
+      });
+    }
+
+    const enriched = packs.length ? await enrichFulfillments(packs) : [];
+    const wfByCode = new Map();
+    for (const w of [...workflows, ...extraWorkflows]) {
+      const plain = w.toJSON ? w.toJSON() : w;
+      wfByCode.set(plain.sale_code, {
+        ...plain,
+        status_label: stageMeta(plain.status)?.label || plain.status,
+        status_color: stageMeta(plain.status)?.color || "slate",
+      });
+    }
 
     const results = enriched.map((p) => ({
       ...p,

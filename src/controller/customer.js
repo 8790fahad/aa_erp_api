@@ -25,6 +25,7 @@ const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances")
 const {
   isWalkInCustomer,
   normalizeCustomerKind,
+  parseCreditLimitValue,
 } = require("../utils/customerKind");
 
 // Get customer entries by receiptNo
@@ -658,7 +659,7 @@ exports.CreateCustomer = async (req, res) => {
       deposit_code = "", // Customer Deposits / Advance from Customer
       opening_balance = 0,
       obdate = new Date(),
-      credit_limit = 0,
+      credit_limit,
       facilityId = "",
       customer_type = "customer",
       created_by,
@@ -754,30 +755,50 @@ exports.CreateCustomer = async (req, res) => {
       .trim()
       .toLowerCase();
     if (normalizedEmail) {
-      const emailDupWhere = {
-        facilityId,
-        [Op.and]: [
-          db.sequelize.where(
-            db.sequelize.fn("LOWER", db.sequelize.fn("TRIM", db.sequelize.col("email"))),
-            normalizedEmail,
-          ),
-        ],
-      };
+      let skipEmailDup = false;
       if (query_type === "update" && customerNo) {
-        emailDupWhere.customerNo = { [Op.ne]: customerNo };
-      }
-      const emailDuplicate = await db.Customer.findOne({
-        where: emailDupWhere,
-        transaction,
-      });
-      if (emailDuplicate) {
-        await transaction.rollback();
-        return res.status(409).json({
-          success: false,
-          field: "email",
-          message:
-            "This email is already registered for another customer. Please use a different email.",
+        const currentRow = await db.Customer.findOne({
+          where: { customerNo, facilityId },
+          attributes: ["email"],
+          transaction,
         });
+        const currentEmail = String(currentRow?.email || "")
+          .trim()
+          .toLowerCase();
+        skipEmailDup = Boolean(currentEmail) && currentEmail === normalizedEmail;
+      }
+      if (!skipEmailDup) {
+        const emailDupWhere = {
+          facilityId,
+          [Op.and]: [
+            db.sequelize.where(
+              db.sequelize.fn(
+                "LOWER",
+                db.sequelize.fn("TRIM", db.sequelize.col("email")),
+              ),
+              normalizedEmail,
+            ),
+          ],
+        };
+        if (query_type === "update" && customerNo) {
+          emailDupWhere.customerNo = { [Op.ne]: String(customerNo) };
+        }
+        const emailDuplicate = await db.Customer.findOne({
+          where: emailDupWhere,
+          transaction,
+        });
+        if (emailDuplicate) {
+          await transaction.rollback();
+          const otherName =
+            emailDuplicate.fullname ||
+            emailDuplicate.company_name ||
+            emailDuplicate.customerNo;
+          return res.status(409).json({
+            success: false,
+            field: "email",
+            message: `This email is already registered for ${otherName} (${emailDuplicate.customerNo}). Please use a different email.`,
+          });
+        }
       }
     }
 
@@ -810,8 +831,9 @@ exports.CreateCustomer = async (req, res) => {
       ? normalizeCustomerKind(customer_type)
       : null;
     const kind = kindFromBody || "customer";
-    const resolvedCreditLimit =
-      kind === "walk-in" ? 0 : parseFloat(credit_limit) || 0;
+    const resolvedCreditLimit = parseCreditLimitValue(credit_limit, {
+      walkIn: kind === "walk-in",
+    });
 
     const profileFields = {
       entity_type:
@@ -827,7 +849,7 @@ exports.CreateCustomer = async (req, res) => {
       currency: currency || "NGN - Nigerian Naira",
       payment_terms: payment_terms || "Due on Receipt",
       tax_rate: tax_rate || null,
-      company_id: company_id || tin || null,
+      company_id: company_id || null,
       enable_portal: Boolean(enable_portal),
       remarks: remarks || null,
     };
@@ -866,8 +888,9 @@ exports.CreateCustomer = async (req, res) => {
 
       const updateKind =
         kindFromBody || normalizeCustomerKind(customer.customer_type);
-      const updateCreditLimit =
-        updateKind === "walk-in" ? 0 : parseFloat(credit_limit) || 0;
+      const updateCreditLimit = parseCreditLimitValue(credit_limit, {
+        walkIn: updateKind === "walk-in",
+      });
 
       await customer.update(
         {
@@ -1243,7 +1266,7 @@ exports.CreateCustomerUpload = async (req, res) => {
         phone = "",
         email = "",
         status = "active",
-        credit_limit = 0,
+        credit_limit,
         customer_type = "customer",
         opening_balance = 0, // Can be positive (owed to you) or negative (advance received)
         obdate, // Optional date
@@ -1327,12 +1350,9 @@ exports.CreateCustomerUpload = async (req, res) => {
           receivable_accural_code: deposit_code,
           status,
           balance: opening_balance, // We'll set real balance via ledger — not directly
-          credit_limit:
-            normalizeCustomerKind(customer_type) === "walk-in"
-              ? 0
-              : !isNaN(Number(credit_limit))
-                ? Number(credit_limit)
-                : 0,
+          credit_limit: parseCreditLimitValue(credit_limit, {
+            walkIn: normalizeCustomerKind(customer_type) === "walk-in",
+          }),
           customer_type: normalizeCustomerKind(customer_type),
           branch_id: parsedBranchId,
           created_by: userId,
@@ -3771,6 +3791,36 @@ export const getCustomerDeposit = async (req, res) => {
 };
 
 // Get all customers for a facility
+exports.getCustomerOne = async (req, res) => {
+  try {
+    const facilityId = String(req.query.facilityId || req.params.facilityId || "").trim();
+    const customerNo = String(req.query.customerNo || req.params.customerNo || "").trim();
+    if (!facilityId || !customerNo) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and customerNo are required",
+      });
+    }
+    const row = await db.Customer.findOne({
+      where: { facilityId, customerNo },
+    });
+    if (!row) {
+      return res.status(404).json({
+        success: false,
+        message: "Customer not found",
+      });
+    }
+    return res.json({ success: true, data: row.get({ plain: true }) });
+  } catch (error) {
+    console.error("getCustomerOne:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load customer",
+      error: error.message,
+    });
+  }
+};
+
 exports.getCustomersList = async (req, res) => {
   try {
     const { facilityId } = req.params;
@@ -3796,6 +3846,11 @@ exports.getCustomersList = async (req, res) => {
         "customerNo",
         "fullname",
         "company_name",
+        "company_id",
+        "tin",
+        "salutation",
+        "first_name",
+        "last_name",
         "address",
         "phone",
         "mobile",
@@ -3808,6 +3863,12 @@ exports.getCustomersList = async (req, res) => {
         "receivable_accural_code",
         "branch_id",
         "facilityId",
+        "language",
+        "currency",
+        "payment_terms",
+        "tax_rate",
+        "enable_portal",
+        "remarks",
         "createdAt",
       ],
     });
@@ -3870,13 +3931,17 @@ exports.getCustomersList = async (req, res) => {
         receivables: 0,
         deposit: 0,
       };
-      const limit = parseFloat(plain.credit_limit) || 0;
+      const limit = parseCreditLimitValue(plain.credit_limit);
       const receivables = bals.receivables;
       const deposit = bals.deposit;
       const credit_used_percent =
-        limit > 0
-          ? Number(((receivables / limit) * 100).toFixed(1))
-          : null;
+        limit == null
+          ? null
+          : limit > 0
+            ? Number(((receivables / limit) * 100).toFixed(1))
+            : receivables > 0
+              ? 100
+              : 0;
       const wh = warehouseById[String(plain.branch_id)] || null;
       return {
         ...plain,
@@ -5152,6 +5217,32 @@ exports.getCombinedSuppliersAndCustomers = async (req, res) => {
  *   transaction_date?, narration?
  * }
  */
+function paymentModesFromHistory(history) {
+  const list = Array.isArray(history) ? history : [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const raw = list[i]?.payment_modes;
+    if (Array.isArray(raw) && raw.length) {
+      return raw
+        .map((m) => String(m || "").toLowerCase().trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function remainderTypeAfterDeposit(modes) {
+  const hasCash = modes.includes("cash");
+  const hasTransfer = modes.includes("transfer");
+  const hasCredit = modes.includes("credit");
+  if (hasCredit && (hasCash || hasTransfer)) return "credit_split";
+  if (hasCash && hasTransfer) return "split";
+  if (hasTransfer) return "transfer";
+  if (hasCash) return "cash";
+  if (hasCredit) return "credit";
+  // Deposit-only: remainder is collected as cash at Verification Points.
+  return "cash";
+}
+
 exports.applyCustomerAdvanceToInvoices = async (req, res) => {
   const {
     facilityId,
@@ -5391,16 +5482,29 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
                 note: "Deposit fully applied — ready for Invoice Separation",
               });
             } else {
-              // Remainder goes to Credit Approval (not Separation yet)
-              wf.status = "awaiting_credit_approval";
+              const modes = paymentModesFromHistory(history);
+              const nextType = remainderTypeAfterDeposit(modes);
               wf.amount = remaining;
-              wf.payment_type = "credit";
-              history.push({
-                status: "awaiting_credit_approval",
-                at: new Date().toISOString(),
-                by: userId,
-                note: `Deposit partial — ₦${remaining.toFixed(2)} remainder awaits Credit Approval before Separation`,
-              });
+              if (nextType === "credit") {
+                wf.status = "awaiting_credit_approval";
+                wf.payment_type = "credit";
+                history.push({
+                  status: "awaiting_credit_approval",
+                  at: new Date().toISOString(),
+                  by: userId,
+                  note: `Deposit partial — ₦${remaining.toFixed(2)} remainder awaits Credit Approval before Separation`,
+                });
+              } else {
+                wf.status = "awaiting_cashier_confirm";
+                wf.payment_type = nextType;
+                history.push({
+                  status: "awaiting_cashier_confirm",
+                  at: new Date().toISOString(),
+                  by: userId,
+                  note: `Deposit partial — ₦${remaining.toFixed(2)} remainder to collect as ${nextType}`,
+                  payment_modes: modes,
+                });
+              }
             }
             wf.history = history;
             if (typeof wf.changed === "function") wf.changed("history", true);
