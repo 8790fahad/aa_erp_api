@@ -1708,6 +1708,7 @@ exports.getSaleByCode = async (req, res) => {
           default_receipt_type: business.default_receipt_type,
           print_delivery_order: business.print_delivery_order,
           show_vat_on_sales_invoice: business.show_vat_on_sales_invoice,
+          sales_invoice_print_in_color: business.sales_invoice_print_in_color,
           delivery_order_format: business.delivery_order_format,
           delivery_document_type: business.delivery_document_type,
           document_header_style: business.document_header_style,

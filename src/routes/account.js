@@ -412,6 +412,10 @@ module.exports = (app) => {
     account.updateShowVatOnSalesInvoice,
   );
   app.post(
+    "/account/update-sales-invoice-print-color/:enabled/:facilityId/:user_id",
+    account.updateSalesInvoicePrintColor,
+  );
+  app.post(
     "/account/update-delivery-order-format/:format/:facilityId/:user_id",
     account.updateDeliveryOrderFormat,
   );

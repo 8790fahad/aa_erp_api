@@ -5461,15 +5461,27 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
             transaction: t,
           });
           if (wf) {
-            // wf.amount is outstanding balance (reduced on each apply)
+            // wf.amount is outstanding (reduced by deposit); cash/transfer live in history
             const due = Number(wf.amount) || 0;
-            const remaining = Number((due - applyAmt).toFixed(2));
             const history = Array.isArray(wf.history) ? [...wf.history] : [];
+            let collected = 0;
+            let creditAlloc = 0;
+            for (const h of history) {
+              const amt = Number(h?.collection?.amount) || 0;
+              if (amt > 0) collected += amt;
+              if (h?.credit_allocation?.amount != null) {
+                creditAlloc = Number(h.credit_allocation.amount) || 0;
+              }
+            }
+            const remaining = Number(
+              (due - collected - creditAlloc - applyAmt).toFixed(2),
+            );
             history.push({
               status: wf.status,
               at: new Date().toISOString(),
               by: userId,
               note: `Deposit applied ₦${applyAmt.toFixed(2)} (balance was ₦${due.toFixed(2)})`,
+              deposit_application: { amount: applyAmt },
             });
 
             if (remaining <= 0.05) {
@@ -5479,12 +5491,12 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
                 status: "invoice_separation",
                 at: new Date().toISOString(),
                 by: userId,
-                note: "Deposit fully applied — ready for Invoice Separation",
+                note: "Last payment (deposit) — ready for Invoice Separation",
               });
             } else {
               const modes = paymentModesFromHistory(history);
               const nextType = remainderTypeAfterDeposit(modes);
-              wf.amount = remaining;
+              wf.amount = Number((due - applyAmt).toFixed(2));
               if (nextType === "credit") {
                 wf.status = "awaiting_credit_approval";
                 wf.payment_type = "credit";
@@ -5493,6 +5505,7 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
                   at: new Date().toISOString(),
                   by: userId,
                   note: `Deposit partial — ₦${remaining.toFixed(2)} remainder awaits Credit Approval before Separation`,
+                  payment_modes: modes,
                 });
               } else {
                 wf.status = "awaiting_cashier_confirm";

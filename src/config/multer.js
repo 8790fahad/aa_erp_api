@@ -61,11 +61,21 @@ const poDocuments = new CloudinaryStorage({
       .replace(/\.[^.]+$/, "")
       .replace(/[^a-zA-Z0-9_-]/g, "_")
       .slice(0, 60);
+    const stamp = Date.now();
+    if (isImage) {
+      return {
+        folder: "aa_erp/purchase_orders",
+        resource_type: "image",
+        public_id: `${stamp}_${base}`,
+      };
+    }
+    // Raw public_ids MUST include the extension. Passing `format` separately
+    // makes Cloudinary store `{id}.{ext}` while the returned URL may omit it,
+    // so later raw/download looks up the wrong public_id (Resource not found).
     return {
       folder: "aa_erp/purchase_orders",
-      resource_type: isImage ? "image" : "raw",
-      public_id: `${Date.now()}_${base}`,
-      ...(isImage ? {} : { format: ext || undefined }),
+      resource_type: "raw",
+      public_id: `${stamp}_${base}${ext ? `.${ext}` : ""}`,
     };
   },
 });
@@ -101,7 +111,20 @@ exports.handlePoDocumentUpload = (req, res, next) => {
     req,
     res,
     (err) => {
-      if (!err) return next();
+      if (!err) {
+        const files = req?.files?.po_documents || [];
+        files.forEach((file) => {
+          console.log("[po-docs] Cloudinary upload ok", {
+            originalname: file.originalname,
+            public_id: file.filename,
+            path: file.path,
+            mimetype: file.mimetype,
+            bytes: file.size,
+          });
+        });
+        return next();
+      }
+      console.error("[po-docs] Cloudinary upload failed:", err.message || err);
       const message = err.message || String(err);
       const missingKey = /missing required parameter - api_key/i.test(message);
       const cloudDisabled =

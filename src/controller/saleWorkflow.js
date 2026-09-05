@@ -72,7 +72,21 @@ function isSplitPaymentType(paymentType) {
     t === "cash + transfer" ||
     t === "credit_split" ||
     t === "credit+cash+transfer" ||
-    t === "credit + cash + transfer"
+    t === "credit + cash + transfer" ||
+    t === "credit_cash_transfer"
+  );
+}
+
+/** Deposit invoices that also selected Cash / Transfer / Credit collect in any order. */
+function workflowCollectsAsSplit(row) {
+  const pt = String(row?.payment_type || "").toLowerCase().trim();
+  if (isSplitPaymentType(pt)) return true;
+  if (!isDepositPaymentType(pt)) return false;
+  const modes = paymentModesFromHistory(row?.history);
+  return (
+    modes.includes("cash") ||
+    modes.includes("transfer") ||
+    modes.includes("credit")
   );
 }
 
@@ -561,9 +575,13 @@ function getSplitCollectionProgress(history) {
   const creditFromHistory =
     creditRem != null ? Number(creditRem.remainder) || 0 : null;
   let creditAllocated = 0;
+  let depositApplied = 0;
   for (const h of list) {
     if (h?.credit_allocation?.amount != null) {
       creditAllocated = Number(h.credit_allocation.amount) || 0;
+    }
+    if (h?.deposit_application?.amount != null) {
+      depositApplied += Number(h.deposit_application.amount) || 0;
     }
   }
   return {
@@ -579,6 +597,7 @@ function getSplitCollectionProgress(history) {
     transfer_at,
     collected_total,
     credit_allocated: Number(creditAllocated.toFixed(2)),
+    deposit_applied: Number(depositApplied.toFixed(2)),
     credit:
       creditFromHistory != null
         ? Number(creditFromHistory.toFixed(2))
@@ -2009,6 +2028,7 @@ exports.getCashierDashboard = async (req, res) => {
       const meta = stageMeta(plain.status);
       const history = normalizeHistory(plain.history);
       const modes = paymentModesFromHistory(history);
+      const split_progress = buildSplitProgressForRow({ ...plain, history });
       return {
         ...plain,
         history,
@@ -2016,6 +2036,7 @@ exports.getCashierDashboard = async (req, res) => {
         status_color: meta?.color || "teal",
         amount: Number(plain.amount) || 0,
         payment_modes: modes,
+        split_progress,
         credit_after_deposit: historyHasCreditAfterDeposit(history),
         collect_after_deposit: historyHasCollectAfterDeposit(history),
       };
@@ -2041,7 +2062,10 @@ exports.getCashierDashboard = async (req, res) => {
       row.credit_remainder = Number(
         Math.max(
           0,
-          (Number(row.amount) || 0) - (Number(row.deposit_available) || 0),
+          (Number(row.amount) || 0) -
+            (Number(row.deposit_available) || 0) -
+            (Number(row.split_progress?.collected_total) || 0) -
+            (Number(row.split_progress?.credit_allocated) || 0),
         ).toFixed(2),
       );
     }
@@ -2870,7 +2894,8 @@ exports.cashierConfirmPayment = async (req, res) => {
           "Credit invoices must be approved on the Credit tab at Verification Points — they cannot be collected as cash/transfer",
       });
     }
-    if (paymentType === "deposit") {
+    const mixedSplit = workflowCollectsAsSplit(row);
+    if (paymentType === "deposit" && !mixedSplit) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
@@ -2888,10 +2913,11 @@ exports.cashierConfirmPayment = async (req, res) => {
     if (
       ct === "cash" &&
       paymentType !== "cash" &&
-      !isSplitPaymentType(paymentType)
+      !isSplitPaymentType(paymentType) &&
+      !mixedSplit
     ) {
       await transaction.rollback();
-      return res.status(403).json({
+      return res.status(400).json({
         success: false,
         message: "Use Cash Collection for cash invoices only",
       });
@@ -2900,7 +2926,8 @@ exports.cashierConfirmPayment = async (req, res) => {
       ct === "transfer" &&
       paymentType !== "transfer" &&
       paymentType !== "bank" &&
-      !isSplitPaymentType(paymentType)
+      !isSplitPaymentType(paymentType) &&
+      !mixedSplit
     ) {
       await transaction.rollback();
       return res.status(403).json({
@@ -2923,7 +2950,7 @@ exports.cashierConfirmPayment = async (req, res) => {
     )
       .toLowerCase()
       .trim();
-    const isSplit = isSplitPaymentType(paymentType);
+    const isSplit = mixedSplit || isSplitPaymentType(paymentType);
     const progress = isSplit
       ? getSplitCollectionProgress(row.history)
       : {
@@ -3232,11 +3259,12 @@ exports.cashierConfirmPayment = async (req, res) => {
     const updatedProgress = isSplit
       ? getSplitCollectionProgress(row.history)
       : null;
+    const creditCover = Number(updatedProgress?.credit_allocated) || 0;
+    const covered = Number(
+      ((updatedProgress?.collected_total || 0) + creditCover).toFixed(2),
+    );
     const fullyPaid = isSplit
-      ? !!(
-          updatedProgress &&
-          Math.abs(updatedProgress.collected_total - amountDue) <= 0.05
-        )
+      ? covered + 0.05 >= amountDue
       : true;
 
     if (fullyPaid) {
@@ -3302,12 +3330,14 @@ exports.cashierConfirmPayment = async (req, res) => {
 
       return res.json({
         success: true,
+        last_pay: true,
         message: `Payment confirmed for ${saleRef} — ready for separation`,
         results: {
           ...row.toJSON(),
           status_color: stageMeta(row.status)?.color || "violet",
           next_status: nextStageFor(row.status, row.payment_type),
           split_progress: updatedProgress,
+          remaining: 0,
           fulfillments: fulfillments
             ? await enrichFulfillments(fulfillments)
             : [],
@@ -3321,7 +3351,11 @@ exports.cashierConfirmPayment = async (req, res) => {
     await transaction.commit();
 
     const rem = Number(
-      (amountDue - (updatedProgress?.collected_total || 0)).toFixed(2),
+      (
+        amountDue -
+        (updatedProgress?.collected_total || 0) -
+        (updatedProgress?.credit_allocated || 0)
+      ).toFixed(2),
     );
     const sideLabel =
       resolvedSide === "transfer"
@@ -3351,18 +3385,15 @@ exports.cashierConfirmPayment = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${rem.toFixed(2)} — collect from Cash and/or Transfer${
-        paymentType === "credit_split"
-          ? ", or send the remainder to Credit Approval"
-          : ""
-      }.`,
+      last_pay: rem <= 0.05,
+      message: `${sideLabel} portion recorded for ${saleRef}. Remaining ₦${Math.max(0, rem).toFixed(2)} — collect the next portion, last payment opens print`,
       results: {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
         split_progress: updatedProgress,
-        partial: true,
-        remaining: rem,
+        partial: rem > 0.05,
+        remaining: Math.max(0, rem),
       },
     });
   } catch (err) {
@@ -3418,15 +3449,19 @@ exports.sendCreditRemainder = async (req, res) => {
     }
 
     const paymentType = String(row.payment_type || "").toLowerCase();
-    if (paymentType !== "credit_split") {
+    const mixedSplit = workflowCollectsAsSplit(row);
+    if (paymentType !== "credit_split" && !mixedSplit) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
         message:
-          "Only Credit + Cash + Transfer invoices can send a remainder to credit",
+          "Only mixed Cash / Transfer / Credit / Deposit invoices can send a remainder to credit",
       });
     }
-    if (row.status !== "awaiting_cashier_confirm") {
+    if (
+      row.status !== "awaiting_cashier_confirm" &&
+      row.status !== "awaiting_payment"
+    ) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
@@ -3499,7 +3534,8 @@ exports.sendCreditRemainder = async (req, res) => {
       return res.json({
         success: true,
         allocated: true,
-        message: `Credit ₦${creditAmount.toFixed(2)} saved. Collect ₦${leftover.toFixed(2)} as cash/transfer, then approve credit.`,
+        last_pay: false,
+        message: `Credit ₦${creditAmount.toFixed(2)} saved. Remaining ₦${leftover.toFixed(2)} — collect the next portion, last payment opens print`,
         results: {
           ...row.toJSON(),
           status_color: stageMeta(row.status)?.color || "amber",
@@ -3507,6 +3543,7 @@ exports.sendCreditRemainder = async (req, res) => {
           split_progress: buildSplitProgressForRow(row.toJSON()),
           credit_amount: creditAmount,
           leftover,
+          remaining: leftover,
         },
       });
     }
@@ -3542,6 +3579,7 @@ exports.sendCreditRemainder = async (req, res) => {
 
     return res.json({
       success: true,
+      last_pay: true,
       message:
         cashCollected <= 0.05 && transferCollected <= 0.05
           ? `₦${creditAmount.toFixed(2)} confirmed as Credit for ${saleCode} — approve on Credit tab`
@@ -3550,6 +3588,7 @@ exports.sendCreditRemainder = async (req, res) => {
         ...row.toJSON(),
         status_color: stageMeta(row.status)?.color || "amber",
         next_status: nextStageFor(row.status, row.payment_type),
+        remaining: 0,
         split_progress: {
           ...progress,
           credit: creditAmount,

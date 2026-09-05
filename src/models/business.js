@@ -103,6 +103,13 @@ module.exports = (sequelize, DataTypes) => {
         comment:
           "When true, sales invoice shows VAT. When false, exclusive VAT is folded into unit price and VAT lines are hidden.",
       },
+      sales_invoice_print_in_color: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment:
+          "When true, sales invoices print in color. When false (default), they print black and white.",
+      },
       vat_account_code: {
         type: DataTypes.STRING(20),
         allowNull: true,

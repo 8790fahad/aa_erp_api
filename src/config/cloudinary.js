@@ -89,6 +89,58 @@ function sanitizeDownloadName(filename) {
   return name || undefined;
 }
 
+function extensionFromFilename(filename) {
+  const name = String(filename || "");
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "";
+  return name.slice(dot + 1).toLowerCase();
+}
+
+function leafHasExtension(publicId) {
+  const leaf = String(publicId || "").split("/").pop() || "";
+  return leaf.includes(".");
+}
+
+/**
+ * Raw assets store the extension IN the public_id. If the delivery URL omitted
+ * it (common when upload used public_id without ext + format: "pdf"), append it
+ * so raw/download matches the stored resource.
+ */
+function rawPublicIdForDownload(parsed, filename) {
+  const id = parsed?.public_id || "";
+  const ext = String(
+    parsed?.format || extensionFromFilename(filename) || "pdf",
+  ).toLowerCase();
+  if (!id) return id;
+  if (id.toLowerCase().endsWith(`.${ext}`)) return id;
+  if (leafHasExtension(id)) return id;
+  return `${id}.${ext}`;
+}
+
+function privateDownloadUrl(
+  publicId,
+  format,
+  resourceType,
+  { attachment = false, filename } = {},
+) {
+  applyCloudinaryConfig();
+  const options = {
+    resource_type: resourceType,
+    type: "upload",
+    attachment: !!attachment,
+    target_filename: attachment ? sanitizeDownloadName(filename) : undefined,
+    expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
+  };
+  if (resourceType === "raw") {
+    return cloudinary.utils.private_download_url(publicId, "", options);
+  }
+  return cloudinary.utils.private_download_url(
+    publicId,
+    format || "pdf",
+    options,
+  );
+}
+
 function signedPoDocumentUrl(filePath, { attachment = false, filename } = {}) {
   if (!filePath || typeof filePath !== "string") return filePath || "";
   if (!/^https?:\/\/res\.cloudinary\.com\//i.test(filePath)) return filePath;
@@ -110,48 +162,18 @@ function signedPoDocumentUrl(filePath, { attachment = false, filename } = {}) {
 
   try {
     if (parsed.resource_type === "raw") {
-      // Raw public_ids normally include the extension (…/file.pdf).
-      const withExt = parsed.public_id;
-      const withoutExt =
-        parsed.format && withExt.toLowerCase().endsWith(`.${parsed.format}`)
-          ? withExt.slice(0, -(parsed.format.length + 1))
-          : withExt;
-
-      // Prefer public_id WITH extension + empty format (Cloudinary raw convention).
-      try {
-        return cloudinary.utils.private_download_url(withExt, "", {
-          resource_type: "raw",
-          type: "upload",
-          attachment: !!attachment,
-          target_filename: attachment
-            ? sanitizeDownloadName(filename)
-            : undefined,
-          expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
-        });
-      } catch (_) {
-        return cloudinary.utils.private_download_url(
-          withoutExt,
-          parsed.format || undefined,
-          {
-            resource_type: "raw",
-            type: "upload",
-            attachment: !!attachment,
-            target_filename: attachment
-              ? sanitizeDownloadName(filename)
-              : undefined,
-            expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
-          },
-        );
-      }
+      return privateDownloadUrl(
+        rawPublicIdForDownload(parsed, filename),
+        "",
+        "raw",
+        { attachment, filename },
+      );
     }
 
-    const format = parsed.format || "pdf";
-    return cloudinary.utils.private_download_url(parsed.public_id, format, {
-      resource_type: parsed.resource_type,
-      type: "upload",
-      attachment: !!attachment,
-      target_filename: attachment ? sanitizeDownloadName(filename) : undefined,
-      expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
+    const format = parsed.format || extensionFromFilename(filename) || "pdf";
+    return privateDownloadUrl(parsed.public_id, format, parsed.resource_type, {
+      attachment,
+      filename,
     });
   } catch (err) {
     console.error("[cloudinary] signedPoDocumentUrl:", err.message);
@@ -159,13 +181,104 @@ function signedPoDocumentUrl(filePath, { attachment = false, filename } = {}) {
   }
 }
 
+function lookupHttpCode(err) {
+  return Number(err?.http_code || err?.error?.http_code || 0);
+}
+
+/**
+ * Confirm the Cloudinary asset exists, trying public_id / resource_type variants
+ * that commonly diverge between upload and download.
+ */
+async function resolveSignedPoDocumentUrl(
+  filePath,
+  { attachment = false, filename } = {},
+) {
+  if (!filePath || typeof filePath !== "string") {
+    return { missing: true, public_id: "", resource_type: "" };
+  }
+  if (!/^https?:\/\/res\.cloudinary\.com\//i.test(filePath)) {
+    return { url: filePath };
+  }
+
+  applyCloudinaryConfig();
+  const parsed = parseCloudinaryDeliveryUrl(filePath);
+  if (!parsed) return { url: filePath };
+
+  const ext = String(
+    parsed.format || extensionFromFilename(filename) || "pdf",
+  ).toLowerCase();
+  const rawId = rawPublicIdForDownload(parsed, filename);
+  const withoutExt = leafHasExtension(rawId)
+    ? rawId.replace(/\.[^.]+$/, "")
+    : parsed.public_id;
+
+  const candidates = [];
+  if (parsed.resource_type === "raw") {
+    candidates.push({ id: rawId, resource_type: "raw", format: "" });
+    if (parsed.public_id !== rawId) {
+      candidates.push({ id: parsed.public_id, resource_type: "raw", format: "" });
+    }
+    candidates.push({
+      id: withoutExt,
+      resource_type: "image",
+      format: ext,
+    });
+  } else {
+    candidates.push({
+      id: parsed.public_id,
+      resource_type: parsed.resource_type,
+      format: parsed.format || ext,
+    });
+    candidates.push({ id: rawId, resource_type: "raw", format: "" });
+  }
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.resource_type}:${candidate.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      await cloudinary.api.resource(candidate.id, {
+        resource_type: candidate.resource_type,
+      });
+      return {
+        url: privateDownloadUrl(
+          candidate.id,
+          candidate.format,
+          candidate.resource_type,
+          { attachment, filename },
+        ),
+        public_id: candidate.id,
+        resource_type: candidate.resource_type,
+      };
+    } catch (err) {
+      if (lookupHttpCode(err) === 404) continue;
+      console.error("[cloudinary] resource lookup failed:", err.message);
+    }
+  }
+
+  console.warn("[cloudinary] PO document missing", {
+    public_id: parsed.public_id,
+    resource_type: parsed.resource_type,
+    filePath,
+  });
+  return {
+    missing: true,
+    public_id: parsed.public_id,
+    resource_type: parsed.resource_type,
+  };
+}
+
 /**
  * Public `/image/upload/*.pdf` URLs return 401 on many Cloudinary plans
  * (PDF delivery is restricted). Return a time-limited API URL that opens
  * inline in the browser. Leave public images on the CDN.
  */
-exports.viewablePoDocumentUrl = function viewablePoDocumentUrl(filePath) {
-  return signedPoDocumentUrl(filePath, { attachment: false });
+exports.viewablePoDocumentUrl = function viewablePoDocumentUrl(
+  filePath,
+  filename,
+) {
+  return signedPoDocumentUrl(filePath, { attachment: false, filename });
 };
 
 /** Force the browser to download the file instead of opening it. */
@@ -177,6 +290,7 @@ exports.downloadablePoDocumentUrl = function downloadablePoDocumentUrl(
 };
 
 exports.parseCloudinaryDeliveryUrl = parseCloudinaryDeliveryUrl;
+exports.resolveSignedPoDocumentUrl = resolveSignedPoDocumentUrl;
 
 exports.uploads = (file) => {
   return new Promise((resolve, reject) => {

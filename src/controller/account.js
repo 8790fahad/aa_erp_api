@@ -26,6 +26,7 @@ const { findAccountCategoryForFacility } = require("./accountCategory");
 const {
   viewablePoDocumentUrl,
   downloadablePoDocumentUrl,
+  resolveSignedPoDocumentUrl,
 } = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
@@ -11169,6 +11170,46 @@ exports.updateShowVatOnSalesInvoice = async (req, res) => {
   }
 };
 
+/** Toggle color vs black-and-white printing for the sales invoice. Default is B&W. */
+exports.updateSalesInvoicePrintColor = async (req, res) => {
+  try {
+    const { enabled, facilityId } = req.params;
+    const enableFlag = parseEnableFlag(enabled);
+
+    const [updatedRowsCount] = await db.business.update(
+      { sales_invoice_print_in_color: enableFlag },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Sales invoice print ${
+        enableFlag ? "color" : "black and white"
+      } saved`,
+    });
+  } catch (err) {
+    console.error("Error updating sales_invoice_print_in_color:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.message : "Server error",
+    });
+  }
+};
+
 /** Set Delivery Order layout: match (with invoice) or thermal (80mm). */
 exports.updateDeliveryOrderFormat = async (req, res) => {
   try {
@@ -12502,6 +12543,21 @@ exports.insertRequisition = async (req, res) => {
         mime_type: file.mimetype,
       });
     }
+    if (docsToSave.some((doc) => !doc.file_path)) {
+      await transaction.rollback();
+      console.error("[po-docs] insertRequisition skipped empty Cloudinary URL", {
+        files: po_documents.map((file) => ({
+          originalname: file.originalname,
+          filename: file.filename,
+          path: file.path,
+        })),
+      });
+      return res.status(503).json({
+        success: false,
+        message:
+          "A document failed to upload to storage. Please try again.",
+      });
+    }
     for (const doc of linked_documents) {
       if (!doc?.file_path) continue;
       docsToSave.push({
@@ -12647,7 +12703,10 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
 
     const results = (rows || []).map((row) => ({
       ...row,
-      url: viewablePoDocumentUrl(row.file_path),
+      url: viewablePoDocumentUrl(
+        row.file_path,
+        row.document_name || row.original_name,
+      ),
       download_url: downloadablePoDocumentUrl(
         row.file_path,
         row.document_name || row.original_name,
@@ -12693,10 +12752,33 @@ exports.openPurchaseOrderDocument = async (req, res) => {
       String(req.query.download || "").toLowerCase() === "true";
     const filename = String(req.query.filename || "").trim() || undefined;
 
-    const target = wantDownload
-      ? downloadablePoDocumentUrl(filePath, filename)
-      : viewablePoDocumentUrl(filePath);
+    const resolved = await resolveSignedPoDocumentUrl(filePath, {
+      attachment: wantDownload,
+      filename,
+    });
 
+    if (resolved?.missing) {
+      const message =
+        "File missing or upload failed. This document was not found in storage. Please re-upload it.";
+      if (String(req.headers.accept || "").includes("application/json")) {
+        return res.status(404).json({
+          success: false,
+          message,
+        });
+      }
+      res.status(404);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(`<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>File not available</title></head>
+  <body style="font-family:sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1e293b">
+    <h1 style="font-size:1.25rem">File missing or upload failed</h1>
+    <p>This purchase order document could not be found in storage. It may never have uploaded successfully. Please go back and re-upload the file.</p>
+  </body>
+</html>`);
+    }
+
+    const target = resolved?.url;
     if (!target || !/^https?:\/\//i.test(target)) {
       return res.status(502).json({
         success: false,
@@ -12717,16 +12799,23 @@ exports.openPurchaseOrderDocument = async (req, res) => {
 /** Cloudinary URL only — never a local disk path. */
 function storedPoDocumentPath(file) {
   if (!file) return "";
+  let url = "";
   if (typeof file.path === "string" && /^https?:\/\//i.test(file.path)) {
-    return file.path;
-  }
-  if (
+    url = file.path;
+  } else if (
     typeof file.secure_url === "string" &&
     /^https?:\/\//i.test(file.secure_url)
   ) {
-    return file.secure_url;
+    url = file.secure_url;
   }
-  return "";
+  const publicId = typeof file.filename === "string" ? file.filename : "";
+  const idLeaf = publicId.split("/").pop() || "";
+  const urlLeaf = url.split("?")[0].split("/").pop() || "";
+  if (url && idLeaf && urlLeaf && idLeaf !== urlLeaf && idLeaf.includes(".")) {
+    const escaped = urlLeaf.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    url = url.replace(new RegExp(`${escaped}(?:\\?.*)?$`), idLeaf);
+  }
+  return url;
 }
 
 /** Save files to Cloudinary immediately and return URLs so the form can link them on submit. */
@@ -12744,13 +12833,25 @@ exports.stagePurchaseOrderDocuments = async (req, res) => {
     for (const file of po_documents) {
       const file_path = storedPoDocumentPath(file);
       if (!file_path) {
+        console.error("[po-docs] stage: Cloudinary returned no URL", {
+          originalname: file.originalname,
+          filename: file.filename,
+          path: file.path,
+          mimetype: file.mimetype,
+        });
         return res.status(503).json({
           success: false,
           message:
             "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
         });
       }
-      const viewUrl = viewablePoDocumentUrl(file_path) || file_path;
+      console.log("[po-docs] staged", {
+        originalname: file.originalname,
+        public_id: file.filename,
+        file_path,
+      });
+      const viewUrl =
+        viewablePoDocumentUrl(file_path, file.originalname) || file_path;
       results.push({
         original_name: file.originalname,
         document_name: file.originalname,
@@ -12821,6 +12922,12 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
     for (const file of po_documents) {
       const file_path = storedPoDocumentPath(file);
       if (!file_path) {
+        console.error("[po-docs] upload: Cloudinary returned no URL", {
+          originalname: file.originalname,
+          filename: file.filename,
+          path: file.path,
+          mimetype: file.mimetype,
+        });
         return res.status(503).json({
           success: false,
           message:
@@ -12850,7 +12957,7 @@ exports.uploadPurchaseOrderDocuments = async (req, res) => {
       saved.push({
         document_name: file.originalname,
         file_path,
-        url: viewablePoDocumentUrl(file_path),
+        url: viewablePoDocumentUrl(file_path, file.originalname),
         download_url: downloadablePoDocumentUrl(file_path, file.originalname),
       });
     }
