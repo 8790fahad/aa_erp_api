@@ -87,6 +87,7 @@ function nextStageFor(current, paymentType) {
   const isPaid =
     paymentType === "cash" ||
     paymentType === "transfer" ||
+    paymentType === "card" ||
     paymentType === "split" ||
     paymentType === "credit_split" ||
     paymentType === "bank";
@@ -131,6 +132,7 @@ function stagesForPaymentType(paymentType) {
   const isPaid =
     paymentType === "cash" ||
     paymentType === "transfer" ||
+    paymentType === "card" ||
     paymentType === "split" ||
     paymentType === "credit_split" ||
     paymentType === "bank";
@@ -232,6 +234,7 @@ module.exports = (sequelize, DataTypes) => {
           "warehouse",
           "credit_split",
           "deposit",
+          "card",
         ),
         allowNull: false,
         defaultValue: "credit",

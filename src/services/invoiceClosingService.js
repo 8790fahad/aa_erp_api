@@ -9,7 +9,7 @@ const UNPAID_NON_CREDIT_STATUSES = [
   "awaiting_cashier_confirm",
 ];
 
-const NON_CREDIT_PAYMENT_TYPES = ["cash", "transfer", "bank", "split"];
+const NON_CREDIT_PAYMENT_TYPES = ["cash", "transfer", "bank", "card", "split"];
 
 function normalizeHistory(history) {
   if (Array.isArray(history)) return history;

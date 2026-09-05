@@ -32,6 +32,8 @@ function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
   const hasCash = modes.includes("cash") || m === "cash";
   const hasTransfer =
     modes.includes("transfer") || m === "transfer" || m === "bank";
+  const hasCard = modes.includes("card") || m === "card";
+  const hasBankLike = hasTransfer || hasCard;
 
   // Apply Deposit first whenever it is selected (including Cash / Transfer remainder).
   if (hasDeposit) return "deposit";
@@ -44,7 +46,7 @@ function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
     m === "credit+cash+transfer" ||
     m === "credit + cash + transfer" ||
     m === "credit_cash_transfer" ||
-    (modes.includes("credit") && (hasCash || hasTransfer))
+    (modes.includes("credit") && (hasCash || hasBankLike))
   ) {
     return "credit_split";
   }
@@ -53,12 +55,16 @@ function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
     m === "both" ||
     m === "cash+transfer" ||
     m === "cash_transfer" ||
-    m === "cash + transfer"
+    m === "cash + transfer" ||
+    (hasCash && hasBankLike) ||
+    (hasTransfer && hasCard)
   ) {
     return "split";
   }
+  if (hasCard && !hasCash && !hasTransfer) return "card";
   if (m === "bank" || m === "transfer") return "transfer";
   if (m === "cash") return "cash";
+  if (m === "card") return "card";
   return "cash";
 }
 
@@ -77,7 +83,7 @@ function isSplitPaymentType(paymentType) {
   );
 }
 
-/** Deposit invoices that also selected Cash / Transfer / Credit collect in any order. */
+/** Deposit invoices that also selected Cash / Transfer / Card / Credit collect in any order. */
 function workflowCollectsAsSplit(row) {
   const pt = String(row?.payment_type || "").toLowerCase().trim();
   if (isSplitPaymentType(pt)) return true;
@@ -86,6 +92,7 @@ function workflowCollectsAsSplit(row) {
   return (
     modes.includes("cash") ||
     modes.includes("transfer") ||
+    modes.includes("card") ||
     modes.includes("credit")
   );
 }
@@ -95,11 +102,13 @@ function inferCollectionSideFromSplits(splits) {
     String(s?.mode || "").toLowerCase().trim(),
   );
   const hasCash = modes.some((m) => m === "cash" || m === "c");
+  const hasCard = modes.some((m) => m === "card");
   const hasBank = modes.some((m) =>
     ["bank", "transfer", "bank transfer"].includes(m),
   );
-  if (hasCash && !hasBank) return "cash";
-  if (hasBank && !hasCash) return "transfer";
+  if (hasCard && !hasCash && !hasBank) return "card";
+  if (hasCash && !hasBank && !hasCard) return "cash";
+  if (hasBank && !hasCash && !hasCard) return "transfer";
   return "";
 }
 
@@ -135,9 +144,12 @@ function paymentModesFromHistory(history) {
 function remainderTypeAfterDeposit(modes) {
   const hasCash = modes.includes("cash");
   const hasTransfer = modes.includes("transfer");
+  const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
-  if (hasCredit && (hasCash || hasTransfer)) return "credit_split";
-  if (hasCash && hasTransfer) return "split";
+  const bankLike = hasTransfer || hasCard;
+  if (hasCredit && (hasCash || bankLike)) return "credit_split";
+  if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
+  if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
   if (hasCredit) return "credit";
@@ -159,7 +171,9 @@ function historyHasCollectAfterDeposit(history) {
     const modes = parseModeList(h?.payment_modes);
     return (
       modes.includes("deposit") &&
-      (modes.includes("cash") || modes.includes("transfer"))
+      (modes.includes("cash") ||
+        modes.includes("transfer") ||
+        modes.includes("card"))
     );
   });
 }
@@ -432,6 +446,7 @@ async function applyPaymentTypeToWorkflow(
     "cash",
     "transfer",
     "bank",
+    "card",
     "split",
     "credit_split",
   ]);
@@ -538,17 +553,21 @@ function getCreditRemainderFromHistory(history) {
   return null;
 }
 
-/** Track partial Cash + Transfer collections on split invoices. */
+/** Track partial Cash + Transfer + Card collections on split invoices. */
 function getSplitCollectionProgress(history) {
   const list = normalizeHistory(history);
   let cash = 0;
   let transfer = 0;
+  let card = 0;
   let cash_by = null;
   let transfer_by = null;
+  let card_by = null;
   let cash_by_name = null;
   let transfer_by_name = null;
+  let card_by_name = null;
   let cash_at = null;
   let transfer_at = null;
+  let card_at = null;
   for (const h of list) {
     const side = String(h?.collection?.side || "").toLowerCase();
     const amt = Number(h?.collection?.amount) || 0;
@@ -560,9 +579,13 @@ function getSplitCollectionProgress(history) {
     if (side === "cash") {
       cash += amt;
       cash_by = h.by || cash_by;
-      // Prefer latest collector name on this side
       if (byName) cash_by_name = byName;
       cash_at = h.at || cash_at;
+    } else if (side === "card") {
+      card += amt;
+      card_by = h.by || card_by;
+      if (byName) card_by_name = byName;
+      card_at = h.at || card_at;
     } else if (side === "transfer" || side === "bank") {
       transfer += amt;
       transfer_by = h.by || transfer_by;
@@ -570,7 +593,7 @@ function getSplitCollectionProgress(history) {
       transfer_at = h.at || transfer_at;
     }
   }
-  const collected_total = Number((cash + transfer).toFixed(2));
+  const collected_total = Number((cash + transfer + card).toFixed(2));
   const creditRem = getCreditRemainderFromHistory(history);
   const creditFromHistory =
     creditRem != null ? Number(creditRem.remainder) || 0 : null;
@@ -587,14 +610,19 @@ function getSplitCollectionProgress(history) {
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
+    card: Number(card.toFixed(2)),
     cash_done: cash > 0.05,
     transfer_done: transfer > 0.05,
+    card_done: card > 0.05,
     cash_by,
     transfer_by,
+    card_by,
     cash_by_name,
     transfer_by_name,
+    card_by_name,
     cash_at,
     transfer_at,
+    card_at,
     collected_total,
     credit_allocated: Number(creditAllocated.toFixed(2)),
     deposit_applied: Number(depositApplied.toFixed(2)),
@@ -1084,7 +1112,9 @@ async function createSaleWorkflowRecord(
     isDepositPaymentType(resolvedPaymentType) && modes.includes("credit");
   const collectAfterDeposit =
     isDepositPaymentType(resolvedPaymentType) &&
-    (modes.includes("cash") || modes.includes("transfer"));
+    (modes.includes("cash") ||
+      modes.includes("transfer") ||
+      modes.includes("card"));
   const isPaid =
     resolvedPaymentType !== "credit" &&
     resolvedPaymentType !== "warehouse" &&
@@ -1133,7 +1163,7 @@ async function createSaleWorkflowRecord(
       statusNote = creditAfterDeposit
         ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
         : collectAfterDeposit
-          ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer"
+          ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer/card"
           : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
     }
   } else if (isPaid) {
@@ -1856,6 +1886,8 @@ exports.getCashierDashboard = async (req, res) => {
       where.payment_type = ["cash", "split", "credit_split"];
     } else if (ct === "transfer") {
       where.payment_type = ["transfer", "bank", "split", "credit_split"];
+    } else if (ct === "card") {
+      where.payment_type = ["card", "split", "credit_split"];
     } else if (ct === "credit") {
       // Credit tab is loaded separately below
       where.payment_type = ["__none__"];
@@ -1864,7 +1896,14 @@ exports.getCashierDashboard = async (req, res) => {
     } else if (ct === "deposit") {
       where.payment_type = ["__none__"];
     } else {
-      where.payment_type = ["cash", "transfer", "bank", "split", "credit_split"];
+      where.payment_type = [
+        "cash",
+        "transfer",
+        "bank",
+        "card",
+        "split",
+        "credit_split",
+      ];
     }
 
     const pending =
@@ -1879,10 +1918,12 @@ exports.getCashierDashboard = async (req, res) => {
     const pendingRows = pending.map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
-      const split_progress = buildSplitProgressForRow(plain);
+      const history = normalizeHistory(plain.history);
+      const split_progress = buildSplitProgressForRow({ ...plain, history });
       return {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
+        payment_modes: paymentModesFromHistory(history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "amber",
         amount: Number(plain.amount) || 0,
@@ -1930,6 +1971,7 @@ exports.getCashierDashboard = async (req, res) => {
     const creditPending =
       ct === "cash" ||
       ct === "transfer" ||
+      ct === "card" ||
       ct === "split" ||
       ct === "discount" ||
       ct === "mode" ||
@@ -2265,12 +2307,13 @@ exports.getCashierDashboard = async (req, res) => {
         ? row.payment_modes
         : paymentModesFromHistory(row.history);
       if (modes.includes("credit")) return true;
-      if (modes.includes("cash") || modes.includes("transfer")) return false;
+      if (modes.includes("cash") || modes.includes("transfer") || modes.includes("card")) return false;
       return Number(row.credit_remainder) > 0.05;
     };
     if (
       ct !== "cash" &&
       ct !== "transfer" &&
+      ct !== "card" &&
       ct !== "split" &&
       ct !== "discount" &&
       ct !== "mode" &&
@@ -2328,6 +2371,7 @@ exports.getCashierDashboard = async (req, res) => {
       const pt = String(row.payment_type || "").toLowerCase();
       if (pt === "cash") summary.pending_cash += amt;
       else if (pt === "transfer" || pt === "bank") summary.pending_transfer += amt;
+      else if (pt === "card") summary.pending_card = (summary.pending_card || 0) + amt;
       else if (pt === "split") summary.pending_split += amt;
       else if (pt === "credit_split") summary.pending_credit += amt;
     }
@@ -2405,10 +2449,12 @@ exports.getCashierDashboard = async (req, res) => {
 
     let collected_cash = 0;
     let collected_transfer = 0;
+    let collected_card = 0;
     for (const row of todayRows || []) {
       const mode = String(row.mode_of_payment || "").toLowerCase();
       const total = Number(row.total) || 0;
       if (mode === "cash") collected_cash += total;
+      else if (mode === "card") collected_card += total;
       else if (
         mode === "bank" ||
         mode === "transfer" ||
@@ -2563,7 +2609,7 @@ exports.getCashierDashboard = async (req, res) => {
         "completed",
         "credit_approved",
       ],
-      payment_type: ["cash", "transfer", "bank", "split", "credit", "credit_split", "deposit"],
+      payment_type: ["cash", "transfer", "bank", "card", "split", "credit", "credit_split", "deposit"],
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -2572,6 +2618,8 @@ exports.getCashierDashboard = async (req, res) => {
     if (ct === "cash") historyWhere.payment_type = ["cash", "split", "credit_split"];
     else if (ct === "transfer")
       historyWhere.payment_type = ["transfer", "bank", "split", "credit_split"];
+    else if (ct === "card")
+      historyWhere.payment_type = ["card", "split", "credit_split"];
     else if (ct === "split") historyWhere.payment_type = ["split", "credit_split"];
     else if (ct === "credit") historyWhere.payment_type = ["credit"];
     else if (ct === "deposit") historyWhere.payment_type = ["deposit"];
@@ -2677,7 +2725,8 @@ exports.getCashierDashboard = async (req, res) => {
           ...summary,
           collected_cash_today: collected_cash,
           collected_transfer_today: collected_transfer,
-          collected_today: collected_cash + collected_transfer,
+          collected_card_today: collected_card,
+          collected_today: collected_cash + collected_transfer + collected_card,
           approved_credit_today,
           approved_credit_count_today,
           applied_deposit_today,
@@ -2939,6 +2988,18 @@ exports.cashierConfirmPayment = async (req, res) => {
         message: "Use Transfer Collection for transfer invoices only",
       });
     }
+    if (
+      ct === "card" &&
+      paymentType !== "card" &&
+      !isSplitPaymentType(paymentType) &&
+      !mixedSplit
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Use Card Collection for card invoices only",
+      });
+    }
 
     const amountDue = Number(row.amount) || 0;
     if (amountDue <= 0) {
@@ -2972,13 +3033,17 @@ exports.cashierConfirmPayment = async (req, res) => {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
-        message: "Provide payment amounts (cash and/or transfer)",
+        message: "Provide payment amounts (cash, transfer, and/or card)",
       });
     }
 
     // Prefer explicit side, else infer from submitted modes (cash-only → cash, etc.)
     let resolvedSide = collectionSide;
-    if (resolvedSide !== "cash" && resolvedSide !== "transfer") {
+    if (
+      resolvedSide !== "cash" &&
+      resolvedSide !== "transfer" &&
+      resolvedSide !== "card"
+    ) {
       resolvedSide = inferCollectionSideFromSplits(rawSplits);
     }
 
@@ -2997,11 +3062,17 @@ exports.cashierConfirmPayment = async (req, res) => {
     if (isSplit) {
       // Cash + Transfer: part payment from either point is always allowed
       // (amount may be less than invoice total; advance when cash+transfer = due).
-      if (resolvedSide === "cash" || resolvedSide === "transfer") {
+      if (
+        resolvedSide === "cash" ||
+        resolvedSide === "transfer" ||
+        resolvedSide === "card"
+      ) {
         const sideModes =
           resolvedSide === "cash"
             ? ["cash", "c"]
-            : ["bank", "transfer", "bank transfer"];
+            : resolvedSide === "card"
+              ? ["card"]
+              : ["bank", "transfer", "bank transfer"];
         rawSplits = rawSplits.filter((s) =>
           sideModes.includes(String(s.mode || "").toLowerCase().trim()),
         );
@@ -3012,7 +3083,9 @@ exports.cashierConfirmPayment = async (req, res) => {
             message:
               resolvedSide === "cash"
                 ? "Cash collection point must submit a cash amount"
-                : "Transfer collection point must submit a transfer amount",
+                : resolvedSide === "card"
+                  ? "Card collection point must submit a card amount"
+                  : "Transfer collection point must submit a transfer amount",
           });
         }
       }
@@ -3089,14 +3162,15 @@ exports.cashierConfirmPayment = async (req, res) => {
           ? "cash"
           : modeRaw === "bank" ||
               modeRaw === "transfer" ||
-              modeRaw === "bank transfer"
+              modeRaw === "bank transfer" ||
+              modeRaw === "card"
             ? "bank"
             : null;
       if (!mode) {
         await transaction.rollback();
         return res.status(400).json({
           success: false,
-          message: "Each payment must be cash or bank/transfer",
+          message: "Each payment must be cash, transfer, or card",
         });
       }
 
@@ -3118,7 +3192,10 @@ exports.cashierConfirmPayment = async (req, res) => {
           await transaction.rollback();
           return res.status(400).json({
             success: false,
-            message: "Bank account is required for transfer",
+            message:
+              modeRaw === "card"
+                ? "Bank account is required for card"
+                : "Bank account is required for transfer",
           });
         }
         const bank = await db.bank_account.findOne({
@@ -3149,7 +3226,10 @@ exports.cashierConfirmPayment = async (req, res) => {
       }
 
       const payAmt = Number(Number(split.amount).toFixed(2));
-      const modeLabel = mode === "cash" ? "cash" : "bank";
+      const isCardPay =
+        modeRaw === "card" || resolvedSide === "card";
+      const modeLabel =
+        mode === "cash" ? "cash" : isCardPay ? "card" : "bank";
 
       ledgerEntries.push({
         transaction_date: saleDate,
@@ -3214,15 +3294,27 @@ exports.cashierConfirmPayment = async (req, res) => {
         { transaction },
       );
 
-      if (isSplit && (resolvedSide === "cash" || resolvedSide === "transfer")) {
-        const side = resolvedSide === "cash" ? "cash" : "transfer";
+      if (
+        isSplit &&
+        (resolvedSide === "cash" ||
+          resolvedSide === "transfer" ||
+          resolvedSide === "card")
+      ) {
+        const side =
+          resolvedSide === "cash"
+            ? "cash"
+            : resolvedSide === "card"
+              ? "card"
+              : "transfer";
+        const sideTitle =
+          side === "cash" ? "Cash" : side === "card" ? "Card" : "Transfer";
         setWorkflowHistory(
           row,
           pushHistory(
             row.history,
             "awaiting_cashier_confirm",
             updated_by,
-            `${side === "cash" ? "Cash" : "Transfer"} portion collected ₦${payAmt.toFixed(2)}${
+            `${sideTitle} portion collected ₦${payAmt.toFixed(2)}${
               collectorName ? ` by ${collectorName}` : ""
             }`,
             {
@@ -3236,14 +3328,17 @@ exports.cashierConfirmPayment = async (req, res) => {
         );
       } else if (isSplit) {
         // Both modes in one submit — record each
-        const side = mode === "cash" ? "cash" : "transfer";
+        const side =
+          mode === "cash" ? "cash" : isCardPay ? "card" : "transfer";
+        const sideTitle =
+          side === "cash" ? "Cash" : side === "card" ? "Card" : "Transfer";
         setWorkflowHistory(
           row,
           pushHistory(
             row.history,
             "awaiting_cashier_confirm",
             updated_by,
-            `${side === "cash" ? "Cash" : "Transfer"} portion collected ₦${payAmt.toFixed(2)}${
+            `${sideTitle} portion collected ₦${payAmt.toFixed(2)}${
               collectorName ? ` by ${collectorName}` : ""
             }`,
             {
@@ -3364,9 +3459,11 @@ exports.cashierConfirmPayment = async (req, res) => {
     const sideLabel =
       resolvedSide === "transfer"
         ? "Transfer"
-        : resolvedSide === "cash"
-          ? "Cash"
-          : "Payment";
+        : resolvedSide === "card"
+          ? "Card"
+          : resolvedSide === "cash"
+            ? "Cash"
+            : "Payment";
 
     try {
       const { notifyBusinessMembers } = require("../services/notifications");
@@ -4159,6 +4256,7 @@ const SPECIAL_TREATMENT_TYPES = [
   "credit",
   "credit_split",
   "deposit",
+  "card",
   "warehouse",
 ];
 

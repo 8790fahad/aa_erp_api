@@ -5233,9 +5233,12 @@ function paymentModesFromHistory(history) {
 function remainderTypeAfterDeposit(modes) {
   const hasCash = modes.includes("cash");
   const hasTransfer = modes.includes("transfer");
+  const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
-  if (hasCredit && (hasCash || hasTransfer)) return "credit_split";
-  if (hasCash && hasTransfer) return "split";
+  const bankLike = hasTransfer || hasCard;
+  if (hasCredit && (hasCash || bankLike)) return "credit_split";
+  if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
+  if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
   if (hasCredit) return "credit";

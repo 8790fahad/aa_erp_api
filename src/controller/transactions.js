@@ -1508,6 +1508,12 @@ exports.getSaleByCode = async (req, res) => {
         ) {
           mode = "cash";
         } else if (
+          modeRaw === "card" ||
+          desc.includes("(card)") ||
+          desc.includes("payment (card)")
+        ) {
+          mode = "card";
+        } else if (
           modeRaw === "bank" ||
           modeRaw === "transfer" ||
           modeRaw.includes("bank") ||
@@ -1548,6 +1554,9 @@ exports.getSaleByCode = async (req, res) => {
       .reduce((s, p) => s + p.amount, 0);
     let transferPaid = paymentBreakdown
       .filter((p) => p.mode === "transfer" || p.mode === "bank")
+      .reduce((s, p) => s + p.amount, 0);
+    let cardPaid = paymentBreakdown
+      .filter((p) => p.mode === "card")
       .reduce((s, p) => s + p.amount, 0);
     let depositPaid = paymentBreakdown
       .filter((p) => p.mode === "deposit" || p.mode === "advance")
@@ -1597,6 +1606,7 @@ exports.getSaleByCode = async (req, res) => {
             Number(progress.transfer) || 0,
             Number(creditRem?.transfer_collected) || 0,
           );
+          cardPaid = Math.max(cardPaid, Number(progress.card) || 0);
           depositPaid = Math.max(
             depositPaid,
             Number(progress.deposit_applied) || 0,
@@ -1637,12 +1647,17 @@ exports.getSaleByCode = async (req, res) => {
     const hasCashMode = selectedModes.includes("cash");
     const hasTransferMode =
       selectedModes.includes("transfer") || selectedModes.includes("bank");
+    const hasCardMode = selectedModes.includes("card");
     const hasCreditMode = selectedModes.includes("credit");
     const hasDepositMode = selectedModes.includes("deposit");
     const mixedModes =
-      [hasCashMode, hasTransferMode, hasCreditMode, hasDepositMode].filter(
-        Boolean,
-      ).length > 1;
+      [
+        hasCashMode,
+        hasTransferMode,
+        hasCardMode,
+        hasCreditMode,
+        hasDepositMode,
+      ].filter(Boolean).length > 1;
 
     // Credit portion: allocated remainder only. Do not dump the whole unpaid
     // balance onto credit when Cash / Transfer / Deposit were also selected.
@@ -1653,6 +1668,7 @@ exports.getSaleByCode = async (req, res) => {
           invoiceTotalAmount -
           cashPaid -
           transferPaid -
+          cardPaid -
           depositPaid
         ).toFixed(2),
       );
@@ -1664,7 +1680,11 @@ exports.getSaleByCode = async (req, res) => {
           String(workflowPaymentType || "")
             .toLowerCase()
             .includes("credit") ||
-          (hasCreditMode && !hasCashMode && !hasTransferMode && !hasDepositMode));
+          (hasCreditMode &&
+            !hasCashMode &&
+            !hasTransferMode &&
+            !hasCardMode &&
+            !hasDepositMode));
       if (unpaid > 0.05 && creditOnly) {
         creditPaid = unpaid;
       }
@@ -1676,6 +1696,7 @@ exports.getSaleByCode = async (req, res) => {
       const parts = [];
       if (hasCashMode) parts.push("Cash");
       if (hasTransferMode) parts.push("Transfer");
+      if (hasCardMode) parts.push("Card");
       if (hasCreditMode) parts.push("Credit");
       if (hasDepositMode) parts.push("Apply Deposit");
       modeOfPayment = parts.join(" + ");
@@ -1693,13 +1714,20 @@ exports.getSaleByCode = async (req, res) => {
       modeOfPayment = "cash";
     } else if (transferPaid > 0 && cashPaid <= 0 && creditPaid <= 0.05) {
       modeOfPayment = "transfer";
+    } else if (
+      cardPaid > 0.05 &&
+      cashPaid <= 0.05 &&
+      transferPaid <= 0.05 &&
+      creditPaid <= 0.05
+    ) {
+      modeOfPayment = "card";
     } else if (creditPaid > 0.05 && cashPaid <= 0.05 && transferPaid <= 0.05) {
       modeOfPayment = "credit";
     }
 
     const amountPaid =
-      cashPaid + transferPaid + depositPaid > 0.05
-        ? Number((cashPaid + transferPaid + depositPaid).toFixed(2))
+      cashPaid + transferPaid + cardPaid + depositPaid > 0.05
+        ? Number((cashPaid + transferPaid + cardPaid + depositPaid).toFixed(2))
         : amountPaidFromEntries > 0
           ? amountPaidFromEntries
           : String(modeOfPayment).toUpperCase() === "CREDIT" ||
@@ -1750,6 +1778,19 @@ exports.getSaleByCode = async (req, res) => {
       });
     }
 
+    if (
+      cardPaid > 0.05 &&
+      !paymentBreakdown.some((p) => p.mode === "card")
+    ) {
+      paymentBreakdown.push({
+        mode: "card",
+        amount: cardPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Card",
+      });
+    }
+
     const transaction = {
       id: saleCode,
       reference: saleCode,
@@ -1759,6 +1800,7 @@ exports.getSaleByCode = async (req, res) => {
       payment_modes: selectedModes,
       cash_paid: cashPaid,
       transfer_paid: transferPaid,
+      card_paid: cardPaid,
       credit_paid: creditPaid,
       deposit_paid: depositPaid,
       transfer_banks: transferBanks,
@@ -1798,6 +1840,7 @@ exports.getSaleByCode = async (req, res) => {
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
+        card_paid: cardPaid,
         credit_paid: creditPaid,
         deposit_paid: depositPaid,
         transfer_banks: transferBanks,
@@ -2864,6 +2907,8 @@ exports.createSale = async (req, res) => {
           cashModeOfPayment = "credit_split";
         } else if (rawMode === "split" || rawMode === "both") {
           cashModeOfPayment = "split";
+        } else if (rawMode === "card") {
+          cashModeOfPayment = "card";
         } else if (
           rawMode === "bank" ||
           rawMode === "bank transfer" ||

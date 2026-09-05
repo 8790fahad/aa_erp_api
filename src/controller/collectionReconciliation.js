@@ -23,6 +23,7 @@ function classifyMode(mode) {
     .toLowerCase()
     .trim();
   if (m === "cash") return "cash";
+  if (m === "card") return "transfer";
   if (
     m === "bank" ||
     m === "transfer" ||
