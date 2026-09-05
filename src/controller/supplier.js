@@ -1075,10 +1075,15 @@ const getSupplierPaymentReceipt = async (req, res) => {
       const [docs] = await db.sequelize.query(
         `SELECT id, document_name, file_path, original_name, file_size, mime_type
          FROM payment_documents
-         WHERE reference_number = :ref AND facilityId = :facilityId
+         WHERE facilityId = :facilityId
+           AND reference_number IN (:ref, :pv)
          ORDER BY id ASC`,
         {
-          replacements: { ref: ref_number, facilityId },
+          replacements: {
+            ref: ref_number,
+            pv: pv_code || ref_number,
+            facilityId,
+          },
         },
       );
       attachments = docs || [];
