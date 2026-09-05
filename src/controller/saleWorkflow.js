@@ -1234,6 +1234,10 @@ async function createSaleWorkflowRecord(
 exports.SALE_WORKFLOW_STAGES = SALE_WORKFLOW_STAGES;
 exports.createSaleWorkflowRecord = createSaleWorkflowRecord;
 exports.normalizePaymentType = normalizePaymentType;
+exports.paymentModesFromHistory = paymentModesFromHistory;
+exports.getSplitCollectionProgress = getSplitCollectionProgress;
+exports.getCreditRemainderFromHistory = getCreditRemainderFromHistory;
+exports.normalizeHistory = normalizeHistory;
 
 exports.getWorkflowStages = async (_req, res) => {
   return res.json({

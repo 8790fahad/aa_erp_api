@@ -1439,15 +1439,33 @@ exports.getSaleByCode = async (req, res) => {
     }
 
     // Mode of payment + amount paid (deposit / sale payment lines + workflow)
-    const paymentEntries = entries.filter((item) => {
+    const isPaymentLine = (item) => {
       const t = String(item.type || "").toLowerCase();
       const desc = String(item.description || "").toLowerCase();
       return (
         t === "deposit" ||
         t.includes("payment") ||
-        desc.includes("sale payment")
+        desc.includes("sale payment") ||
+        desc.includes("advance applied")
       );
-    });
+    };
+    let extraPaymentEntries = [];
+    try {
+      extraPaymentEntries = await CustomerEntry.findAll({
+        where: {
+          facilityId,
+          link_id: saleCode,
+          receiptNo: { [Op.ne]: saleCode },
+        },
+        raw: true,
+      });
+    } catch (linkErr) {
+      console.warn("getSaleByCode linked payments:", linkErr.message);
+    }
+    const paymentEntries = [
+      ...entries.filter(isPaymentLine),
+      ...extraPaymentEntries.filter(isPaymentLine),
+    ];
     const amountPaidFromEntries = paymentEntries.reduce(
       (sum, item) => sum + Number(item.cost || item.amount_paid || 0),
       0,
@@ -1498,6 +1516,13 @@ exports.getSaleByCode = async (req, res) => {
           desc.includes("transfer")
         ) {
           mode = "transfer";
+        } else if (
+          modeRaw === "advance" ||
+          modeRaw === "deposit" ||
+          desc.includes("advance applied") ||
+          desc.includes("deposit applied")
+        ) {
+          mode = "deposit";
         } else if (modeRaw === "cheque" || desc.includes("cheque")) {
           mode = "cheque";
         } else if (modeRaw && modeRaw !== "credit") {
@@ -1518,11 +1543,14 @@ exports.getSaleByCode = async (req, res) => {
       })
       .filter((p) => p.amount > 0);
 
-    const cashPaid = paymentBreakdown
+    let cashPaid = paymentBreakdown
       .filter((p) => p.mode === "cash")
       .reduce((s, p) => s + p.amount, 0);
-    const transferPaid = paymentBreakdown
+    let transferPaid = paymentBreakdown
       .filter((p) => p.mode === "transfer" || p.mode === "bank")
+      .reduce((s, p) => s + p.amount, 0);
+    let depositPaid = paymentBreakdown
+      .filter((p) => p.mode === "deposit" || p.mode === "advance")
       .reduce((s, p) => s + p.amount, 0);
     const transferBanks = [
       ...new Set(
@@ -1535,10 +1563,17 @@ exports.getSaleByCode = async (req, res) => {
     let workflowPaymentType = null;
     let workflowAmount = null;
     let workflowHistory = [];
+    let workflowPaymentModes = [];
     let creditPaidFromWorkflow = 0;
     let originalInvoiceFromWorkflow = null;
     try {
       if (db.SaleWorkflow) {
+        const {
+          paymentModesFromHistory,
+          getSplitCollectionProgress,
+          getCreditRemainderFromHistory,
+          normalizeHistory,
+        } = require("./saleWorkflow");
         const wf = await db.SaleWorkflow.findOne({
           where: { facility_id: facilityId, sale_code: saleCode },
           attributes: ["payment_type", "amount", "status", "history"],
@@ -1548,16 +1583,34 @@ exports.getSaleByCode = async (req, res) => {
           workflowPaymentType = wf.payment_type || null;
           workflowAmount =
             wf.amount != null ? Number(wf.amount) : null;
-          workflowHistory = Array.isArray(wf.history) ? wf.history : [];
-          // Prefer latest credit_remainder from Credit + Cash + Transfer flow
-          for (let i = workflowHistory.length - 1; i >= 0; i -= 1) {
-            const cr = workflowHistory[i]?.credit_remainder;
-            if (cr && Number(cr.remainder) > 0) {
-              creditPaidFromWorkflow = Number(cr.remainder) || 0;
-              if (cr.original_amount != null) {
-                originalInvoiceFromWorkflow = Number(cr.original_amount);
-              }
-              break;
+          workflowHistory = normalizeHistory(wf.history);
+          workflowPaymentModes = paymentModesFromHistory(workflowHistory);
+          const progress = getSplitCollectionProgress(workflowHistory);
+          const creditRem = getCreditRemainderFromHistory(workflowHistory);
+          cashPaid = Math.max(
+            cashPaid,
+            Number(progress.cash) || 0,
+            Number(creditRem?.cash_collected) || 0,
+          );
+          transferPaid = Math.max(
+            transferPaid,
+            Number(progress.transfer) || 0,
+            Number(creditRem?.transfer_collected) || 0,
+          );
+          depositPaid = Math.max(
+            depositPaid,
+            Number(progress.deposit_applied) || 0,
+          );
+          if (Number(progress.credit_allocated) > 0.05) {
+            creditPaidFromWorkflow = Number(progress.credit_allocated);
+          }
+          if (creditRem && Number(creditRem.remainder) > 0) {
+            creditPaidFromWorkflow = Math.max(
+              creditPaidFromWorkflow,
+              Number(creditRem.remainder) || 0,
+            );
+            if (creditRem.original_amount != null) {
+              originalInvoiceFromWorkflow = Number(creditRem.original_amount);
             }
           }
         }
@@ -1578,28 +1631,55 @@ exports.getSaleByCode = async (req, res) => {
       "CREDIT";
 
     const invoiceTotalAmount = Number(totalAmount) || 0;
-    // Credit portion: explicit remainder, or unpaid balance on credit / credit_split
+    const selectedModes = workflowPaymentModes.map((m) =>
+      String(m || "").toLowerCase(),
+    );
+    const hasCashMode = selectedModes.includes("cash");
+    const hasTransferMode =
+      selectedModes.includes("transfer") || selectedModes.includes("bank");
+    const hasCreditMode = selectedModes.includes("credit");
+    const hasDepositMode = selectedModes.includes("deposit");
+    const mixedModes =
+      [hasCashMode, hasTransferMode, hasCreditMode, hasDepositMode].filter(
+        Boolean,
+      ).length > 1;
+
+    // Credit portion: allocated remainder only. Do not dump the whole unpaid
+    // balance onto credit when Cash / Transfer / Deposit were also selected.
     let creditPaid = creditPaidFromWorkflow;
     if (creditPaid <= 0.05) {
       const unpaid = Number(
-        (invoiceTotalAmount - cashPaid - transferPaid).toFixed(2),
+        (
+          invoiceTotalAmount -
+          cashPaid -
+          transferPaid -
+          depositPaid
+        ).toFixed(2),
       );
       const pt = String(modeOfPayment || "").toLowerCase();
-      if (
-        unpaid > 0.05 &&
+      const creditOnly =
+        !mixedModes &&
         (pt === "credit" ||
-          pt === "credit_split" ||
           pt.includes("credit") ||
           String(workflowPaymentType || "")
             .toLowerCase()
-            .includes("credit"))
-      ) {
+            .includes("credit") ||
+          (hasCreditMode && !hasCashMode && !hasTransferMode && !hasDepositMode));
+      if (unpaid > 0.05 && creditOnly) {
         creditPaid = unpaid;
       }
     }
 
-    // Prefer derived label when we have concrete payment lines
-    if (cashPaid > 0.05 && transferPaid > 0.05 && creditPaid > 0.05) {
+    // Prefer the selected mix (and collected lines) over a later workflow status
+    // that may have been rewritten to "credit" or "deposit".
+    if (mixedModes) {
+      const parts = [];
+      if (hasCashMode) parts.push("Cash");
+      if (hasTransferMode) parts.push("Transfer");
+      if (hasCreditMode) parts.push("Credit");
+      if (hasDepositMode) parts.push("Apply Deposit");
+      modeOfPayment = parts.join(" + ");
+    } else if (cashPaid > 0.05 && transferPaid > 0.05 && creditPaid > 0.05) {
       modeOfPayment = "credit_split";
     } else if (cashPaid > 0.05 && transferPaid > 0.05) {
       modeOfPayment = "split";
@@ -1607,6 +1687,8 @@ exports.getSaleByCode = async (req, res) => {
       modeOfPayment = "credit_split";
     } else if (transferPaid > 0.05 && cashPaid <= 0.05 && creditPaid > 0.05) {
       modeOfPayment = "credit_split";
+    } else if (depositPaid > 0.05 && cashPaid <= 0.05 && transferPaid <= 0.05 && creditPaid <= 0.05) {
+      modeOfPayment = "deposit";
     } else if (cashPaid > 0 && transferPaid <= 0 && paymentBreakdown.length && creditPaid <= 0.05) {
       modeOfPayment = "cash";
     } else if (transferPaid > 0 && cashPaid <= 0 && creditPaid <= 0.05) {
@@ -1616,15 +1698,26 @@ exports.getSaleByCode = async (req, res) => {
     }
 
     const amountPaid =
-      amountPaidFromEntries > 0
-        ? amountPaidFromEntries
-        : String(modeOfPayment).toUpperCase() === "CREDIT" ||
-            String(modeOfPayment).toLowerCase() === "credit_split"
-          ? cashPaid + transferPaid
-          : workflowAmount != null && Number.isFinite(workflowAmount)
-            ? workflowAmount
-            : 0;
+      cashPaid + transferPaid + depositPaid > 0.05
+        ? Number((cashPaid + transferPaid + depositPaid).toFixed(2))
+        : amountPaidFromEntries > 0
+          ? amountPaidFromEntries
+          : String(modeOfPayment).toUpperCase() === "CREDIT" ||
+              String(modeOfPayment).toLowerCase() === "credit_split"
+            ? cashPaid + transferPaid
+            : workflowAmount != null && Number.isFinite(workflowAmount)
+              ? workflowAmount
+              : 0;
 
+    if (depositPaid > 0.05 && !paymentBreakdown.some((p) => p.mode === "deposit")) {
+      paymentBreakdown.push({
+        mode: "deposit",
+        amount: depositPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Apply Deposit",
+      });
+    }
     if (creditPaid > 0.05) {
       paymentBreakdown.push({
         mode: "credit",
@@ -1635,15 +1728,39 @@ exports.getSaleByCode = async (req, res) => {
       });
     }
 
+    if (cashPaid > 0.05 && !paymentBreakdown.some((p) => p.mode === "cash")) {
+      paymentBreakdown.push({
+        mode: "cash",
+        amount: cashPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Cash",
+      });
+    }
+    if (
+      transferPaid > 0.05 &&
+      !paymentBreakdown.some((p) => p.mode === "transfer" || p.mode === "bank")
+    ) {
+      paymentBreakdown.push({
+        mode: "transfer",
+        amount: transferPaid,
+        bank_account_id: null,
+        bank_name: null,
+        description: "Transfer",
+      });
+    }
+
     const transaction = {
       id: saleCode,
       reference: saleCode,
       mode_of_payment: modeOfPayment,
       amount_paid: amountPaid,
       payment_type: modeOfPayment,
+      payment_modes: selectedModes,
       cash_paid: cashPaid,
       transfer_paid: transferPaid,
       credit_paid: creditPaid,
+      deposit_paid: depositPaid,
       transfer_banks: transferBanks,
       payment_breakdown: paymentBreakdown,
       invoice_total_amount:
@@ -1677,10 +1794,12 @@ exports.getSaleByCode = async (req, res) => {
         warehouse_name: warehouseLabel || null,
         warehouses: warehouseNames,
         mode_of_payment: modeOfPayment,
+        payment_modes: selectedModes,
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
         credit_paid: creditPaid,
+        deposit_paid: depositPaid,
         transfer_banks: transferBanks,
         payment_breakdown: paymentBreakdown,
         invoice_total_amount: transaction.invoice_total_amount,
