@@ -96,6 +96,13 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         defaultValue: "all",
       },
+      show_vat_on_sales_invoice: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment:
+          "When true, sales invoice shows VAT. When false, exclusive VAT is folded into unit price and VAT lines are hidden.",
+      },
       vat_account_code: {
         type: DataTypes.STRING(20),
         allowNull: true,

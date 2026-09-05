@@ -9,27 +9,52 @@
  *   CLOUDINARY_API_KEY
  *   CLOUDINARY_API_SECRET
  */
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({
+  path: path.join(__dirname, "..", "..", ".env"),
+});
 const cloudinary = require("cloudinary").v2;
 
-const cloudName = String(process.env.CLOUDINARY_CLOUD_NAME || "").trim();
-const apiKey = String(process.env.CLOUDINARY_API_KEY || "").trim();
-const apiSecret = String(process.env.CLOUDINARY_API_SECRET || "").trim();
-
-if (!cloudName || !apiKey || !apiSecret) {
-  console.warn(
-    "[cloudinary] CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET are not fully set. Uploads will fail until configured in .env.",
-  );
+function readCloudinaryEnv() {
+  return {
+    cloud_name: String(process.env.CLOUDINARY_CLOUD_NAME || "").trim(),
+    api_key: String(process.env.CLOUDINARY_API_KEY || "").trim(),
+    api_secret: String(process.env.CLOUDINARY_API_SECRET || "").trim(),
+  };
 }
 
-cloudinary.config({
-  cloud_name: cloudName,
-  api_key: apiKey,
-  api_secret: apiSecret,
-  secure: true,
-});
+function applyCloudinaryConfig() {
+  const cfg = readCloudinaryEnv();
+  if (!cfg.cloud_name || !cfg.api_key || !cfg.api_secret) {
+    console.warn(
+      "[cloudinary] CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET are not fully set. Uploads will fail until configured in aa_erp_api/.env.",
+    );
+    return cfg;
+  }
+
+  // Prefer the official URL form so upload_stream always receives api_key.
+  process.env.CLOUDINARY_URL = `cloudinary://${cfg.api_key}:${cfg.api_secret}@${cfg.cloud_name}`;
+  cloudinary.config(true); // reload from CLOUDINARY_URL / env
+  cloudinary.config({
+    cloud_name: cfg.cloud_name,
+    api_key: cfg.api_key,
+    api_secret: cfg.api_secret,
+    secure: true,
+  });
+  console.log(
+    `[cloudinary] configured for cloud "${cfg.cloud_name}" (api_key present)`,
+  );
+  return cfg;
+}
+
+applyCloudinaryConfig();
 
 exports.cloudinary = cloudinary;
+exports.applyCloudinaryConfig = applyCloudinaryConfig;
+exports.isCloudinaryConfigured = function isCloudinaryConfigured() {
+  const cfg = readCloudinaryEnv();
+  return Boolean(cfg.cloud_name && cfg.api_key && cfg.api_secret);
+};
 
 /**
  * Parse a Cloudinary delivery URL into public_id / resource_type / format.
@@ -68,24 +93,60 @@ function signedPoDocumentUrl(filePath, { attachment = false, filename } = {}) {
   if (!filePath || typeof filePath !== "string") return filePath || "";
   if (!/^https?:\/\/res\.cloudinary\.com\//i.test(filePath)) return filePath;
 
+  applyCloudinaryConfig();
+
   const parsed = parseCloudinaryDeliveryUrl(filePath);
   if (!parsed) return filePath;
 
   const isPdf = String(parsed.format || "").toLowerCase() === "pdf";
-  const needsSigned =
-    attachment || parsed.resource_type === "raw" || isPdf;
-  if (!needsSigned) return filePath;
+  // Public images can stay on the CDN. Raw/PDF delivery is often restricted (401).
+  if (
+    !attachment &&
+    parsed.resource_type === "image" &&
+    !isPdf
+  ) {
+    return filePath;
+  }
 
   try {
-    const format =
-      parsed.resource_type === "raw"
-        ? parsed.format || undefined
-        : parsed.format || "pdf";
-    const publicId =
-      parsed.resource_type === "raw" && parsed.format
-        ? parsed.public_id.replace(new RegExp(`\\.${parsed.format}$`, "i"), "")
-        : parsed.public_id;
-    return cloudinary.utils.private_download_url(publicId, format, {
+    if (parsed.resource_type === "raw") {
+      // Raw public_ids normally include the extension (…/file.pdf).
+      const withExt = parsed.public_id;
+      const withoutExt =
+        parsed.format && withExt.toLowerCase().endsWith(`.${parsed.format}`)
+          ? withExt.slice(0, -(parsed.format.length + 1))
+          : withExt;
+
+      // Prefer public_id WITH extension + empty format (Cloudinary raw convention).
+      try {
+        return cloudinary.utils.private_download_url(withExt, "", {
+          resource_type: "raw",
+          type: "upload",
+          attachment: !!attachment,
+          target_filename: attachment
+            ? sanitizeDownloadName(filename)
+            : undefined,
+          expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
+        });
+      } catch (_) {
+        return cloudinary.utils.private_download_url(
+          withoutExt,
+          parsed.format || undefined,
+          {
+            resource_type: "raw",
+            type: "upload",
+            attachment: !!attachment,
+            target_filename: attachment
+              ? sanitizeDownloadName(filename)
+              : undefined,
+            expires_at: Math.floor(Date.now() / 1000) + 60 * 60 * 6,
+          },
+        );
+      }
+    }
+
+    const format = parsed.format || "pdf";
+    return cloudinary.utils.private_download_url(parsed.public_id, format, {
       resource_type: parsed.resource_type,
       type: "upload",
       attachment: !!attachment,

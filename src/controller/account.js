@@ -11129,6 +11129,46 @@ exports.updatePrintDeliveryOrder = async (req, res) => {
   }
 };
 
+/** Toggle showing VAT lines on the sales invoice preview/print. */
+exports.updateShowVatOnSalesInvoice = async (req, res) => {
+  try {
+    const { enabled, facilityId } = req.params;
+    const enableFlag = parseEnableFlag(enabled);
+
+    const [updatedRowsCount] = await db.business.update(
+      { show_vat_on_sales_invoice: enableFlag },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Show VAT on sales invoice ${
+        enableFlag ? "enabled" : "disabled"
+      } successfully`,
+    });
+  } catch (err) {
+    console.error("Error updating show_vat_on_sales_invoice:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.message : "Server error",
+    });
+  }
+};
+
 /** Set Delivery Order layout: match (with invoice) or thermal (80mm). */
 exports.updateDeliveryOrderFormat = async (req, res) => {
   try {
@@ -12625,6 +12665,55 @@ exports.getPurchaseOrderDocuments = async (req, res) => {
   }
 };
 
+/**
+ * Redirect to a signed Cloudinary URL so PDFs open in the browser.
+ * Public CDN raw/PDF links often return 401 without a signature.
+ * GET /account/purchase-order-documents/open?file_path=...
+ */
+exports.openPurchaseOrderDocument = async (req, res) => {
+  try {
+    const filePath = String(
+      req.query.file_path || req.query.url || "",
+    ).trim();
+    if (!filePath) {
+      return res.status(400).json({
+        success: false,
+        message: "file_path is required",
+      });
+    }
+    if (!/^https?:\/\/res\.cloudinary\.com\//i.test(filePath)) {
+      return res.status(400).json({
+        success: false,
+        message: "Only Cloudinary purchase-order documents can be opened here",
+      });
+    }
+
+    const wantDownload =
+      String(req.query.download || "") === "1" ||
+      String(req.query.download || "").toLowerCase() === "true";
+    const filename = String(req.query.filename || "").trim() || undefined;
+
+    const target = wantDownload
+      ? downloadablePoDocumentUrl(filePath, filename)
+      : viewablePoDocumentUrl(filePath);
+
+    if (!target || !/^https?:\/\//i.test(target)) {
+      return res.status(502).json({
+        success: false,
+        message: "Could not create a viewable document link",
+      });
+    }
+
+    return res.redirect(302, target);
+  } catch (error) {
+    console.error("Error opening PO document:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to open document",
+    });
+  }
+};
+
 /** Cloudinary URL only — never a local disk path. */
 function storedPoDocumentPath(file) {
   if (!file) return "";
@@ -12661,14 +12750,16 @@ exports.stagePurchaseOrderDocuments = async (req, res) => {
             "Cloudinary did not return a file URL. Check CLOUDINARY_CLOUD_NAME, API key, and secret.",
         });
       }
+      const viewUrl = viewablePoDocumentUrl(file_path) || file_path;
       results.push({
         original_name: file.originalname,
         document_name: file.originalname,
         file_path,
         file_size: file.size,
         mime_type: file.mimetype,
-        url: viewablePoDocumentUrl(file_path),
-        download_url: downloadablePoDocumentUrl(file_path, file.originalname),
+        url: viewUrl,
+        download_url:
+          downloadablePoDocumentUrl(file_path, file.originalname) || file_path,
       });
     }
 

@@ -139,6 +139,17 @@ function historyHasCreditAfterDeposit(history) {
   });
 }
 
+function historyHasCollectAfterDeposit(history) {
+  return normalizeHistory(history).some((h) => {
+    if (h?.collect_after_deposit === true) return true;
+    const modes = parseModeList(h?.payment_modes);
+    return (
+      modes.includes("deposit") &&
+      (modes.includes("cash") || modes.includes("transfer"))
+    );
+  });
+}
+
 async function loadDiscountBySaleCode(facilityId, saleCodes) {
   const map = new Map();
   const codes = [...new Set((saleCodes || []).map((c) => String(c || "").trim()).filter(Boolean))];
@@ -1126,6 +1137,7 @@ async function createSaleWorkflowRecord(
   const historyExtra = {
     ...(modes.length ? { payment_modes: modes } : {}),
     ...(creditAfterDeposit ? { credit_after_deposit: true } : {}),
+    ...(collectAfterDeposit ? { collect_after_deposit: true } : {}),
   };
   history = pushHistory(history, "sales_order", createdBy, "Order created");
   history = pushHistory(history, "invoice_generated", createdBy, "Invoice generated");
@@ -1996,13 +2008,16 @@ exports.getCashierDashboard = async (req, res) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
       const history = normalizeHistory(plain.history);
+      const modes = paymentModesFromHistory(history);
       return {
         ...plain,
         history,
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "teal",
         amount: Number(plain.amount) || 0,
+        payment_modes: modes,
         credit_after_deposit: historyHasCreditAfterDeposit(history),
+        collect_after_deposit: historyHasCollectAfterDeposit(history),
       };
     });
 
@@ -2215,9 +2230,16 @@ exports.getCashierDashboard = async (req, res) => {
 
     // Credit + Apply Deposit stays on Apply Deposit until applied, and also
     // lists on Credit so the credit remainder is visible immediately.
-    const listOnCreditTab = (row) =>
-      Boolean(row.credit_after_deposit) ||
-      Number(row.credit_remainder) > 0.05;
+    // Do not treat Cash/Transfer leftovers as Credit unless Credit was selected.
+    const listOnCreditTab = (row) => {
+      if (Boolean(row.credit_after_deposit)) return true;
+      const modes = Array.isArray(row.payment_modes)
+        ? row.payment_modes
+        : paymentModesFromHistory(row.history);
+      if (modes.includes("credit")) return true;
+      if (modes.includes("cash") || modes.includes("transfer")) return false;
+      return Number(row.credit_remainder) > 0.05;
+    };
     if (
       ct !== "cash" &&
       ct !== "transfer" &&

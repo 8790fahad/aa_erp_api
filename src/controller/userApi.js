@@ -63,6 +63,7 @@ const _getBusinessProfile = async (
         "auto_depreciation_day",
         "auto_depreciation_last_run",
         "vat_policy",
+        "show_vat_on_sales_invoice",
         "vat_account_code",
         "seal",
         "inv_ev_m",

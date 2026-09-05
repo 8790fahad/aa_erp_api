@@ -330,6 +330,10 @@ module.exports = (app) => {
     "/account/purchase-order-documents",
     account.getPurchaseOrderDocuments,
   );
+  app.get(
+    "/account/purchase-order-documents/open",
+    account.openPurchaseOrderDocument,
+  );
   app.post(
     "/account/purchase-order-documents/stage",
     handlePoDocumentUpload,
@@ -402,6 +406,10 @@ module.exports = (app) => {
   app.post(
     "/account/update-print-delivery-order/:enabled/:facilityId/:user_id",
     account.updatePrintDeliveryOrder,
+  );
+  app.post(
+    "/account/update-show-vat-on-sales-invoice/:enabled/:facilityId/:user_id",
+    account.updateShowVatOnSalesInvoice,
   );
   app.post(
     "/account/update-delivery-order-format/:format/:facilityId/:user_id",

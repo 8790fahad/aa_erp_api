@@ -1,6 +1,6 @@
 "use strict";
 
-const { cloudinary } = require("./cloudinary");
+const { cloudinary, applyCloudinaryConfig, isCloudinaryConfigured } = require("./cloudinary");
 const { CloudinaryStorage } = require("multer-storage-cloudinary");
 const multer = require("multer");
 
@@ -51,6 +51,7 @@ const poDocAllowedTypes = [
 const poDocuments = new CloudinaryStorage({
   cloudinary,
   params: async (req, file) => {
+    applyCloudinaryConfig();
     const isImage = /^image\//i.test(file.mimetype);
     const original = String(file.originalname || "document");
     const ext = original.includes(".")
@@ -87,19 +88,31 @@ exports.poDocumentStorage = multer({
 
 /** Cloudinary-only upload. Never writes PO files to local disk. */
 exports.handlePoDocumentUpload = (req, res, next) => {
+  applyCloudinaryConfig();
+  if (!isCloudinaryConfigured()) {
+    return res.status(503).json({
+      success: false,
+      message:
+        "Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in aa_erp_api/.env, then restart the API.",
+    });
+  }
+
   exports.poDocumentStorage.fields([{ name: "po_documents", maxCount: 1000 }])(
     req,
     res,
     (err) => {
       if (!err) return next();
       const message = err.message || String(err);
+      const missingKey = /missing required parameter - api_key/i.test(message);
       const cloudDisabled =
         /cloud_name is disabled/i.test(message) || Number(err.http_code) === 401;
-      return res.status(cloudDisabled ? 503 : 400).json({
+      return res.status(cloudDisabled || missingKey ? 503 : 400).json({
         success: false,
-        message: cloudDisabled
-          ? "Cloudinary cloud is disabled. Enable this cloud in the Cloudinary dashboard, or put a working CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in aa_erp_api/.env, then restart the API."
-          : message || "Failed to upload documents to Cloudinary",
+        message: missingKey
+          ? "Cloudinary api_key is missing at upload time. Confirm CLOUDINARY_API_KEY is in aa_erp_api/.env and restart the API."
+          : cloudDisabled
+            ? "Cloudinary cloud is disabled. Enable this cloud in the Cloudinary dashboard, or put a working CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in aa_erp_api/.env, then restart the API."
+            : message || "Failed to upload documents to Cloudinary",
       });
     },
   );
