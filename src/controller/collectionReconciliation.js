@@ -2,7 +2,7 @@ const db = require("../models");
 const {
   money,
   classifyCollectionMode,
-  loadTillExpenses,
+  loadTillSpend,
 } = require("../utils/tillCollections");
 
 const COLLECTION_ENTRY_FILTER = `
@@ -172,13 +172,13 @@ async function expectedAfterExpenses(facilityId, reconDate, branchId) {
     reconDate,
     branchId,
   );
-  const tillExpenses = await loadTillExpenses({
+  const tillSpend = await loadTillSpend({
     facilityId,
     fromDate: reconDate,
     toDate: reconDate,
   });
   const expensesByCashier = {};
-  for (const line of tillExpenses.lines || []) {
+  for (const line of tillSpend.lines || []) {
     const id = String(line.user_id || "").trim();
     if (!id) continue;
     if (!expensesByCashier[id]) {
@@ -539,13 +539,13 @@ exports.getCashierLines = async (req, res) => {
       })
       .filter(Boolean);
 
-    const tillExpenses = await loadTillExpenses({
+    const tillSpend = await loadTillSpend({
       facilityId,
       fromDate: reconDate,
       toDate: reconDate,
       cashierUserId,
     });
-    for (const exp of tillExpenses.lines || []) {
+    for (const exp of tillSpend.lines || []) {
       lines.push({
         entry_id: `exp-${exp.id}`,
         sale_code: exp.sale_code,

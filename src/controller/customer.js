@@ -263,6 +263,25 @@ exports.getReceivedPaymentHistory = async (req, res) => {
          SUM(ce.cost) AS amount,
          SUM(
            CASE
+             WHEN LOWER(TRIM(ce.mode_of_payment)) IN ('cash', 'c') THEN ce.cost
+             ELSE 0
+           END
+         ) AS cash_amount,
+         SUM(
+           CASE
+             WHEN LOWER(TRIM(ce.mode_of_payment)) IN ('transfer', 'bank', 'bank transfer')
+             THEN ce.cost
+             ELSE 0
+           END
+         ) AS transfer_amount,
+         SUM(
+           CASE
+             WHEN LOWER(TRIM(ce.mode_of_payment)) = 'card' THEN ce.cost
+             ELSE 0
+           END
+         ) AS card_amount,
+         SUM(
+           CASE
              WHEN TRIM(COALESCE(ce.link_id, '')) LIKE 'INV-%' THEN ce.cost
              ELSE 0
            END
@@ -296,6 +315,9 @@ exports.getReceivedPaymentHistory = async (req, res) => {
         applied,
         remaining: Math.max(0, amount - applied),
         mode_of_payment: e.mode_of_payment || "",
+        cash_amount: parseFloat(e.cash_amount) || 0,
+        transfer_amount: parseFloat(e.transfer_amount) || 0,
+        card_amount: parseFloat(e.card_amount) || 0,
         branch_id: e.branch_id,
         branch_name: e.branch_name || "",
         direction: "received",

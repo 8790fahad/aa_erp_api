@@ -2,7 +2,10 @@ const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
-const { loadTillExpenses, money: tillMoney } = require("../utils/tillCollections");
+const {
+  loadTillSpend,
+  money: tillMoney,
+} = require("../utils/tillCollections");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const {
   SALE_WORKFLOW_STAGES,
@@ -2437,7 +2440,7 @@ exports.getCashierDashboard = async (req, res) => {
         branchClause = "AND ce.branch_id = :branchId";
       }
     }
-    if (isCashierRole && cashierUserId) {
+    if (cashierUserId) {
       todayReplacements.cashierUserId = cashierUserId;
       collectorClause = "AND ce.created_by = :cashierUserId";
     }
@@ -2493,15 +2496,21 @@ exports.getCashierDashboard = async (req, res) => {
       }
     }
 
-    const tillExpenses = await loadTillExpenses({
+    const tillSpend = await loadTillSpend({
       facilityId,
       fromDate: histFrom,
       toDate: histTo,
-      cashierUserId: isCashierRole && cashierUserId ? cashierUserId : null,
+      cashierUserId: cashierUserId || null,
     });
-    const expenses_cash = tillMoney(tillExpenses.cash);
-    const expenses_card = tillMoney(tillExpenses.card);
-    const expenses_transfer = tillMoney(tillExpenses.transfer);
+    const imprest_cash = tillMoney(tillSpend.imprest?.cash);
+    const imprest_card = tillMoney(tillSpend.imprest?.card);
+    const imprest_transfer = tillMoney(tillSpend.imprest?.transfer);
+    const pay_bills_cash = tillMoney(tillSpend.payBills?.cash);
+    const pay_bills_card = tillMoney(tillSpend.payBills?.card);
+    const pay_bills_transfer = tillMoney(tillSpend.payBills?.transfer);
+    const expenses_cash = tillMoney(tillSpend.cash);
+    const expenses_card = tillMoney(tillSpend.card);
+    const expenses_transfer = tillMoney(tillSpend.transfer);
     const retire_cash = tillMoney(Math.max(0, collected_cash - expenses_cash));
     const retire_card = tillMoney(Math.max(0, collected_card - expenses_card));
     const retire_transfer = tillMoney(
@@ -2768,6 +2777,12 @@ exports.getCashierDashboard = async (req, res) => {
           expenses_cash_today: expenses_cash,
           expenses_card_today: expenses_card,
           expenses_transfer_today: expenses_transfer,
+          imprest_cash_today: imprest_cash,
+          imprest_card_today: imprest_card,
+          imprest_transfer_today: imprest_transfer,
+          pay_bills_cash_today: pay_bills_cash,
+          pay_bills_card_today: pay_bills_card,
+          pay_bills_transfer_today: pay_bills_transfer,
           retire_cash_today: retire_cash,
           retire_card_today: retire_card,
           retire_transfer_today: retire_transfer,
