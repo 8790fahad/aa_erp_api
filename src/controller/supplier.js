@@ -966,9 +966,9 @@ const getSupplierPaymentReceipt = async (req, res) => {
     const generalLedger = await db.GeneralLedger.findOne({
       where: {
         reference_number: ref_number,
-        transaction_ref: pv_code,
         facility_id: facilityId,
       },
+      order: [["transaction_id", "ASC"]],
     });
     // console.log(supplierPayment);
     if (!supplierPayment) {
@@ -985,40 +985,69 @@ const getSupplierPaymentReceipt = async (req, res) => {
         facilityId,
       },
     });
-    // Get account information based on mode of payment
+    // Paid-through account: cash head from GL/entry, otherwise bank account
     let accountInfo = null;
-    if (
-      supplierPayment.mode_of_payment === "cash" &&
-      supplierPayment.bank_account_id
-    ) {
-      accountInfo = await db.AccountCategory.findOne({
-        where: {
-          code: supplierPayment.bank_account_id,
-          facilityId: facilityId,
-        },
-      });
-    } else {
-      // Try Account model first (used elsewhere in this file)
-      try {
-        accountInfo = await db.bank_account.findOne({
-          where: {
-            id: supplierPayment.bank_account_id,
-            facilityId: facilityId,
-          },
-        });
-      } catch (error) {
-        // If Account lookup fails, try bank_account model
-        console.error("Error fetching bank_account:", error);
-      }
+    const mode = String(
+      supplierPayment.mode_of_payment || "",
+    ).toLowerCase();
+    const isCash = mode === "cash";
 
-      // Final fallback to AccountCategory
+    const bankLedger = await db.GeneralLedger.findOne({
+      where: {
+        reference_number: ref_number,
+        facility_id: facilityId,
+        type: "bank",
+      },
+      order: [["transaction_id", "ASC"]],
+    });
+
+    const cashHeadCode = isCash
+      ? supplierPayment.bank_account_id || bankLedger?.account_code || null
+      : null;
+
+    if (isCash && cashHeadCode) {
+      const headCode = String(cashHeadCode).trim();
+      accountInfo = await Account.findOne({
+        where: { head: headCode, facilityId },
+      });
       if (!accountInfo) {
         accountInfo = await db.AccountCategory.findOne({
           where: {
-            code: supplierPayment.bank_account_id,
-            facilityId: facilityId,
+            code: headCode,
+            facilityId,
           },
         });
+      }
+      if (!accountInfo) {
+        accountInfo = {
+          code: headCode,
+          head: headCode,
+          description:
+            bankLedger?.account_description || headCode,
+        };
+      }
+    } else {
+      const paidThrough =
+        supplierPayment.bank_account_id || bankLedger?.bank_account_id;
+      if (paidThrough) {
+        try {
+          accountInfo = await db.bank_account.findOne({
+            where: {
+              id: paidThrough,
+              facilityId: facilityId,
+            },
+          });
+        } catch (error) {
+          console.error("Error fetching bank_account:", error);
+        }
+        if (!accountInfo) {
+          accountInfo = await db.AccountCategory.findOne({
+            where: {
+              code: String(paidThrough),
+              facilityId: facilityId,
+            },
+          });
+        }
       }
     }
 
@@ -1027,22 +1056,48 @@ const getSupplierPaymentReceipt = async (req, res) => {
       parseFloat(
         await getBalance(supplierPayment.supplier_number, facilityId),
       ) || 0;
-    const createdBy = await db.users.findOne({
-      where: {
-        id: supplierPayment.created_by,
-        facilityId: facilityId,
-      },
-    });
+    const createdBy = supplierPayment.created_by
+      ? await db.users.findOne({
+          where: {
+            id: supplierPayment.created_by,
+            facilityId: facilityId,
+          },
+        })
+      : null;
+    const txnDate =
+      generalLedger?.transaction_date ||
+      supplierPayment.transaction_date ||
+      supplierPayment.created_at ||
+      null;
+
+    let attachments = [];
+    try {
+      const [docs] = await db.sequelize.query(
+        `SELECT id, document_name, file_path, original_name, file_size, mime_type
+         FROM payment_documents
+         WHERE reference_number = :ref AND facilityId = :facilityId
+         ORDER BY id ASC`,
+        {
+          replacements: { ref: ref_number, facilityId },
+        },
+      );
+      attachments = docs || [];
+    } catch (_err) {
+      attachments = [];
+    }
+
     const receiptData = {
       createdBy: {
-        name: createdBy?.firstname + " " + createdBy?.lastname,
-        signature: createdBy?.signature,
+        name: [createdBy?.firstname, createdBy?.lastname]
+          .filter(Boolean)
+          .join(" "),
+        signature: createdBy?.signature || null,
       },
       description: supplierPayment.description,
-      reference_number: supplierPayment.ref_number,
-      transaction_date: generalLedger.transaction_date,
-      date: generalLedger.transaction_date,
-      cheque_no:supplierPayment.cheque_no,
+      reference_number: supplierPayment.receiptNo || ref_number,
+      transaction_date: txnDate,
+      date: txnDate,
+      cheque_no: supplierPayment.cheque_no,
       supplier_name: supplier?.supplier_name || supplierPayment.supplier_name,
       supplier_no: supplierPayment.supplier_number,
       supplier_address: supplier?.address || null,
@@ -1053,13 +1108,15 @@ const getSupplierPaymentReceipt = async (req, res) => {
         supplierPayment.payment_method || supplierPayment.mode_of_payment,
       bank_name: supplierPayment.bank_name,
       cheque_number: supplierPayment.cheque_number,
-      narration: supplierPayment.narration,
-      created_by: supplierPayment.userId,
-      created_at: supplierPayment.createdAt,
+      narration: supplierPayment.narration || supplierPayment.description,
+      created_by: supplierPayment.created_by,
+      created_at: supplierPayment.created_at,
+      attachments,
       // Add account information
       account_info: accountInfo
         ? {
-            code: accountInfo.code || accountInfo.head,
+            kind: isCash ? "cash" : "bank",
+            code: accountInfo.code || accountInfo.head || cashHeadCode,
             name:
               accountInfo.account_name ||
               accountInfo.description ||

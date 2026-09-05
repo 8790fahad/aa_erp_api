@@ -62,9 +62,18 @@ const poDocuments = new CloudinaryStorage({
       .replace(/[^a-zA-Z0-9_-]/g, "_")
       .slice(0, 60);
     const stamp = Date.now();
+    const kindRaw = String(req.query?.kind || "purchase_orders")
+      .toLowerCase()
+      .trim();
+    const folderKind = ["purchase_orders", "payments", "memos"].includes(
+      kindRaw,
+    )
+      ? kindRaw
+      : "purchase_orders";
+    const folder = `aa_erp/${folderKind}`;
     if (isImage) {
       return {
-        folder: "aa_erp/purchase_orders",
+        folder,
         resource_type: "image",
         public_id: `${stamp}_${base}`,
       };
@@ -73,7 +82,7 @@ const poDocuments = new CloudinaryStorage({
     // makes Cloudinary store `{id}.{ext}` while the returned URL may omit it,
     // so later raw/download looks up the wrong public_id (Resource not found).
     return {
-      folder: "aa_erp/purchase_orders",
+      folder,
       resource_type: "raw",
       public_id: `${stamp}_${base}${ext ? `.${ext}` : ""}`,
     };

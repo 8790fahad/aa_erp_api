@@ -6194,6 +6194,63 @@ exports.insertUpdateMemoData = (req, res) => {
     });
 };
 
+function memoFilePathFromUpload(file) {
+  if (!file) return "";
+  const url = storedPoDocumentPath(file);
+  if (url) return url;
+  return file.filename || "";
+}
+
+async function insertMemoDocumentRows({
+  memoId,
+  facilityId,
+  files = [],
+  documentNames = [],
+  staged = [],
+  transaction,
+}) {
+  const rows = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const customName = Array.isArray(documentNames)
+      ? documentNames[i]
+      : documentNames;
+    const file_path = memoFilePathFromUpload(file);
+    if (!file_path) continue;
+    rows.push({
+      document_name: customName || file.originalname,
+      file_path,
+      original_name: file.originalname,
+      file_size: file.size,
+      mime_type: file.mimetype,
+    });
+  }
+  for (const doc of staged || []) {
+    const file_path = doc.file_path || doc.url;
+    if (!file_path) continue;
+    rows.push({
+      document_name:
+        doc.document_name || doc.original_name || doc.name || "document",
+      file_path,
+      original_name: doc.original_name || doc.name || "",
+      file_size: doc.file_size || doc.size || null,
+      mime_type: doc.mime_type || null,
+    });
+  }
+  const opts = transaction ? { transaction } : {};
+  for (const row of rows) {
+    await db.sequelize.query(
+      `INSERT INTO memo_documents
+      (memo_id, document_name, file_path, original_name, file_size, mime_type, facilityId)
+      VALUES (:memo_id, :document_name, :file_path, :original_name, :file_size, :mime_type, :facilityId)`,
+      {
+        replacements: { memo_id: memoId, facilityId, ...row },
+        ...opts,
+      },
+    );
+  }
+}
+
 exports.insertMemo = async (req, res) => {
   let files = req.files?.memo_documents?.map((i) => i.filename);
   console.log(files);
@@ -6234,6 +6291,7 @@ exports.insertMemo = async (req, res) => {
       supplier_code = "",
       supplier_number = "",
       account_code = "",
+      attachments = [],
     } = memoData;
     console.log("Parsed Memo Data:", expenses);
     const memo_documents = req?.files?.memo_documents || [];
@@ -6405,33 +6463,15 @@ exports.insertMemo = async (req, res) => {
           });
           await Promise.all(justificationPromises);
         }
-        // Insert uploaded documents
-        if (memo_documents && memo_documents.length > 0) {
-          for (let i = 0; i < memo_documents.length; i++) {
-            const file = memo_documents[i];
-            const customName = Array.isArray(document_names)
-              ? document_names[i]
-              : document_names;
-
-            await db.sequelize.query(
-              `INSERT INTO memo_documents
-              (memo_id, document_name, file_path, original_name, file_size, mime_type, facilityId)
-              VALUES (:memo_id, :document_name, :file_path, :original_name, :file_size, :mime_type, :facilityId)`,
-              {
-                replacements: {
-                  memo_id: newCode,
-                  document_name: customName || file.originalname,
-                  file_path: file.filename,
-                  original_name: file.originalname,
-                  file_size: file.size,
-                  mime_type: file.mimetype,
-                  facilityId,
-                },
-                transaction,
-              },
-            );
-          }
-        }
+        // Insert uploaded / Cloudinary-staged documents
+        await insertMemoDocumentRows({
+          memoId: newCode,
+          facilityId,
+          files: memo_documents,
+          documentNames: document_names,
+          staged: attachments,
+          transaction,
+        });
 
         await transaction.commit();
 
@@ -6523,6 +6563,7 @@ exports.updateMemoNew = async (req, res) => {
       supplier_code = "",
       supplier_number = "",
       account_code = "",
+      attachments = [],
     } = memoData;
 
     const memo_documents = req?.files?.memo_documents || [];
@@ -6678,40 +6719,29 @@ exports.updateMemoNew = async (req, res) => {
         },
       );
 
-      // Delete file from filesystem
-      const filePath = path.join(
-        __dirname,
-        "../../public/uploads",
-        doc.file_path,
-      );
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+      // Delete local disk files only (Cloudinary URLs stay in storage)
+      if (
+        doc.file_path &&
+        !/^https?:\/\//i.test(String(doc.file_path))
+      ) {
+        const filePath = path.join(
+          __dirname,
+          "../../public/uploads",
+          doc.file_path,
+        );
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
       }
     }
 
-    for (let i = 0; i < memo_documents.length; i++) {
-      const file = memo_documents[i];
-      const customName = Array.isArray(document_names)
-        ? document_names[i]
-        : document_names;
-
-      await db.sequelize.query(
-        `INSERT INTO memo_documents
-        (memo_id, document_name, file_path, original_name, file_size, mime_type, facilityId)
-        VALUES (:memo_id, :document_name, :file_path, :original_name, :file_size, :mime_type, :facilityId)`,
-        {
-          replacements: {
-            memo_id,
-            document_name: customName || file.originalname,
-            file_path: file.filename,
-            original_name: file.originalname,
-            file_size: file.size,
-            mime_type: file.mimetype,
-            facilityId,
-          },
-        },
-      );
-    }
+    await insertMemoDocumentRows({
+      memoId: memo_id,
+      facilityId,
+      files: memo_documents,
+      documentNames: document_names,
+      staged: attachments,
+    });
 
     await addLog(
       {

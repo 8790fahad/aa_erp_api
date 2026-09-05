@@ -509,6 +509,7 @@ exports.createSupplierAdvancePayment = async (req, res) => {
     bank_account_id,
     line_of_business = "General",
     payment_splits: paymentSplitsFromBody,
+    attachments: attachmentsFromBody,
   } = req.body;
 
   const facility = facilityId || facilityID;
@@ -806,6 +807,27 @@ exports.createSupplierAdvancePayment = async (req, res) => {
     let amountAppliedToPayable = 0;
     let remainingAmount = amountPaidNum;
 
+    const stagedDocs = Array.isArray(attachmentsFromBody)
+      ? attachmentsFromBody.filter((d) => d && (d.file_path || d.url))
+      : [];
+    if (stagedDocs.length) {
+      await db.sequelize.query(
+        `CREATE TABLE IF NOT EXISTS payment_documents (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          reference_number VARCHAR(100) NOT NULL,
+          facilityId VARCHAR(50) NOT NULL,
+          document_name VARCHAR(255) NOT NULL,
+          file_path VARCHAR(1000) NOT NULL,
+          original_name VARCHAR(255) NULL,
+          file_size INT NULL,
+          mime_type VARCHAR(100) NULL,
+          uploaded_by VARCHAR(100) NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_pay_docs_ref (reference_number, facilityId)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+      );
+    }
+
     const result = await db.sequelize.transaction(async (t) => {
       // Credit bank/cash (money out) — one leg per split, or single total
       if (resolvedSplits.length > 0) {
@@ -954,6 +976,8 @@ exports.createSupplierAdvancePayment = async (req, res) => {
           cost: amountPaidNum,
           facilityId: facility,
           mode_of_payment: mode_of_payment || "cash",
+          bank_account_id: resolvedBankAccountId || null,
+          transaction_date: transactionDate,
           receiptNo: referenceNumber,
           type: "payment",
           line_of_business: lineOfBusinessString,
@@ -962,6 +986,36 @@ exports.createSupplierAdvancePayment = async (req, res) => {
         },
         { transaction: t },
       );
+
+      if (stagedDocs.length) {
+        for (const doc of stagedDocs) {
+          const file_path = doc.file_path || doc.url;
+          if (!file_path) continue;
+          await db.sequelize.query(
+            `INSERT INTO payment_documents
+              (reference_number, facilityId, document_name, file_path, original_name, file_size, mime_type, uploaded_by)
+             VALUES
+              (:reference_number, :facilityId, :document_name, :file_path, :original_name, :file_size, :mime_type, :uploaded_by)`,
+            {
+              replacements: {
+                reference_number: referenceNumber,
+                facilityId: facility,
+                document_name:
+                  doc.document_name ||
+                  doc.original_name ||
+                  doc.name ||
+                  "document",
+                file_path,
+                original_name: doc.original_name || doc.name || "",
+                file_size: doc.file_size || doc.size || null,
+                mime_type: doc.mime_type || null,
+                uploaded_by: userId || "",
+              },
+              transaction: t,
+            },
+          );
+        }
+      }
 
       return {
         reference_number: referenceNumber,
