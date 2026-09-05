@@ -2,6 +2,7 @@ const db = require("../models");
 const { Op } = require("sequelize");
 const moment = require("moment");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const { loadTillExpenses, money: tillMoney } = require("../utils/tillCollections");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const {
   SALE_WORKFLOW_STAGES,
@@ -83,12 +84,21 @@ function isSplitPaymentType(paymentType) {
   );
 }
 
-/** Deposit invoices that also selected Cash / Transfer / Card / Credit collect in any order. */
+/** Mixed modes (Cash + Transfer + Card + Credit + Deposit, etc.) collect in any order, any portion. */
 function workflowCollectsAsSplit(row) {
   const pt = String(row?.payment_type || "").toLowerCase().trim();
   if (isSplitPaymentType(pt)) return true;
+  const modes = [
+    ...new Set([
+      ...parseModeList(row?.payment_modes),
+      ...paymentModesFromHistory(row?.history),
+    ]),
+  ];
+  const collect = ["cash", "transfer", "card", "credit", "deposit"].filter((id) =>
+    modes.includes(id),
+  );
+  if (collect.length > 1) return true;
   if (!isDepositPaymentType(pt)) return false;
-  const modes = paymentModesFromHistory(row?.history);
   return (
     modes.includes("cash") ||
     modes.includes("transfer") ||
@@ -674,7 +684,7 @@ function buildSplitProgressForRow(plain) {
             ),
     };
   }
-  if (isSplitPaymentType(pt)) {
+  if (isSplitPaymentType(pt) || isDepositPaymentType(pt) || workflowCollectsAsSplit(plain)) {
     return progress;
   }
   return null;
@@ -1994,6 +2004,7 @@ exports.getCashierDashboard = async (req, res) => {
       creditRows.push({
         ...plain,
         history: normalizeHistory(plain.history),
+        payment_modes: paymentModesFromHistory(normalizeHistory(plain.history)),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "rose",
         amount: Number(plain.amount) || 0,
@@ -2089,7 +2100,12 @@ exports.getCashierDashboard = async (req, res) => {
     });
 
     const depositCustomerNos = [
-      ...new Set(depositRows.map((r) => r.customer_no).filter(Boolean)),
+      ...new Set(
+        [
+          ...depositRows.map((r) => r.customer_no),
+          ...creditRows.map((r) => r.customer_no),
+        ].filter(Boolean),
+      ),
     ];
     const depositBalByCustomer = new Map();
     await Promise.all(
@@ -2102,7 +2118,7 @@ exports.getCashierDashboard = async (req, res) => {
         }
       }),
     );
-    for (const row of depositRows) {
+    for (const row of [...depositRows, ...creditRows]) {
       row.deposit_available =
         depositBalByCustomer.get(String(row.customer_no || "")) || 0;
       row.credit_remainder = Number(
@@ -2413,12 +2429,17 @@ exports.getCashierDashboard = async (req, res) => {
       histTo,
     };
     let branchClause = "";
+    let collectorClause = "";
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
       if (Number.isFinite(bid) && bid > 0) {
         todayReplacements.branchId = bid;
         branchClause = "AND ce.branch_id = :branchId";
       }
+    }
+    if (isCashierRole && cashierUserId) {
+      todayReplacements.cashierUserId = cashierUserId;
+      collectorClause = "AND ce.created_by = :cashierUserId";
     }
 
     const todayRows = await db.sequelize.query(
@@ -2440,6 +2461,7 @@ exports.getCashierDashboard = async (req, res) => {
            OR ce.description LIKE '%Verification Points advance%' OR ce.description LIKE '%Collection Points advance%'
          )
          ${branchClause}
+         ${collectorClause}
        GROUP BY LOWER(TRIM(ce.mode_of_payment))`,
       {
         replacements: todayReplacements,
@@ -2470,6 +2492,21 @@ exports.getCashierDashboard = async (req, res) => {
         // Split advances are stored as separate cash/bank rows; ignore aggregate if any
       }
     }
+
+    const tillExpenses = await loadTillExpenses({
+      facilityId,
+      fromDate: histFrom,
+      toDate: histTo,
+      cashierUserId: isCashierRole && cashierUserId ? cashierUserId : null,
+    });
+    const expenses_cash = tillMoney(tillExpenses.cash);
+    const expenses_card = tillMoney(tillExpenses.card);
+    const expenses_transfer = tillMoney(tillExpenses.transfer);
+    const retire_cash = tillMoney(Math.max(0, collected_cash - expenses_cash));
+    const retire_card = tillMoney(Math.max(0, collected_card - expenses_card));
+    const retire_transfer = tillMoney(
+      Math.max(0, collected_transfer - expenses_transfer),
+    );
 
     // Credit invoices approved today (left awaiting_credit_approval)
     const approvedCreditTodayRows = await db.sequelize.query(
@@ -2536,6 +2573,7 @@ exports.getCashierDashboard = async (req, res) => {
          )
          AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
          ${branchClause}
+         ${collectorClause}
        ORDER BY ce.created_at DESC
        LIMIT 300`,
       {
@@ -2727,6 +2765,12 @@ exports.getCashierDashboard = async (req, res) => {
           collected_transfer_today: collected_transfer,
           collected_card_today: collected_card,
           collected_today: collected_cash + collected_transfer + collected_card,
+          expenses_cash_today: expenses_cash,
+          expenses_card_today: expenses_card,
+          expenses_transfer_today: expenses_transfer,
+          retire_cash_today: retire_cash,
+          retire_card_today: retire_card,
+          retire_transfer_today: retire_transfer,
           approved_credit_today,
           approved_credit_count_today,
           applied_deposit_today,

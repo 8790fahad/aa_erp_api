@@ -37,6 +37,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: 0,
       },
+      expected_card: {
+        type: DataTypes.DECIMAL(18, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
       expected_transfer: {
         type: DataTypes.DECIMAL(18, 2),
         allowNull: false,
@@ -52,6 +57,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: 0,
       },
+      received_card: {
+        type: DataTypes.DECIMAL(18, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
       received_transfer: {
         type: DataTypes.DECIMAL(18, 2),
         allowNull: false,
@@ -63,6 +73,11 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
       },
       variance_cash: {
+        type: DataTypes.DECIMAL(18, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+      variance_card: {
         type: DataTypes.DECIMAL(18, 2),
         allowNull: false,
         defaultValue: 0,

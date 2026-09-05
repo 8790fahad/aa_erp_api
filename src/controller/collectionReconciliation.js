@@ -1,4 +1,9 @@
 const db = require("../models");
+const {
+  money,
+  classifyCollectionMode,
+  loadTillExpenses,
+} = require("../utils/tillCollections");
 
 const COLLECTION_ENTRY_FILTER = `
   (
@@ -13,26 +18,8 @@ const COLLECTION_ENTRY_FILTER = `
   )
 `;
 
-function money(n) {
-  const v = Number(n);
-  return Number.isFinite(v) ? Math.round(v * 100) / 100 : 0;
-}
-
 function classifyMode(mode) {
-  const m = String(mode || "")
-    .toLowerCase()
-    .trim();
-  if (m === "cash") return "cash";
-  if (m === "card") return "transfer";
-  if (
-    m === "bank" ||
-    m === "transfer" ||
-    m === "bank transfer" ||
-    m === "cheque"
-  ) {
-    return "transfer";
-  }
-  return null;
+  return classifyCollectionMode(mode);
 }
 
 function normalizeBranchId(branchId) {
@@ -156,22 +143,134 @@ async function loadExpectedByCashier(facilityId, reconDate, branchId) {
       byCashier[cashierId] = {
         cashier_user_id: cashierId,
         expected_cash: 0,
+        expected_card: 0,
         expected_transfer: 0,
       };
     }
     const side = classifyMode(row.mode_of_payment);
     const total = money(row.total);
     if (side === "cash") byCashier[cashierId].expected_cash += total;
+    else if (side === "card") byCashier[cashierId].expected_card += total;
     else if (side === "transfer") byCashier[cashierId].expected_transfer += total;
   }
 
   Object.values(byCashier).forEach((c) => {
     c.expected_cash = money(c.expected_cash);
+    c.expected_card = money(c.expected_card);
     c.expected_transfer = money(c.expected_transfer);
-    c.expected_total = money(c.expected_cash + c.expected_transfer);
+    c.expected_total = money(
+      c.expected_cash + c.expected_card + c.expected_transfer,
+    );
   });
 
   return byCashier;
+}
+
+async function expectedAfterExpenses(facilityId, reconDate, branchId) {
+  const expectedMap = await loadExpectedByCashier(
+    facilityId,
+    reconDate,
+    branchId,
+  );
+  const tillExpenses = await loadTillExpenses({
+    facilityId,
+    fromDate: reconDate,
+    toDate: reconDate,
+  });
+  const expensesByCashier = {};
+  for (const line of tillExpenses.lines || []) {
+    const id = String(line.user_id || "").trim();
+    if (!id) continue;
+    if (!expensesByCashier[id]) {
+      expensesByCashier[id] = { cash: 0, card: 0, transfer: 0 };
+    }
+    if (line.till_mode === "cash") expensesByCashier[id].cash += line.amount;
+    else if (line.till_mode === "card") expensesByCashier[id].card += line.amount;
+    else if (line.till_mode === "transfer") {
+      expensesByCashier[id].transfer += line.amount;
+    }
+  }
+  const apply = (id, e) => {
+    if (!expectedMap[id]) {
+      expectedMap[id] = {
+        cashier_user_id: id,
+        expected_cash: 0,
+        expected_card: 0,
+        expected_transfer: 0,
+        expected_total: 0,
+      };
+    }
+    expectedMap[id].expenses_cash = money(e.cash);
+    expectedMap[id].expenses_card = money(e.card);
+    expectedMap[id].expenses_transfer = money(e.transfer);
+    expectedMap[id].collected_cash = money(expectedMap[id].expected_cash);
+    expectedMap[id].collected_card = money(expectedMap[id].expected_card);
+    expectedMap[id].collected_transfer = money(
+      expectedMap[id].expected_transfer,
+    );
+    expectedMap[id].expected_cash = money(
+      Math.max(0, expectedMap[id].expected_cash - e.cash),
+    );
+    expectedMap[id].expected_card = money(
+      Math.max(0, expectedMap[id].expected_card - e.card),
+    );
+    expectedMap[id].expected_transfer = money(
+      Math.max(0, expectedMap[id].expected_transfer - e.transfer),
+    );
+    expectedMap[id].expected_total = money(
+      expectedMap[id].expected_cash +
+        expectedMap[id].expected_card +
+        expectedMap[id].expected_transfer,
+    );
+  };
+  Object.keys(expensesByCashier).forEach((id) =>
+    apply(id, expensesByCashier[id]),
+  );
+  Object.values(expectedMap).forEach((c) => {
+    if (c.expenses_cash == null) {
+      c.expenses_cash = 0;
+      c.expenses_card = 0;
+      c.expenses_transfer = 0;
+      c.collected_cash = money(c.expected_cash);
+      c.collected_card = money(c.expected_card);
+      c.collected_transfer = money(c.expected_transfer);
+    }
+  });
+  return { expectedMap, tillExpenses };
+}
+
+let cardColumnsReady = false;
+async function ensureCardColumns() {
+  if (cardColumnsReady) return;
+  try {
+    const cols = await db.sequelize.query(
+      `SELECT COLUMN_NAME AS name
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'collection_reconciliations'
+         AND COLUMN_NAME IN ('expected_card', 'received_card', 'variance_card')`,
+      { type: db.Sequelize.QueryTypes.SELECT },
+    );
+    const have = new Set((cols || []).map((c) => String(c.name || c.COLUMN_NAME)));
+    const adds = [];
+    if (!have.has("expected_card")) {
+      adds.push("ADD COLUMN expected_card DECIMAL(18,2) NOT NULL DEFAULT 0");
+    }
+    if (!have.has("received_card")) {
+      adds.push("ADD COLUMN received_card DECIMAL(18,2) NOT NULL DEFAULT 0");
+    }
+    if (!have.has("variance_card")) {
+      adds.push("ADD COLUMN variance_card DECIMAL(18,2) NOT NULL DEFAULT 0");
+    }
+    if (adds.length) {
+      await db.sequelize.query(
+        `ALTER TABLE collection_reconciliations ${adds.join(", ")}`,
+      );
+    }
+    cardColumnsReady = true;
+  } catch (err) {
+    console.warn("ensureCardColumns:", err.message);
+  }
 }
 
 /**
@@ -203,7 +302,12 @@ exports.getSummary = async (req, res) => {
       });
     }
 
-    const expectedMap = await loadExpectedByCashier(facilityId, reconDate, branchId);
+    await ensureCardColumns();
+    const { expectedMap } = await expectedAfterExpenses(
+      facilityId,
+      reconDate,
+      branchId,
+    );
     const saved = await db.CollectionReconciliation.findAll({
       where: {
         facility_id: String(facilityId),
@@ -238,6 +342,7 @@ exports.getSummary = async (req, res) => {
         const expected = expectedMap[id] || {
           cashier_user_id: id,
           expected_cash: 0,
+          expected_card: 0,
           expected_transfer: 0,
           expected_total: 0,
         };
@@ -251,13 +356,29 @@ exports.getSummary = async (req, res) => {
         return {
           cashier_user_id: id,
           cashier_name: cashierName,
+          collected_cash: money(expected.collected_cash || expected.expected_cash),
+          collected_card: money(expected.collected_card || expected.expected_card),
+          collected_transfer: money(
+            expected.collected_transfer || expected.expected_transfer,
+          ),
+          expenses_cash: money(expected.expenses_cash),
+          expenses_card: money(expected.expenses_card),
+          expenses_transfer: money(expected.expenses_transfer),
           expected_cash: money(expected.expected_cash),
+          expected_card: money(expected.expected_card),
           expected_transfer: money(expected.expected_transfer),
-          expected_total: money(expected.expected_total),
+          expected_total: money(
+            expected.expected_total ||
+              (Number(expected.expected_cash) || 0) +
+                (Number(expected.expected_card) || 0) +
+                (Number(expected.expected_transfer) || 0),
+          ),
           received_cash: recon ? money(recon.received_cash) : null,
+          received_card: recon ? money(recon.received_card) : null,
           received_transfer: recon ? money(recon.received_transfer) : null,
           received_total: recon ? money(recon.received_total) : null,
           variance_cash: recon ? money(recon.variance_cash) : null,
+          variance_card: recon ? money(recon.variance_card) : null,
           variance_transfer: recon ? money(recon.variance_transfer) : null,
           variance_total: recon ? money(recon.variance_total) : null,
           status: recon?.status || "open",
@@ -275,6 +396,9 @@ exports.getSummary = async (req, res) => {
         (c) =>
           c.is_cashier_role ||
           c.expected_total > 0 ||
+          (Number(c.collected_cash) || 0) > 0 ||
+          (Number(c.collected_card) || 0) > 0 ||
+          (Number(c.collected_transfer) || 0) > 0 ||
           c.status === "confirmed" ||
           c.status === "variance",
       )
@@ -291,11 +415,13 @@ exports.getSummary = async (req, res) => {
     const totals = cashiers.reduce(
       (acc, c) => {
         acc.expected_cash += c.expected_cash;
+        acc.expected_card += c.expected_card || 0;
         acc.expected_transfer += c.expected_transfer;
         acc.expected_total += c.expected_total;
         if (c.status === "confirmed" || c.status === "variance") {
           acc.confirmed_count += 1;
           acc.received_cash += Number(c.received_cash) || 0;
+          acc.received_card += Number(c.received_card) || 0;
           acc.received_transfer += Number(c.received_transfer) || 0;
         } else {
           acc.open_count += 1;
@@ -304,9 +430,11 @@ exports.getSummary = async (req, res) => {
       },
       {
         expected_cash: 0,
+        expected_card: 0,
         expected_transfer: 0,
         expected_total: 0,
         received_cash: 0,
+        received_card: 0,
         received_transfer: 0,
         confirmed_count: 0,
         open_count: 0,
@@ -411,6 +539,26 @@ exports.getCashierLines = async (req, res) => {
       })
       .filter(Boolean);
 
+    const tillExpenses = await loadTillExpenses({
+      facilityId,
+      fromDate: reconDate,
+      toDate: reconDate,
+      cashierUserId,
+    });
+    for (const exp of tillExpenses.lines || []) {
+      lines.push({
+        entry_id: `exp-${exp.id}`,
+        sale_code: exp.sale_code,
+        customer_no: null,
+        customer_name: exp.description || "Till expense",
+        payment_type: exp.payment_type,
+        mode_of_payment: exp.till_mode,
+        amount: -money(exp.amount),
+        description: exp.description,
+        created_at: exp.transaction_date,
+      });
+    }
+
     return res.json({
       success: true,
       cashier_user_id: cashierUserId,
@@ -440,6 +588,7 @@ exports.confirmHandIn = async (req, res) => {
       body.cashierUserId || body.cashier_user_id || "",
     ).trim();
     const receivedCash = money(body.received_cash ?? body.receivedCash);
+    const receivedCard = money(body.received_card ?? body.receivedCard);
     const receivedTransfer = money(
       body.received_transfer ?? body.receivedTransfer,
     );
@@ -467,9 +616,15 @@ exports.confirmHandIn = async (req, res) => {
       });
     }
 
-    const expectedMap = await loadExpectedByCashier(facilityId, reconDate, branchId);
+    await ensureCardColumns();
+    const { expectedMap } = await expectedAfterExpenses(
+      facilityId,
+      reconDate,
+      branchId,
+    );
     const expected = expectedMap[cashierUserId] || {
       expected_cash: 0,
+      expected_card: 0,
       expected_transfer: 0,
       expected_total: 0,
     };
@@ -477,14 +632,18 @@ exports.confirmHandIn = async (req, res) => {
     const cashierName = nameMap[cashierUserId] || cashierUserId;
 
     const expectedCash = money(expected.expected_cash);
+    const expectedCard = money(expected.expected_card);
     const expectedTransfer = money(expected.expected_transfer);
-    const expectedTotal = money(expectedCash + expectedTransfer);
-    const receivedTotal = money(receivedCash + receivedTransfer);
+    const expectedTotal = money(expectedCash + expectedCard + expectedTransfer);
+    const receivedTotal = money(receivedCash + receivedCard + receivedTransfer);
     const varianceCash = money(receivedCash - expectedCash);
+    const varianceCard = money(receivedCard - expectedCard);
     const varianceTransfer = money(receivedTransfer - expectedTransfer);
     const varianceTotal = money(receivedTotal - expectedTotal);
     const balanced =
-      Math.abs(varianceCash) <= 0.05 && Math.abs(varianceTransfer) <= 0.05;
+      Math.abs(varianceCash) <= 0.05 &&
+      Math.abs(varianceCard) <= 0.05 &&
+      Math.abs(varianceTransfer) <= 0.05;
     const status = balanced ? "confirmed" : "variance";
 
     const payload = {
@@ -494,12 +653,15 @@ exports.confirmHandIn = async (req, res) => {
       cashier_user_id: cashierUserId,
       cashier_name: cashierName,
       expected_cash: expectedCash,
+      expected_card: expectedCard,
       expected_transfer: expectedTransfer,
       expected_total: expectedTotal,
       received_cash: receivedCash,
+      received_card: receivedCard,
       received_transfer: receivedTransfer,
       received_total: receivedTotal,
       variance_cash: varianceCash,
+      variance_card: varianceCard,
       variance_transfer: varianceTransfer,
       variance_total: varianceTotal,
       status,

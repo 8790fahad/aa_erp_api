@@ -15454,6 +15454,7 @@ exports.directExpenses = async (req, res) => {
     mode_of_payment, // "cash" | "bank" | "cheque"
     cheque_number,
     skip_invoice, // when true (e.g. imprest UI), do not create a purchase `invoices` row
+    till_mode,
   } = req.body;
   console.log(req.body);
   // === VALIDATIONS ===
@@ -15919,6 +15920,12 @@ exports.directExpenses = async (req, res) => {
           vat_policy: vatPolicy,
           created_by_name: createdByName,
           created_by_id: userId != null ? String(userId) : null,
+          till_mode:
+            String(till_mode || "").toLowerCase() === "card" ||
+            String(till_mode || "").toLowerCase() === "transfer" ||
+            String(till_mode || "").toLowerCase() === "cash"
+              ? String(till_mode).toLowerCase()
+              : null,
         },
       },
       { transaction },
