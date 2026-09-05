@@ -264,13 +264,13 @@ module.exports = (app) => {
   );
   app.post(
     "/account/insert-memo",
-    upload.fields([{ name: "memo_documents", maxCount: 5 }]),
+    upload.fields([{ name: "memo_documents", maxCount: 1000 }]),
     account.insertMemo,
   );
   app.get("/account/get-memo-justification", account.getJustification);
   app.post(
     "/account/update-memo",
-    upload.fields([{ name: "memo_documents", maxCount: 5 }]),
+    upload.fields([{ name: "memo_documents", maxCount: 1000 }]),
     account.updateMemoNew,
   );
   app.post("/account/update-inserted-memo", account.insertUpdateMemoData);
