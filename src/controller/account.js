@@ -11772,11 +11772,20 @@ exports.updateInvoiceNotes = (req, res) => {
     req.body?.terms_conditions !== undefined
       ? String(req.body.terms_conditions)
       : undefined;
+  const invoice_powered_by =
+    req.body?.invoice_powered_by !== undefined
+      ? String(req.body.invoice_powered_by)
+      : undefined;
 
-  if (customer_notes === undefined && terms_conditions === undefined) {
+  if (
+    customer_notes === undefined &&
+    terms_conditions === undefined &&
+    invoice_powered_by === undefined
+  ) {
     return res.status(400).json({
       success: false,
-      message: "customer_notes or terms_conditions is required",
+      message:
+        "customer_notes, terms_conditions, or invoice_powered_by is required",
     });
   }
 
@@ -11789,6 +11798,10 @@ exports.updateInvoiceNotes = (req, res) => {
   if (terms_conditions !== undefined) {
     sets.push("terms_conditions = :terms_conditions");
     replacements.terms_conditions = terms_conditions;
+  }
+  if (invoice_powered_by !== undefined) {
+    sets.push("invoice_powered_by = :invoice_powered_by");
+    replacements.invoice_powered_by = invoice_powered_by;
   }
 
   db.sequelize
@@ -11812,6 +11825,7 @@ exports.updateInvoiceNotes = (req, res) => {
         results: {
           ...(customer_notes !== undefined ? { customer_notes } : {}),
           ...(terms_conditions !== undefined ? { terms_conditions } : {}),
+          ...(invoice_powered_by !== undefined ? { invoice_powered_by } : {}),
         },
       });
     })

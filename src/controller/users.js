@@ -1989,6 +1989,7 @@ exports.create = async (req, res) => {
           "default_valuation_source",
           "customer_notes",
           "terms_conditions",
+          "invoice_powered_by",
         ],
       });
 

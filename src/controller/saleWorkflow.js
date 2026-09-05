@@ -1164,20 +1164,19 @@ async function createSaleWorkflowRecord(
     if (depositFullyApplied || Number(amount) === 0) {
       initialStatus = "invoice_separation";
       statusNote = "Deposit applied — ready for separation";
-    } else if (creditAfterDeposit && availableDeposit <= 0.05) {
-      // Credit + Apply Deposit with nothing to apply — go to Credit, not a cashier queue
-      resolvedPaymentType = "credit";
-      initialStatus = "awaiting_credit_approval";
-      statusNote =
-        "No customer deposit available — awaiting credit approval";
     } else {
-      // Do not send to Credit Approval yet — user applies deposit first
+      // Always queue on Apply Deposit when that mode was selected — even if
+      // available deposit is ₦0. Verification Points shows the invoice; Apply
+      // is blocked until there is a balance.
       initialStatus = "awaiting_payment";
-      statusNote = creditAfterDeposit
-        ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
-        : collectAfterDeposit
-          ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer/card"
-          : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
+      statusNote =
+        availableDeposit <= 0.05
+          ? "Awaiting Apply Deposit — no deposit available; Apply is blocked until a balance exists"
+          : creditAfterDeposit
+            ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
+            : collectAfterDeposit
+              ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer/card"
+              : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
     }
   } else if (isPaid) {
     initialStatus = "awaiting_cashier_confirm";
@@ -2020,6 +2019,42 @@ exports.getCashierDashboard = async (req, res) => {
         credit_over_limit: check.overLimit,
       });
     }
+
+    // Restore invoices that selected Apply Deposit but were forced onto Credit
+    // when the customer had ₦0 deposit — they belong on the Apply Deposit tab.
+    const remainingCredit = [];
+    for (const row of creditRows) {
+      const modes = Array.isArray(row.payment_modes)
+        ? row.payment_modes
+        : paymentModesFromHistory(row.history);
+      if (!modes.includes("deposit")) {
+        remainingCredit.push(row);
+        continue;
+      }
+      const nextStatus = "awaiting_payment";
+      const nextHistory = pushHistory(
+        row.history,
+        nextStatus,
+        null,
+        "Awaiting Apply Deposit — no deposit available; Apply is blocked until a balance exists",
+        { payment_modes: modes },
+      );
+      try {
+        await db.SaleWorkflow.update(
+          {
+            payment_type: "deposit",
+            status: nextStatus,
+            history: nextHistory,
+          },
+          { where: { id: row.id } },
+        );
+      } catch (_) {
+        remainingCredit.push(row);
+      }
+    }
+    creditRows.length = 0;
+    creditRows.push(...remainingCredit);
+
     creditRows.forEach((r) => {
       if (r.split_progress?.cash_by)
         collectorIds.add(String(r.split_progress.cash_by));
@@ -2747,7 +2782,9 @@ exports.getCashierDashboard = async (req, res) => {
       workflowHistory.map((r) => String(r.sale_code || "")).filter(Boolean),
     );
     const advanceHistoryDeduped = advance_history.filter((r) => {
-      if (r.kind !== "deposit_applied") return true;
+      // Only invoice deposit applications belong on Verification Points.
+      // Customer advances (AD-*) are listed under Received Payment.
+      if (r.kind !== "deposit_applied") return false;
       return !workflowSaleCodes.has(String(r.sale_code || ""));
     });
 

@@ -404,6 +404,11 @@ module.exports = (sequelize, DataTypes) => {
         comment:
           "Important note printed on sales invoice / delivery order (and terms)",
       },
+      invoice_powered_by: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+        comment: "Powered-by / Nexifour line printed on sales invoices",
+      },
     },
     {
       tableName: "business",

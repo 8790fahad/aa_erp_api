@@ -79,6 +79,7 @@ const _getBusinessProfile = async (
         "delivery_document_type",
         "customer_notes",
         "terms_conditions",
+        "invoice_powered_by",
         "enable_online_ordering",
         "enable_production_correction",
         "enable_material_requisition",

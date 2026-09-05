@@ -1877,6 +1877,7 @@ exports.getSaleByCode = async (req, res) => {
           business_logo: business.business_logo,
           customer_notes: business.customer_notes,
           terms_conditions: business.terms_conditions,
+          invoice_powered_by: business.invoice_powered_by,
         },
         customPricing: false,
         customPrices: {},
