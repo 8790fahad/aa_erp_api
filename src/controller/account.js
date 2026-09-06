@@ -51,6 +51,9 @@ const {
   pickActor,
 } = require("../services/activityAuditService");
 const { isProductTaxable } = require("../constants/taxableStatus");
+const {
+  resolveRequiredBranchId,
+} = require("../services/branchResolver");
 
 exports.getAccountByCategory = (req, res) => {
   const { category } = req.params;
@@ -180,6 +183,17 @@ function parsePositiveBranchId(value) {
   }
   const n = parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+async function getWarehouseStoreName(facilityId, branchId, transaction) {
+  const id = parseInt(branchId, 10);
+  if (!facilityId || !Number.isFinite(id) || id <= 0) return "";
+  const branch = await db.Branch.findOne({
+    where: { id, facilityId },
+    attributes: ["branch_name"],
+    transaction,
+  });
+  return String(branch?.branch_name || "").trim();
 }
 
 function resolvePostingBranchId(...candidates) {
@@ -13836,8 +13850,27 @@ exports.directPurchaseConsumables = async (req, res) => {
     const ledgerEntries = [];
     const storeEntryPromises = [];
 
-    // branchId = physical warehouse/location from the frontend; branch_name = store zone
-    const targetBranchId = parseInt(target_branch_id, 10) || 0;
+    // branchId = selected warehouse PK from branches.id (never 0)
+    const targetBranchId = await resolveRequiredBranchId(
+      facilityId,
+      target_branch_id,
+      transaction,
+    );
+    if (!targetBranchId) {
+      throw new Error(
+        "Select a warehouse. Purchases cannot be saved without a branch.",
+      );
+    }
+    const warehouseStoreName = await getWarehouseStoreName(
+      facilityId,
+      targetBranchId,
+      transaction,
+    );
+    if (!warehouseStoreName) {
+      throw new Error(
+        "Select a warehouse. Purchases cannot be saved without a branch.",
+      );
+    }
 
     // === PARSE TAX AMOUNT ===
     const totalTaxAmount = parseFloat(tax_amount || 0);
@@ -13925,13 +13958,9 @@ exports.directPurchaseConsumables = async (req, res) => {
       });
 
       // === 1. Store Entry (Stock In) ===
-      // Physical location = selected warehouse (branchId). Store zone is always
-      // `for sales` so purchased stock matches opening-balance / Make Sale.
+      // branch_name is the sales-zone label, not a warehouse.
+      // Real store name goes on source / destination / location.
       const isSalesFloorItem = salesFloorItemTypes.has(product.item_type);
-      const storeZone = SALES_STORE_BRANCH_NAME;
-      const storeDestination = isSalesFloorItem
-        ? "Sales"
-        : target_department || "Main Warehouse";
 
       let salesSellingPrice = null;
       if (priceSetupResalableOnPurchase && isSalesFloorItem) {
@@ -13960,10 +13989,11 @@ exports.directPurchaseConsumables = async (req, res) => {
             transaction_ref: pvCode,
             supplier_code: supplier_no,
             supplier_name,
-            branch_name: storeZone,
+            branch_name: SALES_STORE_BRANCH_NAME,
             branchId: targetBranchId,
-            destination: storeDestination,
-            source: `Direct Purchase`,
+            location: warehouseStoreName,
+            destination: warehouseStoreName,
+            source: warehouseStoreName,
             status: "approved",
             activation: "active",
             type: STORE_ENTRY_TYPE.PURCHASE,
@@ -16725,7 +16755,26 @@ exports.directConsumables = async (req, res) => {
     const supplier_name =
       supplier.supplier_name || supplier.name || supplier_no;
 
-    const targetBranchId = parseInt(target_branch_id, 10) || 0;
+    const targetBranchId = await resolveRequiredBranchId(
+      facilityId,
+      target_branch_id,
+      transaction,
+    );
+    if (!targetBranchId) {
+      throw new Error(
+        "Select a warehouse. Purchases cannot be saved without a branch.",
+      );
+    }
+    const warehouseStoreName = await getWarehouseStoreName(
+      facilityId,
+      targetBranchId,
+      transaction,
+    );
+    if (!warehouseStoreName) {
+      throw new Error(
+        "Select a warehouse. Purchases cannot be saved without a branch.",
+      );
+    }
 
     // === REFERENCE ===
     const refCode = await getAndUpdateNumber("direct_p", facilityId);
@@ -16784,6 +16833,7 @@ exports.directConsumables = async (req, res) => {
             mark_up: 0,
             branch_name: SALES_STORE_BRANCH_NAME,
             branchId: targetBranchId,
+            location: warehouseStoreName,
             inserted_by: userId,
             facilityId,
 
@@ -16791,8 +16841,8 @@ exports.directConsumables = async (req, res) => {
             item_category: product.item_type || "Consumable",
             supplier_code: supplier_no,
             supplier_name,
-            source: `Direct Purchase - ${supplier_name}`,
-            destination: "Warehouse",
+            source: warehouseStoreName,
+            destination: warehouseStoreName,
             status: "approved",
             activation: "active",
             type: STORE_ENTRY_TYPE.PURCHASE,
