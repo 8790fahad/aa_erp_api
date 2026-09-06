@@ -717,48 +717,35 @@ function setWorkflowHistory(row, nextHistory) {
 }
 
 function normalizeSaleCode(value) {
-  return String(value || "").trim();
+  return String(value || "")
+    .replace(/\u00a0/g, " ")
+    .trim();
+}
+
+function saleCodesMatch(a, b) {
+  return normalizeSaleCode(a).toUpperCase() === normalizeSaleCode(b).toUpperCase();
 }
 
 async function findLockedWorkflowForCollection({
   facilityId,
   saleCode,
-  workflowId,
   transaction,
-  requireWorkflowId = false,
 }) {
   const code = normalizeSaleCode(saleCode);
   if (!facilityId || !code) {
     return { error: "facilityId and saleCode are required", status: 400 };
   }
-  const idNum = parseInt(workflowId, 10);
-  if (requireWorkflowId && (!Number.isFinite(idNum) || idNum <= 0)) {
-    return {
-      error: "workflowId is required so collection cannot hit another invoice",
-      status: 400,
-    };
-  }
-  const where = { facility_id: facilityId, sale_code: code };
-  if (Number.isFinite(idNum) && idNum > 0) {
-    where.id = idNum;
-  }
   const row = await db.SaleWorkflow.findOne({
-    where,
+    where: { facility_id: facilityId, sale_code: code },
     transaction,
     lock: transaction.LOCK.UPDATE,
   });
   if (!row) {
-    return { error: "Invoice workflow not found", status: 404 };
+    return { error: `Invoice ${code} was not found`, status: 404 };
   }
-  if (normalizeSaleCode(row.sale_code) !== code) {
+  if (!saleCodesMatch(row.sale_code, code)) {
     return {
-      error: "Invoice mismatch — collection was not applied to this invoice",
-      status: 409,
-    };
-  }
-  if (Number.isFinite(idNum) && idNum > 0 && Number(row.id) !== idNum) {
-    return {
-      error: "Invoice mismatch — collection was not applied to this invoice",
+      error: `Invoice mismatch — collection was not applied to ${code}`,
       status: 409,
     };
   }
@@ -766,31 +753,13 @@ async function findLockedWorkflowForCollection({
 }
 
 async function persistLockedWorkflow(row, transaction) {
-  const saleCode = normalizeSaleCode(row.sale_code);
-  const id = parseInt(row.id, 10);
-  if (!saleCode || !Number.isFinite(id) || id <= 0) {
-    throw new Error("Invoice mismatch — collection was not applied to this invoice");
+  if (!row || typeof row.save !== "function") {
+    throw new Error("Invoice was not found");
   }
-  const payload = {
-    status: row.status,
-    history: row.get ? row.get("history") : row.history,
-    amount: row.amount,
-    payment_type: row.payment_type,
-    hold_overnight: row.hold_overnight,
-    updated_by: row.updated_by,
-    notes: row.notes,
-  };
-  const [affected] = await db.SaleWorkflow.update(payload, {
-    where: {
-      id,
-      facility_id: row.facility_id,
-      sale_code: saleCode,
-    },
-    transaction,
-  });
-  if (!affected) {
-    throw new Error("Invoice mismatch — collection was not applied to this invoice");
+  if (typeof row.changed === "function") {
+    row.changed("history", true);
   }
+  await row.save({ transaction });
 }
 
 function stageMeta(statusId) {
@@ -3082,9 +3051,7 @@ exports.cashierConfirmPayment = async (req, res) => {
     const locked = await findLockedWorkflowForCollection({
       facilityId,
       saleCode: saleCode || sale_code,
-      workflowId: workflowId || workflow_id || req.body.id,
       transaction,
-      requireWorkflowId: true,
     });
     if (locked.error) {
       await transaction.rollback();
@@ -3715,9 +3682,7 @@ exports.sendCreditRemainder = async (req, res) => {
     const locked = await findLockedWorkflowForCollection({
       facilityId,
       saleCode: saleCode || sale_code,
-      workflowId: workflowId || workflow_id || req.body?.id,
       transaction,
-      requireWorkflowId: true,
     });
     if (locked.error) {
       await transaction.rollback();
