@@ -752,14 +752,47 @@ async function findLockedWorkflowForCollection({
   return { row };
 }
 
+function saleWorkflowByInvoiceWhere(facilityId, saleCode) {
+  const code = normalizeSaleCode(saleCode);
+  return { facility_id: facilityId, sale_code: code };
+}
+
 async function persistLockedWorkflow(row, transaction) {
-  if (!row || typeof row.save !== "function") {
+  if (!row) {
+    throw new Error("Invoice was not found");
+  }
+  const facilityId = row.facility_id;
+  const saleCode = normalizeSaleCode(row.sale_code);
+  if (!facilityId || !saleCode) {
     throw new Error("Invoice was not found");
   }
   if (typeof row.changed === "function") {
     row.changed("history", true);
   }
-  await row.save({ transaction });
+  // Persist by unique invoice identity only. Never WHERE id — legacy rows can
+  // share id 0, which would rewrite every pending invoice for the facility.
+  const [affected] = await db.SaleWorkflow.update(
+    {
+      status: row.status,
+      history: row.history,
+      hold_overnight: row.hold_overnight,
+      updated_by: row.updated_by,
+      notes: row.notes,
+      amount: row.amount,
+      payment_type: row.payment_type,
+      assigned_cashier_id: row.assigned_cashier_id,
+      assigned_cashier_name: row.assigned_cashier_name,
+    },
+    {
+      where: saleWorkflowByInvoiceWhere(facilityId, saleCode),
+      transaction,
+    },
+  );
+  if (!affected) {
+    throw new Error(
+      `Invoice mismatch — collection was not applied to ${saleCode}`,
+    );
+  }
 }
 
 function stageMeta(statusId) {
@@ -2106,7 +2139,9 @@ exports.getCashierDashboard = async (req, res) => {
             status: nextStatus,
             history: nextHistory,
           },
-          { where: { id: row.id } },
+          {
+            where: saleWorkflowByInvoiceWhere(facilityId, row.sale_code),
+          },
         );
       } catch (_) {
         remainingCredit.push(row);

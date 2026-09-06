@@ -5557,7 +5557,6 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
               },
               {
                 where: {
-                  id: wf.id,
                   facility_id: facilityId,
                   sale_code: invoice_ref,
                 },
