@@ -13925,12 +13925,10 @@ exports.directPurchaseConsumables = async (req, res) => {
       });
 
       // === 1. Store Entry (Stock In) ===
-      // Physical location = selected warehouse (branchId). Sellable goods use
-      // zone `for sales` so they appear in Make Sale / sales_dep immediately.
+      // Physical location = selected warehouse (branchId). Store zone is always
+      // `for sales` so purchased stock matches opening-balance / Make Sale.
       const isSalesFloorItem = salesFloorItemTypes.has(product.item_type);
-      const storeZone = isSalesFloorItem
-        ? SALES_STORE_BRANCH_NAME
-        : target_department || product.item_type || "Main Warehouse";
+      const storeZone = SALES_STORE_BRANCH_NAME;
       const storeDestination = isSalesFloorItem
         ? "Sales"
         : target_department || "Main Warehouse";
@@ -16683,6 +16681,7 @@ exports.directConsumables = async (req, res) => {
     accountHead = {}, // { head: "104" } for cash
     mode_of_payment, // "cash" | "bank" | "cheque" | "cash+transfer"
     payment_splits = [],
+    target_branch_id = 0,
   } = req.body;
   console.log(req.body);
   const isSplitPayment =
@@ -16725,6 +16724,8 @@ exports.directConsumables = async (req, res) => {
     if (!supplier) throw new Error(`Supplier not found: ${supplier_no}`);
     const supplier_name =
       supplier.supplier_name || supplier.name || supplier_no;
+
+    const targetBranchId = parseInt(target_branch_id, 10) || 0;
 
     // === REFERENCE ===
     const refCode = await getAndUpdateNumber("direct_p", facilityId);
@@ -16781,7 +16782,8 @@ exports.directConsumables = async (req, res) => {
             cost_price: cost,
             selling_price: 0,
             mark_up: 0,
-            branch_name: product.item_type,
+            branch_name: SALES_STORE_BRANCH_NAME,
+            branchId: targetBranchId,
             inserted_by: userId,
             facilityId,
 

@@ -5547,7 +5547,28 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
             wf.history = history;
             if (typeof wf.changed === "function") wf.changed("history", true);
             wf.updated_by = userId;
-            await wf.save({ transaction: t });
+            const [wfAffected] = await db.SaleWorkflow.update(
+              {
+                status: wf.status,
+                amount: wf.amount,
+                payment_type: wf.payment_type,
+                history: wf.history,
+                updated_by: wf.updated_by,
+              },
+              {
+                where: {
+                  id: wf.id,
+                  facility_id: facilityId,
+                  sale_code: invoice_ref,
+                },
+                transaction: t,
+              },
+            );
+            if (!wfAffected) {
+              throw new Error(
+                `Invoice mismatch — deposit was not applied to ${invoice_ref}`,
+              );
+            }
           }
         }
       }

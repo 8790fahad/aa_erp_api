@@ -87,26 +87,40 @@ function isSplitPaymentType(paymentType) {
   );
 }
 
-/** Mixed modes (Cash + Transfer + Card + Credit + Deposit, etc.) collect in any order, any portion. */
-function workflowCollectsAsSplit(row) {
-  const pt = String(row?.payment_type || "").toLowerCase().trim();
-  if (isSplitPaymentType(pt)) return true;
+function collectModeIdsFromRow(row) {
   const modes = [
     ...new Set([
       ...parseModeList(row?.payment_modes),
       ...paymentModesFromHistory(row?.history),
     ]),
   ];
-  const collect = ["cash", "transfer", "card", "credit", "deposit"].filter((id) =>
+  if (!modes.length) {
+    const pt = String(row?.payment_type || "").toLowerCase().trim();
+    if (pt === "credit_split") return ["credit", "cash", "transfer"];
+    if (isSplitPaymentType(pt)) return ["cash", "transfer"];
+    if (isDepositPaymentType(pt)) return ["deposit"];
+    if (pt === "card") return ["card"];
+    if (pt === "transfer" || pt === "bank") return ["transfer"];
+    if (pt === "credit") return ["credit"];
+    if (pt === "cash") return ["cash"];
+  }
+  return ["cash", "transfer", "card", "credit", "deposit"].filter((id) =>
     modes.includes(id),
   );
+}
+
+/** Mixed modes (Cash + Transfer + Card + Credit + Deposit, etc.) collect in any order, any portion. */
+function workflowCollectsAsSplit(row) {
+  const pt = String(row?.payment_type || "").toLowerCase().trim();
+  if (isSplitPaymentType(pt)) return true;
+  const collect = collectModeIdsFromRow(row);
   if (collect.length > 1) return true;
   if (!isDepositPaymentType(pt)) return false;
   return (
-    modes.includes("cash") ||
-    modes.includes("transfer") ||
-    modes.includes("card") ||
-    modes.includes("credit")
+    collect.includes("cash") ||
+    collect.includes("transfer") ||
+    collect.includes("card") ||
+    collect.includes("credit")
   );
 }
 
@@ -699,6 +713,83 @@ function setWorkflowHistory(row, nextHistory) {
   row.set("history", value);
   if (typeof row.changed === "function") {
     row.changed("history", true);
+  }
+}
+
+function normalizeSaleCode(value) {
+  return String(value || "").trim();
+}
+
+async function findLockedWorkflowForCollection({
+  facilityId,
+  saleCode,
+  workflowId,
+  transaction,
+  requireWorkflowId = false,
+}) {
+  const code = normalizeSaleCode(saleCode);
+  if (!facilityId || !code) {
+    return { error: "facilityId and saleCode are required", status: 400 };
+  }
+  const idNum = parseInt(workflowId, 10);
+  if (requireWorkflowId && (!Number.isFinite(idNum) || idNum <= 0)) {
+    return {
+      error: "workflowId is required so collection cannot hit another invoice",
+      status: 400,
+    };
+  }
+  const where = { facility_id: facilityId, sale_code: code };
+  if (Number.isFinite(idNum) && idNum > 0) {
+    where.id = idNum;
+  }
+  const row = await db.SaleWorkflow.findOne({
+    where,
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+  if (!row) {
+    return { error: "Invoice workflow not found", status: 404 };
+  }
+  if (normalizeSaleCode(row.sale_code) !== code) {
+    return {
+      error: "Invoice mismatch — collection was not applied to this invoice",
+      status: 409,
+    };
+  }
+  if (Number.isFinite(idNum) && idNum > 0 && Number(row.id) !== idNum) {
+    return {
+      error: "Invoice mismatch — collection was not applied to this invoice",
+      status: 409,
+    };
+  }
+  return { row };
+}
+
+async function persistLockedWorkflow(row, transaction) {
+  const saleCode = normalizeSaleCode(row.sale_code);
+  const id = parseInt(row.id, 10);
+  if (!saleCode || !Number.isFinite(id) || id <= 0) {
+    throw new Error("Invoice mismatch — collection was not applied to this invoice");
+  }
+  const payload = {
+    status: row.status,
+    history: row.get ? row.get("history") : row.history,
+    amount: row.amount,
+    payment_type: row.payment_type,
+    hold_overnight: row.hold_overnight,
+    updated_by: row.updated_by,
+    notes: row.notes,
+  };
+  const [affected] = await db.SaleWorkflow.update(payload, {
+    where: {
+      id,
+      facility_id: row.facility_id,
+      sale_code: saleCode,
+    },
+    transaction,
+  });
+  if (!affected) {
+    throw new Error("Invoice mismatch — collection was not applied to this invoice");
   }
 }
 
@@ -2114,7 +2205,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "mode"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: depositWhere,
+            where: withCreatedToday(depositWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2188,7 +2279,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: discountWhere,
+            where: withCreatedToday(discountWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2722,10 +2813,13 @@ exports.getCashierDashboard = async (req, res) => {
 
     const workflowHistory = history.map((r) => {
       const plain = r.toJSON();
+      const hist = normalizeHistory(plain.history);
       return {
         ...plain,
         kind: "invoice",
-        history: normalizeHistory(plain.history),
+        history: hist,
+        payment_modes: paymentModesFromHistory(hist),
+        split_progress: buildSplitProgressForRow({ ...plain, history: hist }),
         status_label:
           SALE_WORKFLOW_STAGES.find((s) => s.id === plain.status)?.label ||
           plain.status,
@@ -2976,19 +3070,30 @@ exports.cashierConfirmPayment = async (req, res) => {
     const {
       facilityId,
       saleCode,
+      sale_code,
+      workflowId,
+      workflow_id,
       updated_by,
       note,
       payment_splits = [],
       cashier_type,
     } = req.body;
 
-    if (!facilityId || !saleCode) {
+    const locked = await findLockedWorkflowForCollection({
+      facilityId,
+      saleCode: saleCode || sale_code,
+      workflowId: workflowId || workflow_id || req.body.id,
+      transaction,
+      requireWorkflowId: true,
+    });
+    if (locked.error) {
       await transaction.rollback();
-      return res.status(400).json({
+      return res.status(locked.status || 400).json({
         success: false,
-        message: "facilityId and saleCode are required",
+        message: locked.error,
       });
     }
+    const row = locked.row;
 
     let collectorName =
       String(req.body.collector_name || req.body.updated_by_name || "").trim() ||
@@ -3008,19 +3113,6 @@ exports.cashierConfirmPayment = async (req, res) => {
       } catch (_) {
         /* ignore */
       }
-    }
-
-    const row = await db.SaleWorkflow.findOne({
-      where: { facility_id: facilityId, sale_code: saleCode },
-      transaction,
-      lock: transaction.LOCK.UPDATE,
-    });
-    if (!row) {
-      await transaction.rollback();
-      return res.status(404).json({
-        success: false,
-        message: "Invoice workflow not found",
-      });
     }
 
     if (
@@ -3491,7 +3583,7 @@ exports.cashierConfirmPayment = async (req, res) => {
         ),
       );
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
 
       const fulfillments = await ensureSaleFulfillments(
         {
@@ -3542,7 +3634,7 @@ exports.cashierConfirmPayment = async (req, res) => {
 
     // Partial split — stay at collection points until cash + transfer cover amount due
     row.updated_by = updated_by || row.updated_by;
-    await row.save({ transaction });
+    await persistLockedWorkflow(row, transaction);
     await transaction.commit();
 
     const rem = Number(
@@ -3613,37 +3705,28 @@ exports.sendCreditRemainder = async (req, res) => {
     const {
       facilityId,
       saleCode,
+      sale_code,
+      workflowId,
+      workflow_id,
       updated_by,
       note,
     } = req.body || {};
 
-    if (!facilityId || !saleCode) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message: "facilityId and saleCode are required",
-      });
-    }
-    if (!db.SaleWorkflow) {
-      await transaction.rollback();
-      return res.status(500).json({
-        success: false,
-        message: "SaleWorkflow model not loaded",
-      });
-    }
-
-    const row = await db.SaleWorkflow.findOne({
-      where: { facility_id: facilityId, sale_code: saleCode },
+    const locked = await findLockedWorkflowForCollection({
+      facilityId,
+      saleCode: saleCode || sale_code,
+      workflowId: workflowId || workflow_id || req.body?.id,
       transaction,
-      lock: transaction.LOCK.UPDATE,
+      requireWorkflowId: true,
     });
-    if (!row) {
+    if (locked.error) {
       await transaction.rollback();
-      return res.status(404).json({
+      return res.status(locked.status || 400).json({
         success: false,
-        message: "Invoice workflow not found",
+        message: locked.error,
       });
     }
+    const row = locked.row;
 
     const paymentType = String(row.payment_type || "").toLowerCase();
     const mixedSplit = workflowCollectsAsSplit(row);
@@ -3726,7 +3809,7 @@ exports.sendCreditRemainder = async (req, res) => {
           { credit_allocation: { amount: creditAmount } },
         ),
       );
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -3771,7 +3854,7 @@ exports.sendCreditRemainder = async (req, res) => {
         },
       ),
     );
-    await row.save({ transaction });
+    await persistLockedWorkflow(row, transaction);
     await transaction.commit();
 
     return res.json({

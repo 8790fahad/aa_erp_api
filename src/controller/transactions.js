@@ -1101,9 +1101,27 @@ exports.getSaleByCode = async (req, res) => {
       });
     }
 
-    const entries = customerEntries.map((entry) =>
-      entry.get ? entry.get({ plain: true }) : entry
-    );
+    const saleCodeNorm = String(saleCode || "").trim().toUpperCase();
+    const belongsToThisSale = (entry) => {
+      const rec = String(entry.receiptNo || "").trim();
+      if (/^INV-/i.test(rec) && rec.toUpperCase() !== saleCodeNorm) return false;
+      const link = String(entry.link_id || "").trim();
+      if (/^INV-/i.test(link) && link.toUpperCase() !== saleCodeNorm) return false;
+      const found = String(entry.description || "").match(/INV-\d+/gi) || [];
+      return !found.some((code) => code.toUpperCase() !== saleCodeNorm);
+    };
+
+    const entries = customerEntries
+      .map((entry) => (entry.get ? entry.get({ plain: true }) : entry))
+      .filter(belongsToThisSale);
+
+    if (!entries.length) {
+      return res.status(404).json({
+        success: false,
+        message: "No sale found for the provided sale code",
+      });
+    }
+
     const baseEntry = entries[0];
 
     const customer = baseEntry?.customerNo
@@ -1464,7 +1482,10 @@ exports.getSaleByCode = async (req, res) => {
     }
     const paymentEntries = [
       ...entries.filter(isPaymentLine),
-      ...extraPaymentEntries.filter(isPaymentLine),
+      ...extraPaymentEntries
+        .map((entry) => (entry.get ? entry.get({ plain: true }) : entry))
+        .filter(belongsToThisSale)
+        .filter(isPaymentLine),
     ];
     const amountPaidFromEntries = paymentEntries.reduce(
       (sum, item) => sum + Number(item.cost || item.amount_paid || 0),
