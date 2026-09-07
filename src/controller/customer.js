@@ -5239,6 +5239,27 @@ exports.getCombinedSuppliersAndCustomers = async (req, res) => {
  *   transaction_date?, narration?
  * }
  */
+// SaleWorkflow.history is a JSON column. Sequelize does not always hand it
+// back already-parsed (depending on the query path / transaction context it
+// can come back as a raw JSON string, or occasionally a single object
+// instead of an array). Treating that as "no history" silently drops the
+// original payment_modes recorded at invoice creation, which caused the
+// Credit + Apply Deposit remainder to wrongly fall back to "cash". Always
+// normalize defensively before reading it.
+function normalizeWorkflowHistory(history) {
+  if (Array.isArray(history)) return history;
+  if (typeof history === "string" && history.trim()) {
+    try {
+      const parsed = JSON.parse(history);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  if (history && typeof history === "object") return [history];
+  return [];
+}
+
 function paymentModesFromHistory(history) {
   const list = Array.isArray(history) ? history : [];
   for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -5488,7 +5509,7 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
           if (wf) {
             // wf.amount is outstanding (reduced by deposit); cash/transfer live in history
             const due = Number(wf.amount) || 0;
-            const history = Array.isArray(wf.history) ? [...wf.history] : [];
+            const history = normalizeWorkflowHistory(wf.history);
             let collected = 0;
             let creditAlloc = 0;
             for (const h of history) {

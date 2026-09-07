@@ -2120,7 +2120,13 @@ exports.getCashierDashboard = async (req, res) => {
       const modes = Array.isArray(row.payment_modes)
         ? row.payment_modes
         : paymentModesFromHistory(row.history);
-      if (!modes.includes("deposit")) {
+      // "modes" is the invoice's original payment method selection and keeps
+      // "deposit" forever, even after the deposit has been applied. Only
+      // restore to Apply Deposit when the deposit was NEVER applied (e.g. it
+      // was force-routed to Credit at ₦0 balance). Otherwise this is a
+      // genuine Credit remainder after a real deposit application and must
+      // stay on the Credit tab.
+      if (!modes.includes("deposit") || historyHasDepositApplied(row.history)) {
         remainingCredit.push(row);
         continue;
       }
