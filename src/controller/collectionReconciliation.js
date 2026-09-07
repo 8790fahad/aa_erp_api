@@ -236,7 +236,7 @@ async function expectedAfterExpenses(facilityId, reconDate, branchId) {
       c.collected_transfer = money(c.expected_transfer);
     }
   });
-  return { expectedMap, tillExpenses };
+  return { expectedMap };
 }
 
 let cardColumnsReady = false;
@@ -320,7 +320,6 @@ exports.getSummary = async (req, res) => {
       savedByCashier[String(row.cashier_user_id)] = row.toJSON();
     });
 
-    // Always include every Cashier-role user for the business (dropdown + list)
     const cashierRoleUsers = await loadCashierRoleUsers(facilityId);
     const cashierRoleIds = new Set(
       cashierRoleUsers.map((c) => String(c.cashier_user_id)),
@@ -330,8 +329,9 @@ exports.getSummary = async (req, res) => {
       cashierRoleNameMap[String(c.cashier_user_id)] = c.cashier_name;
     });
 
+    // Only cashiers who collected, spent from till, or already have a
+    // confirmation for this date — not every Cashier-role user.
     const cashierIds = new Set([
-      ...cashierRoleIds,
       ...Object.keys(expectedMap),
       ...Object.keys(savedByCashier),
     ]);
@@ -390,15 +390,15 @@ exports.getSummary = async (req, res) => {
           is_cashier_role: cashierRoleIds.has(id),
         };
       })
-      // Keep Cashier-role users even with 0 collections; still include anyone
-      // who collected or already has a confirmation for the day.
       .filter(
         (c) =>
-          c.is_cashier_role ||
           c.expected_total > 0 ||
           (Number(c.collected_cash) || 0) > 0 ||
           (Number(c.collected_card) || 0) > 0 ||
           (Number(c.collected_transfer) || 0) > 0 ||
+          (Number(c.expenses_cash) || 0) > 0 ||
+          (Number(c.expenses_card) || 0) > 0 ||
+          (Number(c.expenses_transfer) || 0) > 0 ||
           c.status === "confirmed" ||
           c.status === "variance",
       )

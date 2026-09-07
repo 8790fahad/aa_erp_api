@@ -18600,6 +18600,282 @@ exports.getDebtorsCreditorsCombinedReport = async (req, res) => {
   }
 };
 
+/**
+ * Customer deposits (prepaid / advance received from customers) and
+ * supplier advances (prepaid to suppliers) — mirrors the dashboard's
+ * fetchAdvanceDepositBalances but returns the FULL party list (not just a
+ * top-N sample) and supports an as-at-date cutoff, for the standalone
+ * Deposit Report / Advance Report pages.
+ *
+ * Customer deposit balance: GL type = 'deposit', SUM(cr) - SUM(dr) per party.
+ * Supplier advance balance: GL type IN ('accrued', 'advance'), SUM(dr) - SUM(cr) per party.
+ */
+async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
+  const customerDepositRows = await db.sequelize.query(
+    `
+    SELECT
+      c.customerNo AS party_id,
+      COALESCE(
+        NULLIF(TRIM(c.fullname), ''),
+        NULLIF(TRIM(c.store_name), ''),
+        NULLIF(TRIM(c.company_name), ''),
+        c.customerNo
+      ) AS party_name,
+      c.address,
+      c.phone,
+      c.email,
+      COALESCE((
+        SELECT COALESCE(SUM(gl.cr), 0) - COALESCE(SUM(gl.dr), 0)
+        FROM general_ledger gl
+        WHERE gl.facility_id = :facilityId
+          AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+          AND LOWER(COALESCE(gl.type, '')) = 'deposit'
+          AND (
+            gl.transaction_ref = c.customerNo
+            OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
+          )
+      ), 0) AS balance
+    FROM customers c
+    WHERE c.facilityId = :facilityId
+    HAVING balance > 0.0001
+    ORDER BY party_name ASC
+    `,
+    {
+      replacements: { facilityId, asAtDate: asAtDate || null },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const supplierAdvanceRows = await db.sequelize.query(
+    `
+    SELECT
+      s.supplier_number AS party_id,
+      COALESCE(
+        NULLIF(TRIM(s.supplier_name), ''),
+        NULLIF(TRIM(s.company_name), ''),
+        s.supplier_number
+      ) AS party_name,
+      s.address,
+      s.phone,
+      s.email,
+      COALESCE((
+        SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+        FROM general_ledger gl
+        WHERE gl.facility_id = :facilityId
+          AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+          AND LOWER(COALESCE(gl.type, '')) IN ('accrued', 'advance')
+          AND (
+            gl.transaction_ref = s.supplier_number
+            OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')
+          )
+      ), 0) AS balance
+    FROM suppliersinfo s
+    WHERE s.facilityId = :facilityId
+    HAVING balance > 0.0001
+    ORDER BY party_name ASC
+    `,
+    {
+      replacements: { facilityId, asAtDate: asAtDate || null },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  const mapRow = (row, partyType) => ({
+    party_type: partyType,
+    party_id: row.party_id,
+    party_name: row.party_name,
+    address: row.address,
+    phone: row.phone,
+    email: row.email,
+    balance: parseFloat(row.balance || 0) || 0,
+  });
+
+  return {
+    customerDepositRows: customerDepositRows.map((r) => mapRow(r, "customer")),
+    supplierAdvanceRows: supplierAdvanceRows.map((r) => mapRow(r, "supplier")),
+  };
+}
+
+// Get Customer Deposits Report (customers with a prepaid / deposit balance)
+exports.getCustomerDepositsReport = async (req, res) => {
+  try {
+    const { facilityId, asAtDate } = req.body;
+    if (!facilityId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "facilityId is required" });
+    }
+
+    const { customerDepositRows } = await fetchDepositAdvanceBalances(
+      facilityId,
+      asAtDate || null,
+    );
+    const totalBalance = customerDepositRows.reduce(
+      (sum, row) => sum + row.balance,
+      0,
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        asAtDate: asAtDate || null,
+        rows: customerDepositRows,
+        totalBalance,
+        count: customerDepositRows.length,
+      },
+    });
+  } catch (error) {
+    console.error("Customer Deposits Report Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error generating customer deposits report",
+      error: error.message,
+    });
+  }
+};
+
+// Get Supplier Advances Report (suppliers with a prepaid / advance balance)
+exports.getSupplierAdvancesReport = async (req, res) => {
+  try {
+    const { facilityId, asAtDate } = req.body;
+    if (!facilityId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "facilityId is required" });
+    }
+
+    const { supplierAdvanceRows } = await fetchDepositAdvanceBalances(
+      facilityId,
+      asAtDate || null,
+    );
+    const totalBalance = supplierAdvanceRows.reduce(
+      (sum, row) => sum + row.balance,
+      0,
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        asAtDate: asAtDate || null,
+        rows: supplierAdvanceRows,
+        totalBalance,
+        count: supplierAdvanceRows.length,
+      },
+    });
+  } catch (error) {
+    console.error("Supplier Advances Report Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error generating supplier advances report",
+      error: error.message,
+    });
+  }
+};
+
+// Drill-down ledger for a single customer's deposits or a single supplier's advances
+exports.getPartyDepositAdvanceLedger = async (req, res) => {
+  try {
+    const { facilityId, partyType, partyNo, fromDate, toDate } = req.body;
+    if (!facilityId || !partyType || !partyNo) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId, partyType and partyNo are required",
+      });
+    }
+    const isSupplier = String(partyType).trim().toLowerCase() === "supplier";
+    const typeFilter = isSupplier ? "IN ('accrued', 'advance')" : "= 'deposit'";
+    const from = fromDate ? moment(fromDate).format("YYYY-MM-DD") : null;
+    const to = toDate ? moment(toDate).format("YYYY-MM-DD") : null;
+
+    const openingRows = await db.sequelize.query(
+      `
+      SELECT COALESCE(SUM(dr), 0) AS total_dr, COALESCE(SUM(cr), 0) AS total_cr
+      FROM general_ledger
+      WHERE facility_id = :facilityId
+        AND LOWER(COALESCE(type, '')) ${typeFilter}
+        AND (transaction_ref = :partyNo OR transaction_ref LIKE CONCAT(:partyNo, '-%'))
+        AND (:from IS NULL OR transaction_date < :from)
+      `,
+      {
+        replacements: { facilityId, partyNo, from },
+        type: QueryTypes.SELECT,
+      },
+    );
+    const opening = isSupplier
+      ? parseFloat(openingRows[0]?.total_dr || 0) -
+        parseFloat(openingRows[0]?.total_cr || 0)
+      : parseFloat(openingRows[0]?.total_cr || 0) -
+        parseFloat(openingRows[0]?.total_dr || 0);
+
+    const transactions = await db.sequelize.query(
+      `
+      SELECT
+        transaction_date,
+        reference_number,
+        transaction_ref,
+        dr,
+        cr,
+        COALESCE(transaction_description, account_description, purpose_of_payment, '') AS description
+      FROM general_ledger
+      WHERE facility_id = :facilityId
+        AND LOWER(COALESCE(type, '')) ${typeFilter}
+        AND (transaction_ref = :partyNo OR transaction_ref LIKE CONCAT(:partyNo, '-%'))
+        AND (:from IS NULL OR transaction_date >= :from)
+        AND (:to IS NULL OR transaction_date <= :to)
+      ORDER BY transaction_date ASC, transaction_id ASC
+      `,
+      {
+        replacements: { facilityId, partyNo, from, to },
+        type: QueryTypes.SELECT,
+      },
+    );
+
+    let running = opening;
+    const rows = transactions.map((t) => {
+      const dr = parseFloat(t.dr || 0);
+      const cr = parseFloat(t.cr || 0);
+      running += isSupplier ? dr - cr : cr - dr;
+      return {
+        transaction_date: t.transaction_date,
+        reference_number: t.reference_number,
+        transaction_ref: t.transaction_ref,
+        description: t.description,
+        dr,
+        cr,
+        running_balance: Number(running.toFixed(2)),
+      };
+    });
+    const totalDebit = transactions.reduce(
+      (s, t) => s + parseFloat(t.dr || 0),
+      0,
+    );
+    const totalCredit = transactions.reduce(
+      (s, t) => s + parseFloat(t.cr || 0),
+      0,
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        partyType: isSupplier ? "supplier" : "customer",
+        partyNo,
+        opening: Number(opening.toFixed(2)),
+        closing: Number(running.toFixed(2)),
+        totalDebit,
+        totalCredit,
+        transactions: rows,
+      },
+    });
+  } catch (error) {
+    console.error("Party Deposit/Advance Ledger Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error generating party ledger",
+      error: error.message,
+    });
+  }
+};
+
 // Get outstanding payable invoices for all suppliers (or one supplier)
 exports.getOutstandingPayableInvoices = async (req, res) => {
   try {

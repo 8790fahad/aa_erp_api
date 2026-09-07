@@ -729,14 +729,20 @@ function saleCodesMatch(a, b) {
 async function findLockedWorkflowForCollection({
   facilityId,
   saleCode,
+  workflowId,
   transaction,
 }) {
   const code = normalizeSaleCode(saleCode);
   if (!facilityId || !code) {
     return { error: "facilityId and saleCode are required", status: 400 };
   }
+  const where = { facility_id: facilityId, sale_code: code };
+  const id = parseInt(workflowId, 10);
+  if (Number.isFinite(id) && id > 0) {
+    where.id = id;
+  }
   const row = await db.SaleWorkflow.findOne({
-    where: { facility_id: facilityId, sale_code: code },
+    where,
     transaction,
     lock: transaction.LOCK.UPDATE,
   });
@@ -769,8 +775,13 @@ async function persistLockedWorkflow(row, transaction) {
   if (typeof row.changed === "function") {
     row.changed("history", true);
   }
-  // Persist by unique invoice identity only. Never WHERE id — legacy rows can
-  // share id 0, which would rewrite every pending invoice for the facility.
+  // Persist by unique invoice identity only. Never WHERE id alone — legacy
+  // rows can share id 0, which would rewrite every pending invoice.
+  const where = saleWorkflowByInvoiceWhere(facilityId, saleCode);
+  const rowId = parseInt(row.id, 10);
+  if (Number.isFinite(rowId) && rowId > 0) {
+    where.id = rowId;
+  }
   const [affected] = await db.SaleWorkflow.update(
     {
       status: row.status,
@@ -2899,6 +2910,52 @@ exports.getCashierDashboard = async (req, res) => {
         new Date(a.updated_at || a.createdAt || 0),
     );
 
+    // `row.amount` on these queue rows is the amount OUTSTANDING for the
+    // current step (it gets reduced as deposits/splits are applied — see
+    // customer.js applyCustomerAdvanceToInvoices). That is correct for
+    // driving collection math, but confusing to show as "Amount due" in the
+    // queue — e.g. a ₦49,500 invoice with ₦40,500 deposit applied shows
+    // "₦9,000" with no indication of the real invoice size. Look up the
+    // untouched original total from `invoices` (keyed by invoice_ref) and
+    // expose it separately as `invoice_amount` so the UI can show the real
+    // invoice amount up top and the remaining/credit portion underneath.
+    const invoiceAmountRows = [
+      ...pendingRows,
+      ...creditRows,
+      ...depositRows,
+      ...discountRows,
+      ...modeRows,
+    ];
+    const invoiceAmountCodes = [
+      ...new Set(
+        invoiceAmountRows.map((r) => String(r.sale_code || "")).filter(Boolean),
+      ),
+    ];
+    if (invoiceAmountCodes.length) {
+      try {
+        const invRows = await db.sequelize.query(
+          `SELECT invoice_ref, amount
+           FROM invoices
+           WHERE facility_id = :facilityId
+             AND invoice_ref IN (:invoiceAmountCodes)`,
+          {
+            replacements: { facilityId, invoiceAmountCodes },
+            type: db.Sequelize.QueryTypes.SELECT,
+          },
+        );
+        const invoiceAmtByRef = {};
+        for (const r of invRows || []) {
+          invoiceAmtByRef[String(r.invoice_ref)] = Number(r.amount) || 0;
+        }
+        for (const row of invoiceAmountRows) {
+          const invAmt = invoiceAmtByRef[String(row.sale_code)];
+          row.invoice_amount = invAmt > 0 ? invAmt : Number(row.amount) || 0;
+        }
+      } catch (_) {
+        // Non-fatal — fall back to row.amount on the frontend.
+      }
+    }
+
     return res.json({
       success: true,
       results: {
@@ -3092,6 +3149,7 @@ exports.cashierConfirmPayment = async (req, res) => {
     const locked = await findLockedWorkflowForCollection({
       facilityId,
       saleCode: saleCode || sale_code,
+      workflowId: workflowId || workflow_id,
       transaction,
     });
     if (locked.error) {
@@ -3723,6 +3781,7 @@ exports.sendCreditRemainder = async (req, res) => {
     const locked = await findLockedWorkflowForCollection({
       facilityId,
       saleCode: saleCode || sale_code,
+      workflowId: workflowId || workflow_id,
       transaction,
     });
     if (locked.error) {

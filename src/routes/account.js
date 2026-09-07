@@ -764,6 +764,19 @@ module.exports = (app) => {
     "/account/debtors-creditors-report",
     account.getDebtorsCreditorsCombinedReport,
   );
+  // Customer Deposits (Deposit Report) / Supplier Advances (Advance Report)
+  app.post(
+    "/account/customer-deposits-report",
+    account.getCustomerDepositsReport,
+  );
+  app.post(
+    "/account/supplier-advances-report",
+    account.getSupplierAdvancesReport,
+  );
+  app.post(
+    "/account/deposit-advance-ledger",
+    account.getPartyDepositAdvanceLedger,
+  );
   app.get(
     "/api/v1/get-outstanding-payable-invoices",
     account.getOutstandingPayableInvoices,

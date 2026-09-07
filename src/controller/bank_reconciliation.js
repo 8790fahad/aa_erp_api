@@ -17,6 +17,183 @@ const parseStatementBalance = (value) => {
   return Number.isFinite(n) ? n : null;
 };
 
+async function findGlAccountByHead(facilityId, head, transaction) {
+  const code = String(head || "").trim();
+  if (!code) return null;
+  const account = await db.Account.findOne({
+    where: { facilityId, head: code },
+    transaction,
+  });
+  if (account) {
+    return {
+      head: account.head,
+      subhead: account.subhead || 0,
+      description: account.description,
+    };
+  }
+  if (db.AccountCategory) {
+    const cat = await db.AccountCategory.findOne({
+      where: { facilityId, code },
+      transaction,
+    });
+    if (cat) {
+      return {
+        head: cat.code,
+        subhead: cat.subhead || 0,
+        description: cat.description || cat.name || cat.code,
+      };
+    }
+  }
+  return null;
+}
+
+async function resolveOpeningBalanceEquityHead(facilityId, requested) {
+  const fromRequest = String(requested || "").trim();
+  if (fromRequest) return fromRequest;
+  const Business = db.business || db.Business;
+  if (!Business) return "";
+  const biz = await Business.findByPk(String(facilityId));
+  return String(biz?.opening_balance_equity || "").trim();
+}
+
+async function postBankOpeningBalanceGl({
+  bankAccount,
+  openingBalance,
+  openingBalanceDate,
+  openingBalanceEquity,
+  userId,
+  facilityId,
+  transaction,
+}) {
+  const amountRaw = parseFloat(openingBalance) || 0;
+  if (amountRaw === 0) {
+    return { ok: false, message: "Enter an opening balance amount to post" };
+  }
+  const obDate = String(openingBalanceDate || "").trim();
+  if (!obDate) {
+    return {
+      ok: false,
+      message:
+        "Opening Balance Date is required when an Opening Balance amount is entered",
+    };
+  }
+  if (!moment(obDate, "YYYY-MM-DD", true).isValid()) {
+    return {
+      ok: false,
+      message: "Opening Balance Date must be a valid date (YYYY-MM-DD)",
+    };
+  }
+
+  const equityHead = await resolveOpeningBalanceEquityHead(
+    facilityId,
+    openingBalanceEquity,
+  );
+  if (!equityHead) {
+    return {
+      ok: false,
+      message:
+        "Set Opening Balance Equity under Default accounts before posting opening balances.",
+    };
+  }
+
+  const bankHead = bankAccount.head;
+  if (!bankHead) {
+    return {
+      ok: false,
+      message: "This bank account has no GL account (head) to post against.",
+    };
+  }
+
+  const existingOb = await db.GeneralLedger.findOne({
+    where: {
+      facility_id: String(facilityId),
+      type: "opening_balance",
+      [Op.or]: [
+        { bank_account_id: bankAccount.id },
+        { account_code: String(bankHead) },
+      ],
+    },
+    transaction,
+  });
+  if (existingOb) {
+    return {
+      ok: false,
+      message: "Opening balance already posted for this bank account.",
+    };
+  }
+
+  const glAccount = await findGlAccountByHead(facilityId, bankHead, transaction);
+  if (!glAccount) {
+    return {
+      ok: false,
+      message: `GL Account not found for head: ${bankHead}`,
+    };
+  }
+
+  const equityAccount = await findGlAccountByHead(
+    facilityId,
+    equityHead,
+    transaction,
+  );
+  if (!equityAccount) {
+    return {
+      ok: false,
+      message:
+        "Opening Balance Equity account not found. Set it under Default accounts.",
+    };
+  }
+
+  const ref = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
+  const isPositive = amountRaw >= 0;
+  const amount = Math.abs(amountRaw);
+
+  await db.GeneralLedger.create(
+    {
+      transaction_date: obDate,
+      account_code: glAccount.head,
+      account_subhead: glAccount.subhead || 0,
+      dr: isPositive ? amount : 0,
+      cr: isPositive ? 0 : amount,
+      bank_account_id: bankAccount.id,
+      mode_of_payment: "bank",
+      account_description: glAccount.description || bankAccount.account_name,
+      transaction_description: `Opening Balance - ${bankAccount.account_name} (${bankAccount.account_number})`,
+      reference_number: ref,
+      purpose_of_payment: "Opening Balance",
+      payee: bankAccount.account_name,
+      created_by: userId,
+      facility_id: facilityId,
+      status: "paid",
+      type: "opening_balance",
+      transaction_ref: `${ref}-BANK`,
+    },
+    { transaction },
+  );
+
+  await db.GeneralLedger.create(
+    {
+      transaction_date: obDate,
+      account_code: equityAccount.head,
+      account_subhead: equityAccount.subhead || 0,
+      dr: isPositive ? 0 : amount,
+      cr: isPositive ? amount : 0,
+      account_description: equityAccount.description,
+      transaction_description: `Opening Balance Equity Offset - ${bankAccount.account_name}`,
+      reference_number: ref,
+      purpose_of_payment: "Opening Balance",
+      payee: "",
+      created_by: userId,
+      facility_id: facilityId,
+      status: "paid",
+      type: "opening_balance",
+      transaction_ref: `${ref}-EQUITY`,
+    },
+    { transaction },
+  );
+
+  return { ok: true, ref };
+}
+
 /** Closing bank balance as at endDate from uploaded statement lines. */
 const resolveBankStatementBalance = async (
   bankAccountId,
@@ -891,8 +1068,11 @@ exports.getBankAccounts = async (req, res) => {
     const bankAccounts = await db.sequelize.query(
       `SELECT
         bld.*,
-        lr.last_reconciled
+        lr.last_reconciled,
+        COALESCE(ob.opening_balance, obc.opening_balance, 0) AS opening_balance,
+        COALESCE(ob.opening_balance_date, obc.opening_balance_date) AS opening_balance_date
       FROM bank_list_data bld
+      LEFT JOIN bank_accounts ba ON ba.id = bld.id
       LEFT JOIN (
         SELECT
           bs.bank_account_id,
@@ -902,6 +1082,27 @@ exports.getBankAccounts = async (req, res) => {
         WHERE bst.reconciled = 'matched'
         GROUP BY bs.bank_account_id
       ) lr ON bld.id = lr.bank_account_id
+      LEFT JOIN (
+        SELECT
+          gl.bank_account_id,
+          SUM(gl.dr - gl.cr) AS opening_balance,
+          MIN(gl.transaction_date) AS opening_balance_date
+        FROM general_ledger gl
+        WHERE gl.type = 'opening_balance'
+          AND gl.facility_id = :facilityId
+          AND gl.bank_account_id IS NOT NULL
+        GROUP BY gl.bank_account_id
+      ) ob ON ob.bank_account_id = bld.id
+      LEFT JOIN (
+        SELECT
+          gl.account_code,
+          SUM(gl.dr - gl.cr) AS opening_balance,
+          MIN(gl.transaction_date) AS opening_balance_date
+        FROM general_ledger gl
+        WHERE gl.type = 'opening_balance'
+          AND gl.facility_id = :facilityId
+        GROUP BY gl.account_code
+      ) obc ON obc.account_code = ba.head
       WHERE bld.facility_id = :facilityId AND bld.status = 'active'`,
       {
         replacements: {
@@ -926,6 +1127,7 @@ exports.getBankAccounts = async (req, res) => {
 };
 
 exports.updateBankAccount = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
   try {
     const { id } = req.params;
     const {
@@ -939,9 +1141,14 @@ exports.updateBankAccount = async (req, res) => {
       subhead,
       facilityId,
       category,
+      opening_balance,
+      opening_balance_date,
+      opening_balance_equity,
+      post_opening_balance,
     } = req.body;
 
     if (!id) {
+      await transaction.rollback();
       return res.json({
         success: false,
         message: "Bank account ID is required",
@@ -955,9 +1162,11 @@ exports.updateBankAccount = async (req, res) => {
         facilityId,
         status: "active",
       },
+      transaction,
     });
 
     if (!bankAccount) {
+      await transaction.rollback();
       return res.json({
         success: false,
         message: "Bank account not found",
@@ -973,9 +1182,11 @@ exports.updateBankAccount = async (req, res) => {
           status: "active",
           id: { [Op.ne]: id },
         },
+        transaction,
       });
 
       if (existingAccount) {
+        await transaction.rollback();
         return res.json({
           success: false,
           message: "Bank account with this account number already exists",
@@ -984,30 +1195,62 @@ exports.updateBankAccount = async (req, res) => {
     }
 
     // Update the bank account
-    await bankAccount.update({
-      account_number: account_number
-        ? String(account_number)
-        : bankAccount.account_number,
-      account_name: account_name
-        ? String(account_name)
-        : bankAccount.account_name,
-      bank_code: bank_code ? String(bank_code) : bankAccount.bank_code,
-      user_id: user_id ? String(user_id) : bankAccount.user_id,
-      bank_name: bank_name ? String(bank_name) : bankAccount.bank_name,
-      account_bank_type: account_bank_type
-        ? String(account_bank_type)
-        : bankAccount.account_bank_type,
-      head: head ? String(head) : bankAccount.head,
-      subhead: subhead ? String(subhead) : bankAccount.subhead,
-      category: category !== undefined ? category : bankAccount.category,
-    });
+    await bankAccount.update(
+      {
+        account_number: account_number
+          ? String(account_number)
+          : bankAccount.account_number,
+        account_name: account_name
+          ? String(account_name)
+          : bankAccount.account_name,
+        bank_code: bank_code ? String(bank_code) : bankAccount.bank_code,
+        user_id: user_id ? String(user_id) : bankAccount.user_id,
+        bank_name: bank_name ? String(bank_name) : bankAccount.bank_name,
+        account_bank_type: account_bank_type
+          ? String(account_bank_type)
+          : bankAccount.account_bank_type,
+        head: head ? String(head) : bankAccount.head,
+        subhead: subhead ? String(subhead) : bankAccount.subhead,
+        category: category !== undefined ? category : bankAccount.category,
+      },
+      { transaction },
+    );
 
+    const shouldPost =
+      post_opening_balance === true ||
+      post_opening_balance === "true" ||
+      post_opening_balance === 1 ||
+      post_opening_balance === "1";
+
+    if (shouldPost) {
+      const posted = await postBankOpeningBalanceGl({
+        bankAccount,
+        openingBalance: opening_balance,
+        openingBalanceDate: opening_balance_date,
+        openingBalanceEquity: opening_balance_equity,
+        userId: user_id || bankAccount.user_id,
+        facilityId,
+        transaction,
+      });
+      if (!posted.ok) {
+        await transaction.rollback();
+        return res.json({
+          success: false,
+          message: posted.message,
+        });
+      }
+    }
+
+    await transaction.commit();
     res.json({
       success: true,
-      message: "Bank account updated successfully",
+      message: shouldPost
+        ? "Opening balance posted"
+        : "Bank account updated successfully",
       data: bankAccount,
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Error updating bank account:", error);
     res.json({
       success: false,

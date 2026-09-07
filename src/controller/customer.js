@@ -5273,6 +5273,35 @@ function paymentModesFromHistory(history) {
   return [];
 }
 
+function leftoverAfterCollections(wf) {
+  const due = Number(wf?.amount) || 0;
+  const history = normalizeWorkflowHistory(wf?.history);
+  let collected = 0;
+  let creditAlloc = 0;
+  let depositAlready = 0;
+  for (const h of history) {
+    const amt = Number(h?.collection?.amount) || 0;
+    if (amt > 0) collected += amt;
+    if (h?.credit_remainder?.remainder != null) {
+      creditAlloc = Number(h.credit_remainder.remainder) || 0;
+    } else if (h?.credit_remainder?.credit != null) {
+      creditAlloc = Number(h.credit_remainder.credit) || 0;
+    }
+    if (h?.credit_allocation?.amount != null) {
+      creditAlloc = Number(h.credit_allocation.amount) || 0;
+    }
+    if (h?.deposit_application?.amount != null) {
+      depositAlready += Number(h.deposit_application.amount) || 0;
+    }
+  }
+  const settled = Number(
+    (collected + creditAlloc + depositAlready).toFixed(2),
+  );
+  if (due <= 0) return 0;
+  if (settled > due + 0.05) return due;
+  return Math.max(0, Number((due - settled).toFixed(2)));
+}
+
 function remainderTypeAfterDeposit(modes) {
   const hasCash = modes.includes("cash");
   const hasTransfer = modes.includes("transfer");
@@ -5424,8 +5453,26 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
       const settled = [];
 
       for (const { invoice_ref, amount } of cleaned) {
-        const applyAmt = Math.min(amount, remainingPool);
-        if (applyAmt <= 0) break;
+        let leftover = amount;
+        let wf = null;
+        if (db.SaleWorkflow) {
+          wf = await db.SaleWorkflow.findOne({
+            where: {
+              facility_id: facilityId,
+              sale_code: invoice_ref,
+            },
+            transaction: t,
+          });
+          if (wf) leftover = leftoverAfterCollections(wf);
+        }
+        const applyAmt = Math.min(amount, remainingPool, leftover);
+        if (applyAmt <= 0.05) {
+          throw new Error(
+            leftover <= 0.05
+              ? `No leftover balance to apply deposit on ${invoice_ref}`
+              : `Deposit cannot exceed leftover ₦${leftover.toFixed(2)} on ${invoice_ref}`,
+          );
+        }
 
         // DR deposit liability (consume advance)
         await GeneralLedger.create(
@@ -5498,35 +5545,14 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
         settled.push({ invoice_ref, amount: applyAmt });
 
         // Move sale workflow after deposit application
-        if (db.SaleWorkflow) {
-          const wf = await db.SaleWorkflow.findOne({
-            where: {
-              facility_id: facilityId,
-              sale_code: invoice_ref,
-            },
-            transaction: t,
-          });
-          if (wf) {
-            // wf.amount is outstanding (reduced by deposit); cash/transfer live in history
-            const due = Number(wf.amount) || 0;
+        if (wf) {
             const history = normalizeWorkflowHistory(wf.history);
-            let collected = 0;
-            let creditAlloc = 0;
-            for (const h of history) {
-              const amt = Number(h?.collection?.amount) || 0;
-              if (amt > 0) collected += amt;
-              if (h?.credit_allocation?.amount != null) {
-                creditAlloc = Number(h.credit_allocation.amount) || 0;
-              }
-            }
-            const remaining = Number(
-              (due - collected - creditAlloc - applyAmt).toFixed(2),
-            );
+            const remaining = Number((leftover - applyAmt).toFixed(2));
             history.push({
               status: wf.status,
               at: new Date().toISOString(),
               by: userId,
-              note: `Deposit applied ₦${applyAmt.toFixed(2)} (balance was ₦${due.toFixed(2)})`,
+              note: `Deposit applied ₦${applyAmt.toFixed(2)} (leftover was ₦${leftover.toFixed(2)})`,
               deposit_application: { amount: applyAmt },
             });
 
@@ -5542,7 +5568,7 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
             } else {
               const modes = paymentModesFromHistory(history);
               const nextType = remainderTypeAfterDeposit(modes);
-              wf.amount = Number((due - applyAmt).toFixed(2));
+              wf.amount = remaining;
               if (nextType === "credit") {
                 wf.status = "awaiting_credit_approval";
                 wf.payment_type = "credit";
@@ -5589,7 +5615,6 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
                 `Invoice mismatch — deposit was not applied to ${invoice_ref}`,
               );
             }
-          }
         }
       }
 
@@ -5611,6 +5636,10 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
     });
   } catch (error) {
     console.error("applyCustomerAdvanceToInvoices:", error);
+    const msg = String(error?.message || "");
+    if (/leftover|Invoice mismatch/i.test(msg)) {
+      return res.status(400).json({ success: false, error: msg });
+    }
     return res.status(500).json({
       success: false,
       error: "Failed to apply customer advance",
