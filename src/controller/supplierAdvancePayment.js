@@ -31,43 +31,154 @@ function parseFuncList(value) {
     .filter(Boolean);
 }
 
+function normPersonId(value) {
+  return String(value || "").trim();
+}
+
+function isUserCodeLabel(value) {
+  return /^USER-\d+$/i.test(normPersonId(value));
+}
+
 function personDisplayName(row) {
   if (!row) return "";
-  const fromParts = [row.firstname, row.lastname]
+  const fromParts = [row.firstname || row.firstName, row.lastname || row.lastName]
     .map((v) => String(v || "").trim())
     .filter(Boolean)
     .join(" ");
   if (fromParts) return fromParts;
   const username = String(row.username || "").trim();
-  if (username && !/^USER-\d+$/i.test(username)) return username;
+  if (username && !isUserCodeLabel(username)) return username;
   const email = String(row.email || "").trim();
-  if (email.includes("@")) return email.split("@")[0];
+  if (email.includes("@")) {
+    const local = email.split("@")[0];
+    if (local && !isUserCodeLabel(local)) return local;
+  }
   return "";
 }
 
-async function resolvePayerNames(userIds) {
-  const ids = [
-    ...new Set(
-      (userIds || []).map((id) => String(id || "").trim()).filter(Boolean),
-    ),
+function addPersonNameKeys(map, row) {
+  const name = personDisplayName(row);
+  if (!name) return;
+  const keys = [
+    row.id,
+    row.user_id,
+    row.userId,
+    row.membership_user_id,
+    row.username,
+    row.code,
+    row.employeeId,
   ];
+  for (const key of keys) {
+    const id = normPersonId(key);
+    if (id) map[id] = name;
+  }
+}
+
+function idsForPerson(selectedId, nameMap) {
+  const key = normPersonId(selectedId);
+  if (!key) return [];
+  const aliases = new Set([key]);
+  const name = nameMap[key];
+  if (name) {
+    for (const [id, label] of Object.entries(nameMap)) {
+      if (label === name) aliases.add(id);
+    }
+  }
+  return [...aliases];
+}
+
+async function loadFacilityPersonMap(facilityId) {
   const map = {};
-  if (!ids.length) return map;
+  const fid = String(facilityId || "").trim();
+  if (!fid) return map;
+
   try {
-    const users = await db.sequelize.query(
-      `SELECT id, firstname, lastname, username, email
-       FROM users
-       WHERE CAST(id AS CHAR) IN (:ids)`,
+    const members = await db.sequelize.query(
+      `SELECT
+         m.user_id AS membership_user_id,
+         u.id,
+         u.firstname,
+         u.lastname,
+         u.username,
+         u.email,
+         u.code
+       FROM membership m
+       LEFT JOIN users u
+         ON TRIM(CONVERT(u.email USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+          = TRIM(CONVERT(m.email USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+         OR TRIM(CONVERT(u.id USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+          = TRIM(CONVERT(m.user_id USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+       WHERE TRIM(CONVERT(m.business_id USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+           = TRIM(CONVERT(:facilityId USING utf8mb4)) COLLATE utf8mb4_unicode_ci`,
       {
-        replacements: { ids },
+        replacements: { facilityId: fid },
         type: db.sequelize.QueryTypes.SELECT,
       },
     );
-    for (const u of users || []) {
-      const id = String(u.id || "").trim();
-      if (!id) continue;
-      map[id] = personDisplayName(u) || id;
-    }
+    for (const row of members || []) addPersonNameKeys(map, row);
+  } catch (err) {
+    console.warn("loadFacilityPersonMap membership:", err.message);
+  }
+
+  try {
+    const users = await db.sequelize.query(
+      `SELECT id, firstname, lastname, username, email, code
+       FROM users
+       WHERE TRIM(CONVERT(facilityId USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+           = TRIM(CONVERT(:facilityId USING utf8mb4)) COLLATE utf8mb4_unicode_ci`,
+      {
+        replacements: { facilityId: fid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    for (const row of users || []) addPersonNameKeys(map, row);
+  } catch (err) {
+    console.warn("loadFacilityPersonMap users:", err.message);
+  }
+
+  try {
+    const employees = await db.sequelize.query(
+      `SELECT userId, user_id, employeeId,
+              firstName AS firstname, lastName AS lastname
+       FROM employees
+       WHERE TRIM(CONVERT(facilityId USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+           = TRIM(CONVERT(:facilityId USING utf8mb4)) COLLATE utf8mb4_unicode_ci`,
+      {
+        replacements: { facilityId: fid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    for (const row of employees || []) addPersonNameKeys(map, row);
+  } catch (err) {
+    console.warn("loadFacilityPersonMap employees:", err.message);
+  }
+
+  return map;
+}
+
+async function resolvePayerNames(userIds, facilityId) {
+  const map = await loadFacilityPersonMap(facilityId);
+  const missing = [
+    ...new Set(
+      (userIds || [])
+        .map((id) => normPersonId(id))
+        .filter((id) => id && !map[id]),
+    ),
+  ];
+  if (!missing.length) return map;
+  try {
+    const users = await db.sequelize.query(
+      `SELECT id, firstname, lastname, username, email, code
+       FROM users
+       WHERE TRIM(CONVERT(id USING utf8mb4)) COLLATE utf8mb4_unicode_ci IN (:ids)
+          OR TRIM(CONVERT(username USING utf8mb4)) COLLATE utf8mb4_unicode_ci IN (:ids)
+          OR TRIM(CONVERT(code USING utf8mb4)) COLLATE utf8mb4_unicode_ci IN (:ids)`,
+      {
+        replacements: { ids: missing },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    for (const u of users || []) addPersonNameKeys(map, u);
   } catch (err) {
     console.warn("resolvePayerNames:", err.message);
   }
@@ -1174,10 +1285,19 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       String(viewAll || "").toLowerCase() === "yes";
     const seeAll = allowedAll && (requestedAll || allowedAll);
     const payerFilter = String(createdBy || "").trim();
+    const nameMap = await resolvePayerNames(
+      [actorId, payerFilter].filter(Boolean),
+      facilityId,
+    );
     const filterByCreator = seeAll
       ? Boolean(payerFilter)
       : Boolean(actorId);
-    const creatorId = seeAll ? payerFilter : actorId;
+    const creatorIds = filterByCreator
+      ? idsForPerson(seeAll ? payerFilter : actorId, nameMap)
+      : [];
+    if (filterByCreator && !creatorIds.length) {
+      creatorIds.push(seeAll ? payerFilter : actorId);
+    }
 
     const rows = await db.sequelize.query(
       `SELECT
@@ -1199,12 +1319,14 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
          u.email AS payer_email
        FROM supplier_entries se
        LEFT JOIN suppliersinfo si ON si.supplier_number = se.supplier_number AND si.facilityId = se.facilityId
-       LEFT JOIN users u ON CAST(u.id AS CHAR) = CAST(se.created_by AS CHAR)
+       LEFT JOIN users u
+         ON TRIM(CONVERT(u.id USING utf8mb4)) COLLATE utf8mb4_unicode_ci
+          = TRIM(CONVERT(se.created_by USING utf8mb4)) COLLATE utf8mb4_unicode_ci
        WHERE se.facilityId = :facilityId
          ${filterBySupplier ? "AND se.supplier_number = :supplierNo" : ""}
          ${
            filterByCreator
-             ? "AND CONVERT(se.created_by USING utf8mb4) = CONVERT(:userId USING utf8mb4)"
+             ? "AND TRIM(CONVERT(se.created_by USING utf8mb4)) COLLATE utf8mb4_unicode_ci IN (:creatorIds)"
              : ""
          }
          AND (se.type = 'payment' OR se.type IS NULL OR se.type = '')
@@ -1214,7 +1336,7 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
         replacements: {
           facilityId,
           ...(filterBySupplier ? { supplierNo: filterBySupplier } : {}),
-          ...(filterByCreator ? { userId: creatorId } : {}),
+          ...(filterByCreator ? { creatorIds } : {}),
           rowLimit,
         },
         type: db.sequelize.QueryTypes.SELECT,
@@ -1238,20 +1360,13 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
     if (allowedAll) {
       try {
         payers = await db.sequelize.query(
-          `SELECT
-             se.created_by AS id,
-             u.firstname,
-             u.lastname,
-             u.username,
-             u.email
+          `SELECT se.created_by AS id
            FROM supplier_entries se
-           LEFT JOIN users u
-             ON CAST(u.id AS CHAR) = CAST(se.created_by AS CHAR)
            WHERE se.facilityId = :facilityId
              AND se.created_by IS NOT NULL
              AND TRIM(se.created_by) <> ''
              AND (se.type = 'payment' OR se.type IS NULL OR se.type = '')
-           GROUP BY se.created_by, u.firstname, u.lastname, u.username, u.email
+           GROUP BY se.created_by
            ORDER BY se.created_by ASC`,
           {
             replacements: { facilityId },
@@ -1268,10 +1383,10 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       ...rows.map((r) => r.created_by),
       ...(payers || []).map((p) => p.id),
     ];
-    const nameMap = await resolvePayerNames(nameIds);
+    Object.assign(nameMap, await resolvePayerNames(nameIds, facilityId));
 
     const labelFor = (id, row = {}) => {
-      const key = String(id || "").trim();
+      const key = normPersonId(id);
       return (
         nameMap[key] ||
         personDisplayName({
@@ -1280,21 +1395,31 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
           username: row.payer_username || row.username,
           email: row.payer_email || row.email,
         }) ||
-        key
+        ""
       );
     };
+
+    const payerByName = new Map();
+    const rememberPayer = (id, name) => {
+      const key = normPersonId(id);
+      const label = String(name || "").trim();
+      if (!key || !label || isUserCodeLabel(label)) return;
+      const nk = label.toLowerCase();
+      if (!payerByName.has(nk)) payerByName.set(nk, { id: key, name: label });
+    };
+    for (const p of payers || []) {
+      rememberPayer(p.id, labelFor(p.id, p));
+    }
+    for (const [id, name] of Object.entries(nameMap)) {
+      rememberPayer(id, name);
+    }
 
     return res.json({
       success: true,
       see_all: allowedAll,
-      payers: (payers || [])
-        .map((p) => {
-          const id = String(p.id || "").trim();
-          if (!id) return null;
-          return { id, name: labelFor(id, p) };
-        })
-        .filter(Boolean)
-        .sort((a, b) => String(a.name).localeCompare(String(b.name))),
+      payers: [...payerByName.values()].sort((a, b) =>
+        String(a.name).localeCompare(String(b.name)),
+      ),
       results: rows.map((r) => ({
         entry_id:        r.entry_id,
         supplier_no:     r.supplier_number || "",
