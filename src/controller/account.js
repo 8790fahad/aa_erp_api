@@ -2373,7 +2373,7 @@ exports.getChartOfAccountsForFacility = async (req, res) => {
 exports.getReviewedMemosWithItems = async (req, res) => {
   try {
     const { facilityId, userId } = req.params;
-    const { dateFrom, dateTo, memo_id } = req.query;
+    const { dateFrom, dateTo, memo_id, status } = req.query;
 
     console.log("📥 Get Reviewed Memos With Items Request:", {
       facilityId,
@@ -2396,9 +2396,18 @@ exports.getReviewedMemosWithItems = async (req, res) => {
     // but hide memos that have already been fully processed/closed.
     const whereClause = {
       facilityId: facilityId,
-      // Only approved memos may be converted to expense bills
-      status: "approved",
     };
+
+    const statusKind = String(status || "all")
+      .trim()
+      .toLowerCase();
+    if (statusKind === "approved") {
+      whereClause.status = "approved";
+    } else if (statusKind === "pending") {
+      whereClause.status = "pending";
+    } else {
+      whereClause.status = { [Op.in]: ["approved", "pending"] };
+    }
 
     // Add optional filters
     if (memo_id) {

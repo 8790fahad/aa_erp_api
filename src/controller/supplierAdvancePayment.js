@@ -18,6 +18,98 @@ const {
 const { parseAmount } = require("../utils/parseAmount");
 const { validatePostingDate } = require("../utils/validatePostingDate");
 
+const SEE_ALL_PAY_BILLS = "See All Pay Bills";
+const SUPERUSER_KEYS = ["Administrator", "Super Administrator", "Admin"];
+
+function parseFuncList(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v).trim()).filter(Boolean);
+  }
+  return String(value || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function personDisplayName(row) {
+  if (!row) return "";
+  const fromParts = [row.firstname, row.lastname]
+    .map((v) => String(v || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  if (fromParts) return fromParts;
+  const username = String(row.username || "").trim();
+  if (username && !/^USER-\d+$/i.test(username)) return username;
+  const email = String(row.email || "").trim();
+  if (email.includes("@")) return email.split("@")[0];
+  return "";
+}
+
+async function resolvePayerNames(userIds) {
+  const ids = [
+    ...new Set(
+      (userIds || []).map((id) => String(id || "").trim()).filter(Boolean),
+    ),
+  ];
+  const map = {};
+  if (!ids.length) return map;
+  try {
+    const users = await db.sequelize.query(
+      `SELECT id, firstname, lastname, username, email
+       FROM users
+       WHERE CAST(id AS CHAR) IN (:ids)`,
+      {
+        replacements: { ids },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    for (const u of users || []) {
+      const id = String(u.id || "").trim();
+      if (!id) continue;
+      map[id] = personDisplayName(u) || id;
+    }
+  } catch (err) {
+    console.warn("resolvePayerNames:", err.message);
+  }
+  return map;
+}
+
+async function userCanSeeAllPayBills(facilityId, userId) {
+  const uid = String(userId || "").trim();
+  if (!facilityId || !uid) return false;
+  try {
+    const bizRows = await db.sequelize.query(
+      `SELECT business_admin FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    if (String(bizRows[0]?.business_admin || "") === uid) return true;
+
+    const memRows = await db.sequelize.query(
+      `SELECT functionalities, role
+       FROM membership
+       WHERE business_id = :facilityId
+         AND CAST(user_id AS CHAR) = CAST(:userId AS CHAR)
+       LIMIT 1`,
+      {
+        replacements: { facilityId, userId: uid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const funcs = parseFuncList(memRows[0]?.functionalities);
+    const role = String(memRows[0]?.role || "");
+    if (SUPERUSER_KEYS.some((k) => funcs.includes(k) || role === k)) {
+      return true;
+    }
+    return funcs.includes(SEE_ALL_PAY_BILLS);
+  } catch (err) {
+    console.warn("userCanSeeAllPayBills:", err.message);
+    return false;
+  }
+}
+
 /** Available supplier deposit/advance on prepaid (accrued) GL only. */
 async function getAvailableSupplierAdvance(facilityId, supplierNo, transaction) {
   const balRows = await db.sequelize.query(
@@ -1062,11 +1154,30 @@ exports.createSupplierAdvancePayment = async (req, res) => {
 /** Payment history — all suppliers or filtered by supplierNo. */
 exports.getSupplierAdvanceHistory = async (req, res) => {
   try {
-    const { supplierNo, facilityId, limit = 100 } = req.query;
+    const {
+      supplierNo,
+      facilityId,
+      limit = 100,
+      userId,
+      viewAll,
+      createdBy,
+    } = req.query;
     if (!facilityId) return res.status(400).json({ success: false, message: "facilityId is required" });
 
     const rowLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const filterBySupplier = supplierNo && String(supplierNo).trim();
+    const actorId = String(userId || pickActor(req) || "").trim();
+    const allowedAll = await userCanSeeAllPayBills(facilityId, actorId);
+    const requestedAll =
+      viewAll === "1" ||
+      viewAll === "true" ||
+      String(viewAll || "").toLowerCase() === "yes";
+    const seeAll = allowedAll && (requestedAll || allowedAll);
+    const payerFilter = String(createdBy || "").trim();
+    const filterByCreator = seeAll
+      ? Boolean(payerFilter)
+      : Boolean(actorId);
+    const creatorId = seeAll ? payerFilter : actorId;
 
     const rows = await db.sequelize.query(
       `SELECT
@@ -1080,16 +1191,32 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
          se.type,
          se.mode_of_payment,
          se.receiptNo         AS receipt_no,
-         se.link_id
+         se.link_id,
+         se.created_by,
+         u.firstname AS payer_firstname,
+         u.lastname AS payer_lastname,
+         u.username AS payer_username,
+         u.email AS payer_email
        FROM supplier_entries se
        LEFT JOIN suppliersinfo si ON si.supplier_number = se.supplier_number AND si.facilityId = se.facilityId
+       LEFT JOIN users u ON CAST(u.id AS CHAR) = CAST(se.created_by AS CHAR)
        WHERE se.facilityId = :facilityId
          ${filterBySupplier ? "AND se.supplier_number = :supplierNo" : ""}
+         ${
+           filterByCreator
+             ? "AND CONVERT(se.created_by USING utf8mb4) = CONVERT(:userId USING utf8mb4)"
+             : ""
+         }
          AND (se.type = 'payment' OR se.type IS NULL OR se.type = '')
        ORDER BY se.created_at DESC
        LIMIT :rowLimit`,
       {
-        replacements: { facilityId, ...(filterBySupplier ? { supplierNo: filterBySupplier } : {}), rowLimit },
+        replacements: {
+          facilityId,
+          ...(filterBySupplier ? { supplierNo: filterBySupplier } : {}),
+          ...(filterByCreator ? { userId: creatorId } : {}),
+          rowLimit,
+        },
         type: db.sequelize.QueryTypes.SELECT,
       },
     );
@@ -1107,8 +1234,67 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       );
     }
 
+    let payers = [];
+    if (allowedAll) {
+      try {
+        payers = await db.sequelize.query(
+          `SELECT
+             se.created_by AS id,
+             u.firstname,
+             u.lastname,
+             u.username,
+             u.email
+           FROM supplier_entries se
+           LEFT JOIN users u
+             ON CAST(u.id AS CHAR) = CAST(se.created_by AS CHAR)
+           WHERE se.facilityId = :facilityId
+             AND se.created_by IS NOT NULL
+             AND TRIM(se.created_by) <> ''
+             AND (se.type = 'payment' OR se.type IS NULL OR se.type = '')
+           GROUP BY se.created_by, u.firstname, u.lastname, u.username, u.email
+           ORDER BY se.created_by ASC`,
+          {
+            replacements: { facilityId },
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        );
+      } catch (err) {
+        console.warn("getSupplierAdvanceHistory payers:", err.message);
+        payers = [];
+      }
+    }
+
+    const nameIds = [
+      ...rows.map((r) => r.created_by),
+      ...(payers || []).map((p) => p.id),
+    ];
+    const nameMap = await resolvePayerNames(nameIds);
+
+    const labelFor = (id, row = {}) => {
+      const key = String(id || "").trim();
+      return (
+        nameMap[key] ||
+        personDisplayName({
+          firstname: row.payer_firstname || row.firstname,
+          lastname: row.payer_lastname || row.lastname,
+          username: row.payer_username || row.username,
+          email: row.payer_email || row.email,
+        }) ||
+        key
+      );
+    };
+
     return res.json({
       success: true,
+      see_all: allowedAll,
+      payers: (payers || [])
+        .map((p) => {
+          const id = String(p.id || "").trim();
+          if (!id) return null;
+          return { id, name: labelFor(id, p) };
+        })
+        .filter(Boolean)
+        .sort((a, b) => String(a.name).localeCompare(String(b.name))),
       results: rows.map((r) => ({
         entry_id:        r.entry_id,
         supplier_no:     r.supplier_number || "",
@@ -1119,6 +1305,8 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
         amount:          parseFloat(r.amount) || 0,
         mode_of_payment: r.mode_of_payment || "",
         type:            r.type || "",
+        created_by:      r.created_by || "",
+        created_by_name: labelFor(r.created_by, r),
       })),
       count:             rows.length,
       available_advance: availableAdvance,

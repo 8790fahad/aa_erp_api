@@ -6376,6 +6376,39 @@ exports.getSalesLineReport = async (req, res) => {
        AND inv_vat.facilityId = se.facilityId
       LEFT JOIN (
         SELECT
+          ce.receiptNo,
+          ce.facilityId,
+          COALESCE(
+            MAX(CASE
+              WHEN NULLIF(ce.mode_of_payment, '') IS NOT NULL
+                AND LOWER(TRIM(ce.type)) IN (
+                  'sales', 'service', 'pro-bono', 'payment', 'deposit', 'bank'
+                )
+              THEN ce.mode_of_payment
+            END),
+            MAX(NULLIF(ce.mode_of_payment, ''))
+          ) AS mode_of_payment
+        FROM customer_entries ce
+        WHERE ce.receiptNo IS NOT NULL
+          AND TRIM(ce.receiptNo) != ''
+        GROUP BY ce.receiptNo, ce.facilityId
+      ) ce_mode
+        ON ce_mode.receiptNo = se.reference_number
+       AND ce_mode.facilityId = se.facilityId
+      LEFT JOIN (
+        SELECT
+          gl.reference_number,
+          gl.facility_id,
+          MAX(NULLIF(gl.mode_of_payment, '')) AS mode_of_payment
+        FROM general_ledger gl
+        WHERE gl.reference_number IS NOT NULL
+          AND TRIM(gl.reference_number) != ''
+        GROUP BY gl.reference_number, gl.facility_id
+      ) gl_pay
+        ON gl_pay.reference_number = se.reference_number
+       AND gl_pay.facility_id = se.facilityId
+      LEFT JOIN (
+        SELECT
           se2.reference_number,
           se2.facilityId,
           COALESCE(SUM(
@@ -6452,6 +6485,11 @@ exports.getSalesLineReport = async (req, res) => {
            NULLIF(TRIM(se.inserted_by), ''),
            '—'
          ) AS salesperson_name,
+         COALESCE(
+           NULLIF(ce_mode.mode_of_payment, ''),
+           NULLIF(gl_pay.mode_of_payment, ''),
+           ''
+         ) AS mode_of_payment,
          se.id AS store_entry_id
        ${fromSql}
        WHERE ${whereSql}
@@ -6491,6 +6529,7 @@ exports.getSalesLineReport = async (req, res) => {
         branch_name: row.branch_name || "",
         salesperson_id: row.salesperson_id || "",
         salesperson_name: row.salesperson_name || "—",
+        mode_of_payment: row.mode_of_payment || "",
         store_entry_id: row.store_entry_id,
       };
     });

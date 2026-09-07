@@ -1215,6 +1215,7 @@ const getSupplierBills = async (req, res) => {
       status, // filter by status: "Unpaid", "Partially Paid", or "Unpaid,Partially Paid" (when onlyUnpaid)
       fromDate,
       toDate,
+      billType, // inventory | expense
     } = req.query;
 
     if (!facilityId) {
@@ -1250,6 +1251,17 @@ const getSupplierBills = async (req, res) => {
     if (toDate) {
       whereClause += " AND DATE(i.transaction_date) <= :toDate";
       replacements.toDate = toDate;
+    }
+
+    const billKind = String(billType || "")
+      .trim()
+      .toLowerCase();
+    if (billKind === "inventory") {
+      whereClause +=
+        " AND i.invoice_ref NOT LIKE 'EP-%' AND i.invoice_ref NOT LIKE 'DE/%'";
+    } else if (billKind === "expense") {
+      whereClause +=
+        " AND (i.invoice_ref LIKE 'EP-%' OR i.invoice_ref LIKE 'DE/%')";
     }
 
     // Base query to fetch invoices with supplier info, payment status, and available advance
@@ -1393,6 +1405,10 @@ const getSupplierBills = async (req, res) => {
           NULLIF(gl_mode.mode_of_payment, ''),
           'credit'
         ) AS mode_of_payment,
+        CASE
+          WHEN i.invoice_ref LIKE 'EP-%' OR i.invoice_ref LIKE 'DE/%' THEN 'expense'
+          ELSE 'inventory'
+        END AS bill_type,
         CASE
           WHEN COALESCE(payments.total_paid, 0) >= i.amount THEN 'Paid'
           WHEN COALESCE(payments.total_paid, 0) > 0 THEN 'Partially Paid'
