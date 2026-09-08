@@ -801,6 +801,7 @@ module.exports = (app) => {
 
   // Account Ledger Report
   app.post("/account/account-ledger-report", account.getAccountLedgerReport);
+  app.get("/account/vat-head-position", account.getVatHeadPosition);
 
   // Invoice correction (sync invoices + general_ledger)
   app.get(

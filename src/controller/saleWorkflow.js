@@ -726,6 +726,67 @@ function saleCodesMatch(a, b) {
   return normalizeSaleCode(a).toUpperCase() === normalizeSaleCode(b).toUpperCase();
 }
 
+const POST_COLLECTION_STATUSES = new Set([
+  "payment_confirmed",
+  "credit_approved",
+  "invoice_separation",
+  "final_invoice",
+  "warehouse_picking",
+  "dual_signature",
+  "goods_released",
+  "completed",
+  "cancelled",
+  "reversed",
+]);
+
+function processorLabelFromHistory(history) {
+  const list = normalizeHistory(history);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const h = list[i];
+    const named = String(h?.collection?.by_name || h?.by_name || "").trim();
+    if (named) return named;
+    const note = String(h?.note || "");
+    const collectedBy = note.match(/\sby\s+([^.,;]+)/i);
+    if (collectedBy?.[1]) {
+      const who = collectedBy[1].replace(/\s+/g, " ").trim();
+      if (who && who.length < 80) return who;
+    }
+  }
+  return null;
+}
+
+function alreadyProcessedCollection(row) {
+  if (!row) return null;
+  const status = String(row.status || "").toLowerCase();
+  if (!POST_COLLECTION_STATUSES.has(status)) return null;
+  const who = processorLabelFromHistory(row.history);
+  const reversed = status === "cancelled" || status === "reversed";
+  const code = normalizeSaleCode(row.sale_code);
+  return {
+    already_processed: true,
+    collectable: false,
+    processed_by: who,
+    status,
+    message: reversed
+      ? `Invoice ${code} has been reversed and cannot be processed.`
+      : who
+        ? `This invoice is already processed by ${who}.`
+        : "This invoice is already processed.",
+  };
+}
+
+function alreadyProcessedHttpBody(processed) {
+  return {
+    success: false,
+    already_processed: true,
+    code: "ALREADY_PROCESSED",
+    message: processed?.message || "This invoice is already processed.",
+    processed_by: processed?.processed_by || null,
+  };
+}
+
+exports.alreadyProcessedCollection = alreadyProcessedCollection;
+
 async function findLockedWorkflowForCollection({
   facilityId,
   saleCode,
@@ -753,6 +814,16 @@ async function findLockedWorkflowForCollection({
     return {
       error: `Invoice mismatch — collection was not applied to ${code}`,
       status: 409,
+    };
+  }
+  const processed = alreadyProcessedCollection(row);
+  if (processed) {
+    return {
+      error: processed.message,
+      status: 409,
+      already_processed: true,
+      code: "ALREADY_PROCESSED",
+      processed_by: processed.processed_by,
     };
   }
   return { row };
@@ -1464,8 +1535,12 @@ exports.getSaleWorkflow = async (req, res) => {
         message: "facilityId and saleCode are required",
       });
     }
+    const code = normalizeSaleCode(saleCode);
     const row = await db.SaleWorkflow.findOne({
-      where: { facility_id: facilityId, sale_code: saleCode },
+      where: {
+        facility_id: facilityId,
+        sale_code: code,
+      },
     });
     if (!row) {
       return res.status(404).json({
@@ -1474,18 +1549,32 @@ exports.getSaleWorkflow = async (req, res) => {
       });
     }
     const plain = row.toJSON();
+    const history = normalizeHistory(plain.history);
     const next = nextStageFor(plain.status, plain.payment_type);
     const meta = stageMeta(plain.status);
+    const processed = alreadyProcessedCollection({ ...plain, history });
+    const status = String(plain.status || "").toLowerCase();
+    const collectable =
+      !processed &&
+      (status === "awaiting_cashier_confirm" || status === "awaiting_payment");
     return res.json({
       success: true,
+      already_processed: Boolean(processed),
+      collectable,
+      message: processed?.message || undefined,
       results: {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         next_status: next,
         next_status_label: stageMeta(next)?.label || null,
         stage_path: stagesForPaymentType(plain.payment_type),
+        split_progress: buildSplitProgressForRow({ ...plain, history }),
+        already_processed: Boolean(processed),
+        collectable,
+        processed_by: processed?.processed_by || null,
+        processed_message: processed?.message || null,
       },
     });
   } catch (err) {
@@ -1520,6 +1609,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
     const row = await db.SaleWorkflow.findOne({
       where: { facility_id: facilityId, sale_code: saleCode },
       transaction,
+      lock: transaction.LOCK.UPDATE,
     });
     if (!row) {
       await transaction.rollback();
@@ -1527,6 +1617,15 @@ exports.advanceSaleWorkflow = async (req, res) => {
         success: false,
         message: "Workflow not found",
       });
+    }
+
+    const actionNorm = String(action || "advance").toLowerCase();
+    if (actionNorm !== "set_status" && actionNorm !== "hold_overnight") {
+      const processed = alreadyProcessedCollection(row);
+      if (processed) {
+        await transaction.rollback();
+        return res.status(409).json(alreadyProcessedHttpBody(processed));
+      }
     }
 
     if (action === "send_remainder_to_credit") {
@@ -1905,6 +2004,98 @@ exports.advanceSaleWorkflow = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: err.message || "Failed to advance workflow",
+    });
+  }
+};
+
+/**
+ * Cheap pending-invoice fingerprint for Verification Points live sync.
+ * Other cashiers poll this; when the queue changes they refresh the dashboard.
+ */
+exports.getCashierQueueSnapshot = async (req, res) => {
+  try {
+    const { facilityId, branchId, userId, role } = req.query;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+
+    const startOfDay = moment().startOf("day").toDate();
+    const endOfDay = moment().endOf("day").toDate();
+    const where = {
+      facility_id: facilityId,
+      status: [
+        "awaiting_cashier_confirm",
+        "awaiting_payment",
+        "awaiting_credit_approval",
+        "awaiting_discount_approval",
+        "awaiting_payment_mode_approval",
+        "awaiting_payment_method",
+      ],
+      created_at: { [Op.between]: [startOfDay, endOfDay] },
+    };
+    if (branchId && branchId !== "all") {
+      const bid = parseInt(branchId, 10);
+      if (Number.isFinite(bid) && bid > 0) where.branch_id = bid;
+    }
+    const roleNorm = String(role || "").toLowerCase().trim();
+    const isCashierRole =
+      roleNorm === "cashier" ||
+      roleNorm === "casher" ||
+      roleNorm.includes("cashier") ||
+      roleNorm.includes("casher");
+    const cashierUserId =
+      userId != null && String(userId).trim() ? String(userId).trim() : "";
+    if (isCashierRole && cashierUserId) {
+      where[Op.or] = [
+        { assigned_cashier_id: cashierUserId },
+        { assigned_cashier_id: null },
+        { assigned_cashier_id: "" },
+      ];
+    }
+
+    const rows = await db.SaleWorkflow.findAll({
+      attributes: ["sale_code", "status", "updated_at"],
+      where,
+      raw: true,
+      limit: 200,
+    });
+
+    const items = (rows || [])
+      .map((r) => ({
+        sale_code: normalizeSaleCode(r.sale_code),
+        status: String(r.status || ""),
+        updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : "",
+      }))
+      .filter((r) => r.sale_code)
+      .sort((a, b) => a.sale_code.localeCompare(b.sale_code));
+
+    const codes = items.map((r) => r.sale_code);
+    const stamp = items
+      .map((r) => `${r.sale_code}:${r.status}:${r.updated_at}`)
+      .join("|");
+
+    return res.json({
+      success: true,
+      results: {
+        codes,
+        stamp,
+        count: codes.length,
+      },
+    });
+  } catch (err) {
+    console.error("getCashierQueueSnapshot:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to load queue snapshot",
     });
   }
 };
@@ -3157,6 +3348,9 @@ exports.cashierConfirmPayment = async (req, res) => {
       return res.status(locked.status || 400).json({
         success: false,
         message: locked.error,
+        already_processed: Boolean(locked.already_processed),
+        code: locked.code || undefined,
+        processed_by: locked.processed_by || undefined,
       });
     }
     const row = locked.row;
@@ -3349,9 +3543,11 @@ exports.cashierConfirmPayment = async (req, res) => {
       );
       if (remaining <= 0.05) {
         await transaction.rollback();
-        return res.status(400).json({
+        return res.status(409).json({
           success: false,
-          message: "This invoice is already fully collected",
+          already_processed: true,
+          code: "ALREADY_PROCESSED",
+          message: "This invoice is already processed.",
         });
       }
       const paidNow = rawSplits.reduce(
@@ -3789,6 +3985,9 @@ exports.sendCreditRemainder = async (req, res) => {
       return res.status(locked.status || 400).json({
         success: false,
         message: locked.error,
+        already_processed: Boolean(locked.already_processed),
+        code: locked.code || undefined,
+        processed_by: locked.processed_by || undefined,
       });
     }
     const row = locked.row;

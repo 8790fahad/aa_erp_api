@@ -28,6 +28,18 @@ const {
   parseCreditLimitValue,
 } = require("../utils/customerKind");
 
+function resolveVendorType(value) {
+  const resolved = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (resolved === "expenses") return "expense";
+  if (resolved === "inventories") return "inventory";
+  if (resolved === "inventory" || resolved === "expense" || resolved === "all") {
+    return resolved;
+  }
+  return "all";
+}
+
 // Get customer entries by receiptNo
 exports.getCustomerEntriesByReceiptNo = async (req, res) => {
   try {
@@ -1642,6 +1654,7 @@ exports.CreateSupplierUpload = async (req, res) => {
           payable_code,
           payable_accural_code,
           branch_id,
+          vendor_type,
         } = item;
 
         const parsedBranchId =
@@ -1688,6 +1701,7 @@ exports.CreateSupplierUpload = async (req, res) => {
             payable_code,
             payable_accural_code: payable_accural_code || null,
             branch_id: parsedBranchId,
+            vendor_type: resolveVendorType(vendor_type),
             date: moment().format("YYYY-MM-DD"),
           },
           { transaction },
@@ -5462,8 +5476,28 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
               sale_code: invoice_ref,
             },
             transaction: t,
+            lock: t.LOCK.UPDATE,
           });
-          if (wf) leftover = leftoverAfterCollections(wf);
+          if (wf) {
+            const wfStatus = String(wf.status || "").toLowerCase();
+            if (
+              [
+                "payment_confirmed",
+                "credit_approved",
+                "invoice_separation",
+                "final_invoice",
+                "warehouse_picking",
+                "dual_signature",
+                "goods_released",
+                "completed",
+                "cancelled",
+                "reversed",
+              ].includes(wfStatus)
+            ) {
+              throw new Error("This invoice is already processed.");
+            }
+            leftover = leftoverAfterCollections(wf);
+          }
         }
         const applyAmt = Math.min(amount, remainingPool, leftover);
         if (applyAmt <= 0.05) {
@@ -5637,7 +5671,7 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
   } catch (error) {
     console.error("applyCustomerAdvanceToInvoices:", error);
     const msg = String(error?.message || "");
-    if (/leftover|Invoice mismatch/i.test(msg)) {
+    if (/leftover|Invoice mismatch|already processed/i.test(msg)) {
       return res.status(400).json({ success: false, error: msg });
     }
     return res.status(500).json({

@@ -1592,6 +1592,7 @@ exports.getSaleByCode = async (req, res) => {
 
     let workflowPaymentType = null;
     let workflowAmount = null;
+    let workflowStatus = null;
     let workflowHistory = [];
     let workflowPaymentModes = [];
     let creditPaidFromWorkflow = 0;
@@ -1613,6 +1614,7 @@ exports.getSaleByCode = async (req, res) => {
           workflowPaymentType = wf.payment_type || null;
           workflowAmount =
             wf.amount != null ? Number(wf.amount) : null;
+          workflowStatus = wf.status || null;
           workflowHistory = normalizeHistory(wf.history);
           workflowPaymentModes = paymentModesFromHistory(workflowHistory);
           const progress = getSplitCollectionProgress(workflowHistory);
@@ -1858,6 +1860,7 @@ exports.getSaleByCode = async (req, res) => {
         warehouses: warehouseNames,
         mode_of_payment: modeOfPayment,
         payment_modes: selectedModes,
+        workflow_status: workflowStatus,
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
@@ -1872,10 +1875,12 @@ exports.getSaleByCode = async (req, res) => {
         customer: customer
           ? {
               customer_name: customer.fullname,
+              fullname: customer.fullname,
               customerNo: customer.customerNo,
               address: customer.address,
               phone: customer.phone,
               email: customer.email,
+              customer_type: customer.customer_type,
             }
           : null,
         business: {
@@ -2773,6 +2778,197 @@ export const calculateValuation = async (
  *    receivable_accural_code (no request/business fallbacks).
  * ============================================================================
  */
+
+const EDITABLE_SALES_INVOICE_STATUSES = new Set([
+  "sales_order",
+  "invoice_generated",
+  "submitted",
+  "awaiting_payment",
+  "awaiting_cashier_confirm",
+  "awaiting_discount_approval",
+  "awaiting_credit_approval",
+  "awaiting_payment_mode_approval",
+  "awaiting_payment_method",
+]);
+
+function isEditableSalesInvoiceStatus(status) {
+  if (status == null || String(status).trim() === "") return true;
+  return EDITABLE_SALES_INVOICE_STATUSES.has(
+    String(status).toLowerCase().trim(),
+  );
+}
+
+function saleEditError(message, statusCode = 400) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+const SUPERUSER_KEYS = ["Administrator", "Super Administrator", "Admin"];
+const EDIT_INVOICE_PRIVILEGE = "Edit Invoice";
+
+function parseFuncList(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    return value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+async function userCanEditSalesInvoice(facilityId, userId) {
+  const uid = String(userId || "").trim();
+  if (!facilityId || !uid) return false;
+  try {
+    const bizRows = await db.sequelize.query(
+      `SELECT business_admin FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    if (String(bizRows[0]?.business_admin || "") === uid) return true;
+
+    const memRows = await db.sequelize.query(
+      `SELECT functionalities, role
+       FROM membership
+       WHERE business_id = :facilityId
+         AND CAST(user_id AS CHAR) = CAST(:userId AS CHAR)
+       LIMIT 1`,
+      {
+        replacements: { facilityId, userId: uid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const funcs = parseFuncList(memRows[0]?.functionalities);
+    const role = String(memRows[0]?.role || "");
+    if (SUPERUSER_KEYS.some((k) => funcs.includes(k) || role === k)) {
+      return true;
+    }
+    return funcs.includes(EDIT_INVOICE_PRIVILEGE);
+  } catch (err) {
+    console.warn("userCanEditSalesInvoice:", err.message);
+    return false;
+  }
+}
+
+/** Wipe an existing sales invoice so createSale can reuse the same INV number. */
+async function clearExistingSaleForEdit(facilityId, saleCode, transaction) {
+  const normalizedRef = String(saleCode || "").trim();
+  if (!facilityId || !normalizedRef) {
+    throw saleEditError("facilityId and edit_sale_code are required");
+  }
+
+  const wf = db.SaleWorkflow
+    ? await db.SaleWorkflow.findOne({
+        where: { facility_id: facilityId, sale_code: normalizedRef },
+        attributes: ["id", "status"],
+        transaction,
+      })
+    : null;
+
+  if (wf && !isEditableSalesInvoiceStatus(wf.status)) {
+    throw saleEditError(
+      "This invoice cannot be edited after payment or warehouse processing. Issue a credit note instead.",
+      409,
+    );
+  }
+
+  const invoice = await db.Invoice.findOne({
+    where: { facility_id: facilityId, invoice_ref: normalizedRef },
+    transaction,
+  });
+
+  if (invoice && String(invoice.type || "").toLowerCase() !== "sales") {
+    throw saleEditError("Only sales invoices can be edited here");
+  }
+
+  const customerCount = await db.CustomerEntry.count({
+    where: {
+      facilityId,
+      [Op.or]: [{ receiptNo: normalizedRef }, { link_id: normalizedRef }],
+    },
+    transaction,
+  });
+
+  if (!invoice && !wf && !customerCount) {
+    throw saleEditError("Invoice not found", 404);
+  }
+
+  if (db.SaleFulfillment) {
+    const packs = await db.SaleFulfillment.findAll({
+      where: { facility_id: facilityId, sale_code: normalizedRef },
+      attributes: ["id", "status"],
+      transaction,
+    });
+    const lockedPack = packs.some((p) =>
+      ["collecting", "collected"].includes(
+        String(p.status || "").toLowerCase(),
+      ),
+    );
+    if (lockedPack) {
+      throw saleEditError(
+        "This invoice cannot be edited after warehouse collection has started. Issue a credit note instead.",
+        409,
+      );
+    }
+    const ids = packs.map((p) => p.id);
+    if (ids.length && db.SaleFulfillmentLine) {
+      await db.SaleFulfillmentLine.destroy({
+        where: { fulfillment_id: { [Op.in]: ids } },
+        transaction,
+      });
+    }
+    await db.SaleFulfillment.destroy({
+      where: { facility_id: facilityId, sale_code: normalizedRef },
+      transaction,
+    });
+  }
+
+  if (db.SaleWorkflow) {
+    await db.SaleWorkflow.destroy({
+      where: { facility_id: facilityId, sale_code: normalizedRef },
+      transaction,
+    });
+  }
+
+  if (db.CustomerCopy) {
+    await db.CustomerCopy.destroy({
+      where: { facilityId, reference_id: normalizedRef },
+      transaction,
+    });
+  }
+
+  await db.GeneralLedger.destroy({
+    where: { facility_id: facilityId, reference_number: normalizedRef },
+    transaction,
+  });
+
+  if (db.StoreEntry) {
+    await db.StoreEntry.destroy({
+      where: { facilityId, reference_number: normalizedRef },
+      transaction,
+    });
+  }
+
+  await db.CustomerEntry.destroy({
+    where: {
+      facilityId,
+      [Op.or]: [{ receiptNo: normalizedRef }, { link_id: normalizedRef }],
+    },
+    transaction,
+  });
+
+  if (invoice) {
+    await db.Invoice.destroy({
+      where: { facility_id: facilityId, invoice_ref: normalizedRef },
+      transaction,
+    });
+  }
+}
+
 exports.createSale = async (req, res) => {
   const t = await db.sequelize.transaction();
   let saleRef, saleDate;
@@ -2812,6 +3008,8 @@ exports.createSale = async (req, res) => {
       assigned_cashier_name = null,
       cashier_user_id = null,
       cashier_name = null,
+      edit_sale_code = null,
+      existing_sale_code = null,
     } = req.body;
 
     let discount_amount =
@@ -3087,7 +3285,31 @@ exports.createSale = async (req, res) => {
     saleDate = transaction_date || saleDateFromClient
       ? moment(transaction_date || saleDateFromClient).format("YYYY-MM-DD")
       : moment().format("YYYY-MM-DD");
-    saleRef = `INV-${await getAndUpdateNumber("sale", facilityId)}`;
+    const editSaleCode = String(edit_sale_code || existing_sale_code || "").trim();
+    if (editSaleCode) {
+      const editorId = created_by || req.user?.id || req.user?.user_id;
+      const allowed = await userCanEditSalesInvoice(facilityId, editorId);
+      if (!allowed) {
+        await t.rollback();
+        return res.status(403).json({
+          success: false,
+          message:
+            "You do not have permission to edit invoices. Ask an admin to grant Edit Invoice under Verification Points.",
+        });
+      }
+      try {
+        await clearExistingSaleForEdit(facilityId, editSaleCode, t);
+        saleRef = editSaleCode;
+      } catch (editErr) {
+        await t.rollback();
+        return res.status(editErr.statusCode || 400).json({
+          success: false,
+          message: editErr.message || "Cannot edit this invoice",
+        });
+      }
+    } else {
+      saleRef = `INV-${await getAndUpdateNumber("sale", facilityId)}`;
+    }
 
     // branchId comes directly from the frontend (integer)
     let saleBranchId = parseInt(sale_branch_id, 10) || 0;
@@ -6783,6 +7005,221 @@ exports.getPurchaseLineReport = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error fetching purchase line report",
+      error: err.message,
+    });
+  }
+};
+
+/**
+ * Input VAT report — purchase/expense bill lines with VAT
+ * (supplier_entries), same idea as sales VAT Report.
+ * GET /api/v1/transactions/input-vat-report?facilityId=&userId=&fromDate=&toDate=&search=
+ */
+exports.getInputVatReport = async (req, res) => {
+  try {
+    const {
+      facilityId,
+      userId,
+      fromDate,
+      toDate,
+      search = "",
+      page,
+      pageSize,
+    } = req.query;
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "userId is required",
+      });
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(500, Math.max(1, parseInt(pageSize, 10) || 100));
+    const offset = (pageNum - 1) * limitNum;
+
+    const replacements = {
+      facilityId,
+      userId: String(userId),
+      limit: limitNum,
+      offset,
+    };
+
+    const lineTotalSql = `CASE
+      WHEN COALESCE(se.qty_in, 0) > 0 THEN se.qty_in * COALESCE(se.cost, 0)
+      ELSE COALESCE(se.cost, 0)
+    END`;
+
+    const whereParts = [
+      "se.facilityId = :facilityId",
+      "LOWER(TRIM(COALESCE(se.type, ''))) IN ('purchase', 'service')",
+      "se.receiptNo IS NOT NULL",
+      "TRIM(se.receiptNo) != ''",
+    ];
+
+    if (fromDate && String(fromDate).trim()) {
+      whereParts.push(
+        "DATE(COALESCE(i.transaction_date, se.transaction_date, se.created_at)) >= :fromDate",
+      );
+      replacements.fromDate = String(fromDate).trim();
+    }
+    if (toDate && String(toDate).trim()) {
+      whereParts.push(
+        "DATE(COALESCE(i.transaction_date, se.transaction_date, se.created_at)) <= :toDate",
+      );
+      replacements.toDate = String(toDate).trim();
+    }
+
+    const searchTerm = String(search || "").trim();
+    if (searchTerm) {
+      whereParts.push(`(
+        se.receiptNo LIKE :search
+        OR COALESCE(s.supplier_name, '') LIKE :search
+        OR COALESCE(se.supplier_number, '') LIKE :search
+        OR COALESCE(se.description, '') LIKE :search
+        OR COALESCE(se.link_id, '') LIKE :search
+      )`);
+      replacements.search = `%${searchTerm}%`;
+    }
+
+    const whereSql = whereParts.join(" AND ");
+
+    const fromSql = `
+      FROM supplier_entries se
+      LEFT JOIN invoices i
+        ON i.facility_id = se.facilityId
+       AND i.invoice_ref = se.receiptNo
+       AND LOWER(TRIM(COALESCE(i.type, ''))) IN ('purchase', 'expenses')
+      LEFT JOIN suppliersinfo s
+        ON s.facilityId = se.facilityId
+       AND s.supplier_number = se.supplier_number
+      LEFT JOIN (
+        SELECT
+          receiptNo,
+          facilityId,
+          COALESCE(SUM(cost), 0) AS tax_total
+        FROM supplier_entries
+        WHERE LOWER(TRIM(COALESCE(type, ''))) = 'tax'
+        GROUP BY receiptNo, facilityId
+      ) inv_tax
+        ON inv_tax.receiptNo = se.receiptNo
+       AND inv_tax.facilityId = se.facilityId
+      LEFT JOIN (
+        SELECT
+          receiptNo,
+          facilityId,
+          COALESCE(SUM(
+            CASE
+              WHEN COALESCE(qty_in, 0) > 0 THEN qty_in * COALESCE(cost, 0)
+              ELSE COALESCE(cost, 0)
+            END
+          ), 0) AS goods_total
+        FROM supplier_entries
+        WHERE LOWER(TRIM(COALESCE(type, ''))) IN ('purchase', 'service')
+        GROUP BY receiptNo, facilityId
+      ) inv_goods
+        ON inv_goods.receiptNo = se.receiptNo
+       AND inv_goods.facilityId = se.facilityId
+    `;
+
+    const vatSql = `CASE
+      WHEN COALESCE(se.vat_amount, 0) > 0.0001 THEN COALESCE(se.vat_amount, 0)
+      WHEN COALESCE(inv_goods.goods_total, 0) > 0.0001
+        THEN COALESCE(inv_tax.tax_total, 0) * ((${lineTotalSql}) / inv_goods.goods_total)
+      ELSE 0
+    END`;
+
+    const countRows = await db.sequelize.query(
+      `SELECT COUNT(*) AS total ${fromSql} WHERE ${whereSql}`,
+      {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const totalCount = parseInt(countRows[0]?.total || 0, 10);
+
+    const rows = await db.sequelize.query(
+      `SELECT
+         se.receiptNo AS invoice_no,
+         COALESCE(i.transaction_date, se.transaction_date, se.created_at) AS invoice_date,
+         COALESCE(s.supplier_name, se.supplier_number, '—') AS supplier_name,
+         COALESCE(se.supplier_number, i.ref_number, '') AS supplier_no,
+         COALESCE(NULLIF(TRIM(se.description), ''), se.link_id, '—') AS product_name,
+         COALESCE(se.link_id, '') AS product_sku,
+         CASE WHEN COALESCE(se.qty_in, 0) > 0 THEN se.qty_in ELSE 1 END AS qty,
+         COALESCE(se.cost, 0) AS unit_price,
+         ${lineTotalSql} AS line_total,
+         ${vatSql} AS vat_amount,
+         COALESCE(se.mode_of_payment, '') AS mode_of_payment,
+         COALESCE(i.type, 'purchase') AS bill_type,
+         se.entry_id
+       ${fromSql}
+       WHERE ${whereSql}
+       ORDER BY
+         COALESCE(i.transaction_date, se.transaction_date, se.created_at) DESC,
+         se.receiptNo DESC,
+         se.entry_id ASC
+       LIMIT :limit OFFSET :offset`,
+      {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const results = rows.map((row) => {
+      const lineTotal = parseFloat(row.line_total || 0) || 0;
+      const vatAmount = parseFloat(row.vat_amount || 0) || 0;
+      return {
+        invoice_no: row.invoice_no,
+        invoice_date: row.invoice_date,
+        supplier_name: row.supplier_name || "",
+        supplier_no: row.supplier_no || "",
+        customer_name: row.supplier_name || "",
+        customer_no: row.supplier_no || "",
+        product_name: row.product_name || "—",
+        product_sku: row.product_sku || "",
+        qty: parseFloat(row.qty || 0) || 0,
+        unit_price: parseFloat(row.unit_price || 0) || 0,
+        line_total: lineTotal,
+        vat_amount: vatAmount,
+        vat: vatAmount,
+        total_incl_vat: lineTotal + vatAmount,
+        mode_of_payment: row.mode_of_payment || "",
+        bill_type: row.bill_type || "purchase",
+        entry_id: row.entry_id,
+      };
+    });
+
+    const lineTotalSum = results.reduce((s, r) => s + r.line_total, 0);
+    const vatSum = results.reduce((s, r) => s + r.vat_amount, 0);
+
+    return res.json({
+      success: true,
+      results,
+      count: results.length,
+      totalCount,
+      page: pageNum,
+      pageSize: limitNum,
+      totalPages: Math.ceil(totalCount / limitNum) || 0,
+      summary: {
+        line_total: lineTotalSum,
+        vat_amount: vatSum,
+        total_incl_vat: lineTotalSum + vatSum,
+      },
+      userId: String(userId),
+      source: "supplier_entries",
+    });
+  } catch (err) {
+    console.error("getInputVatReport error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching Input VAT report",
       error: err.message,
     });
   }

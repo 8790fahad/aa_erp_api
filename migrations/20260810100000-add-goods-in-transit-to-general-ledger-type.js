@@ -3,8 +3,11 @@
 /**
  * Add goods_in_transit / git to general_ledger.type for supplier deposit → GIT.
  *
- * Production deploy runs migrations/ (repo root), not this folder.
- * Keep this file in sync with migrations/20260810100000-add-goods-in-transit-to-general-ledger-type.js
+ * Production deploy runs this folder (migrations/), not src/migrations/.
+ * Reads the live ENUM and appends missing values so we do not drop existing ones.
+ *
+ * MySQL revalidates the table on MODIFY. Older general_ledger rows can have
+ * zero-date timestamps which fail under NO_ZERO_DATE — relax sql_mode briefly.
  */
 
 function parseEnumValues(columnType) {

@@ -2,6 +2,10 @@ module.exports = (app) => {
   const saleWorkflow = require("../controller/saleWorkflow");
 
   app.get("/api/v1/sale-workflows/stages", saleWorkflow.getWorkflowStages);
+  app.get(
+    "/api/v1/sale-workflows/cashier-queue-snapshot",
+    saleWorkflow.getCashierQueueSnapshot,
+  );
   app.get("/api/v1/sale-workflows/cashier-dashboard", saleWorkflow.getCashierDashboard);
   app.get(
     "/api/v1/sale-workflows/separation-dashboard",

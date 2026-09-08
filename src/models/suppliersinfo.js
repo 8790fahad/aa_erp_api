@@ -176,6 +176,11 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.INTEGER,
         allowNull: true,
       },
+      vendor_type: {
+        type: DataTypes.STRING(20),
+        allowNull: true,
+        validate: { isIn: [["inventory", "expense", "all"]] },
+      },
       // other_payable_code: {
       //   type: DataTypes.STRING(50),
       //   allowNull: true,

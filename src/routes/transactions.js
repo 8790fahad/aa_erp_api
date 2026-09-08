@@ -330,6 +330,10 @@ module.exports = (app) => {
     transactions.getPurchaseLineReport
   );
   app.get(
+    "/api/v1/transactions/input-vat-report",
+    transactions.getInputVatReport
+  );
+  app.get(
     "/api/v1/transactions/sale-taxes/:saleReference",
     transactions.getSaleTaxes
   );

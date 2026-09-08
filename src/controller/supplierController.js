@@ -13,6 +13,59 @@ const {
 } = require("../services/activityAuditService");
 // const { getAndUpdateNumber } = require("../services/numberGen");
 
+const ALLOWED_VENDOR_TYPES = ["inventory", "expense", "all"];
+
+function resolveVendorType(value) {
+  const resolved = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (resolved === "expenses") return "expense";
+  if (resolved === "inventories") return "inventory";
+  return ALLOWED_VENDOR_TYPES.includes(resolved) ? resolved : null;
+}
+
+function parseVendorTypeList(value) {
+  return [
+    ...new Set(
+      String(value || "")
+        .split(",")
+        .map(resolveVendorType)
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function applyVendorTypeWhere(whereClause, { vendorType, vendorTypes }) {
+  const permissionTypes = parseVendorTypeList(vendorTypes);
+  const billType = resolveVendorType(vendorType);
+  const permissionIsAll =
+    permissionTypes.includes("inventory") &&
+    permissionTypes.includes("expense") &&
+    permissionTypes.includes("all");
+
+  let types = null;
+  if (permissionTypes.length && !permissionIsAll) {
+    types = permissionTypes;
+  }
+
+  if (billType === "inventory" || billType === "expense") {
+    const billSet = [billType, "all"];
+    types = types ? billSet.filter((t) => types.includes(t)) : billSet;
+  }
+
+  if (types && types.length === 0) {
+    whereClause.vendor_type = "__none__";
+    return;
+  }
+  if (!types || !types.length) return;
+
+  const or = types.map((t) => ({ vendor_type: t }));
+  if (types.includes("all")) {
+    or.push({ vendor_type: null }, { vendor_type: "" });
+  }
+  whereClause[Op.and] = [...(whereClause[Op.and] || []), { [Op.or]: or }];
+}
+
 exports.createSupplier = async (req, res) => {
   const transaction = await db.sequelize.transaction();
 
@@ -43,6 +96,7 @@ exports.createSupplier = async (req, res) => {
       billing_address,
       shipping_address,
       contact_persons = [],
+      vendor_type,
     } = req.body;
 
     const userId = created_by || req.user?.id || null;
@@ -57,6 +111,15 @@ exports.createSupplier = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "fullname, facilityId and payable_code are required",
+      });
+    }
+
+    const vendorType = resolveVendorType(vendor_type);
+    if (!vendorType) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "vendor_type is required (inventory, expense, or all)",
       });
     }
 
@@ -94,6 +157,7 @@ exports.createSupplier = async (req, res) => {
         payable_code: payable_code || null,
         payable_accural_code: advance_code || null,
         branch_id: parsedBranchId,
+        vendor_type: vendorType,
         date: moment().format("YYYY-MM-DD"),
       },
       { transaction },
@@ -356,7 +420,15 @@ exports.createSupplier = async (req, res) => {
  */
 exports.getAllSuppliers = async (req, res) => {
   try {
-    const { facilityId, status, search, page = 1, limit = 50 } = req.query;
+    const {
+      facilityId,
+      status,
+      search,
+      page = 1,
+      limit = 50,
+      vendorType,
+      vendorTypes,
+    } = req.query;
 
     if (!facilityId) {
       return res.status(400).json({
@@ -382,6 +454,8 @@ exports.getAllSuppliers = async (req, res) => {
         { email: { [Op.like]: `%${search}%` } },
       ];
     }
+
+    applyVendorTypeWhere(whereClause, { vendorType, vendorTypes });
 
     const { count, rows: suppliers } = await db.SuppliersInfo.findAndCountAll({
       where: whereClause,
@@ -509,6 +583,7 @@ exports.updateSupplier = async (req, res) => {
       billing_address,
       shipping_address,
       contact_persons = [],
+      vendor_type,
     } = req.body;
 
     if (!supplier_number || !facilityId) {
@@ -584,6 +659,21 @@ exports.updateSupplier = async (req, res) => {
         branch_id == null || branch_id === "" || branch_id === "all"
           ? null
           : parseInt(branch_id, 10) || null;
+    }
+
+    if (vendor_type !== undefined) {
+      const resolved = resolveVendorType(vendor_type);
+      if (resolved) {
+        updateData.vendor_type = resolved;
+      } else if (!String(vendor_type || "").trim()) {
+        updateData.vendor_type = null;
+      } else {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "vendor_type must be inventory, expense, or all",
+        });
+      }
     }
 
     await supplier.update(updateData, { transaction });
@@ -805,6 +895,7 @@ exports.bulkCreateSuppliers = async (req, res) => {
           payable_accural_code,
           other_payable_code,
           branch_id,
+          vendor_type,
         } = suppliers[i];
 
         const parsedBranchId =
@@ -851,6 +942,7 @@ exports.bulkCreateSuppliers = async (req, res) => {
             payable_accural_code: payable_accural_code || null,
             branch_id: parsedBranchId,
             other_payable_code: other_payable_code || null,
+            vendor_type: resolveVendorType(vendor_type) || "all",
             date: moment().format("YYYY-MM-DD"),
           },
           { transaction },

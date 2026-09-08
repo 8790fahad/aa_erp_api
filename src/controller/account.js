@@ -9663,6 +9663,7 @@ exports.updatePayableCode = async (req, res) => {
         updateFields.scrap_inventory_account = head;
         break;
       case "VAT Account":
+      case "VAT Recoverable":
         updateFields.vat_account_code = head;
         break;
       default:
@@ -15506,6 +15507,8 @@ exports.directExpenses = async (req, res) => {
     cheque_number,
     skip_invoice, // when true (e.g. imprest UI), do not create a purchase `invoices` row
     till_mode,
+    supplier_number,
+    supplier_name,
   } = req.body;
   console.log(req.body);
   // === VALIDATIONS ===
@@ -15971,6 +15974,8 @@ exports.directExpenses = async (req, res) => {
           vat_policy: vatPolicy,
           created_by_name: createdByName,
           created_by_id: userId != null ? String(userId) : null,
+          supplier_number: supplier_number || null,
+          supplier_name: supplier_name || null,
           till_mode:
             String(till_mode || "").toLowerCase() === "card" ||
             String(till_mode || "").toLowerCase() === "transfer" ||
@@ -20325,6 +20330,108 @@ exports.getAccountLedgerReport = async (req, res) => {
   } catch (error) {
     console.error("Error generating account ledger report:", error);
     return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * VAT position for one GL head (VAT Recoverable).
+ * Input VAT = debits on that head, Output VAT = credits on that head.
+ * GET /account/vat-head-position?facilityId=&head=&fromDate=&toDate=
+ */
+exports.getVatHeadPosition = async (req, res) => {
+  try {
+    const facilityId = req.query.facilityId || req.body.facilityId;
+    const fromDate = req.query.fromDate || req.body.fromDate;
+    const toDate = req.query.toDate || req.body.toDate;
+    let head = String(req.query.head || req.body.head || "").trim();
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    if (!head) {
+      const business = await db.business.findOne({
+        where: { id: facilityId },
+        attributes: ["vat_account_code"],
+        raw: true,
+      });
+      head = String(business?.vat_account_code || "").trim();
+    }
+
+    if (!head) {
+      return res.json({
+        success: true,
+        head: "",
+        description: "",
+        input_vat: 0,
+        output_vat: 0,
+        amount_to_pay: 0,
+        recoverable: 0,
+        line_count: 0,
+      });
+    }
+
+    const fromDateStr = fromDate
+      ? moment(fromDate).format("YYYY-MM-DD")
+      : moment().startOf("month").format("YYYY-MM-DD");
+    const toDateStr = toDate
+      ? moment(toDate).format("YYYY-MM-DD")
+      : moment().format("YYYY-MM-DD");
+
+    const account = await db.AccountCategory.findOne({
+      where: { code: head, facilityId: String(facilityId) },
+      attributes: ["code", "description"],
+      raw: true,
+    });
+
+    const totals = await db.sequelize.query(
+      `SELECT
+         COALESCE(SUM(gl.dr), 0) AS input_vat,
+         COALESCE(SUM(gl.cr), 0) AS output_vat,
+         COUNT(*) AS line_count
+       FROM general_ledger gl
+       WHERE gl.facility_id = :facilityId
+         AND TRIM(gl.account_code) = :head
+         AND DATE(gl.transaction_date) >= :fromDate
+         AND DATE(gl.transaction_date) <= :toDate`,
+      {
+        replacements: {
+          facilityId,
+          head,
+          fromDate: fromDateStr,
+          toDate: toDateStr,
+        },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const inputVat = parseFloat(totals[0]?.input_vat || 0) || 0;
+    const outputVat = parseFloat(totals[0]?.output_vat || 0) || 0;
+    const net = Number((outputVat - inputVat).toFixed(2));
+
+    return res.json({
+      success: true,
+      head,
+      description: account?.description || "VAT Recoverable",
+      fromDate: fromDateStr,
+      toDate: toDateStr,
+      input_vat: Number(inputVat.toFixed(2)),
+      output_vat: Number(outputVat.toFixed(2)),
+      net,
+      amount_to_pay: net > 0.005 ? net : 0,
+      recoverable: net < -0.005 ? Math.abs(net) : 0,
+      line_count: parseInt(totals[0]?.line_count || 0, 10),
+    });
+  } catch (error) {
+    console.error("getVatHeadPosition error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching VAT Recoverable totals",
+      error: error.message,
+    });
   }
 };
 
