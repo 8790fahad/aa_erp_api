@@ -504,19 +504,31 @@ async function applyPaymentTypeToWorkflow(
   const requested = parseModeList(paymentModes);
   const modes = requested.length ? requested : paymentModesForType(paymentType);
 
-  if (
-    [
-      "warehouse_picking",
-      "dual_signature",
-      "goods_released",
-      "completed",
-    ].includes(String(row.status || ""))
-  ) {
-    return { changed: false, skipped: true, reason: "Sale already in fulfillment" };
+  const statusNorm = String(row.status || "").toLowerCase();
+  const reversed =
+    statusNorm === "reversed" || statusNorm === "cancelled";
+  const alreadyPaid =
+    reversed ||
+    historyHasPaymentConfirmed(row.history) ||
+    POST_COLLECTION_STATUSES.has(statusNorm);
+
+  const postedSwitchable = new Set([
+    "cash",
+    "transfer",
+    "bank",
+    "card",
+    "split",
+  ]);
+  if (alreadyPaid && !postedSwitchable.has(paymentType)) {
+    return {
+      changed: false,
+      skipped: true,
+      reason:
+        "Paid or reversed invoices can only switch between Cash, Transfer, POS, or Cash + Transfer.",
+    };
   }
 
   const pendingBefore = getPendingPaymentMode(row.history);
-  const alreadyPaid = historyHasPaymentConfirmed(row.history);
   const modeMeta = {
     payment_modes: modes,
     pending_payment_mode_resolved: true,
@@ -944,20 +956,16 @@ async function persistLockedWorkflow(row, transaction) {
     throw new Error("Invoice was not found");
   }
   const facilityId = row.facility_id;
-  const saleCode = normalizeSaleCode(row.sale_code);
-  if (!facilityId || !saleCode) {
+  const saleCode = row.sale_code;
+  if (!facilityId || !normalizeSaleCode(saleCode)) {
     throw new Error("Invoice was not found");
   }
   if (typeof row.changed === "function") {
     row.changed("history", true);
   }
   // Persist by unique invoice identity only. Never WHERE id alone — legacy
-  // rows can share id 0, which would rewrite every pending invoice.
-  const where = saleWorkflowByInvoiceWhere(facilityId, saleCode);
-  const rowId = parseInt(row.id, 10);
-  if (Number.isFinite(rowId) && rowId > 0) {
-    where.id = rowId;
-  }
+  // rows can share id 0, which would rewrite every matching invoice.
+  const where = { facility_id: facilityId, sale_code: saleCode };
   const [affected] = await db.SaleWorkflow.update(
     {
       status: row.status,
@@ -971,7 +979,7 @@ async function persistLockedWorkflow(row, transaction) {
       assigned_cashier_name: row.assigned_cashier_name,
     },
     {
-      where: saleWorkflowByInvoiceWhere(facilityId, saleCode),
+      where,
       transaction,
     },
   );
@@ -1370,7 +1378,7 @@ async function maybeAdvanceAfterAllCollected({
     "Sale completed after warehouse collection",
   );
   row.updated_by = updatedBy || row.updated_by;
-  await row.save({ transaction });
+  await persistLockedWorkflow(row, transaction);
   return row;
 }
 
@@ -1539,7 +1547,7 @@ async function createSaleWorkflowRecord(
       "Awaiting discount approval before collection",
     );
     row.updated_by = createdBy || row.updated_by;
-    await row.save({ transaction });
+    await persistLockedWorkflow(row, transaction);
   }
 
   // Packs for warehouse treatment / separation; credit packs created after approval
@@ -1837,7 +1845,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         { credit_after_deposit: true },
       );
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -1886,7 +1894,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         );
       }
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -1907,7 +1915,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         note || "Held — not paid before closing hours",
       );
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -1958,7 +1966,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         );
         row.status = restore;
         row.updated_by = updated_by || row.updated_by;
-        await row.save({ transaction });
+        await persistLockedWorkflow(row, transaction);
         await transaction.commit();
         return res.json({
           success: true,
@@ -1995,7 +2003,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         { pending_payment_mode_resolved: true, approved: true },
       );
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -2107,7 +2115,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         advanceNote || "Discount approved",
       );
       row.updated_by = updated_by || row.updated_by;
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       await transaction.commit();
       return res.json({
         success: true,
@@ -2142,7 +2150,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
     if (next === "invoice_separation" && row.payment_type === "credit") {
       row.hold_overnight = false;
     }
-    await row.save({ transaction });
+    await persistLockedWorkflow(row, transaction);
 
     let fulfillments = null;
     if (
@@ -2895,17 +2903,13 @@ exports.getCashierDashboard = async (req, res) => {
       };
     });
 
-    // Mode Switch tab: approval requests + invoices still eligible to switch.
-    // Do not restrict to created-today — cashiers change mode on unpaid invoices
-    // from prior days, and those requests must remain visible until resolved.
+    // Mode Switch tab: only invoices with a pending payment-mode approval.
+    // Unpaid invoices stay on Cash / Transfer / POS / Credit until someone
+    // actually requests a switch. Do not date-filter — requests stay visible
+    // until they are approved or rejected.
     const modeWhere = {
       facility_id: facilityId,
-      status: [
-        "awaiting_payment_mode_approval",
-        "awaiting_cashier_confirm",
-        "awaiting_payment",
-        "awaiting_credit_approval",
-      ],
+      status: "awaiting_payment_mode_approval",
     };
     const modePaidWhere = {
       facility_id: facilityId,
@@ -2948,22 +2952,28 @@ exports.getCashierDashboard = async (req, res) => {
       const code = String(r.sale_code);
       if (!modeByCode.has(code)) modeByCode.set(code, r);
     }
-    const modeRows = [...modeByCode.values()].map((r) => {
-      const plain = r.toJSON();
-      const meta = stageMeta(plain.status);
-      const history = normalizeHistory(plain.history);
-      const pending_mode = getPendingPaymentMode(history);
-      return {
-        ...plain,
-        history,
-        payment_modes: paymentModesFromHistory(history),
-        status_label: meta?.label || plain.status,
-        status_color: meta?.color || "indigo",
-        amount: Number(plain.amount) || 0,
-        pending_payment_mode: pending_mode,
-        proposed_payment_type: pending_mode?.to || null,
-      };
-    });
+    const modeRows = [...modeByCode.values()]
+      .map((r) => {
+        const plain = r.toJSON();
+        const meta = stageMeta(plain.status);
+        const history = normalizeHistory(plain.history);
+        const pending_mode = getPendingPaymentMode(history);
+        return {
+          ...plain,
+          history,
+          payment_modes: paymentModesFromHistory(history),
+          status_label: meta?.label || plain.status,
+          status_color: meta?.color || "indigo",
+          amount: Number(plain.amount) || 0,
+          pending_payment_mode: pending_mode,
+          proposed_payment_type: pending_mode?.to || null,
+        };
+      })
+      .filter(
+        (row) =>
+          row.status === "awaiting_payment_mode_approval" ||
+          Boolean(row.pending_payment_mode?.to),
+      );
 
     // Tag queues with posted discounts; pull skipped discounted invoices into Discount tab
     const queueCodes = [
@@ -3414,6 +3424,8 @@ exports.getCashierDashboard = async (req, res) => {
         "goods_released",
         "completed",
         "credit_approved",
+        "reversed",
+        "cancelled",
       ],
       payment_type: ["cash", "transfer", "bank", "card", "split", "credit", "credit_split", "deposit"],
     };
@@ -4827,7 +4839,7 @@ exports.completeSeparation = async (req, res) => {
       "Branch invoice copies ready for warehouse collection",
     );
     row.updated_by = updated_by || row.updated_by;
-    await row.save({ transaction });
+    await persistLockedWorkflow(row, transaction);
 
     // If warehouse already collected packs (legacy leak), finish the sale.
     const afterCollect = await maybeAdvanceAfterAllCollected({
@@ -5248,27 +5260,13 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
     const updated = [];
     for (const row of rows) {
       const prevType = normalizeSpecialPaymentType(row.payment_type);
+      const statusNorm = String(row.status || "").toLowerCase();
+      const isPostedOrVoid =
+        ["reversed", "cancelled"].includes(statusNorm) ||
+        POST_COLLECTION_STATUSES.has(statusNorm) ||
+        historyHasPaymentConfirmed(row.history);
 
-      if (
-        [
-          "warehouse_picking",
-          "dual_signature",
-          "goods_released",
-          "completed",
-        ].includes(String(row.status || ""))
-      ) {
-        updated.push({
-          sale_code: row.sale_code,
-          payment_type: row.payment_type,
-          status: row.status,
-          changed: false,
-          skipped: true,
-          reason: "Sale already in fulfillment",
-        });
-        continue;
-      }
-
-      if (requireApproval) {
+      if (requireApproval && !isPostedOrVoid) {
         const nextModes = requestedModes.length
           ? requestedModes
           : paymentModesForType(paymentType);
@@ -5335,7 +5333,7 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
           row.status = "awaiting_payment_mode_approval";
         }
         row.updated_by = updated_by || row.updated_by;
-        await row.save({ transaction });
+        await persistLockedWorkflow(row, transaction);
         updated.push({
           sale_code: row.sale_code,
           payment_type: row.payment_type,
@@ -5378,7 +5376,7 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
         });
         continue;
       }
-      await row.save({ transaction });
+      await persistLockedWorkflow(row, transaction);
       updated.push({
         sale_code: row.sale_code,
         payment_type: row.payment_type,
