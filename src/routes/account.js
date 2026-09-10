@@ -371,6 +371,14 @@ module.exports = (app) => {
     account.updateSessionLockSettings,
   );
   app.post(
+    "/account/update-login-hours/:facilityId/:user_id",
+    account.updateLoginHoursSettings,
+  );
+  app.get(
+    "/account/login-hours-status/:facilityId/:userId",
+    account.getLoginHoursStatus,
+  );
+  app.post(
     "/account/run-invoice-closing/:facilityId",
     account.runInvoiceClosingNow,
   );

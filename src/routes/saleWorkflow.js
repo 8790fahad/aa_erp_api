@@ -3,8 +3,16 @@ module.exports = (app) => {
 
   app.get("/api/v1/sale-workflows/stages", saleWorkflow.getWorkflowStages);
   app.get(
+    "/api/v1/sale-workflows/verification-invoices",
+    saleWorkflow.listVerificationInvoices,
+  );
+  app.get(
     "/api/v1/sale-workflows/cashier-queue-snapshot",
     saleWorkflow.getCashierQueueSnapshot,
+  );
+  app.get(
+    "/api/v1/sale-workflows/till-report",
+    saleWorkflow.getTillReport,
   );
   app.get("/api/v1/sale-workflows/cashier-dashboard", saleWorkflow.getCashierDashboard);
   app.get(

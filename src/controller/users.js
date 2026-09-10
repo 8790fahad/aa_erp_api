@@ -62,6 +62,7 @@ const validateLoginForm = require("../validation/login");
 const moment = require("moment");
 const { response } = require("express");
 const userApi = require("./userApi");
+const { assertUserCanLoginNow } = require("../services/loginHours");
 
 // ========================================
 // HELPER FUNCTIONS
@@ -644,6 +645,7 @@ exports.createNewUser = async (req, res) => {
           facilityId,
           branchId: parsedPrimaryBranchId,
           cashier_type: null,
+          allow_after_hours_login: true,
         },
         { transaction },
       );
@@ -2816,10 +2818,21 @@ exports.login = (req, res) => {
       //check for password
       bcrypt
         .compare(password, originalPassword)
-        .then((isMatch) => {
+        .then(async (isMatch) => {
           if (isMatch) {
             // user matched
             console.log("matched!");
+            const hoursCheck = await assertUserCanLoginNow(
+              db,
+              user[0].dataValues,
+            );
+            if (!hoursCheck.allowed) {
+              return res.status(403).json({
+                success: false,
+                code: hoursCheck.code || "LOGIN_HOURS",
+                message: hoursCheck.message,
+              });
+            }
             // console.log(user[0].dataValues);
             const { id, username, email, facilityId } = user[0].dataValues;
             const payload = { id, username, email, facilityId }; //jwt payload
@@ -2873,6 +2886,9 @@ exports.login = (req, res) => {
                       departmentId: user[0].dataValues.departmentId || null,
                       role: userRole,
                       cashier_type: user[0].dataValues.cashier_type || null,
+                      allow_after_hours_login:
+                        user[0].dataValues.allow_after_hours_login !== false &&
+                        user[0].dataValues.allow_after_hours_login !== 0,
                       description:
                         currentBusiness?.description ??
                         business?.dataValues?.description,
@@ -2958,11 +2974,20 @@ exports.loginWithUsername = (req, res) => {
       //check for password
       bcrypt
         .compare(password, originalPassword)
-        .then((isMatch) => {
+        .then(async (isMatch) => {
           if (isMatch) {
             // user matched
             console.log("matched!");
-            const { id, username } = user[0].dataValues;
+            const userRow = user?.dataValues || user?.[0]?.dataValues || user;
+            const hoursCheck = await assertUserCanLoginNow(db, userRow);
+            if (!hoursCheck.allowed) {
+              return res.status(403).json({
+                success: false,
+                code: hoursCheck.code || "LOGIN_HOURS",
+                message: hoursCheck.message,
+              });
+            }
+            const { id, username } = userRow;
             const payload = { id, username }; //jwt payload
             // console.log(payload)
 
@@ -3088,6 +3113,15 @@ exports.verifyUserToken = (req, res) => {
             const primaryBranch =
               branches.find((b) => b.is_primary) || branches[0];
 
+            const hoursCheck = await assertUserCanLoginNow(
+              db,
+              user[0].dataValues,
+            );
+            const loginHoursLocked = !hoursCheck.allowed;
+
+            // Keep the existing session so the app can show a password lock
+            // instead of sending the user back to /login.
+
             // Issue a fresh token on each successful verify (sliding session)
             const freshToken = jwt.sign(
               {
@@ -3116,6 +3150,9 @@ exports.verifyUserToken = (req, res) => {
                 address: user[0].dataValues.address,
                 role: userRole,
                 cashier_type: user[0].dataValues.cashier_type || null,
+                allow_after_hours_login:
+                  user[0].dataValues.allow_after_hours_login !== false &&
+                  user[0].dataValues.allow_after_hours_login !== 0,
                 designation: designation,
                 facilityId: user[0].dataValues.facilityId,
                 facilityID: user[0].dataValues.facilityId,
@@ -3148,6 +3185,9 @@ exports.verifyUserToken = (req, res) => {
               business: business || [],
               businessesList: businessesList || [],
               businessCount: (businessesList || []).length,
+              loginHoursLocked,
+              code: loginHoursLocked ? hoursCheck.code || "LOGIN_HOURS" : undefined,
+              message: loginHoursLocked ? hoursCheck.message : undefined,
             });
           },
           (profileErr) => {
@@ -3285,6 +3325,7 @@ exports.getUserByFacility = async (req, res) => {
         users.code,
         users.role,
         users.cashier_type,
+        users.allow_after_hours_login,
         users.store,
         users.createdAt,
         users.updatedAt,

@@ -4,12 +4,27 @@ const { Op } = require("sequelize");
 const db = require("../models");
 const { recordActivity } = require("./activityAuditService");
 
-const UNPAID_NON_CREDIT_STATUSES = [
+const VERIFICATION_STATUSES = [
   "awaiting_payment",
   "awaiting_cashier_confirm",
+  "awaiting_discount_approval",
+  "awaiting_payment_mode_approval",
+  "awaiting_credit_approval",
 ];
 
-const NON_CREDIT_PAYMENT_TYPES = ["cash", "transfer", "bank", "card", "split"];
+/** @deprecated use VERIFICATION_STATUSES */
+const UNPAID_NON_CREDIT_STATUSES = VERIFICATION_STATUSES;
+
+const NON_CREDIT_PAYMENT_TYPES = [
+  "cash",
+  "transfer",
+  "bank",
+  "card",
+  "split",
+  "deposit",
+];
+
+const CREDIT_PAYMENT_TYPES = ["credit", "credit_split"];
 
 function normalizeHistory(history) {
   if (Array.isArray(history)) return history;
@@ -35,6 +50,53 @@ function pushHistory(history, status, userId, note) {
   return list;
 }
 
+function collectedAmountFromHistory(history) {
+  const list = normalizeHistory(history);
+  let total = 0;
+  for (const h of list) {
+    total += Number(h?.collection?.amount) || 0;
+    total += Number(h?.deposit_application?.amount) || 0;
+  }
+  return Number(total.toFixed(2));
+}
+
+async function saleHasAnyPayment({
+  facilityId,
+  saleCode,
+  workflow,
+  transaction = null,
+} = {}) {
+  const fromHistory = collectedAmountFromHistory(workflow?.history);
+  if (fromHistory > 0.05) {
+    return { paid: true, amount: fromHistory, source: "history" };
+  }
+
+  if (db.CustomerEntry) {
+    const rows = await db.CustomerEntry.findAll({
+      where: {
+        facilityId,
+        [Op.or]: [{ receiptNo: saleCode }, { link_id: saleCode }],
+        type: "deposit",
+      },
+      attributes: ["cost", "type"],
+      transaction,
+    });
+    const paid = rows.reduce(
+      (sum, r) => sum + (parseFloat(r.cost || 0) || 0),
+      0,
+    );
+    if (paid > 0.05) {
+      return {
+        paid: true,
+        amount: Number(paid.toFixed(2)),
+        source: "customer_entries",
+      };
+    }
+  }
+
+  return { paid: false, amount: 0 };
+}
+
 /**
  * Reverse (void) a single unpaid non-credit sale invoice:
  * removes GL / store / customer entries + invoice, cancels sale workflow.
@@ -43,7 +105,7 @@ async function voidUnpaidNonCreditSale({
   facilityId,
   saleCode,
   userId = "system",
-  reason = "Auto-reversed after daily closing time (unpaid non-credit invoice)",
+  reason = "Auto-reversed after daily closing time (still on Verification Points, unpaid)",
   transaction: outerTx = null,
 } = {}) {
   const ownTx = !outerTx;
@@ -63,25 +125,33 @@ async function voidUnpaidNonCreditSale({
     });
 
     if (workflow) {
-      const pt = String(workflow.payment_type || "").toLowerCase();
       const st = String(workflow.status || "").toLowerCase();
-      if (pt === "credit") {
-        throw Object.assign(
-          new Error("Credit invoices are not auto-reversed"),
-          { status: 400 },
-        );
-      }
       if (st === "cancelled" || st === "reversed") {
         if (ownTx) await transaction.commit();
         return { skipped: true, sale_code: normalizedRef, reason: "already_cancelled" };
       }
-      if (!UNPAID_NON_CREDIT_STATUSES.includes(st)) {
+      if (!VERIFICATION_STATUSES.includes(st)) {
         throw Object.assign(
           new Error(
-            `Sale ${normalizedRef} is not in an unpaid non-credit status (${st})`,
+            `Sale ${normalizedRef} is not on Verification Points (${st})`,
           ),
           { status: 400 },
         );
+      }
+      const payCheck = await saleHasAnyPayment({
+        facilityId,
+        saleCode: normalizedRef,
+        workflow,
+        transaction,
+      });
+      if (payCheck.paid) {
+        if (ownTx) await transaction.commit();
+        return {
+          skipped: true,
+          sale_code: normalizedRef,
+          reason: "has_payment",
+          amount_paid: payCheck.amount,
+        };
       }
     }
 
@@ -105,23 +175,31 @@ async function voidUnpaidNonCreditSale({
     let reversedLedgerCount = 0;
     for (const row of ledgerRows) {
       const plain = row.get ? row.get({ plain: true }) : row;
+      const desc = String(plain.transaction_description || "");
+      if (/^VOID:/i.test(desc)) continue;
       const dr = parseFloat(plain.dr || plain.debit || 0);
       const cr = parseFloat(plain.cr || plain.credit || 0);
       if (dr === 0 && cr === 0) continue;
       const clone = { ...plain };
+      delete clone.transaction_id;
       delete clone.id;
       delete clone.createdAt;
       delete clone.updatedAt;
       delete clone.created_at;
       delete clone.updated_at;
-      // Flip debit/credit for reversing entry
       clone.dr = cr;
       clone.cr = dr;
-      clone.transaction_description = `VOID: ${plain.transaction_description || normalizedRef}`;
-      clone.transaction_ref =
-        plain.transaction_ref
-          ? `VOID-${plain.transaction_ref}`.slice(0, 100)
-          : `VOID-${normalizedRef}`.slice(0, 100);
+      clone.status = "reversed";
+      clone.transaction_description = `VOID: ${plain.transaction_description || normalizedRef}`.slice(
+        0,
+        500,
+      );
+      clone.purpose_of_payment =
+        plain.purpose_of_payment || "Void unpaid invoice";
+      clone.transaction_ref = `VOID-${plain.transaction_id || Date.now()}-${normalizedRef}`.slice(
+        0,
+        100,
+      );
       await db.GeneralLedger.create(clone, { transaction });
       reversedLedgerCount += 1;
     }
@@ -137,11 +215,14 @@ async function voidUnpaidNonCreditSale({
     let reversedStoreEntries = 0;
     for (const row of storeRows) {
       const plain = row.get ? row.get({ plain: true }) : row;
+      if (String(plain.status || "").toLowerCase() === "voided") continue;
+      if (String(plain.destination || "").toLowerCase() === "void") continue;
       const qtyOut = parseFloat(plain.qty_out || 0);
       const qtyIn = parseFloat(plain.qty_in || 0);
       if (qtyOut <= 0 && qtyIn <= 0) continue;
       const clone = { ...plain };
       delete clone.id;
+      delete clone.entry_id;
       delete clone.createdAt;
       delete clone.updatedAt;
       delete clone.created_at;
@@ -165,14 +246,8 @@ async function voidUnpaidNonCreditSale({
     });
 
     if (invoice) {
-      await invoice.update(
-        {
-          status: "Cancelled",
-          balance: 0,
-          description: [invoice.description, reason].filter(Boolean).join(" | "),
-        },
-        { transaction },
-      );
+      const nextDesc = [invoice.description, reason].filter(Boolean).join(" | ");
+      await invoice.update({ description: nextDesc }, { transaction });
     }
 
     // Soft-cancel: leave fulfillment rows for audit (no hard-delete)
@@ -185,17 +260,29 @@ async function voidUnpaidNonCreditSale({
     const prevAmount = workflow?.amount || invoice?.amount || null;
 
     if (workflow) {
-      workflow.status = "cancelled";
-      workflow.hold_overnight = true;
-      workflow.notes = [workflow.notes, reason].filter(Boolean).join(" | ");
-      workflow.history = pushHistory(
+      const nextNotes = [workflow.notes, reason].filter(Boolean).join(" | ");
+      const nextHistory = pushHistory(
         workflow.history,
         "cancelled",
         userId,
         reason,
       );
-      workflow.updated_by = userId;
-      await workflow.save({ transaction });
+      await db.SaleWorkflow.update(
+        {
+          status: "cancelled",
+          hold_overnight: true,
+          notes: nextNotes,
+          history: nextHistory,
+          updated_by: userId,
+        },
+        {
+          where: {
+            facility_id: facilityId,
+            sale_code: normalizedRef,
+          },
+          transaction,
+        },
+      );
     }
 
     if (ownTx) await transaction.commit();
@@ -238,24 +325,38 @@ async function voidUnpaidNonCreditSale({
 }
 
 /**
- * Find unpaid non-credit sale workflows for a facility and void them.
+ * Reverse invoices still on Verification Points with no payment collected.
+ * Unapproved credit is included. Partially paid invoices are kept.
  */
 async function reverseUnpaidNonCreditInvoicesForFacility({
   facilityId,
   userId = "system",
-  reason = "Auto-reversed after daily closing time (unpaid non-credit invoice)",
+  reason = "Auto-reversed after daily closing time (still on Verification Points, unpaid)",
 } = {}) {
   const rows = await db.SaleWorkflow.findAll({
     where: {
       facility_id: facilityId,
-      payment_type: { [Op.in]: NON_CREDIT_PAYMENT_TYPES },
-      status: { [Op.in]: UNPAID_NON_CREDIT_STATUSES },
+      status: { [Op.in]: VERIFICATION_STATUSES },
     },
     order: [["created_at", "ASC"]],
   });
 
   const results = [];
   for (const row of rows) {
+    const payCheck = await saleHasAnyPayment({
+      facilityId,
+      saleCode: row.sale_code,
+      workflow: row,
+    });
+    if (payCheck.paid) {
+      results.push({
+        sale_code: row.sale_code,
+        skipped: true,
+        reason: "has_payment",
+        amount_paid: payCheck.amount,
+      });
+      continue;
+    }
     try {
       const out = await voidUnpaidNonCreditSale({
         facilityId,
@@ -350,6 +451,10 @@ module.exports = {
   isPastClosingTime,
   getNowPartsInTimezone,
   parseClosingTime,
+  collectedAmountFromHistory,
+  saleHasAnyPayment,
+  VERIFICATION_STATUSES,
   UNPAID_NON_CREDIT_STATUSES,
   NON_CREDIT_PAYMENT_TYPES,
+  CREDIT_PAYMENT_TYPES,
 };

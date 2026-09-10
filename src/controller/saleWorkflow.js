@@ -5,6 +5,7 @@ const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances")
 const {
   loadTillSpend,
   money: tillMoney,
+  classifyCollectionMode,
 } = require("../utils/tillCollections");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const {
@@ -17,6 +18,29 @@ function parseModeList(paymentModes) {
   return (Array.isArray(paymentModes) ? paymentModes : [])
     .map((m) => String(m || "").toLowerCase().trim())
     .filter(Boolean);
+}
+
+function modeListsEqual(a, b) {
+  const left = [...new Set(parseModeList(a))].sort();
+  const right = [...new Set(parseModeList(b))].sort();
+  return (
+    left.length === right.length && left.every((id, i) => id === right[i])
+  );
+}
+
+/** Mode ids stored in history so Verification Points tabs follow a switch. */
+function paymentModesForType(paymentType) {
+  const pt = String(paymentType || "").toLowerCase().trim();
+  if (pt === "credit_split") return ["credit", "cash", "transfer"];
+  if (pt === "split") return ["cash", "transfer"];
+  if (pt === "deposit" || pt === "apply_deposit" || pt === "apply deposit") {
+    return ["deposit"];
+  }
+  if (pt === "card" || pt === "pos") return ["card"];
+  if (pt === "transfer" || pt === "bank") return ["transfer"];
+  if (pt === "credit") return ["credit"];
+  if (pt === "cash") return ["cash"];
+  return [];
 }
 
 function isDepositPaymentType(paymentType) {
@@ -417,12 +441,32 @@ async function assertCreditLimitMessage(
 /** Latest unresolved payment-mode switch request from history. */
 function getPendingPaymentMode(history) {
   const list = normalizeHistory(history);
-  for (let i = list.length - 1; i >= 0; i -= 1) {
-    const h = list[i];
-    if (h?.pending_payment_mode_resolved) return null;
-    if (h?.pending_payment_mode?.to) return h.pending_payment_mode;
+  let pending = null;
+  for (const h of list) {
+    if (h?.pending_payment_mode?.to) pending = h.pending_payment_mode;
+    if (h?.pending_payment_mode_resolved) pending = null;
   }
-  return null;
+  return pending;
+}
+
+/** Paid / Invoice Separation queue — warehouse must not see packs yet. */
+const SEPARATION_QUEUE_STATUSES = [
+  "payment_confirmed",
+  "invoice_separation",
+  "credit_approved",
+  "final_invoice",
+];
+
+const WAREHOUSE_COLLECT_STATUSES = ["warehouse_picking", "dual_signature"];
+
+function isSeparationQueueStatus(status) {
+  return SEPARATION_QUEUE_STATUSES.includes(String(status || ""));
+}
+
+function historyHasPaymentConfirmed(history) {
+  return normalizeHistory(history).some(
+    (h) => String(h?.status || "") === "payment_confirmed",
+  );
 }
 
 function normalizeSpecialPaymentType(rawType) {
@@ -430,6 +474,7 @@ function normalizeSpecialPaymentType(rawType) {
     .toLowerCase()
     .trim();
   if (paymentType === "bank") paymentType = "transfer";
+  if (paymentType === "pos") paymentType = "card";
   if (
     paymentType === "both" ||
     paymentType === "cash+transfer" ||
@@ -451,10 +496,67 @@ async function applyPaymentTypeToWorkflow(
     paymentType,
     updated_by,
     note,
+    paymentModes = null,
   },
   transaction,
 ) {
-  const prevType = String(row.payment_type || "").toLowerCase();
+  const prevType = normalizeSpecialPaymentType(row.payment_type);
+  const requested = parseModeList(paymentModes);
+  const modes = requested.length ? requested : paymentModesForType(paymentType);
+
+  if (
+    [
+      "warehouse_picking",
+      "dual_signature",
+      "goods_released",
+      "completed",
+    ].includes(String(row.status || ""))
+  ) {
+    return { changed: false, skipped: true, reason: "Sale already in fulfillment" };
+  }
+
+  const pendingBefore = getPendingPaymentMode(row.history);
+  const alreadyPaid = historyHasPaymentConfirmed(row.history);
+  const modeMeta = {
+    payment_modes: modes,
+    pending_payment_mode_resolved: true,
+  };
+
+  if (prevType === paymentType) {
+    const currentModes = paymentModesFromHistory(normalizeHistory(row.history));
+    const pendingMode = getPendingPaymentMode(row.history);
+    if (
+      modeListsEqual(modes, currentModes) &&
+      !pendingMode &&
+      row.status !== "awaiting_payment_mode_approval"
+    ) {
+      return { changed: false, skipped: false };
+    }
+    row.history = pushHistory(
+      row.history,
+      row.status,
+      updated_by,
+      note || `Payment mode confirmed as ${paymentType}`,
+      modeMeta,
+    );
+    row.updated_by = updated_by || row.updated_by;
+    if (row.status !== "awaiting_payment_mode_approval") {
+      return { changed: true, skipped: false };
+    }
+    // Fall through so approval of a same-type mix (e.g. cash-only vs split)
+    // still moves the invoice off awaiting_payment_mode_approval.
+  } else {
+    row.payment_type = paymentType;
+    row.history = pushHistory(
+      row.history,
+      row.status,
+      updated_by,
+      note ||
+        `Payment mode switched from ${prevType || "—"} to ${paymentType}`,
+      modeMeta,
+    );
+  }
+
   const earlyCashier = new Set([
     "submitted",
     "awaiting_payment",
@@ -479,30 +581,10 @@ async function applyPaymentTypeToWorkflow(
   ]);
 
   if (
-    [
-      "warehouse_picking",
-      "dual_signature",
-      "goods_released",
-      "completed",
-    ].includes(String(row.status || ""))
+    paymentType === "warehouse" &&
+    earlyCashier.has(row.status) &&
+    !alreadyPaid
   ) {
-    return { changed: false, skipped: true, reason: "Sale already in fulfillment" };
-  }
-
-  if (prevType === paymentType) {
-    return { changed: false, skipped: false };
-  }
-
-  row.payment_type = paymentType;
-  row.history = pushHistory(
-    row.history,
-    row.status,
-    updated_by,
-    note ||
-      `Payment mode switched from ${prevType || "—"} to ${paymentType}`,
-  );
-
-  if (paymentType === "warehouse" && earlyCashier.has(row.status)) {
     row.status = "invoice_separation";
     row.hold_overnight = false;
     row.history = pushHistory(
@@ -510,6 +592,7 @@ async function applyPaymentTypeToWorkflow(
       "invoice_separation",
       updated_by,
       "Warehouse treatment — ready for separation",
+      modeMeta,
     );
     await ensureSaleFulfillments(
       {
@@ -523,7 +606,8 @@ async function applyPaymentTypeToWorkflow(
 
   if (
     paymentType === "credit" &&
-    (earlyCashier.has(row.status) || earlyWarehouse.has(row.status))
+    (earlyCashier.has(row.status) || earlyWarehouse.has(row.status)) &&
+    !alreadyPaid
   ) {
     // Credit must always wait for Credit Approval before Invoice Separation
     row.status = "awaiting_credit_approval";
@@ -532,16 +616,22 @@ async function applyPaymentTypeToWorkflow(
       "awaiting_credit_approval",
       updated_by,
       "Switched to credit — must be approved on Credit tab before Invoice Separation",
+      modeMeta,
     );
   }
 
-  if (paymentType === "deposit" && earlyCashier.has(row.status)) {
+  if (
+    paymentType === "deposit" &&
+    earlyCashier.has(row.status) &&
+    !alreadyPaid
+  ) {
     row.status = "awaiting_payment";
     row.history = pushHistory(
       row.history,
       "awaiting_payment",
       updated_by,
       "Switched to Apply Deposit — apply customer deposit before collection or credit approval",
+      modeMeta,
     );
   }
 
@@ -552,7 +642,9 @@ async function applyPaymentTypeToWorkflow(
       row.status === "awaiting_credit_approval" ||
       earlyCashier.has(row.status))
   ) {
-    if (
+    if (alreadyPaid) {
+      // Payment already collected — stay on Invoice Separation.
+    } else if (
       row.status !== "awaiting_discount_approval" &&
       row.status !== "awaiting_cashier_confirm"
     ) {
@@ -562,8 +654,21 @@ async function applyPaymentTypeToWorkflow(
         "awaiting_cashier_confirm",
         updated_by,
         `Switched to ${paymentType} — awaiting cashier`,
+        modeMeta,
       );
     }
+  }
+
+  // Paid sales that were parked on awaiting_payment_mode_approval stay
+  // on the Invoice Separation queue after the switch is applied.
+  if (
+    alreadyPaid &&
+    row.status === "awaiting_payment_mode_approval"
+  ) {
+    const restore = pendingBefore?.previous_status;
+    row.status = isSeparationQueueStatus(restore)
+      ? restore
+      : "invoice_separation";
   }
 
   row.updated_by = updated_by || row.updated_by;
@@ -1463,6 +1568,83 @@ exports.getWorkflowStages = async (_req, res) => {
   });
 };
 
+const VERIFICATION_EDIT_STATUSES = [
+  "submitted",
+  "awaiting_payment",
+  "awaiting_cashier_confirm",
+  "awaiting_discount_approval",
+  "awaiting_credit_approval",
+  "awaiting_payment_mode_approval",
+  "awaiting_payment_method",
+];
+
+const REVERSED_WORKFLOW_STATUSES = ["cancelled", "reversed"];
+
+/**
+ * Invoices currently on Verification Points (unpaid) and not reversed.
+ * Used by Edit Invoice so the picker never lists paid, warehouse, or voided sales.
+ */
+exports.listVerificationInvoices = async (req, res) => {
+  try {
+    const facilityId = String(req.query.facilityId || "").trim();
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+
+    const rows = await db.SaleWorkflow.findAll({
+      where: {
+        facility_id: facilityId,
+        status: { [Op.in]: VERIFICATION_EDIT_STATUSES },
+      },
+      order: [
+        ["updated_at", "DESC"],
+        ["created_at", "DESC"],
+      ],
+      limit: 500,
+    });
+
+    const results = [];
+    for (const r of rows) {
+      const plain = r.toJSON ? r.toJSON() : r;
+      const status = String(plain.status || "").toLowerCase().trim();
+      if (!VERIFICATION_EDIT_STATUSES.includes(status)) continue;
+      if (REVERSED_WORKFLOW_STATUSES.includes(status)) continue;
+      const history = normalizeHistory(plain.history);
+      const latest = history.length ? history[history.length - 1] : null;
+      const latestStatus = String(latest?.status || "").toLowerCase();
+      if (REVERSED_WORKFLOW_STATUSES.includes(latestStatus)) continue;
+      results.push({
+        sale_code: plain.sale_code,
+        customer_no: plain.customer_no,
+        customer_name: plain.customer_name,
+        payment_type: plain.payment_type,
+        status: plain.status,
+        amount: Number(plain.amount) || 0,
+        date: plain.created_at || plain.createdAt || null,
+        created_at: plain.created_at || plain.createdAt || null,
+        updated_at: plain.updated_at || plain.updatedAt || null,
+      });
+    }
+
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("listVerificationInvoices:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to load verification invoices",
+    });
+  }
+};
+
 exports.listSaleWorkflows = async (req, res) => {
   try {
     const { facilityId, status, paymentType } = req.query;
@@ -1745,12 +1927,17 @@ exports.advanceSaleWorkflow = async (req, res) => {
         .toLowerCase()
         .trim() === "credit";
 
-    // Approve / reject payment mode switch (Verification Points)
-    if (
-      row.status === "awaiting_payment_mode_approval" &&
-      (!action || action === "advance" || action === "reject_payment_mode")
-    ) {
-      const pending = getPendingPaymentMode(row.history);
+    // Approve / reject payment mode switch (Verification Points).
+    // Paid sales stay on Invoice Separation, so approval must also run
+    // when a pending_payment_mode exists on those statuses.
+    const pendingModeSwitch = getPendingPaymentMode(row.history);
+    const isModeReject = action === "reject_payment_mode";
+    const isModeApprove =
+      action === "approve_payment_mode" ||
+      (row.status === "awaiting_payment_mode_approval" &&
+        (!action || action === "advance"));
+    if (isModeApprove || isModeReject) {
+      const pending = pendingModeSwitch;
       if (!pending?.to) {
         await transaction.rollback();
         return res.status(400).json({
@@ -1789,6 +1976,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
           note:
             advanceNote ||
             `Payment mode switch approved: ${pending.from || "—"} → ${pending.to}`,
+          paymentModes: parseModeList(pending.payment_modes),
         },
         transaction,
       );
@@ -2028,8 +2216,6 @@ exports.getCashierQueueSnapshot = async (req, res) => {
       });
     }
 
-    const startOfDay = moment().startOf("day").toDate();
-    const endOfDay = moment().endOf("day").toDate();
     const where = {
       facility_id: facilityId,
       status: [
@@ -2040,7 +2226,6 @@ exports.getCashierQueueSnapshot = async (req, res) => {
         "awaiting_payment_mode_approval",
         "awaiting_payment_method",
       ],
-      created_at: { [Op.between]: [startOfDay, endOfDay] },
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -2069,7 +2254,22 @@ exports.getCashierQueueSnapshot = async (req, res) => {
       limit: 200,
     });
 
-    const items = (rows || [])
+    const paidModeWhere = {
+      facility_id: facilityId,
+      status: [...SEPARATION_QUEUE_STATUSES],
+    };
+    if (where.branch_id) paidModeWhere.branch_id = where.branch_id;
+    const paidModeRows = await db.SaleWorkflow.findAll({
+      attributes: ["sale_code", "status", "updated_at", "history"],
+      where: paidModeWhere,
+      raw: true,
+      limit: 400,
+    });
+    const paidModePending = (paidModeRows || []).filter((r) =>
+      getPendingPaymentMode(r.history),
+    );
+
+    const items = [...(rows || []), ...paidModePending]
       .map((r) => ({
         sale_code: normalizeSaleCode(r.sale_code),
         status: String(r.status || ""),
@@ -2096,6 +2296,190 @@ exports.getCashierQueueSnapshot = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: err.message || "Failed to load queue snapshot",
+    });
+  }
+};
+
+/**
+ * Line-item till report for Verification Points (Collected / Imprest / Pay Bill).
+ */
+exports.getTillReport = async (req, res) => {
+  try {
+    const { facilityId, fromDate, toDate, tillMode, userId, role } = req.query;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const modeRaw = String(tillMode || "cash").toLowerCase().trim();
+    const mode =
+      modeRaw === "card" || modeRaw === "transfer" ? modeRaw : "cash";
+    const todayYmd = moment().format("YYYY-MM-DD");
+    const parseYmd = (v) => {
+      const s = String(v || "").trim();
+      return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+    };
+    let histFrom = parseYmd(fromDate) || todayYmd;
+    let histTo = parseYmd(toDate) || histFrom;
+    if (histFrom > histTo) {
+      const tmp = histFrom;
+      histFrom = histTo;
+      histTo = tmp;
+    }
+
+    const roleNorm = String(role || "").toLowerCase().trim();
+    const isCashierRole =
+      roleNorm === "cashier" ||
+      roleNorm === "casher" ||
+      roleNorm.includes("cashier") ||
+      roleNorm.includes("casher");
+    const cashierUserId =
+      isCashierRole && userId != null && String(userId).trim()
+        ? String(userId).trim()
+        : "";
+
+    const replacements = { facilityId, histFrom, histTo };
+    let collectorClause = "";
+    if (cashierUserId) {
+      replacements.cashierUserId = cashierUserId;
+      collectorClause = "AND ce.created_by = :cashierUserId";
+    }
+
+    const collectedRows = await db.sequelize.query(
+      `SELECT
+         ce.entry_id,
+         ce.receiptNo,
+         ce.link_id,
+         ce.customerNo,
+         COALESCE(c.fullname, ce.customerNo) AS customer_name,
+         ce.mode_of_payment,
+         ce.cost,
+         ce.description,
+         ce.created_at,
+         ce.created_by
+       FROM customer_entries ce
+       LEFT JOIN customers c
+         ON c.customerNo = ce.customerNo
+        AND c.facilityId = ce.facilityId
+       WHERE ce.facilityId = :facilityId
+         AND ce.type = 'deposit'
+         AND ce.cost > 0
+         AND DATE(ce.created_at) BETWEEN :histFrom AND :histTo
+         AND (
+           ce.description LIKE 'Sale payment%'
+           OR ce.link_id LIKE 'INV-%'
+           OR ce.receiptNo LIKE 'INV-%'
+           OR ce.receiptNo LIKE 'AD-%'
+           OR ce.description LIKE '%advance%'
+           OR ce.description LIKE '%Advance%'
+           OR ce.description LIKE '%Verification Points advance%'
+           OR ce.description LIKE '%Collection Points advance%'
+         )
+         ${collectorClause}
+       ORDER BY ce.created_at DESC`,
+      {
+        replacements,
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const collectedLines = [];
+    for (const row of collectedRows || []) {
+      const side = classifyCollectionMode(row.mode_of_payment);
+      if (side !== mode) continue;
+      collectedLines.push({
+        id: row.entry_id,
+        sale_code: row.link_id || row.receiptNo || "",
+        party: row.customer_name || row.customerNo || "",
+        description: row.description || "",
+        amount: tillMoney(row.cost),
+        transaction_date: row.created_at,
+        user_id: row.created_by || null,
+        till_mode: side,
+      });
+    }
+
+    const spend = await loadTillSpend({
+      facilityId,
+      fromDate: histFrom,
+      toDate: histTo,
+      cashierUserId: cashierUserId || null,
+    });
+    const imprestLines = (spend.imprest?.lines || []).filter(
+      (l) => l.till_mode === mode,
+    );
+    const payBillLines = (spend.payBills?.lines || []).filter(
+      (l) => l.till_mode === mode,
+    );
+
+    const nameIds = new Set();
+    for (const line of [...collectedLines, ...imprestLines, ...payBillLines]) {
+      if (line.user_id) nameIds.add(String(line.user_id));
+    }
+    const nameById = {};
+    if (nameIds.size && db.users) {
+      try {
+        const users = await db.users.findAll({
+          where: { id: [...nameIds] },
+          attributes: ["id", "firstname", "lastname", "username"],
+        });
+        users.forEach((u) => {
+          nameById[String(u.id)] =
+            [u.firstname, u.lastname].filter(Boolean).join(" ").trim() ||
+            u.username ||
+            String(u.id);
+        });
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    const withNames = (lines) =>
+      (lines || []).map((l) => ({
+        ...l,
+        by_name: l.user_id ? nameById[String(l.user_id)] || "" : "",
+      }));
+
+    const collectedTotal = tillMoney(
+      collectedLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
+    );
+    const imprestTotal = tillMoney(
+      imprestLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
+    );
+    const payBillTotal = tillMoney(
+      payBillLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
+    );
+
+    return res.json({
+      success: true,
+      results: {
+        till_mode: mode,
+        from_date: histFrom,
+        to_date: histTo,
+        collected: {
+          total: collectedTotal,
+          lines: withNames(collectedLines),
+        },
+        imprest: {
+          total: imprestTotal,
+          lines: withNames(imprestLines),
+        },
+        pay_bills: {
+          total: payBillTotal,
+          lines: withNames(payBillLines),
+        },
+        retire: tillMoney(
+          Math.max(0, collectedTotal - imprestTotal - payBillTotal),
+        ),
+      },
+    });
+  } catch (err) {
+    console.error("getTillReport:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to load till report",
     });
   }
 };
@@ -2148,7 +2532,11 @@ exports.getCashierDashboard = async (req, res) => {
       db.sequelize.fn("DATE", db.sequelize.col("created_at")),
       todayYmd,
     );
-    const withCreatedToday = (clause) => ({
+    const updatedToday = db.sequelize.where(
+      db.sequelize.fn("DATE", db.sequelize.col("updated_at")),
+      todayYmd,
+    );
+    const withActiveToday = (clause) => ({
       ...clause,
       [Op.and]: [
         ...(Array.isArray(clause[Op.and])
@@ -2156,7 +2544,7 @@ exports.getCashierDashboard = async (req, res) => {
           : clause[Op.and]
             ? [clause[Op.and]]
             : []),
-        createdToday,
+        { [Op.or]: [createdToday, updatedToday] },
       ],
     });
 
@@ -2217,7 +2605,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "credit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(where),
+            where: withActiveToday(where),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2285,7 +2673,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(creditWhere),
+            where: withActiveToday(creditWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2417,7 +2805,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "mode"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(depositWhere),
+            where: withActiveToday(depositWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2491,7 +2879,7 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "deposit"
         ? []
         : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(discountWhere),
+            where: withActiveToday(discountWhere),
             order: [["created_at", "DESC"]],
             limit: 200,
           });
@@ -2507,35 +2895,68 @@ exports.getCashierDashboard = async (req, res) => {
       };
     });
 
-    // Payment mode switch requests awaiting approval
+    // Mode Switch tab: approval requests + invoices still eligible to switch.
+    // Do not restrict to created-today — cashiers change mode on unpaid invoices
+    // from prior days, and those requests must remain visible until resolved.
     const modeWhere = {
       facility_id: facilityId,
-      status: "awaiting_payment_mode_approval",
+      status: [
+        "awaiting_payment_mode_approval",
+        "awaiting_cashier_confirm",
+        "awaiting_payment",
+        "awaiting_credit_approval",
+      ],
+    };
+    const modePaidWhere = {
+      facility_id: facilityId,
+      status: [...SEPARATION_QUEUE_STATUSES],
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
-      if (Number.isFinite(bid) && bid > 0) modeWhere.branch_id = bid;
+      if (Number.isFinite(bid) && bid > 0) {
+        modeWhere.branch_id = bid;
+        modePaidWhere.branch_id = bid;
+      }
     }
-    const modePending =
+    const skipModeTab =
       ct === "cash" ||
       ct === "transfer" ||
       ct === "split" ||
       ct === "credit" ||
       ct === "discount" ||
-      ct === "deposit"
-        ? []
-        : await db.SaleWorkflow.findAll({
-            where: withCreatedToday(modeWhere),
-            order: [["updated_at", "DESC"], ["created_at", "DESC"]],
-            limit: 200,
-          });
-    const modeRows = modePending.map((r) => {
+      ct === "deposit";
+    const modePending = skipModeTab
+      ? []
+      : await db.SaleWorkflow.findAll({
+          where: modeWhere,
+          order: [["updated_at", "DESC"], ["created_at", "DESC"]],
+          limit: 200,
+        });
+    const modePaidCandidates = skipModeTab
+      ? []
+      : await db.SaleWorkflow.findAll({
+          where: modePaidWhere,
+          order: [["updated_at", "DESC"]],
+          limit: 400,
+        });
+    const modeByCode = new Map();
+    for (const r of modePending) {
+      modeByCode.set(String(r.sale_code), r);
+    }
+    for (const r of modePaidCandidates) {
+      if (!getPendingPaymentMode(r.history)) continue;
+      const code = String(r.sale_code);
+      if (!modeByCode.has(code)) modeByCode.set(code, r);
+    }
+    const modeRows = [...modeByCode.values()].map((r) => {
       const plain = r.toJSON();
       const meta = stageMeta(plain.status);
-      const pending_mode = getPendingPaymentMode(plain.history);
+      const history = normalizeHistory(plain.history);
+      const pending_mode = getPendingPaymentMode(history);
       return {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
+        payment_modes: paymentModesFromHistory(history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "indigo",
         amount: Number(plain.amount) || 0,
@@ -3212,12 +3633,7 @@ exports.getSeparationDashboard = async (req, res) => {
       });
     }
 
-    const pendingStatuses = [
-      "payment_confirmed",
-      "invoice_separation",
-      "credit_approved",
-      "final_invoice",
-    ];
+    const pendingStatuses = [...SEPARATION_QUEUE_STATUSES];
     const historyStatuses = [
       "warehouse_picking",
       "dual_signature",
@@ -3228,9 +3644,13 @@ exports.getSeparationDashboard = async (req, res) => {
     const mapWorkflow = (r) => {
       const plain = r.toJSON ? r.toJSON() : r;
       const meta = stageMeta(plain.status);
+      const history = normalizeHistory(plain.history);
+      const pending_mode = getPendingPaymentMode(history);
       return {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
+        pending_payment_mode: pending_mode,
+        proposed_payment_type: pending_mode?.to || null,
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         amount: Number(plain.amount) || 0,
@@ -3245,6 +3665,25 @@ exports.getSeparationDashboard = async (req, res) => {
       order: [["updated_at", "DESC"]],
       limit: 200,
     });
+
+    const parkedModeRows = await db.SaleWorkflow.findAll({
+      where: {
+        facility_id: facilityId,
+        status: "awaiting_payment_mode_approval",
+      },
+      order: [["updated_at", "DESC"]],
+      limit: 200,
+    });
+    const pendingByCode = new Map(
+      pending.map((r) => [String(r.sale_code), r]),
+    );
+    for (const r of parkedModeRows) {
+      const prev = getPendingPaymentMode(r.history)?.previous_status;
+      if (!isSeparationQueueStatus(prev)) continue;
+      const code = String(r.sale_code);
+      if (!pendingByCode.has(code)) pendingByCode.set(code, r);
+    }
+    const pendingMerged = [...pendingByCode.values()];
 
     const historyRows = await db.SaleWorkflow.findAll({
       where: {
@@ -3300,10 +3739,10 @@ exports.getSeparationDashboard = async (req, res) => {
     return res.json({
       success: true,
       results: {
-        pending: pending.map(mapWorkflow),
+        pending: pendingMerged.map(mapWorkflow),
         history,
         summary: {
-          pending_count: pending.length,
+          pending_count: pendingMerged.length,
           history_count: history.length,
           packs_total: history.reduce((s, r) => s + (r.pack_count || 0), 0),
         },
@@ -4286,13 +4725,12 @@ exports.completeSeparation = async (req, res) => {
       });
     }
 
-    const allowed = [
-      "payment_confirmed",
-      "invoice_separation",
-      "credit_approved",
-      "final_invoice",
-    ];
-    if (!allowed.includes(row.status)) {
+    const allowed = [...SEPARATION_QUEUE_STATUSES];
+    const pendingMode = getPendingPaymentMode(row.history);
+    const parkedOnModeSwitch =
+      row.status === "awaiting_payment_mode_approval" &&
+      isSeparationQueueStatus(pendingMode?.previous_status);
+    if (!allowed.includes(row.status) && !parkedOnModeSwitch) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
@@ -4319,13 +4757,19 @@ exports.completeSeparation = async (req, res) => {
       });
     }
 
-    if (row.status === "payment_confirmed" || row.status === "credit_approved") {
+    if (
+      row.status === "payment_confirmed" ||
+      row.status === "credit_approved" ||
+      parkedOnModeSwitch
+    ) {
       row.status = "invoice_separation";
       row.history = pushHistory(
         row.history,
         "invoice_separation",
         updated_by,
-        "Ready for invoice separation by branch",
+        parkedOnModeSwitch
+          ? "Ready for invoice separation by branch (payment already collected)"
+          : "Ready for invoice separation by branch",
       );
     }
 
@@ -4385,6 +4829,15 @@ exports.completeSeparation = async (req, res) => {
     row.updated_by = updated_by || row.updated_by;
     await row.save({ transaction });
 
+    // If warehouse already collected packs (legacy leak), finish the sale.
+    const afterCollect = await maybeAdvanceAfterAllCollected({
+      facilityId,
+      saleCode,
+      updatedBy: updated_by,
+      transaction,
+    });
+    const resultRow = afterCollect || row;
+
     await transaction.commit();
 
     const enriched = await enrichFulfillments(fulfillments);
@@ -4394,9 +4847,9 @@ exports.completeSeparation = async (req, res) => {
         branchCount === 1 ? "y" : "ies"
       } — sent to warehouse`,
       results: {
-        ...row.toJSON(),
-        status_color: stageMeta(row.status)?.color || "slate",
-        next_status: nextStageFor(row.status, row.payment_type),
+        ...resultRow.toJSON(),
+        status_color: stageMeta(resultRow.status)?.color || "slate",
+        next_status: nextStageFor(resultRow.status, resultRow.payment_type),
         fulfillments: enriched,
       },
     });
@@ -4503,6 +4956,20 @@ exports.markFulfillmentCollected = async (req, res) => {
       return res.status(403).json({
         success: false,
         message: "You do not have access to this warehouse",
+      });
+    }
+
+    const saleWorkflow = await db.SaleWorkflow.findOne({
+      where: { facility_id: facilityId, sale_code: row.sale_code },
+      transaction,
+    });
+    const wfStatus = String(saleWorkflow?.status || "");
+    if (!WAREHOUSE_COLLECT_STATUSES.includes(wfStatus)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "This pack is not ready for warehouse collection until Invoice Separation is completed",
       });
     }
 
@@ -4632,6 +5099,10 @@ exports.listWarehouseRequests = async (req, res) => {
       });
     }
 
+    const pendingSaleCodes = workflows
+      .filter((w) => WAREHOUSE_COLLECT_STATUSES.includes(String(w.status)))
+      .map((w) => w.sale_code);
+
     const fulBase = { facility_id: facilityId };
     if (scopedBranchIds.length === 1) {
       fulBase.branch_id = scopedBranchIds[0];
@@ -4639,12 +5110,18 @@ exports.listWarehouseRequests = async (req, res) => {
       fulBase.branch_id = { [Op.in]: scopedBranchIds };
     }
 
-    const pendingPacks = await db.SaleFulfillment.findAll({
-      where: { ...fulBase, status: { [Op.ne]: "collected" } },
-      include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
-      order: [["updated_at", "DESC"]],
-      limit: 200,
-    });
+    const pendingPacks = pendingSaleCodes.length
+      ? await db.SaleFulfillment.findAll({
+          where: {
+            ...fulBase,
+            status: { [Op.ne]: "collected" },
+            sale_code: { [Op.in]: pendingSaleCodes },
+          },
+          include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+          order: [["updated_at", "DESC"]],
+          limit: 200,
+        })
+      : [];
     const collectedPacks = await db.SaleFulfillment.findAll({
       where: { ...fulBase, status: "collected" },
       include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
@@ -4705,7 +5182,9 @@ const SPECIAL_TREATMENT_TYPES = [
 
 /**
  * Switch payment mode on a sale (Verification Points / special treatment).
- * When requireApproval is true, queues awaiting_payment_mode_approval instead of applying.
+ * When requireApproval is true, unpaid sales queue as
+ * awaiting_payment_mode_approval. Paid / Invoice Separation sales keep their
+ * current status so they stay on the separation queue.
  */
 exports.applySpecialInvoiceTreatment = async (req, res) => {
   const transaction = await db.sequelize.transaction();
@@ -4717,9 +5196,11 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
       updated_by,
       note,
       requireApproval = false,
+      payment_modes: rawPaymentModes,
     } = req.body;
 
     const paymentType = normalizeSpecialPaymentType(rawType);
+    const requestedModes = parseModeList(rawPaymentModes);
 
     const codes = Array.isArray(saleCodes)
       ? [...new Set(saleCodes.map((c) => String(c || "").trim()).filter(Boolean))]
@@ -4766,16 +5247,7 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
 
     const updated = [];
     for (const row of rows) {
-      const prevType = String(row.payment_type || "").toLowerCase();
-      if (prevType === paymentType && !requireApproval) {
-        updated.push({
-          sale_code: row.sale_code,
-          payment_type: row.payment_type,
-          status: row.status,
-          changed: false,
-        });
-        continue;
-      }
+      const prevType = normalizeSpecialPaymentType(row.payment_type);
 
       if (
         [
@@ -4797,7 +5269,19 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
       }
 
       if (requireApproval) {
-        if (prevType === paymentType) {
+        const nextModes = requestedModes.length
+          ? requestedModes
+          : paymentModesForType(paymentType);
+        const currentModes = [
+          ...parseModeList(row.payment_modes),
+          ...paymentModesFromHistory(normalizeHistory(row.history)),
+        ];
+        const uniqueCurrent = [...new Set(currentModes.length ? currentModes : paymentModesForType(prevType))];
+        if (
+          prevType === paymentType &&
+          modeListsEqual(nextModes, uniqueCurrent) &&
+          !getPendingPaymentMode(row.history)
+        ) {
           updated.push({
             sale_code: row.sale_code,
             payment_type: row.payment_type,
@@ -4806,24 +5290,24 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
           });
           continue;
         }
-        if (row.status === "awaiting_payment_mode_approval") {
-          const existing = getPendingPaymentMode(row.history);
-          if (existing?.to === paymentType) {
-            updated.push({
-              sale_code: row.sale_code,
-              payment_type: row.payment_type,
-              status: row.status,
-              proposed_payment_type: paymentType,
-              changed: false,
-            });
-            continue;
-          }
+        const existingPending = getPendingPaymentMode(row.history);
+        if (
+          existingPending?.to === paymentType &&
+          modeListsEqual(existingPending.payment_modes || [], nextModes)
+        ) {
+          updated.push({
+            sale_code: row.sale_code,
+            payment_type: row.payment_type,
+            status: row.status,
+            proposed_payment_type: paymentType,
+            changed: false,
+          });
+          continue;
         }
 
         const previousStatus =
           row.status === "awaiting_payment_mode_approval"
-            ? getPendingPaymentMode(row.history)?.previous_status ||
-              "awaiting_cashier_confirm"
+            ? existingPending?.previous_status || "awaiting_cashier_confirm"
             : row.status;
 
         row.history = pushHistory(
@@ -4837,10 +5321,19 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
               from: prevType,
               to: paymentType,
               previous_status: previousStatus,
+              payment_modes: requestedModes.length
+                ? requestedModes
+                : paymentModesForType(paymentType),
             },
           },
         );
-        row.status = "awaiting_payment_mode_approval";
+        // Paid invoices stay on Invoice Separation while the switch awaits
+        // approval so they do not disappear from that queue.
+        if (isSeparationQueueStatus(previousStatus)) {
+          row.status = previousStatus;
+        } else {
+          row.status = "awaiting_payment_mode_approval";
+        }
         row.updated_by = updated_by || row.updated_by;
         await row.save({ transaction });
         updated.push({
@@ -4861,6 +5354,7 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
           paymentType,
           updated_by,
           note,
+          paymentModes: requestedModes,
         },
         transaction,
       );

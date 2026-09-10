@@ -132,7 +132,7 @@ async function loadTillPayBills({
     }
     const rows = await db.sequelize.query(
       `SELECT entry_id, created_by AS user_id, receiptNo, description,
-              mode_of_payment, cost, transaction_date, created_at
+              mode_of_payment, cost, transaction_date, created_at, supplier_number
        FROM supplier_entries
        WHERE ${where.join(" AND ")}`,
       {
@@ -151,6 +151,7 @@ async function loadTillPayBills({
         id: row.entry_id,
         user_id: row.user_id,
         sale_code: row.receiptNo,
+        party: row.supplier_number || "",
         description: row.description,
         payment_type: `pay bill (${side})`,
         till_mode: side,

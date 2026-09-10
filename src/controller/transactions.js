@@ -1076,6 +1076,176 @@ exports.batchSelling = (req, res) => {
 // -----------------------------------------------------------------------------
 // GET SALE BY CODE
 // -----------------------------------------------------------------------------
+/**
+ * Daily closing voids unpaid invoices by deleting customer_entries while
+ * leaving the invoice, original store lines, and original (non-VOID) GL.
+ * Rebuild enough of the sale for invoice reprint / VAT test copy.
+ */
+async function reconstructSaleEntriesFromInvoice(saleCode, facilityId) {
+  const invoice = await db.Invoice.findOne({
+    where: {
+      facility_id: facilityId,
+      invoice_ref: saleCode,
+      type: "sales",
+    },
+    raw: true,
+  });
+
+  let storeRows = [];
+  if (db.StoreEntry) {
+    storeRows = await db.StoreEntry.findAll({
+      where: {
+        facilityId,
+        reference_number: saleCode,
+        qty_out: { [Op.gt]: 0 },
+      },
+      raw: true,
+    });
+  }
+
+  const originalStore = storeRows.filter((row) => {
+    const status = String(row.status || "").toLowerCase();
+    const destination = String(row.destination || "").toLowerCase();
+    return status !== "voided" && destination !== "void";
+  });
+
+  if (!invoice && !originalStore.length) {
+    return [];
+  }
+
+  const customerNo =
+    invoice?.ref_number ||
+    invoice?.customerNo ||
+    originalStore[0]?.customer_code ||
+    "";
+  const createdBy =
+    invoice?.created_by || originalStore[0]?.inserted_by || "";
+  const createdAt =
+    invoice?.transaction_date ||
+    invoice?.created_at ||
+    originalStore[0]?.createdAt ||
+    originalStore[0]?.created_at ||
+    new Date();
+
+  const entries = originalStore.map((row, idx) => {
+    const rowType = String(row.type || "sales").toLowerCase();
+    const lineType = rowType.includes("service")
+      ? "service"
+      : rowType.includes("pro-bono")
+        ? "pro-bono"
+        : "sales";
+    return {
+      entry_id: row.id || `store-${idx}`,
+      customerNo,
+      description: row.product_id,
+      qty_in: 0,
+      qty_out: Number(row.qty_out || 0),
+      cost: Number(row.selling_price || 0),
+      facilityId,
+      mode_of_payment: "",
+      link_id: row.product_id,
+      receiptNo: saleCode,
+      type: lineType,
+      created_by: createdBy,
+      created_at: createdAt,
+      branch_id: row.branchId != null ? Number(row.branchId) : null,
+    };
+  });
+
+  let originalLedger = [];
+  if (db.GeneralLedger) {
+    const ledgerRows = await db.GeneralLedger.findAll({
+      where: {
+        facility_id: facilityId,
+        reference_number: saleCode,
+      },
+      raw: true,
+    });
+    originalLedger = ledgerRows.filter((row) => {
+      const desc = String(row.transaction_description || "");
+      const status = String(row.status || "").toLowerCase();
+      return !/^VOID:/i.test(desc) && status !== "reversed";
+    });
+  }
+
+  for (const row of originalLedger) {
+    const desc = String(row.transaction_description || "");
+    const glType = String(row.type || "").toLowerCase();
+    const cr = Number(row.cr || 0);
+    const dr = Number(row.dr || 0);
+    if (glType === "tax" && cr > 0.001) {
+      const rateMatch = desc.match(/@\s*(\d+(?:\.\d+)?)\s*%/i);
+      const incMatch = desc.match(/\((inclusive|exclusive)\)/i);
+      entries.push({
+        entry_id: `tax-${row.transaction_id}`,
+        customerNo,
+        description: desc || "VAT",
+        qty_in: 0,
+        qty_out: 0,
+        cost: cr,
+        amount: cr,
+        rate: rateMatch ? Number(rateMatch[1]) : undefined,
+        inclusive_type: incMatch ? incMatch[1].toLowerCase() : undefined,
+        facilityId,
+        mode_of_payment: "",
+        link_id: "",
+        receiptNo: saleCode,
+        type: "tax",
+        created_by: row.created_by || createdBy,
+        created_at: row.transaction_date || createdAt,
+        branch_id: row.branch_id != null ? Number(row.branch_id) : null,
+      });
+    }
+    if (
+      /discount/i.test(desc) &&
+      dr > 0.001 &&
+      (glType === "expenses" || glType === "expense")
+    ) {
+      entries.push({
+        entry_id: `discount-${row.transaction_id}`,
+        customerNo,
+        description: desc || "Discount",
+        qty_in: 0,
+        qty_out: 0,
+        cost: dr,
+        facilityId,
+        mode_of_payment: "",
+        link_id: "",
+        receiptNo: saleCode,
+        type: "discount",
+        created_by: row.created_by || createdBy,
+        created_at: row.transaction_date || createdAt,
+        branch_id: row.branch_id != null ? Number(row.branch_id) : null,
+      });
+    }
+  }
+
+  if (!entries.some((item) => typeof item.type === "string" && (
+    String(item.type).toLowerCase().includes("sales") ||
+    String(item.type).toLowerCase().includes("service") ||
+    String(item.type).toLowerCase().includes("pro-bono")
+  )) && invoice) {
+    entries.unshift({
+      entry_id: `invoice-${invoice.invoice_id || saleCode}`,
+      customerNo,
+      description: String(invoice.description || saleCode).split(" | ")[0],
+      qty_in: 0,
+      qty_out: 1,
+      cost: Number(invoice.amount || 0),
+      facilityId,
+      mode_of_payment: "",
+      link_id: saleCode,
+      receiptNo: saleCode,
+      type: "sales",
+      created_by: createdBy,
+      created_at: createdAt,
+      branch_id: invoice.branchId != null ? Number(invoice.branchId) : null,
+    });
+  }
+
+  return entries;
+}
+
 exports.getSaleByCode = async (req, res) => {
   try {
     const { sale_code: saleCode, facility_id: facilityId } = req.query;
@@ -1094,11 +1264,18 @@ exports.getSaleByCode = async (req, res) => {
       },
     });
 
+    let reconstructedEntries = [];
     if (!customerEntries.length) {
-      return res.status(404).json({
-        success: false,
-        message: "No sale found for the provided sale code",
-      });
+      reconstructedEntries = await reconstructSaleEntriesFromInvoice(
+        saleCode,
+        facilityId,
+      );
+      if (!reconstructedEntries.length) {
+        return res.status(404).json({
+          success: false,
+          message: "No sale found for the provided sale code",
+        });
+      }
     }
 
     const saleCodeNorm = String(saleCode || "").trim().toUpperCase();
@@ -1111,9 +1288,12 @@ exports.getSaleByCode = async (req, res) => {
       return !found.some((code) => code.toUpperCase() !== saleCodeNorm);
     };
 
-    const entries = customerEntries
-      .map((entry) => (entry.get ? entry.get({ plain: true }) : entry))
-      .filter(belongsToThisSale);
+    const entries = (customerEntries.length
+      ? customerEntries.map((entry) =>
+          entry.get ? entry.get({ plain: true }) : entry,
+        )
+      : reconstructedEntries
+    ).filter(belongsToThisSale);
 
     if (!entries.length) {
       return res.status(404).json({
@@ -2780,8 +2960,6 @@ export const calculateValuation = async (
  */
 
 const EDITABLE_SALES_INVOICE_STATUSES = new Set([
-  "sales_order",
-  "invoice_generated",
   "submitted",
   "awaiting_payment",
   "awaiting_cashier_confirm",
@@ -2792,10 +2970,9 @@ const EDITABLE_SALES_INVOICE_STATUSES = new Set([
 ]);
 
 function isEditableSalesInvoiceStatus(status) {
-  if (status == null || String(status).trim() === "") return true;
-  return EDITABLE_SALES_INVOICE_STATUSES.has(
-    String(status).toLowerCase().trim(),
-  );
+  const s = String(status || "").toLowerCase().trim();
+  if (!s || s === "cancelled" || s === "reversed") return false;
+  return EDITABLE_SALES_INVOICE_STATUSES.has(s);
 }
 
 function saleEditError(message, statusCode = 400) {
@@ -2870,8 +3047,21 @@ async function clearExistingSaleForEdit(facilityId, saleCode, transaction) {
     : null;
 
   if (wf && !isEditableSalesInvoiceStatus(wf.status)) {
+    const st = String(wf.status || "").toLowerCase();
+    if (st === "cancelled" || st === "reversed") {
+      throw saleEditError(
+        "This invoice has been reversed and cannot be edited.",
+        409,
+      );
+    }
     throw saleEditError(
       "This invoice cannot be edited after payment or warehouse processing. Issue a credit note instead.",
+      409,
+    );
+  }
+  if (!wf) {
+    throw saleEditError(
+      "This invoice is not on Verification Points and cannot be edited here.",
       409,
     );
   }

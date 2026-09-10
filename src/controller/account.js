@@ -10224,6 +10224,10 @@ exports.updateSessionLockSettings = async (req, res) => {
         b.invoice_closing_last_run,
         b.session_lock_enabled,
         b.session_lock_idle_minutes,
+        b.login_hours_enabled,
+        b.login_opening_time,
+        b.login_closing_time,
+        b.login_hours_timezone,
         m.access_to,
         m.functionalities
       FROM membership m
@@ -10264,6 +10268,292 @@ exports.updateSessionLockSettings = async (req, res) => {
   }
 };
 
+function normalizeLoginHhMm(time, fieldName) {
+  const raw = String(time || "").trim();
+  if (!/^\d{1,2}:\d{2}$/.test(raw)) {
+    return { error: `${fieldName} must be HH:mm (e.g. 08:00)` };
+  }
+  const [hRaw, mRaw] = raw.split(":");
+  const h = Math.min(23, Math.max(0, parseInt(hRaw, 10)));
+  const m = Math.min(59, Math.max(0, parseInt(mRaw, 10)));
+  return {
+    value: `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`,
+  };
+}
+
+/**
+ * POST /account/update-login-hours/:facilityId/:user_id
+ * body: {
+ *   login_hours_enabled,
+ *   login_opening_time,
+ *   login_closing_time,
+ *   login_hours_timezone?,
+ *   after_hours_user_ids?: string[]
+ * }
+ * Checked users may sign in after closing until opening. Unchecked users may
+ * only sign in during the opening–closing window. Defaults: all users checked.
+ */
+exports.updateLoginHoursSettings = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const body = req.body || {};
+    const updatePayload = {};
+
+    if (body.login_hours_enabled !== undefined) {
+      updatePayload.login_hours_enabled =
+        body.login_hours_enabled === true ||
+        body.login_hours_enabled === "true" ||
+        body.login_hours_enabled === 1 ||
+        body.login_hours_enabled === "1";
+    }
+
+    if (body.login_opening_time !== undefined) {
+      const parsed = normalizeLoginHhMm(
+        body.login_opening_time,
+        "login_opening_time",
+      );
+      if (parsed.error) {
+        return res.status(400).json({ success: false, message: parsed.error });
+      }
+      updatePayload.login_opening_time = parsed.value;
+    }
+
+    if (body.login_closing_time !== undefined) {
+      const parsed = normalizeLoginHhMm(
+        body.login_closing_time,
+        "login_closing_time",
+      );
+      if (parsed.error) {
+        return res.status(400).json({ success: false, message: parsed.error });
+      }
+      updatePayload.login_closing_time = parsed.value;
+    }
+
+    if (body.login_hours_timezone !== undefined) {
+      const tz = String(body.login_hours_timezone || "").trim();
+      if (tz.length < 3 || tz.length > 64) {
+        return res.status(400).json({
+          success: false,
+          message: "login_hours_timezone is invalid",
+        });
+      }
+      updatePayload.login_hours_timezone = tz;
+    }
+
+    const hasUserIds = Object.prototype.hasOwnProperty.call(
+      body,
+      "after_hours_user_ids",
+    );
+
+    if (Object.keys(updatePayload).length === 0 && !hasUserIds) {
+      return res.status(400).json({
+        success: false,
+        message: "No login hours settings provided",
+      });
+    }
+
+    if (Object.keys(updatePayload).length > 0) {
+      const [updatedRowsCount] = await db.business.update(updatePayload, {
+        where: { id: facilityId },
+      });
+      if (updatedRowsCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Business not found",
+        });
+      }
+    }
+
+    if (hasUserIds) {
+      const allowedIds = new Set(
+        (Array.isArray(body.after_hours_user_ids)
+          ? body.after_hours_user_ids
+          : []
+        )
+          .map((id) => String(id || "").trim())
+          .filter(Boolean),
+      );
+
+      const members = await db.sequelize.query(
+        `SELECT user_id
+           FROM membership
+          WHERE business_id = :facilityId
+            AND user_id IS NOT NULL
+            AND user_id <> ''`,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      const memberIds = [
+        ...new Set(
+          members.map((row) => String(row.user_id || "")).filter(Boolean),
+        ),
+      ];
+
+      if (memberIds.length) {
+        await db.users.update(
+          { allow_after_hours_login: false },
+          { where: { id: memberIds } },
+        );
+        const onIds = memberIds.filter((id) => allowedIds.has(id));
+        if (onIds.length) {
+          await db.users.update(
+            { allow_after_hours_login: true },
+            { where: { id: onIds } },
+          );
+        }
+      }
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.id,
+        b.business_name,
+        b.business_type,
+        b.business_logo,
+        b.primary_color,
+        b.secondary_color,
+        b.business_phone,
+        b.prefix,
+        b.payable_code,
+        b.receivable_code,
+        b.cost_of_sale,
+        b.payable_accural_code,
+        b.receivable_accural_code,
+        b.sale_revenue_code,
+        b.inv_ev_m,
+        b.costing_method,
+        b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
+        b.invoice_closing_enabled,
+        b.invoice_closing_time,
+        b.invoice_closing_timezone,
+        b.invoice_closing_last_run,
+        b.session_lock_enabled,
+        b.session_lock_idle_minutes,
+        b.login_hours_enabled,
+        b.login_opening_time,
+        b.login_closing_time,
+        b.login_hours_timezone,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Login hours",
+      after: {
+        ...updatePayload,
+        after_hours_user_count: hasUserIds
+          ? (Array.isArray(body.after_hours_user_ids)
+              ? body.after_hours_user_ids
+              : []
+            ).length
+          : undefined,
+      },
+      remark: "Business login opening/closing hours updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: "Login hours settings updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating login hours settings:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
+/**
+ * GET /account/login-hours-status/:facilityId/:userId
+ * Source of truth for whether this user's session should expire now.
+ */
+exports.getLoginHoursStatus = async (req, res) => {
+  try {
+    const { facilityId, userId } = req.params;
+    if (!facilityId || !userId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and userId are required",
+      });
+    }
+
+    const {
+      evaluateLoginHours,
+      msUntilForcedLogout,
+      userAllowsAfterHoursLogin,
+    } = require("../services/loginHours");
+
+    const [business, staff] = await Promise.all([
+      db.business.findByPk(facilityId, {
+        attributes: [
+          "id",
+          "login_hours_enabled",
+          "login_opening_time",
+          "login_closing_time",
+          "login_hours_timezone",
+        ],
+      }),
+      db.users.findByPk(userId, {
+        attributes: ["id", "allow_after_hours_login", "facilityId"],
+      }),
+    ]);
+
+    if (!business) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const userRow = staff
+      ? staff.get({ plain: true })
+      : { id: userId, allow_after_hours_login: false };
+    const check = evaluateLoginHours(business, userRow);
+    const msUntilLock = msUntilForcedLogout(business, userRow);
+
+    return res.json({
+      success: true,
+      enabled: Boolean(business.login_hours_enabled),
+      opening: business.login_opening_time,
+      closing: business.login_closing_time,
+      timezone: business.login_hours_timezone || "Africa/Lagos",
+      allow_after_hours_login: userAllowsAfterHoursLogin(userRow),
+      shouldLock: Boolean(business.login_hours_enabled) && !check.allowed,
+      msUntilLock,
+    });
+  } catch (err) {
+    console.error("Error reading login hours status:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
 /**
  * POST /account/run-invoice-closing/:facilityId
  * Manual trigger for today's unpaid non-credit reverse (owner/admin).
@@ -10291,7 +10581,7 @@ exports.runInvoiceClosingNow = async (req, res) => {
       userId,
       reason:
         req.body?.reason ||
-        `Manually reversed unpaid non-credit invoices after closing time ${business.invoice_closing_time || "17:00"}`,
+        `Manually reversed unpaid verification invoices after closing time ${business.invoice_closing_time || "17:00"}`,
     });
 
     const parts = getNowPartsInTimezone(
@@ -10304,7 +10594,7 @@ exports.runInvoiceClosingNow = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Reversed ${summary.reversed} of ${summary.candidates} unpaid non-credit invoice(s)`,
+      message: `Reversed ${summary.reversed} of ${summary.candidates} unpaid verification invoice(s)`,
       data: summary,
     });
   } catch (err) {
@@ -11755,11 +12045,31 @@ exports.updateDocumentHeaderStyle = (req, res) => {
     });
   }
 
+  const hasPrintColor =
+    req.body?.sales_invoice_print_in_color !== undefined &&
+    req.body?.sales_invoice_print_in_color !== null;
+  const printInColor = ["1", "true", true, 1].includes(
+    req.body?.sales_invoice_print_in_color,
+  );
+  const receiptType = String(req.body?.default_receipt_type || "")
+    .trim()
+    .toLowerCase();
+  const hasReceiptType = ["pdf", "a5", "terminal"].includes(receiptType);
+
+  const sets = ["document_header_style = :style"];
+  if (hasPrintColor) sets.push("sales_invoice_print_in_color = :printInColor");
+  if (hasReceiptType) sets.push("default_receipt_type = :receiptType");
+
   db.sequelize
     .query(
-      `UPDATE business SET document_header_style = :style WHERE id = :businessId`,
+      `UPDATE business SET ${sets.join(", ")} WHERE id = :businessId`,
       {
-        replacements: { style, businessId },
+        replacements: {
+          style,
+          printInColor: printInColor ? 1 : 0,
+          receiptType,
+          businessId,
+        },
         type: db.Sequelize.QueryTypes.UPDATE,
       },
     )
@@ -11773,7 +12083,13 @@ exports.updateDocumentHeaderStyle = (req, res) => {
       res.json({
         success: true,
         message: "Document header style updated successfully",
-        results: { document_header_style: style },
+        results: {
+          document_header_style: style,
+          ...(hasPrintColor
+            ? { sales_invoice_print_in_color: printInColor }
+            : {}),
+          ...(hasReceiptType ? { default_receipt_type: receiptType } : {}),
+        },
       });
     })
     .catch((err) => {

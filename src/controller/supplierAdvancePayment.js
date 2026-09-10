@@ -374,6 +374,146 @@ async function getAvailableSupplierGoodsInTransit(
   return Math.max(0, parseFloat(balRows[0]?.available_git || 0));
 }
 
+function parseApplyDepositVendorTypes(value) {
+  return [
+    ...new Set(
+      String(value || "")
+        .split(",")
+        .map((t) => {
+          const v = String(t || "").trim().toLowerCase();
+          if (v === "inventories") return "inventory";
+          if (v === "expenses") return "expense";
+          if (v === "inventory" || v === "expense" || v === "all") return v;
+          return "";
+        })
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function vendorTypeSqlForApplyDeposit(types) {
+  const set = new Set(types);
+  if (!types.length || set.has("all") || (set.has("inventory") && set.has("expense"))) {
+    return "";
+  }
+  if (set.has("inventory")) {
+    return ` AND (LOWER(TRIM(IFNULL(s.vendor_type, ''))) IN ('inventory', 'all', '')
+      OR s.vendor_type IS NULL)`;
+  }
+  if (set.has("expense")) {
+    return ` AND (LOWER(TRIM(IFNULL(s.vendor_type, ''))) IN ('expense', 'all', '')
+      OR s.vendor_type IS NULL)`;
+  }
+  return "";
+}
+
+/**
+ * GET /api/v1/suppliers-for-apply-deposit
+ * Inventory vendors by default; optional withBalance=1 limits to those with
+ * deposit or goods-in-transit.
+ */
+exports.listSuppliersForApplyDeposit = async (req, res) => {
+  try {
+    const facilityId = String(req.query.facilityId || "").trim();
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const types = parseApplyDepositVendorTypes(
+      req.query.vendorTypes || req.query.vendorType || "inventory",
+    );
+    const withBalanceRaw = String(req.query.withBalance ?? "1").toLowerCase();
+    const withBalance =
+      withBalanceRaw !== "0" &&
+      withBalanceRaw !== "false" &&
+      withBalanceRaw !== "no";
+
+    const gitAcc = await resolveGoodsInTransitAccount(facilityId);
+    const gitCode = gitAcc?.code || null;
+    const typeSql = vendorTypeSqlForApplyDeposit(types);
+
+    const gitJoin = gitCode
+      ? `LEFT JOIN (
+           SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
+             FROM general_ledger
+            WHERE facility_id = :facilityId
+              AND account_code = :gitCode
+              AND LOWER(type) IN ('goods_in_transit', 'git', 'inventory', 'prepayment')
+            GROUP BY transaction_ref
+         ) git ON git.transaction_ref = s.supplier_number`
+      : `LEFT JOIN (
+           SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
+             FROM general_ledger
+            WHERE facility_id = :facilityId
+              AND LOWER(type) IN ('goods_in_transit', 'git')
+            GROUP BY transaction_ref
+         ) git ON git.transaction_ref = s.supplier_number`;
+
+    const balanceSql = withBalance
+      ? " AND (COALESCE(adv.bal, 0) > 0.009 OR COALESCE(git.bal, 0) > 0.009)"
+      : "";
+
+    const rows = await db.sequelize.query(
+      `SELECT
+         s.supplier_number,
+         s.supplier_name,
+         s.vendor_type,
+         s.email,
+         s.phone,
+         GREATEST(COALESCE(adv.bal, 0), 0) AS available_deposit,
+         GREATEST(COALESCE(git.bal, 0), 0) AS available_git
+       FROM (
+         SELECT
+           supplier_number,
+           MAX(NULLIF(supplier_name, '')) AS supplier_name,
+           MAX(vendor_type) AS vendor_type,
+           MAX(email) AS email,
+           MAX(phone) AS phone
+         FROM suppliersinfo
+         WHERE facilityId = :facilityId
+         GROUP BY supplier_number
+       ) s
+       LEFT JOIN (
+         SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
+           FROM general_ledger
+          WHERE facility_id = :facilityId
+            AND LOWER(type) IN ('accrued', 'advance')
+          GROUP BY transaction_ref
+       ) adv ON adv.transaction_ref = s.supplier_number
+       ${gitJoin}
+       WHERE 1 = 1
+         ${typeSql}
+         ${balanceSql}
+       ORDER BY s.supplier_name ASC
+       LIMIT 2000`,
+      {
+        replacements: {
+          facilityId,
+          ...(gitCode ? { gitCode } : {}),
+        },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    return res.json({
+      success: true,
+      results: rows,
+      count: rows.length,
+      withBalance,
+      vendorTypes: types.length ? types : ["inventory"],
+    });
+  } catch (err) {
+    console.error("listSuppliersForApplyDeposit:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load suppliers",
+    });
+  }
+};
+
 async function getBillAmountDue(facilityId, invoiceRef, transaction) {
   const rows = await db.sequelize.query(
     `SELECT

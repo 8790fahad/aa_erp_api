@@ -51,7 +51,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: false,
         comment:
-          "When true, unpaid non-credit invoices auto-reverse after daily closing time",
+          "When true, unpaid invoices still on Verification Points (including unapproved credit) auto-reverse after daily closing time",
       },
       invoice_closing_time: {
         type: DataTypes.STRING(5),
@@ -82,6 +82,31 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: 10,
         comment: "Idle minutes before session lock (1–240) for this business",
+      },
+      login_hours_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment:
+          "When true, only after-hours-checked users may sign in outside opening–closing time",
+      },
+      login_opening_time: {
+        type: DataTypes.STRING(5),
+        allowNull: false,
+        defaultValue: "08:00",
+        comment: "Daily opening time HH:mm for staff login",
+      },
+      login_closing_time: {
+        type: DataTypes.STRING(5),
+        allowNull: false,
+        defaultValue: "17:00",
+        comment: "Daily closing time HH:mm for staff login",
+      },
+      login_hours_timezone: {
+        type: DataTypes.STRING(64),
+        allowNull: false,
+        defaultValue: "Africa/Lagos",
+        comment: "IANA timezone for staff login opening/closing hours",
       },
       pro_bono_code: {
         type: DataTypes.STRING(50),

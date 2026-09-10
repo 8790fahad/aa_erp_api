@@ -22,7 +22,7 @@ async function processFacility(business, now = new Date()) {
   const summary = await reverseUnpaidNonCreditInvoicesForFacility({
     facilityId,
     userId: "system",
-    reason: `Auto-reversed after daily closing time ${business.invoice_closing_time} (unpaid non-credit invoice)`,
+    reason: `Auto-reversed after daily closing time ${business.invoice_closing_time} (still on Verification Points, unpaid)`,
   });
 
   await db.business.update(

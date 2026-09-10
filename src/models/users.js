@@ -47,6 +47,13 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(20),
         allowNull: true,
       },
+      allow_after_hours_login: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment:
+          "When true, user may sign in after closing until opening. Default all users checked.",
+      },
       store: DataTypes.STRING,
       branchId: {
         type: DataTypes.INTEGER,

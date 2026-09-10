@@ -93,6 +93,10 @@ module.exports = (app) => {
     "/api/v1/get-outstanding-supplier-invoices",
     supplierAdvancePayment.getOutstandingSupplierPurchaseInvoices,
   );
+  app.get(
+    "/api/v1/suppliers-for-apply-deposit",
+    supplierAdvancePayment.listSuppliersForApplyDeposit,
+  );
   app.post(
     "/api/v1/supplier-advance-payment",
     supplierAdvancePayment.createSupplierAdvancePayment,
