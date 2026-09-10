@@ -29,6 +29,7 @@ const {
   resolveSignedPoDocumentUrl,
 } = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { collectPurchaseRequisitionRefs } = require("../utils/purchaseRequisitionRefs");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const {
   fetchEnrichedSalesInvoices,
@@ -2582,25 +2583,6 @@ function clientError(message, statusCode = 400) {
   return Object.assign(new Error(message), { statusCode });
 }
 
-function collectPurchaseRequisitionRefs(body = {}) {
-  const prNos = new Set();
-  const orderIds = new Set();
-  (Array.isArray(body.pr_nos) ? body.pr_nos : []).forEach((n) => {
-    if (n) prNos.add(String(n).trim());
-  });
-  (Array.isArray(body.data) ? body.data : []).forEach((item) => {
-    if (item?.pr_no) prNos.add(String(item.pr_no).trim());
-    const oid = String(item?.order_id || "").trim();
-    const po = String(item?.po_no || "").trim();
-    if (oid && oid.toUpperCase() !== "DIRECT") orderIds.add(oid);
-    else if (po && po.toUpperCase() !== "DIRECT") orderIds.add(po);
-  });
-  return {
-    prNos: [...prNos].filter(Boolean),
-    orderIds: [...orderIds],
-  };
-}
-
 function storeEntryOrderRef(item) {
   const oid = String(item?.order_id || item?.po_no || item?.pr_no || "").trim();
   return oid || "DIRECT";
@@ -2640,19 +2622,44 @@ async function markPurchaseRequisitionsConverted({
     ),
   ];
 
-  if (!uniquePrNos.size && uniqueOrderIds.length) {
+  if (uniqueOrderIds.length) {
     const byOrder = await db.PurchaseRequisition.findAll({
       where: {
         facilityId,
-        [Op.or]: [
-          { order_id: { [Op.in]: uniqueOrderIds } },
-          { po_no: { [Op.in]: uniqueOrderIds } },
-        ],
+        [Op.or]: uniqueOrderIds.flatMap((id) => [
+          Sequelize.where(
+            Sequelize.fn("LOWER", Sequelize.col("order_id")),
+            id.toLowerCase(),
+          ),
+          Sequelize.where(
+            Sequelize.fn("LOWER", Sequelize.col("po_no")),
+            id.toLowerCase(),
+          ),
+        ]),
       },
       transaction,
       lock: transaction.LOCK.UPDATE,
     });
     byOrder.forEach((pr) => uniquePrNos.add(pr.pr_no));
+
+    const billedStore = await db.StoreEntry.findOne({
+      where: {
+        facilityId,
+        [Op.or]: uniqueOrderIds.map((id) =>
+          Sequelize.where(
+            Sequelize.fn("LOWER", Sequelize.col("po_no")),
+            id.toLowerCase(),
+          ),
+        ),
+      },
+      transaction,
+    });
+    if (billedStore) {
+      throw clientError(
+        `PO ${billedStore.po_no} already treated and cannot be billed again`,
+        409,
+      );
+    }
   }
 
   const prNoList = [...uniquePrNos];
@@ -2820,6 +2827,7 @@ exports.getApprovedPRsWithItems = async (req, res) => {
               attributes: [
                 "name",
                 "sku",
+                "cost_price",
                 "inventory_account",
                 "unit_of_measure",
                 "cogs_head",
@@ -2874,12 +2882,12 @@ exports.getApprovedPRsWithItems = async (req, res) => {
       const mappedItems = items.map((item) => ({
         id: item.id,
         item_code: item.item_code,
-        item_name: item.product?.name || item.item_name,
+        item_name: item.product?.name || item.item_name || item.item_code,
         quantity: item.approved_qty ?? item.quantity,
         requested_qty: item.quantity,
         approved_qty: item.approved_qty,
         unit_measure: item.unit_measure,
-        unit_cost: item.est_cost,
+        unit_cost: item.est_cost || item.product?.cost_price,
         inventory_account: item.product?.inventory_account,
         uom: item.product?.unit_of_measure,
         cogs_head: item.product?.cogs_head,
@@ -12656,6 +12664,7 @@ function withSearch(where, search) {
         [Op.or]: [
           { pr_no: like },
           { order_id: like },
+          { po_no: like },
           { supplier_name: like },
           { reason: like },
           { branch: like },
@@ -12738,8 +12747,8 @@ async function runPurchaseRequisitionQuery({
     await db.PurchaseRequisition.create(
       {
         pr_no,
-        po_no: po_no || null,
-        order_id: order_id || null,
+        po_no: po_no || order_id || null,
+        order_id: order_id || po_no || null,
         branch: branch || "",
         branch_id: branch_id || null,
         date: date || moment().format("YYYY-MM-DD"),
@@ -12882,19 +12891,39 @@ async function runPurchaseRequisitionQuery({
   }
 
   if (qt === "update") {
+    const existing = await db.PurchaseRequisition.findOne({
+      where: facilityId ? { pr_no, facilityId } : { pr_no },
+      ...opts,
+    });
+    const poNumber =
+      po_no || existing?.order_id || existing?.po_no || null;
     await db.PurchaseRequisition.update(
-      { status: "Approved", po_no: po_no || null },
-      { where: { pr_no }, ...opts },
+      {
+        status: "Approved",
+        po_no: poNumber,
+        order_id: existing?.order_id || poNumber,
+      },
+      { where: facilityId ? { pr_no, facilityId } : { pr_no }, ...opts },
     );
-    return [{ pr_no, status: "Approved", po_no }];
+    return [{ pr_no, status: "Approved", po_no: poNumber }];
   }
 
   if (qt === "update-pending") {
+    const existing = await db.PurchaseRequisition.findOne({
+      where: facilityId ? { pr_no, facilityId } : { pr_no },
+      ...opts,
+    });
+    const poNumber =
+      po_no || existing?.order_id || existing?.po_no || null;
     await db.PurchaseRequisition.update(
-      { status: "Pending Payment", po_no: po_no || null },
-      { where: { pr_no }, ...opts },
+      {
+        status: "Pending Payment",
+        po_no: poNumber,
+        order_id: existing?.order_id || poNumber,
+      },
+      { where: facilityId ? { pr_no, facilityId } : { pr_no }, ...opts },
     );
-    return [{ pr_no, status: "Pending Payment", po_no }];
+    return [{ pr_no, status: "Pending Payment", po_no: poNumber }];
   }
 
   throw new Error(`Unsupported purchase requisition query_type: ${qt || "(empty)"}`);
@@ -13003,9 +13032,13 @@ async function resolveUniqueOrderId({
     db.PurchaseRequisition.findOne({
       where: {
         facilityId,
-        [Op.and]: [
+        [Op.or]: [
           Sequelize.where(
             Sequelize.fn("LOWER", Sequelize.col("order_id")),
+            String(value).toLowerCase(),
+          ),
+          Sequelize.where(
+            Sequelize.fn("LOWER", Sequelize.col("po_no")),
             String(value).toLowerCase(),
           ),
         ],
@@ -13130,7 +13163,7 @@ exports.insertRequisition = async (req, res) => {
       supplier_code,
       total,
       pr_no: newCode,
-      po_no,
+      po_no: resolvedOrderId,
       order_id: resolvedOrderId,
       account_code: account_code || "",
       transaction,
@@ -13237,7 +13270,7 @@ exports.insertRequisition = async (req, res) => {
           {
             replacements: {
               pr_no: newCode,
-              po_no: po_no || null,
+              po_no: resolvedOrderId || po_no || null,
               facilityId,
               document_name: doc.document_name,
               file_path: doc.file_path,
@@ -13265,6 +13298,7 @@ exports.insertRequisition = async (req, res) => {
       after: {
         pr_no: newCode,
         order_id: resolvedOrderId,
+        po_no: resolvedOrderId,
         supplier_code,
         total,
         reason,
@@ -13655,8 +13689,14 @@ exports.updateRequisition = async (req, res) => {
 
     let newCode = "";
     if (query_type === "update" || query_type === "update-pending") {
-      const code = await getAndUpdateNumber("po", facilityId);
-      newCode = `PO/${moment().format("YY")}/${code}`;
+      const existing = await db.PurchaseRequisition.findOne({
+        where: facilityId ? { pr_no, facilityId } : { pr_no },
+      });
+      newCode = String(existing?.order_id || existing?.po_no || "").trim();
+      if (!newCode) {
+        const code = await getAndUpdateNumber("po", facilityId);
+        newCode = `PO/${moment().format("YY")}/${code}`;
+      }
     }
 
     const results = await runPurchaseRequisitionQuery({
