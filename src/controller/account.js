@@ -2577,6 +2577,176 @@ exports.closeMemo = async (req, res) => {
     });
   }
 };
+
+function clientError(message, statusCode = 400) {
+  return Object.assign(new Error(message), { statusCode });
+}
+
+function collectPurchaseRequisitionRefs(body = {}) {
+  const prNos = new Set();
+  const orderIds = new Set();
+  (Array.isArray(body.pr_nos) ? body.pr_nos : []).forEach((n) => {
+    if (n) prNos.add(String(n).trim());
+  });
+  (Array.isArray(body.data) ? body.data : []).forEach((item) => {
+    if (item?.pr_no) prNos.add(String(item.pr_no).trim());
+    const oid = String(item?.order_id || "").trim();
+    const po = String(item?.po_no || "").trim();
+    if (oid && oid.toUpperCase() !== "DIRECT") orderIds.add(oid);
+    else if (po && po.toUpperCase() !== "DIRECT") orderIds.add(po);
+  });
+  return {
+    prNos: [...prNos].filter(Boolean),
+    orderIds: [...orderIds],
+  };
+}
+
+function storeEntryOrderRef(item) {
+  const oid = String(item?.order_id || item?.po_no || item?.pr_no || "").trim();
+  return oid || "DIRECT";
+}
+
+function narrationWithOrderIds(remark, fallback, items = []) {
+  const ids = [
+    ...new Set(
+      (items || [])
+        .map((item) => String(item?.order_id || item?.po_no || "").trim())
+        .filter((id) => id && id.toUpperCase() !== "DIRECT"),
+    ),
+  ];
+  const base = String(remark || "").trim() || fallback;
+  if (!ids.length) return base;
+  const tag = ids.length === 1 ? `Order ${ids[0]}` : `Orders ${ids.join(", ")}`;
+  if (ids.every((id) => base.includes(id))) return base;
+  return `${base} [${tag}]`;
+}
+
+async function markPurchaseRequisitionsConverted({
+  facilityId,
+  prNos = [],
+  orderIds = [],
+  invoiceRef,
+  userId,
+  transaction,
+}) {
+  if (!facilityId) return [];
+
+  const uniquePrNos = new Set((prNos || []).map(String).filter(Boolean));
+  const uniqueOrderIds = [
+    ...new Set(
+      (orderIds || [])
+        .map((id) => String(id).trim())
+        .filter((id) => id && id.toUpperCase() !== "DIRECT"),
+    ),
+  ];
+
+  if (!uniquePrNos.size && uniqueOrderIds.length) {
+    const byOrder = await db.PurchaseRequisition.findAll({
+      where: {
+        facilityId,
+        [Op.or]: [
+          { order_id: { [Op.in]: uniqueOrderIds } },
+          { po_no: { [Op.in]: uniqueOrderIds } },
+        ],
+      },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    byOrder.forEach((pr) => uniquePrNos.add(pr.pr_no));
+  }
+
+  const prNoList = [...uniquePrNos];
+  if (!prNoList.length) return [];
+
+  if (uniqueOrderIds.length) {
+    const treated = await db.PurchaseRequisition.findAll({
+      where: {
+        facilityId,
+        status: "Converted",
+        [Op.or]: [
+          { order_id: { [Op.in]: uniqueOrderIds } },
+          { po_no: { [Op.in]: uniqueOrderIds } },
+        ],
+      },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (treated.length) {
+      const labels = treated
+        .map((pr) => pr.order_id || pr.po_no || pr.pr_no)
+        .join(", ");
+      throw clientError(
+        `Order ${labels} already treated and cannot be billed again`,
+        409,
+      );
+    }
+  }
+
+  const prs = await db.PurchaseRequisition.findAll({
+    where: { facilityId, pr_no: { [Op.in]: prNoList } },
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+
+  const found = new Set(prs.map((pr) => pr.pr_no));
+  const missing = prNoList.filter((n) => !found.has(n));
+  if (missing.length) {
+    throw clientError(
+      `Purchase requisition not found: ${missing.join(", ")}`,
+      404,
+    );
+  }
+
+  const already = prs.filter(
+    (pr) => String(pr.status || "").toLowerCase() === "converted",
+  );
+  if (already.length) {
+    const labels = already
+      .map((pr) => pr.order_id || pr.po_no || pr.pr_no)
+      .join(", ");
+    throw clientError(
+      `Order ${labels} already treated and cannot be billed again`,
+      409,
+    );
+  }
+
+  const notApproved = prs.filter((pr) => pr.status !== "Approved");
+  if (notApproved.length) {
+    const first = notApproved[0];
+    throw clientError(
+      `Requisition ${first.pr_no} is ${first.status} and cannot be billed`,
+      409,
+    );
+  }
+
+  await db.PurchaseRequisition.update(
+    { status: "Converted" },
+    {
+      where: { facilityId, pr_no: { [Op.in]: prNoList } },
+      transaction,
+    },
+  );
+
+  for (const pr of prs) {
+    await recordActivity({
+      facilityId,
+      userId,
+      action: "status_change",
+      entityType: "purchase_requisition",
+      entityId: pr.pr_no,
+      entityLabel: pr.order_id || pr.po_no || pr.pr_no,
+      before: { status: pr.status },
+      after: { status: "Converted", invoice_ref: invoiceRef || null },
+      remark: invoiceRef
+        ? `PR converted to bill ${invoiceRef}`
+        : "PR converted to product bill",
+      transaction,
+    });
+  }
+
+  return prs;
+}
+
 /**
  * Get approved purchase requisitions with their items using ORM
  * Combines the functionality of:
@@ -2675,6 +2845,7 @@ exports.getApprovedPRsWithItems = async (req, res) => {
       attributes: [
         "pr_no",
         "po_no",
+        "order_id",
         "memo_id",
         "requisitor",
         "branch",
@@ -2689,7 +2860,6 @@ exports.getApprovedPRsWithItems = async (req, res) => {
         "total",
         "date",
         "facilityId",
-        "order_id",
         "created_at",
       ],
       order: [["date", "DESC"]],
@@ -2714,8 +2884,6 @@ exports.getApprovedPRsWithItems = async (req, res) => {
         uom: item.product?.unit_of_measure,
         cogs_head: item.product?.cogs_head,
         revenue_account: item.product?.revenue_account,
-        order_id: prData.order_id || prData.po_no || "",
-        pr_no: prData.pr_no,
       }));
 
       // Calculate total item cost
@@ -2931,6 +3099,16 @@ exports.updatePRStatus = async (req, res) => {
     const existing = await db.PurchaseRequisition.findOne({
       where: { pr_no, facilityId },
     });
+    if (
+      status === "Converted" &&
+      String(existing?.status || "").toLowerCase() === "converted"
+    ) {
+      return res.status(409).json({
+        success: false,
+        already_treated: true,
+        message: `Order ${existing.order_id || existing.po_no || pr_no} already treated and cannot be billed again`,
+      });
+    }
     const [updated] = await db.PurchaseRequisition.update(
       { status },
       { where: { pr_no, facilityId } },
@@ -14257,7 +14435,12 @@ exports.directPurchaseConsumables = async (req, res) => {
     // === GENERATE CODES ===
     const pvCode = `PB-${await getAndUpdateNumber("direct_p", facilityId)}`;
     const dpCode = `DP/${moment().format("YY")}/${pvCode}`;
-    const narration = remark || `Direct Purchase - ${dpCode}`;
+    const requisitionRefs = collectPurchaseRequisitionRefs(req.body);
+    const narration = narrationWithOrderIds(
+      remark,
+      `Direct Purchase - ${dpCode}`,
+      data,
+    );
 
     let totalPurchaseAmount = 0;
     let totalSettledUsingAdvance = 0;
@@ -14285,6 +14468,15 @@ exports.directPurchaseConsumables = async (req, res) => {
         "Select a warehouse. Purchases cannot be saved without a branch.",
       );
     }
+
+    await markPurchaseRequisitionsConverted({
+      facilityId,
+      prNos: requisitionRefs.prNos,
+      orderIds: requisitionRefs.orderIds,
+      invoiceRef: pvCode,
+      userId,
+      transaction,
+    });
 
     // === PARSE TAX AMOUNT ===
     const totalTaxAmount = parseFloat(tax_amount || 0);
@@ -14389,7 +14581,7 @@ exports.directPurchaseConsumables = async (req, res) => {
             receive_date: moment(
               item.transaction_date || transaction_date || new Date(),
             ).format("YYYY-MM-DD"),
-            po_no: "DIRECT",
+            po_no: storeEntryOrderRef(item),
             reference_number: pvCode,
             qty_in: qty,
             qty_out: 0,
@@ -14902,9 +15094,14 @@ exports.directPurchaseConsumables = async (req, res) => {
   } catch (err) {
     if (transaction) await transaction.rollback().catch(() => {});
     console.error("Direct Purchase Error:", err);
-    return res.status(500).json({
+    const statusCode =
+      err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
+    return res.status(statusCode).json({
       success: false,
-      message: "Failed to process direct purchase",
+      message:
+        statusCode < 500
+          ? err.message
+          : "Failed to process direct purchase",
       error: err.message,
     });
   }
@@ -17109,10 +17306,10 @@ exports.paySupplierBills = async (req, res) => {
       (typeof err === "string" ? err : null) ||
       "Failed to process payment";
 
-    return res.status(isClientError ? 400 : 500).json({
+    return res.status(500).json({
       success: false,
-      message,
-      error: message,
+      message: "Failed to process direct consumables purchase",
+      error: err.message,
     });
   }
 };
@@ -17197,7 +17394,21 @@ exports.directConsumables = async (req, res) => {
     // === REFERENCE ===
     const refCode = await getAndUpdateNumber("direct_p", facilityId);
     const reference = `DC/${moment().format("YY")}/${refCode}`;
-    const narration = remark || `Direct Consumables Purchase - ${reference}`;
+    const requisitionRefs = collectPurchaseRequisitionRefs(req.body);
+    const narration = narrationWithOrderIds(
+      remark,
+      `Direct Consumables Purchase - ${reference}`,
+      data,
+    );
+
+    await markPurchaseRequisitionsConverted({
+      facilityId,
+      prNos: requisitionRefs.prNos,
+      orderIds: requisitionRefs.orderIds,
+      invoiceRef: reference,
+      userId,
+      transaction,
+    });
 
     let totalAmount = 0;
     const ledgerEntries = [];
@@ -17241,7 +17452,7 @@ exports.directConsumables = async (req, res) => {
             receive_date: moment(transaction_date || undefined).format(
               "YYYY-MM-DD",
             ),
-            po_no: "DIRECT",
+            po_no: storeEntryOrderRef(item),
             reference_number: refCode,
             qty_in: qty,
             qty_out: 0,
@@ -17499,9 +17710,14 @@ exports.directConsumables = async (req, res) => {
     if (transaction && !transaction.finished) {
       await transaction.rollback().catch(console.error);
     }
-    return res.status(500).json({
+    const statusCode =
+      err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 500;
+    return res.status(statusCode).json({
       success: false,
-      message: "Failed to process direct consumables purchase",
+      message:
+        statusCode < 500
+          ? err.message
+          : "Failed to process direct consumables purchase",
       error: err.message,
     });
   }
