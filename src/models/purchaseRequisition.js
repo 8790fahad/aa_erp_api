@@ -37,6 +37,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         field: "po_no",
       },
+      order_id: {
+        type: DataTypes.STRING(100),
+        allowNull: true,
+        field: "order_id",
+      },
       memo_id: {
         type: DataTypes.STRING(50),
         allowNull: true,
@@ -124,6 +129,11 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         { fields: ["supplier_code", "account_code"] },
         { fields: ["memo_id"] },
+        {
+          unique: true,
+          fields: ["facilityId", "order_id"],
+          name: "purchase_requisition_facility_order_id_unique",
+        },
       ],
     }
   );

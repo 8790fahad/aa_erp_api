@@ -35,6 +35,10 @@ module.exports = (sequelize, DataTypes) => {
       },
       receive_date: DataTypes.STRING(50),
       reference_number: DataTypes.STRING(20),
+      po_no: {
+        type: DataTypes.STRING(100),
+        allowNull: true,
+      },
 
       // Quantities
       qty_in: {

@@ -2689,6 +2689,7 @@ exports.getApprovedPRsWithItems = async (req, res) => {
         "total",
         "date",
         "facilityId",
+        "order_id",
         "created_at",
       ],
       order: [["date", "DESC"]],
@@ -2713,6 +2714,8 @@ exports.getApprovedPRsWithItems = async (req, res) => {
         uom: item.product?.unit_of_measure,
         cogs_head: item.product?.cogs_head,
         revenue_account: item.product?.revenue_account,
+        order_id: prData.order_id || prData.po_no || "",
+        pr_no: prData.pr_no,
       }));
 
       // Calculate total item cost
@@ -12474,6 +12477,7 @@ function withSearch(where, search) {
       {
         [Op.or]: [
           { pr_no: like },
+          { order_id: like },
           { supplier_name: like },
           { reason: like },
           { branch: like },
@@ -12541,6 +12545,7 @@ async function runPurchaseRequisitionQuery({
   total = null,
   pr_no = "",
   po_no = "",
+  order_id = "",
   account_code = "",
   transaction = null,
   page = null,
@@ -12556,6 +12561,7 @@ async function runPurchaseRequisitionQuery({
       {
         pr_no,
         po_no: po_no || null,
+        order_id: order_id || null,
         branch: branch || "",
         branch_id: branch_id || null,
         date: date || moment().format("YYYY-MM-DD"),
@@ -12799,6 +12805,59 @@ exports.getRequisition = async (req, res) => {
   }
 };
 
+function isAutoOrderId(raw) {
+  return String(raw || "").trim().toLowerCase() === "auto";
+}
+
+async function resolveUniqueOrderId({
+  facilityId,
+  orderId,
+  transaction,
+}) {
+  const raw = String(orderId || "").trim();
+  if (!raw) {
+    throw Object.assign(new Error("Order ID is required. Type an ID or auto."), {
+      statusCode: 400,
+    });
+  }
+
+  const findExisting = (value) =>
+    db.PurchaseRequisition.findOne({
+      where: {
+        facilityId,
+        [Op.and]: [
+          Sequelize.where(
+            Sequelize.fn("LOWER", Sequelize.col("order_id")),
+            String(value).toLowerCase(),
+          ),
+        ],
+      },
+      transaction,
+    });
+
+  if (!isAutoOrderId(raw)) {
+    const existing = await findExisting(raw);
+    if (existing) {
+      throw Object.assign(
+        new Error("This Order ID is already used in this facility"),
+        { statusCode: 400 },
+      );
+    }
+    return raw;
+  }
+
+  for (let i = 0; i < 8; i += 1) {
+    const code = await getAndUpdateNumber("po", facilityId, transaction);
+    const generated = `PO/${moment().format("YY")}/${code}`;
+    const existing = await findExisting(generated);
+    if (!existing) return generated;
+  }
+  throw Object.assign(
+    new Error("Could not generate a unique Order ID. Try again."),
+    { statusCode: 400 },
+  );
+}
+
 exports.insertRequisition = async (req, res) => {
   // Support JSON body (legacy) and multipart FormData (with po_documents).
   let body = req.body || {};
@@ -12836,6 +12895,7 @@ exports.insertRequisition = async (req, res) => {
     total = null,
     pr_no = "",
     po_no = "",
+    order_id = "",
     account_code = "",
   } = body;
 
@@ -12861,8 +12921,23 @@ exports.insertRequisition = async (req, res) => {
       });
     }
 
-    const code = await getAndUpdateNumber("pr", facilityId);
+    const code = await getAndUpdateNumber("pr", facilityId, transaction);
     const newCode = pr_no || `PR/${moment().format("YY")}/${code}`;
+
+    let resolvedOrderId;
+    try {
+      resolvedOrderId = await resolveUniqueOrderId({
+        facilityId,
+        orderId: order_id,
+        transaction,
+      });
+    } catch (orderErr) {
+      await transaction.rollback();
+      return res.status(orderErr.statusCode || 400).json({
+        success: false,
+        message: orderErr.message,
+      });
+    }
 
     const requisitionResult = await runPurchaseRequisitionQuery({
       query_type: query_type || "insert",
@@ -12878,6 +12953,7 @@ exports.insertRequisition = async (req, res) => {
       total,
       pr_no: newCode,
       po_no,
+      order_id: resolvedOrderId,
       account_code: account_code || "",
       transaction,
     });
@@ -13010,6 +13086,7 @@ exports.insertRequisition = async (req, res) => {
       entityLabel: newCode,
       after: {
         pr_no: newCode,
+        order_id: resolvedOrderId,
         supplier_code,
         total,
         reason,
@@ -13023,12 +13100,23 @@ exports.insertRequisition = async (req, res) => {
       success: true,
       results: requisitionResult,
       pr_no: newCode,
+      order_id: resolvedOrderId,
       message: "Requisition created successfully",
       documents_saved: docsToSave.length,
     });
   } catch (error) {
     await transaction.rollback();
     console.error("Error creating requisition:", error);
+    const duplicate =
+      error?.name === "SequelizeUniqueConstraintError" ||
+      error?.original?.code === "ER_DUP_ENTRY" ||
+      /Duplicate entry/i.test(String(error?.message || ""));
+    if (duplicate) {
+      return res.status(400).json({
+        success: false,
+        message: "This Order ID is already used in this facility",
+      });
+    }
     return res.status(500).json({
       success: false,
       error: error.message,

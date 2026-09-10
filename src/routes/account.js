@@ -18,6 +18,7 @@ const { generateGoodReceive } = require("../controller/goodsReceiveNew");
 module.exports = (app) => {
   const account = require("../controller/account");
   const account2 = require("../controller/account2");
+  const vatOutputTestHistory = require("../controller/vatOutputTestHistory");
   const storage = multer.memoryStorage();
   // const upload = multer({ storage });
   const notImplemented = (name) => (req, res) =>
@@ -810,6 +811,14 @@ module.exports = (app) => {
   // Account Ledger Report
   app.post("/account/account-ledger-report", account.getAccountLedgerReport);
   app.get("/account/vat-head-position", account.getVatHeadPosition);
+  app.get(
+    "/account/vat-output-test-history",
+    vatOutputTestHistory.listVatOutputTestHistory,
+  );
+  app.post(
+    "/account/vat-output-test-history",
+    vatOutputTestHistory.createVatOutputTestHistory,
+  );
 
   // Invoice correction (sync invoices + general_ledger)
   app.get(
