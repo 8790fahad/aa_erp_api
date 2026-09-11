@@ -153,6 +153,21 @@ exports.createPurchaseOrder = async (req, res) => {
 
       await transaction.commit();
 
+      const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: createdBy,
+        documentId: poData.po_number || poId,
+        documentType: "Purchase order",
+        eventLabel: "created",
+        nextStep: WORKFLOW_NEXT.purchaseApproval,
+        details: [
+          ["PO number", poData.po_number],
+          ["Supplier", supplierId],
+          ["Amount", totalAmount],
+        ],
+      });
+
       res.status(201).json({
         success: true,
         data: {

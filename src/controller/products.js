@@ -687,6 +687,31 @@ exports.updateProductSellingPrice = async (req, res) => {
 
     await product.update({ selling_price: price });
 
+    try {
+      const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId:
+          req.body?.userId ||
+          req.body?.user_id ||
+          req.user?.id ||
+          req.user?.user_id ||
+          null,
+        documentId: product.sku || product.name || String(id),
+        documentType: "Price update",
+        eventLabel: "posted",
+        nextStep: WORKFLOW_NEXT.priceUpdate,
+        details: [
+          ["Item", product.name],
+          ["SKU", product.sku],
+          ["Selling price", price],
+        ],
+        inAppType: "price_update",
+      });
+    } catch (mailErr) {
+      console.warn("Price update mail skipped:", mailErr?.message || mailErr);
+    }
+
     res.json({
       success: true,
       data: {

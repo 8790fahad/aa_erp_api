@@ -173,6 +173,37 @@ exports.createRule = async (req, res) => {
       updated_by: userId ? String(userId) : null,
     });
 
+    try {
+      const { notifyWorkflowPosting } = require("../services/workflowMail");
+      const mapped = mapRule(row);
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: userId,
+        documentId: mapped.name,
+        documentType: "Rebate rule",
+        eventLabel: "created",
+        nextStep: {
+          moduleTitles: ["Rebate Ledger"],
+          nextLabel: "Rebate Ledger",
+          actionPath: "/app/sales/rebate",
+          actionVerb: "track",
+        },
+        inAppType: "rebate_rule",
+        details: [
+          ["Rule", mapped.name],
+          ["Basis", mapped.basis === "purchase" ? "Purchase" : "Sales"],
+          ["Party", mapped.customerName || mapped.supplierName],
+          ["Period", mapped.period],
+          ["Min qty", mapped.minQty],
+          ["Rebate %", `${mapped.rebatePercent}%`],
+          ["Applies to", mapped.product],
+        ],
+        remark: `Reminders go to Rebate Ledger at 50%, 75%, and 100% of the volume target. Rebate is ${mapped.rebatePercent}% once the minimum quantity is met.`,
+      });
+    } catch (mailErr) {
+      console.warn("Rebate rule mail skipped:", mailErr?.message || mailErr);
+    }
+
     return res.json({ success: true, result: mapRule(row) });
   } catch (err) {
     console.error("createRule", err);
@@ -600,21 +631,27 @@ exports.issueCreditNote = async (req, res) => {
     }
 
     try {
-      const { notifyBusinessMembers } = require("../services/notifications");
-      const amountLabel = Number(amount || 0).toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      });
-      void notifyBusinessMembers({
+      const { notifyWorkflowPosting } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
         facilityId,
-        excludeUserId: userId,
         actorUserId: userId,
-        type: "rebate_credit_note",
-        title: `Credit note ${creditNoteNumber} issued`,
-        body: `Rebate for ${entityName} — ₦${amountLabel} (${rule.name || "rule"})`,
-        link: "/app/sales/rebate",
-        entityType: "rebate",
-        entityId: String(creditNoteNumber),
+        documentId: creditNoteNumber,
+        documentType: isPurchase ? "Vendor credit" : "Credit note",
+        eventLabel: "created",
+        nextStep: {
+          moduleTitles: ["Rebate Ledger"],
+          nextLabel: "Rebate Ledger",
+          actionPath: "/app/sales/rebate",
+          actionVerb: "view",
+        },
+        details: [
+          ["Reference", creditNoteNumber],
+          ["Party", entityName],
+          ["Amount", amount],
+          ["Rule", rule.name],
+          ["Rebate %", `${parseFloat(rule.rebate_percent) || 0}%`],
+        ],
+        inAppType: "rebate_credit_note",
       });
     } catch (notifErr) {
       console.warn("Rebate credit-note notification skipped:", notifErr?.message || notifErr);
@@ -996,23 +1033,28 @@ exports.issuePayment = async (req, res) => {
     await transaction.commit();
 
     try {
-      const { notifyBusinessMembers } = require("../services/notifications");
-      const amountLabel = Number(amount || 0).toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      });
-      void notifyBusinessMembers({
+      const { notifyWorkflowPosting } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
         facilityId,
-        excludeUserId: userId,
         actorUserId: userId,
-        type: "rebate_payment",
-        title: isPurchase
-          ? `Purchase rebate received (${paymentRef})`
-          : `Rebate paid (${paymentRef})`,
-        body: `${customerName} via ${mode} — ₦${amountLabel}`,
-        link: "/app/sales/rebate",
-        entityType: "rebate",
-        entityId: String(paymentRef),
+        documentId: paymentRef,
+        documentType: isPurchase ? "Purchase rebate" : "Rebate payment",
+        eventLabel: "posted",
+        nextStep: {
+          moduleTitles: ["Rebate Ledger"],
+          nextLabel: "Rebate Ledger",
+          actionPath: "/app/sales/rebate",
+          actionVerb: "view",
+        },
+        details: [
+          ["Reference", paymentRef],
+          ["Party", customerName],
+          ["Mode", mode],
+          ["Amount", amount],
+          ["Rule", rule.name],
+          ["Rebate %", `${parseFloat(rule.rebate_percent) || 0}%`],
+        ],
+        inAppType: "rebate_payment",
       });
     } catch (notifErr) {
       console.warn("Rebate payment notification skipped:", notifErr?.message || notifErr);

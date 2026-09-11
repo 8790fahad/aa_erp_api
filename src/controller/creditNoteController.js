@@ -1075,6 +1075,30 @@ exports.createCreditNote = async (req, res) => {
       remark: reason || "Credit note created",
     });
 
+    try {
+      const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: userId,
+        documentId: creditNoteNumber,
+        documentType: type === "supplier" ? "Vendor credit" : "Credit note",
+        eventLabel: "created",
+        nextStep: WORKFLOW_NEXT.creditNote,
+        details: [
+          ["Reference", creditNoteNumber],
+          ["Party", entityName || entityId],
+          ["Type", type],
+          ["Amount", totalAmount],
+          ["Reason", reason],
+          ["Invoice", reference],
+          ["Status", docStatusOnCreate],
+        ],
+        inAppType: "credit_note",
+      });
+    } catch (notifErr) {
+      console.warn("Credit note mail skipped:", notifErr?.message || notifErr);
+    }
+
     res.status(201).json({
       success: true,
       message:

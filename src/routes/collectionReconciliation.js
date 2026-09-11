@@ -6,6 +6,10 @@ module.exports = (app) => {
     collectionReconciliation.getSummary,
   );
   app.get(
+    "/api/v1/collection-reconciliation/history",
+    collectionReconciliation.getHistory,
+  );
+  app.get(
     "/api/v1/collection-reconciliation/:cashierUserId/lines",
     collectionReconciliation.getCashierLines,
   );

@@ -1314,10 +1314,38 @@ exports.getSaleByCode = async (req, res) => {
         })
       : null;
 
-    const business = await db.business.findOne({
-      where: { id: facilityId },
-      raw: true,
-    });
+    let business = null;
+    try {
+      business = await db.business.findOne({
+        where: { id: facilityId },
+        attributes: [
+          "id",
+          "business_name",
+          "business_address",
+          "business_phone",
+          "fax",
+          "business_email",
+          "description",
+          "rc",
+          "vat_policy",
+          "show_vat_on_sales_invoice",
+          "sales_invoice_print_in_color",
+          "default_receipt_type",
+          "print_delivery_order",
+          "delivery_order_format",
+          "delivery_document_type",
+          "document_header_style",
+          "business_logo",
+          "customer_notes",
+          "terms_conditions",
+          "invoice_powered_by",
+        ],
+        raw: true,
+      });
+    } catch (bizErr) {
+      console.warn("getSaleByCode business lookup:", bizErr.message);
+    }
+    business = business || { id: facilityId };
 
     const taxEntries = entries.filter(
       (item) => typeof item.type === "string" && item.type.includes("tax")
@@ -5586,12 +5614,13 @@ exports.createSale = async (req, res) => {
     await t.commit();
 
     // Sales Management workflow (Cash/Transfer confirm or Credit approval → fulfillment)
+    let workflowRow = null;
     try {
       const {
         createSaleWorkflowRecord,
         normalizePaymentType,
       } = require("./saleWorkflow");
-      await createSaleWorkflowRecord({
+      workflowRow = await createSaleWorkflowRecord({
         facilityId,
         saleCode: saleRef,
         customerNo: customer_id,
@@ -5626,32 +5655,61 @@ exports.createSale = async (req, res) => {
       console.error("Sale workflow create skipped:", wfErr?.message || wfErr, wfErr?.stack || "");
     }
 
-    // In-app notification (business members except actor)
+    // Email + privilege-scoped in-app: creator, then people who can open the next page
     try {
-      const { notifyBusinessMembers } = require("../services/notifications");
+      const { notifySaleWorkflow } = require("../services/workflowMail");
       const customerLabel =
         customer?.fullname ||
         customer?.company_name ||
         [customer?.first_name, customer?.last_name].filter(Boolean).join(" ") ||
         customer_id ||
         "customer";
-      const amountLabel = Number(netAmount || 0).toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      });
-      void notifyBusinessMembers({
+      const wf = workflowRow
+        ? typeof workflowRow.toJSON === "function"
+          ? workflowRow.toJSON()
+          : workflowRow
+        : null;
+      void notifySaleWorkflow({
         facilityId,
-        excludeUserId: created_by,
         actorUserId: created_by,
-        type: "invoice_created",
-        title: `Invoice ${saleRef} created`,
-        body: `${isCashSale ? "Cash" : "Credit"} sale for ${customerLabel} — ₦${amountLabel}`,
-        link: "/app/sales/invoices",
-        entityType: "invoice",
-        entityId: saleRef,
+        saleCode: saleRef,
+        status: wf?.status || (isCashSale ? "awaiting_cashier_confirm" : "awaiting_credit_approval"),
+        paymentType: wf?.payment_type || (isCashSale ? cashModeOfPayment : "credit"),
+        customerName: customerLabel,
+        amount: netAmount,
+        assignedCashierId: wf?.assigned_cashier_id || assigned_cashier_id || cashier_user_id || null,
+        eventLabel: editSaleCode ? "updated" : "created",
+        remark: editSaleCode ? "Invoice edited" : "",
+        details: [
+          ["Invoice", saleRef],
+          ["Customer", customerLabel],
+          ["Type", isCashSale ? "Cash" : "Credit"],
+          ["Amount", Number(netAmount || 0).toFixed(2)],
+          ["Discount", Number(discount_amount || 0).toFixed(2)],
+          ["Date", saleDate],
+        ],
       });
     } catch (notifErr) {
       console.warn("Invoice notification skipped:", notifErr?.message || notifErr);
+    }
+
+    try {
+      const customerLabel =
+        customer?.fullname ||
+        customer?.company_name ||
+        [customer?.first_name, customer?.last_name].filter(Boolean).join(" ") ||
+        customer_id ||
+        "";
+      const { evaluateRebateReminders } = require("../services/rebateReminders");
+      void evaluateRebateReminders({
+        facilityId,
+        basis: "sales",
+        partyNo: customer_id,
+        partyName: customerLabel,
+        actorUserId: created_by,
+      });
+    } catch (rebateErr) {
+      console.warn("Rebate progress reminder skipped:", rebateErr?.message || rebateErr);
     }
 
     // ===================================================================

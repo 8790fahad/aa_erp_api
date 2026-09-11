@@ -113,6 +113,44 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.DATE,
         allowNull: true,
       },
+      cash_from_account: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
+      cash_from_account_name: {
+        type: DataTypes.STRING(200),
+        allowNull: true,
+      },
+      safe_account: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
+      safe_account_name: {
+        type: DataTypes.STRING(200),
+        allowNull: true,
+      },
+      cash_to_safe_amount: {
+        type: DataTypes.DECIMAL(18, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+      shortage_account: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
+      shortage_account_name: {
+        type: DataTypes.STRING(200),
+        allowNull: true,
+      },
+      shortage_amount: {
+        type: DataTypes.DECIMAL(18, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+      cash_transfer_id: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
     },
     {
       sequelize,

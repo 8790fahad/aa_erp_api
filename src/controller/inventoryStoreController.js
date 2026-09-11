@@ -1,5 +1,6 @@
 const db = require("../models");
 const moment = require("moment");
+const { salesTypesSqlList } = require("../constants/storeEntryTypes");
 
 /** Normalize mixed latin1 / utf8mb4 columns before comparing. */
 const sqlEq = (a, b) =>
@@ -135,6 +136,12 @@ exports.getInventoryItemDetails = async (req, res) => {
       SELECT
         se.*,
         CASE
+          WHEN LOWER(IFNULL(se.destination, '')) IN ('void', 'reversed', 'reverse')
+            OR LOWER(IFNULL(se.status, '')) IN ('voided', 'reversed')
+            OR LOWER(IFNULL(se.type, '')) IN ('reverse', 'reversal', 'void')
+            THEN 'REVERSE'
+          WHEN LOWER(IFNULL(se.type, '')) IN ('sales_return', 'purchase_return')
+            THEN 'RETURN'
           WHEN se.qty_in > 0 THEN 'IN'
           WHEN se.qty_out > 0 THEN 'OUT'
           ELSE 'OTHER'
@@ -187,6 +194,9 @@ exports.getInventoryItemDetails = async (req, res) => {
       totalIssued: transactionHistory
         .filter((tx) => tx.movement_type === "OUT")
         .reduce((sum, tx) => sum + (parseFloat(tx.quantity_out) || 0), 0),
+      reverseCount: transactionHistory.filter(
+        (tx) => tx.movement_type === "REVERSE",
+      ).length,
       averageCost:
         transactionHistory.length > 0
           ? transactionHistory.reduce(
@@ -203,7 +213,10 @@ exports.getInventoryItemDetails = async (req, res) => {
         (tx) => tx.type && tx.type.toLowerCase() === "wip"
       ).length,
       salesCount: transactionHistory.filter(
-        (tx) => tx.type && tx.type.toLowerCase() === "sales"
+        (tx) =>
+          tx.type &&
+          tx.type.toLowerCase() === "sales" &&
+          tx.movement_type !== "REVERSE",
       ).length,
     };
 
@@ -516,6 +529,12 @@ exports.getTransactionHistoryBySalesType = async (req, res) => {
         p.unit_of_measure,
         -- Determine movement type
         CASE
+          WHEN LOWER(IFNULL(se.destination, '')) IN ('void', 'reversed', 'reverse')
+            OR LOWER(IFNULL(se.status, '')) IN ('voided', 'reversed')
+            OR LOWER(IFNULL(se.type, '')) IN ('reverse', 'reversal', 'void')
+            THEN 'REVERSE'
+          WHEN LOWER(IFNULL(se.type, '')) IN ('sales_return', 'purchase_return')
+            THEN 'RETURN'
           WHEN se.qty_in > 0 THEN 'IN'
           WHEN se.qty_out > 0 THEN 'OUT'
           ELSE 'OTHER'
@@ -838,7 +857,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       });
     }
 
-    const replacements = { facilityId };
+    const replacements = { facilityId, branchId: 0 };
     const parsedBranchId = parseInt(branchId, 10);
     const zoneList = ["for sales", "for sale"]
       .map((z) => `'${z}'`)
@@ -849,6 +868,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       Number.isInteger(parsedBranchId) &&
       parsedBranchId > 0
     ) {
+      replacements.branchId = parsedBranchId;
       branchCondition = `
         AND LOWER(TRIM(se.branch_name)) IN (${zoneList})
         AND (
@@ -858,7 +878,6 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
             AND (se.branchId = 0 OR se.branchId IS NULL)
           )
         )`;
-      replacements.branchId = parsedBranchId;
     } else if (branch_name && branch_name !== "all" && branch_name !== "") {
       branchCondition = " AND LOWER(TRIM(se.branch_name)) = LOWER(TRIM(:branch_name))";
       replacements.branch_name = branch_name;
@@ -866,14 +885,93 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       branchCondition = ` AND LOWER(TRIM(se.branch_name)) IN (${zoneList})`;
     }
 
-    // Stock at the selected branch from store_entries (sellable zone only).
-    // Matches approval-time balance in goodsTransfers.getAvailableQty.
-    const query = `
+    // Ledger qty by warehouse. Keep zero-balance rows so pending-only stock can show.
+    const stockAgg = `
       SELECT
-        SUM(se.qty_in) - SUM(se.qty_out) AS qty,
-        COALESCE(MAX(se.branch_name), 'for sales') AS branch_name,
+        se.product_id AS product_id,
         se.branchId AS branch_id,
-        se.product_id,
+        SUM(se.qty_in) - SUM(se.qty_out) AS qty,
+        COALESCE(MAX(se.branch_name), 'for sales') AS branch_name
+      FROM store_entries se
+      INNER JOIN products p
+        ON ${sqlEq("se.product_id", "p.sku")}
+        AND ${sqlEq("se.facilityId", "p.facility_id")}
+      WHERE se.facilityId = :facilityId
+        ${branchCondition}
+      GROUP BY se.product_id, se.branchId
+    `;
+
+    // Sold on invoices, minus already collected at the warehouse.
+    // Uses store_entries (written when the invoice is created) so pending
+    // appears immediately — not only after Invoice Separation packs exist.
+    const pendingAgg = `
+      SELECT
+        sold.branch_id,
+        sold.product_id,
+        GREATEST(
+          sold.qty_sold - IFNULL(col.qty_collected, 0),
+          0
+        ) AS pending_to_collect
+      FROM (
+        SELECT
+          se.branchId AS branch_id,
+          se.product_id AS product_id,
+          SUM(se.qty_out) AS qty_sold
+        FROM store_entries se
+        LEFT JOIN sale_workflows sw
+          ON ${sqlEq("sw.facility_id", "se.facilityId")}
+          AND ${sqlEq("sw.sale_code", "se.reference_number")}
+        WHERE se.facilityId = :facilityId
+          AND se.qty_out > 0
+          AND LOWER(TRIM(IFNULL(se.branch_name, ''))) IN (${zoneList})
+          AND (
+            LOWER(TRIM(IFNULL(se.destination, ''))) = 'sold'
+            OR LOWER(IFNULL(se.type, '')) IN (${salesTypesSqlList()})
+            OR se.reference_number LIKE 'INV-%'
+          )
+          AND LOWER(IFNULL(se.type, '')) NOT IN (
+            'service',
+            'transfer',
+            'adjustment',
+            'write-off',
+            'sales_return',
+            'purchase_return'
+          )
+          AND (
+            sw.id IS NULL
+            OR LOWER(IFNULL(sw.status, '')) NOT IN ('reversed', 'cancelled')
+          )
+          AND (:branchId = 0 OR se.branchId = :branchId)
+        GROUP BY se.branchId, se.product_id
+      ) sold
+      LEFT JOIN (
+        SELECT
+          f.branch_id,
+          l.product_id,
+          SUM(IFNULL(l.qty_collected, 0)) AS qty_collected
+        FROM sale_fulfillments f
+        INNER JOIN sale_fulfillment_lines l
+          ON l.fulfillment_id = f.id
+        WHERE f.facility_id = :facilityId
+          AND (:branchId = 0 OR f.branch_id = :branchId)
+        GROUP BY f.branch_id, l.product_id
+      ) col
+        ON ${sqlEq("col.product_id", "sold.product_id")}
+       AND col.branch_id <=> sold.branch_id
+      WHERE GREATEST(sold.qty_sold - IFNULL(col.qty_collected, 0), 0) > 0
+    `;
+
+    // qty = ledger balance; pending_to_collect = sold but not collected;
+    // total = physical stock still at the warehouse (balance + pending).
+    // Keys come from stock OR pending so a zero balance still lists if
+    // there is anything waiting to be collected.
+    const buildQuery = (withPending) => `
+      SELECT
+        COALESCE(st.qty, 0) AS qty,
+        ${withPending ? "COALESCE(pc.pending_to_collect, 0)" : "0"} AS pending_to_collect,
+        COALESCE(st.branch_name, 'for sales') AS branch_name,
+        item_keys.branch_id,
+        item_keys.product_id,
         p.name,
         p.sku AS item_code,
         p.unit_of_measure,
@@ -881,43 +979,74 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
         p.selling_price,
         p.item_type,
         p.mark_up
-      FROM store_entries se
+      FROM (
+        SELECT CONVERT(product_id USING utf8mb4) COLLATE utf8mb4_general_ci AS product_id,
+               branch_id
+        FROM (${stockAgg}) stock_keys
+        ${
+          withPending
+            ? `UNION
+        SELECT CONVERT(product_id USING utf8mb4) COLLATE utf8mb4_general_ci AS product_id,
+               branch_id
+        FROM (${pendingAgg}) pending_keys`
+            : ""
+        }
+      ) item_keys
       INNER JOIN products p
-        ON ${sqlEq("se.product_id", "p.sku")}
-        AND ${sqlEq("se.facilityId", "p.facility_id")}
-      WHERE se.facilityId = :facilityId
-        AND p.facility_id = :facilityId
-        AND p.item_type IN ('Finished Good', 'Resalable', 'By-Product')
+        ON ${sqlEq("item_keys.product_id", "p.sku")}
+       AND p.facility_id = :facilityId
+      LEFT JOIN (${stockAgg}) st
+        ON ${sqlEq("st.product_id", "item_keys.product_id")}
+       AND st.branch_id <=> item_keys.branch_id
+      ${
+        withPending
+          ? `LEFT JOIN (${pendingAgg}) pc
+        ON ${sqlEq("pc.product_id", "item_keys.product_id")}
+       AND pc.branch_id <=> item_keys.branch_id`
+          : ""
+      }
+      WHERE p.item_type IN ('Finished Good', 'Resalable', 'By-Product')
         AND p.status = 'Active'
-        ${branchCondition}
-      GROUP BY
-        se.product_id,
-        se.branchId,
-        p.name,
-        p.sku,
-        p.unit_of_measure,
-        p.cost_price,
-        p.selling_price,
-        p.item_type,
-        p.mark_up
-      HAVING qty > 0
+        AND (
+          COALESCE(st.qty, 0) > 0
+          ${withPending ? "OR COALESCE(pc.pending_to_collect, 0) > 0" : ""}
+        )
       ORDER BY p.name ASC
     `;
 
-    const inventoryItems = await db.sequelize.query(query, {
-      replacements,
-      type: db.sequelize.QueryTypes.SELECT,
-    });
+    let inventoryItems;
+    try {
+      inventoryItems = await db.sequelize.query(buildQuery(true), {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      });
+    } catch (pendingErr) {
+      console.warn(
+        "Goods pending-to-collect join skipped:",
+        pendingErr?.message || pendingErr,
+      );
+      inventoryItems = await db.sequelize.query(buildQuery(false), {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      });
+    }
 
-    const results = inventoryItems.map((item) => ({
-      ...item,
-      product_id: item.product_id,
-      name: item.name,
-      item_name: item.name,
-      item_code: item.item_code || item.product_id,
-      unit_of_measure: item.unit_of_measure || "Pcs",
-      qty: parseFloat(item.qty) || 0,
-    }));
+    const results = inventoryItems.map((item) => {
+      const qty = parseFloat(item.qty) || 0;
+      const pending = Math.max(0, parseFloat(item.pending_to_collect) || 0);
+      return {
+        ...item,
+        product_id: item.product_id,
+        name: item.name,
+        item_name: item.name,
+        item_code: item.item_code || item.product_id,
+        unit_of_measure: item.unit_of_measure || "Pcs",
+        qty,
+        pending_to_collect: pending,
+        balance: qty,
+        total: qty + pending,
+      };
+    });
 
     res.status(200).json({
       success: true,

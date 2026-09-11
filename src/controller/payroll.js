@@ -4,6 +4,11 @@ const { v4: uuidv4 } = require("uuid");
 const payrollAccounting = require("./payrollAccounting");
 const { computePAYE } = require("../utils/paye2026");
 const payeSettingsController = require("./payeSettings");
+const {
+  notifyPayrollInitiated,
+  notifyPayrollReadyForPayment,
+  notifyPayrollPaid,
+} = require("../services/payrollMail");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -408,6 +413,14 @@ exports.runPayroll = async (req, res) => {
     // ── General Ledger Entries ────────────────────────────────────────────
     // GL Entries are now DEFERRED to the Payment Release stage (markPayrollAsPaid)
 
+    void notifyPayrollInitiated({
+      facilityId,
+      actorUserId: createdBy,
+      month,
+      year,
+      summary,
+    });
+
     res.json({
       success: true,
       message: `Payroll processed successfully for ${payrollResults.length} employee(s)`,
@@ -696,6 +709,15 @@ exports.markPayrollAsPaid = async (req, res) => {
       }
     );
 
+    void notifyPayrollPaid({
+      facilityId,
+      actorUserId: updatedBy,
+      month,
+      year,
+      payrollIds: payrolls.map((row) => row.id),
+      totalRecords: payrolls.length,
+    });
+
     res.json({
       success: true,
       message: "Payroll marked as paid successfully",
@@ -899,6 +921,26 @@ exports.updatePayrollStatus = async (req, res) => {
       updatedBy: userId
     });
 
+    if (nextStatus === "Processed") {
+      const remainingDrafts = await db.payroll.count({
+        where: {
+          facilityId,
+          month: payroll.month,
+          year: payroll.year,
+          status: "Draft",
+        },
+      });
+      if (remainingDrafts === 0) {
+        void notifyPayrollReadyForPayment({
+          facilityId,
+          actorUserId: userId,
+          month: payroll.month,
+          year: payroll.year,
+          count: 1,
+        });
+      }
+    }
+
     res.json({
       success: true,
       message: `Payroll status updated to ${nextStatus}`,
@@ -1004,6 +1046,32 @@ exports.batchUpdateStatus = async (req, res) => {
       { status: nextStatus, updatedBy: userId },
       { where: { id: { [Op.in]: ids }, facilityId } }
     );
+
+    if (nextStatus === "Processed" && updatedCount > 0) {
+      const sample = await db.payroll.findOne({
+        where: { id: { [Op.in]: ids }, facilityId },
+        attributes: ["month", "year"],
+      });
+      if (sample) {
+        const remainingDrafts = await db.payroll.count({
+          where: {
+            facilityId,
+            month: sample.month,
+            year: sample.year,
+            status: "Draft",
+          },
+        });
+        if (remainingDrafts === 0) {
+          void notifyPayrollReadyForPayment({
+            facilityId,
+            actorUserId: userId,
+            month: sample.month,
+            year: sample.year,
+            count: updatedCount,
+          });
+        }
+      }
+    }
 
     res.json({
       success: true,

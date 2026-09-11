@@ -568,6 +568,28 @@ const startServer = () => {
           err.message,
         );
       }
+      try {
+        const {
+          startRebateRemindersCron,
+        } = require("./jobs/rebateRemindersCron");
+        startRebateRemindersCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start rebate reminder cron:`,
+          err.message,
+        );
+      }
+      try {
+        const {
+          startVatPaymentReminderCron,
+        } = require("./jobs/vatPaymentReminderCron");
+        startVatPaymentReminderCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start VAT payment reminder cron:`,
+          err.message,
+        );
+      }
     }
   });
   return server;

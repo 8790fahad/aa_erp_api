@@ -140,6 +140,26 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         comment: "Default VAT account head (Output VAT / VAT payable)",
       },
+      recon_cash_account_code: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        comment: "Default till / cash-on-hand head for Collection Reconciliation",
+      },
+      recon_safe_account_code: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        comment: "Default Safe head for Collection Reconciliation",
+      },
+      recon_shortage_account_code: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+        comment: "Default shortage head for Collection Reconciliation",
+      },
+      vat_payment_reminder_last_sent: {
+        type: DataTypes.STRING(7),
+        allowNull: true,
+        comment: "YYYY-MM of last VAT payment reminder sent on the 21st",
+      },
       business_name: {
         type: DataTypes.STRING(100),
         allowNull: false,
@@ -476,6 +496,35 @@ module.exports = (sequelize, DataTypes) => {
         sourceKey: "id",
         as: "accounts",
       });
+    }
+  };
+
+  let reconDefaultColsReady = false;
+  Business.ensureReconDefaultColumns = async function ensureReconDefaultColumns() {
+    if (reconDefaultColsReady) return;
+    try {
+      const cols = await sequelize.query("SHOW COLUMNS FROM business", {
+        type: sequelize.QueryTypes.SELECT,
+      });
+      const have = new Set(
+        (cols || []).map((c) => String(c.Field || c.field || "")),
+      );
+      const adds = [];
+      if (!have.has("recon_cash_account_code")) {
+        adds.push("ADD COLUMN recon_cash_account_code VARCHAR(50) NULL");
+      }
+      if (!have.has("recon_safe_account_code")) {
+        adds.push("ADD COLUMN recon_safe_account_code VARCHAR(50) NULL");
+      }
+      if (!have.has("recon_shortage_account_code")) {
+        adds.push("ADD COLUMN recon_shortage_account_code VARCHAR(50) NULL");
+      }
+      if (adds.length) {
+        await sequelize.query(`ALTER TABLE business ${adds.join(", ")}`);
+      }
+      reconDefaultColsReady = true;
+    } catch (err) {
+      console.warn("ensureReconDefaultColumns:", err.message);
     }
   };
 

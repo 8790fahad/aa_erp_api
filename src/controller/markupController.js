@@ -1,5 +1,46 @@
 const db = require("../models");
 
+function pickPriceActor(req) {
+  return (
+    req.body?.userId ||
+    req.body?.user_id ||
+    req.user?.id ||
+    req.user?.user_id ||
+    null
+  );
+}
+
+function firePriceUpdateMail({
+  facilityId,
+  actorUserId,
+  itemName,
+  sku,
+  sellingPrice,
+  markUp,
+}) {
+  if (!facilityId) return;
+  try {
+    const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+    void notifyWorkflowPosting({
+      facilityId,
+      actorUserId,
+      documentId: sku || itemName || "price",
+      documentType: "Price update",
+      eventLabel: "posted",
+      nextStep: WORKFLOW_NEXT.priceUpdate,
+      details: [
+        ["Item", itemName],
+        ["SKU", sku],
+        ["Selling price", sellingPrice],
+        ["Markup", markUp],
+      ],
+      inAppType: "price_update",
+    });
+  } catch (err) {
+    console.warn("Price update mail skipped:", err?.message || err);
+  }
+}
+
 // Get goods available for markup (these are the produced goods)
 exports.getGoodsForMarkup = async (req, res) => {
   try {
@@ -153,6 +194,40 @@ exports.updateMarkup = async (req, res) => {
       });
     }
 
+    try {
+      const infoRows = await db.sequelize.query(
+        `SELECT
+           se.facilityId,
+           se.item_name,
+           se.item_code,
+           se.product_id,
+           se.selling_price,
+           se.mark_up,
+           p.name AS product_name
+         FROM store_entries se
+         LEFT JOIN products p
+           ON p.sku = se.product_id
+          AND p.facility_id = se.facilityId
+         WHERE se.id = :id
+         LIMIT 1`,
+        {
+          replacements: { id },
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+      const info = infoRows?.[0] || {};
+      firePriceUpdateMail({
+        facilityId: info.facilityId,
+        actorUserId: pickPriceActor(req),
+        itemName: info.product_name || info.item_name || sku || product_id,
+        sku: info.item_code || info.product_id || sku || product_id,
+        sellingPrice: sellingPrice || info.selling_price,
+        markUp: mark_up || info.mark_up,
+      });
+    } catch (mailErr) {
+      console.warn("Price update mail skipped:", mailErr?.message || mailErr);
+    }
+
     res.status(200).json({
       success: true,
       message: "Selling price updated successfully",
@@ -229,6 +304,38 @@ exports.updateMarkupSellingPrice = async (req, res) => {
       replacements,
       type: db.sequelize.QueryTypes.UPDATE,
     });
+
+    try {
+      const infoRows = await db.sequelize.query(
+        `SELECT
+           se.facilityId,
+           se.item_name,
+           se.item_code,
+           se.product_id,
+           se.selling_price,
+           p.name AS product_name
+         FROM store_entries se
+         LEFT JOIN products p
+           ON p.sku = se.product_id
+          AND p.facility_id = se.facilityId
+         WHERE se.product_id = :product_id
+         LIMIT 1`,
+        {
+          replacements: { product_id },
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+      const info = infoRows?.[0] || {};
+      firePriceUpdateMail({
+        facilityId: facilityId || info.facilityId,
+        actorUserId: pickPriceActor(req),
+        itemName: info.product_name || info.item_name || product_id,
+        sku: info.item_code || info.product_id || product_id,
+        sellingPrice: selling_price || info.selling_price,
+      });
+    } catch (mailErr) {
+      console.warn("Price update mail skipped:", mailErr?.message || mailErr);
+    }
 
     res.status(200).json({
       success: true,

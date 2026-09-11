@@ -63,6 +63,60 @@ async function notifyBusinessMembers({
   }
 }
 
+/**
+ * Fan-out in-app notifications to specific user ids in a facility.
+ * Never throws to callers — failures are logged only.
+ */
+async function notifySpecificUsers({
+  facilityId,
+  userIds = [],
+  type,
+  title,
+  body = null,
+  link = null,
+  entityType = null,
+  entityId = null,
+  actorUserId = null,
+} = {}) {
+  try {
+    if (!db.notifications) {
+      console.warn("[notifications] model not loaded");
+      return null;
+    }
+    if (!facilityId || !type || !title) return null;
+
+    const actor = actorUserId != null ? String(actorUserId) : null;
+    const recipientIds = [
+      ...new Set(
+        (Array.isArray(userIds) ? userIds : [])
+          .map((id) => (id != null ? String(id) : null))
+          .filter((id) => id && id !== actor),
+      ),
+    ];
+    if (!recipientIds.length) return [];
+
+    const now = new Date();
+    const rows = recipientIds.map((userId) => ({
+      facility_id: String(facilityId),
+      user_id: userId,
+      type: String(type).slice(0, 40),
+      title: String(title).slice(0, 255),
+      body: body != null ? String(body).slice(0, 500) : null,
+      link: link != null ? String(link).slice(0, 255) : null,
+      entity_type: entityType != null ? String(entityType).slice(0, 80) : null,
+      entity_id: entityId != null ? String(entityId).slice(0, 120) : null,
+      actor_user_id: actor,
+      read_at: null,
+      created_at: now,
+    }));
+
+    return await db.notifications.bulkCreate(rows);
+  } catch (err) {
+    console.warn("[notifications] notifySpecificUsers failed:", err.message);
+    return null;
+  }
+}
+
 async function listNotifications({
   facilityId,
   userId,
@@ -140,6 +194,7 @@ async function markAllRead({ facilityId, userId } = {}) {
 
 module.exports = {
   notifyBusinessMembers,
+  notifySpecificUsers,
   listNotifications,
   unreadCount,
   markRead,

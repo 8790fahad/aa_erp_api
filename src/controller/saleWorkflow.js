@@ -13,6 +13,23 @@ const {
   nextStageFor,
   stagesForPaymentType,
 } = require("../models/sale_workflows");
+const { notifySaleWorkflow } = require("../services/workflowMail");
+
+function fireSaleWorkflowMail(row, actorUserId, extra = {}) {
+  if (!row) return;
+  const data = typeof row.toJSON === "function" ? row.toJSON() : row;
+  void notifySaleWorkflow({
+    facilityId: data.facility_id,
+    actorUserId,
+    saleCode: data.sale_code,
+    status: data.status,
+    paymentType: data.payment_type,
+    customerName: data.customer_name,
+    amount: data.amount,
+    assignedCashierId: data.assigned_cashier_id,
+    ...extra,
+  });
+}
 
 function parseModeList(paymentModes) {
   return (Array.isArray(paymentModes) ? paymentModes : [])
@@ -1442,7 +1459,7 @@ async function createSaleWorkflowRecord(
     }
   }
 
-  // Discounted invoices must be approved before Verification Points / credit path
+  // Discounted invoices must be approved on Collection Reconciliation before cashier / credit path
   let initialStatus;
   let statusNote;
   if (hasDiscount && !isDepositPaymentType(resolvedPaymentType)) {
@@ -1809,6 +1826,9 @@ exports.advanceSaleWorkflow = async (req, res) => {
       });
     }
 
+    const startedAsDiscountApproval =
+      row.status === "awaiting_discount_approval";
+
     const actionNorm = String(action || "advance").toLowerCase();
     if (actionNorm !== "set_status" && actionNorm !== "hold_overnight") {
       const processed = alreadyProcessedCollection(row);
@@ -1847,6 +1867,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
       row.updated_by = updated_by || row.updated_by;
       await persistLockedWorkflow(row, transaction);
       await transaction.commit();
+      fireSaleWorkflowMail(row, updated_by);
       return res.json({
         success: true,
         message: "Remainder sent to Credit approval",
@@ -1896,6 +1917,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
       row.updated_by = updated_by || row.updated_by;
       await persistLockedWorkflow(row, transaction);
       await transaction.commit();
+      fireSaleWorkflowMail(row, updated_by);
       return res.json({
         success: true,
         message:
@@ -1968,6 +1990,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
         row.updated_by = updated_by || row.updated_by;
         await persistLockedWorkflow(row, transaction);
         await transaction.commit();
+        fireSaleWorkflowMail(row, updated_by);
         return res.json({
           success: true,
           message: "Payment mode switch rejected",
@@ -2005,6 +2028,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
       row.updated_by = updated_by || row.updated_by;
       await persistLockedWorkflow(row, transaction);
       await transaction.commit();
+      fireSaleWorkflowMail(row, updated_by);
       return res.json({
         success: true,
         message: `Payment mode switched to ${row.payment_type}`,
@@ -2117,6 +2141,10 @@ exports.advanceSaleWorkflow = async (req, res) => {
       row.updated_by = updated_by || row.updated_by;
       await persistLockedWorkflow(row, transaction);
       await transaction.commit();
+      fireSaleWorkflowMail(row, updated_by, {
+        eventLabel: "discount approved",
+        remark: advanceNote || "Discount approved",
+      });
       return res.json({
         success: true,
         message: "Discount approved",
@@ -2179,6 +2207,13 @@ exports.advanceSaleWorkflow = async (req, res) => {
     }
 
     await transaction.commit();
+
+    fireSaleWorkflowMail(row, updated_by, {
+      eventLabel: startedAsDiscountApproval ? "discount approved" : "posted",
+      remark: startedAsDiscountApproval
+        ? advanceNote || "Discount approved"
+        : note || "",
+    });
 
     return res.json({
       success: true,
@@ -3896,7 +3931,7 @@ exports.cashierConfirmPayment = async (req, res) => {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
-        message: "Use Card Collection for card invoices only",
+        message: "Use POS Collection for POS invoices only",
       });
     }
 
@@ -4309,24 +4344,7 @@ exports.cashierConfirmPayment = async (req, res) => {
 
       await transaction.commit();
 
-      try {
-        const { notifyBusinessMembers } = require("../services/notifications");
-        void notifyBusinessMembers({
-          facilityId,
-          excludeUserId: updated_by,
-          actorUserId: updated_by,
-          type: "payment_collected",
-          title: `Payment collected for ${saleRef}`,
-          body: row.customer_name
-            ? `${row.customer_name} — ready for separation`
-            : "Ready for invoice separation",
-          link: "/app/payments/verification-points",
-          entityType: "invoice",
-          entityId: saleRef,
-        });
-      } catch (notifErr) {
-        console.warn("Payment notification skipped:", notifErr?.message || notifErr);
-      }
+      fireSaleWorkflowMail(row, updated_by, { eventLabel: "posted" });
 
       return res.json({
         success: true,
@@ -4366,24 +4384,7 @@ exports.cashierConfirmPayment = async (req, res) => {
             ? "Cash"
             : "Payment";
 
-    try {
-      const { notifyBusinessMembers } = require("../services/notifications");
-      void notifyBusinessMembers({
-        facilityId,
-        excludeUserId: updated_by,
-        actorUserId: updated_by,
-        type: "payment_collected",
-        title: `${sideLabel} recorded for ${saleRef}`,
-        body: `Remaining ₦${rem.toFixed(2)}${
-          row.customer_name ? ` — ${row.customer_name}` : ""
-        }`,
-        link: "/app/payments/verification-points",
-        entityType: "invoice",
-        entityId: saleRef,
-      });
-    } catch (notifErr) {
-      console.warn("Payment notification skipped:", notifErr?.message || notifErr);
-    }
+    fireSaleWorkflowMail(row, updated_by, { eventLabel: "posted" });
 
     return res.json({
       success: true,
@@ -4571,6 +4572,8 @@ exports.sendCreditRemainder = async (req, res) => {
     );
     await persistLockedWorkflow(row, transaction);
     await transaction.commit();
+
+    fireSaleWorkflowMail(row, updated_by);
 
     return res.json({
       success: true,
@@ -4852,6 +4855,8 @@ exports.completeSeparation = async (req, res) => {
 
     await transaction.commit();
 
+    fireSaleWorkflowMail(resultRow, updated_by);
+
     const enriched = await enrichFulfillments(fulfillments);
     return res.json({
       success: true,
@@ -5028,6 +5033,8 @@ exports.markFulfillmentCollected = async (req, res) => {
     });
 
     await transaction.commit();
+
+    if (workflow) fireSaleWorkflowMail(workflow, updated_by);
 
     const full = await db.SaleFulfillment.findByPk(row.id, {
       include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
@@ -5390,6 +5397,18 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
     const appliedCount = updated.filter(
       (u) => u.changed && !u.pending_approval,
     ).length;
+    for (const item of updated) {
+      if (!item.changed && !item.pending_approval) continue;
+      fireSaleWorkflowMail(
+        {
+          facility_id: facilityId,
+          sale_code: item.sale_code,
+          status: item.status,
+          payment_type: item.payment_type,
+        },
+        updated_by,
+      );
+    }
     return res.json({
       success: true,
       message: requireApproval

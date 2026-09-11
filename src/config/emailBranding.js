@@ -23,11 +23,16 @@ function pick(value, fallback) {
 
 function getEmailBranding() {
   applyMailEnvFromFile();
+  const logoRaw = String(process.env.COMPANY_LOGO_URL || "").trim();
   return {
     companyName: pick(
       process.env.MAIL_FROM_NAME || process.env.COMPANY_NAME,
       DEFAULT_NAME,
     ),
+    companyLogoUrl: looksLikeFlowbooks(logoRaw)
+      ? "https://res.cloudinary.com/drxkp1erj/image/upload/aa_erp-blue_utcqmg.png"
+      : logoRaw ||
+        "https://res.cloudinary.com/drxkp1erj/image/upload/aa_erp-blue_utcqmg.png",
     companyWebsite: pick(process.env.COMPANY_WEBSITE, DEFAULT_WEBSITE),
     companyEmail: pick(process.env.COMPANY_EMAIL, DEFAULT_EMAIL),
     companyPhone: pick(process.env.COMPANY_PHONE, DEFAULT_PHONE),

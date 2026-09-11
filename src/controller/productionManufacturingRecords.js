@@ -233,6 +233,23 @@ exports.createManufacturingRecord = async (req, res) => {
       throw error;
     }
 
+    if (String(runStatus || "complete").toLowerCase() !== "partial") {
+      const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: createdBy,
+        documentId: productionRecordId,
+        documentType: "Production",
+        eventLabel: "posted",
+        nextStep: WORKFLOW_NEXT.productionCosting,
+        details: [
+          ["Batch", productionRecordId],
+          ["Date", productionDate],
+          ["Line", productionLine],
+        ],
+      });
+    }
+
     res.status(201).json({
       success: true,
       data: {

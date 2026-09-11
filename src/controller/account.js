@@ -31,6 +31,7 @@ const {
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { collectPurchaseRequisitionRefs } = require("../utils/purchaseRequisitionRefs");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const { notifyMemoWorkflow, notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
 const {
   fetchEnrichedSalesInvoices,
   aggregateReceivableMetrics,
@@ -3137,6 +3138,34 @@ exports.updatePRStatus = async (req, res) => {
       after: { status },
       remark: `PR status updated to ${status}`,
     });
+    const st = String(status).toLowerCase();
+    if (st === "approved") {
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: pickActor(req),
+        documentId: pr_no,
+        documentType: "Purchase requisition",
+        eventLabel: "posted",
+        nextStep: WORKFLOW_NEXT.purchaseBilling,
+        details: [
+          ["PR number", pr_no],
+          ["Status", status],
+        ],
+      });
+    } else if (st === "pending" || st === "draft") {
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: pickActor(req),
+        documentId: pr_no,
+        documentType: "Purchase requisition",
+        eventLabel: "created",
+        nextStep: WORKFLOW_NEXT.purchaseApproval,
+        details: [
+          ["PR number", pr_no],
+          ["Status", status],
+        ],
+      });
+    }
     return res.json({
       success: true,
       message: `PR ${pr_no} status updated to ${status}`,
@@ -6395,6 +6424,23 @@ exports.insertUpdateMemoData = (req, res) => {
         message: "Memo inserted and updated successfully",
         memo_id: reference_number,
       });
+      void notifyMemoWorkflow({
+        facilityId,
+        memoId: reference_number,
+        status,
+        actorUserId: user_id,
+        remark,
+        memoSnapshot: {
+          subject,
+          raise_by,
+          from_name,
+          amount,
+          total,
+          status,
+          facilityId,
+          user_id,
+        },
+      });
     })
     .catch((err) => {
       console.error("❌ Error during insert/update of memo:", err);
@@ -6715,6 +6761,25 @@ exports.insertMemo = async (req, res) => {
           rev: [{ mm: code }],
           message: "Memo, expenses and documents added successfully",
         });
+        void notifyMemoWorkflow({
+          facilityId,
+          memoId: newCode,
+          status,
+          actorUserId: user_id,
+          remark,
+          memoSnapshot: {
+            subject,
+            raise_by,
+            from_name,
+            amount,
+            total,
+            status,
+            facilityId,
+            user_id,
+            supplier_name,
+            date,
+          },
+        });
       } catch (txError) {
         await transaction.rollback();
         throw txError;
@@ -6976,6 +7041,23 @@ exports.updateMemoNew = async (req, res) => {
       success: true,
       results: [{ memo_id }],
       message: "Memo updated successfully",
+    });
+    void notifyMemoWorkflow({
+      facilityId,
+      memoId: memo_id,
+      status,
+      actorUserId: user_id,
+      remark,
+      memoSnapshot: {
+        subject,
+        raise_by,
+        from_name,
+        amount,
+        total,
+        status,
+        facilityId,
+        user_id,
+      },
     });
   } catch (error) {
     console.error("Server error:", error);
@@ -7296,6 +7378,24 @@ exports.updateMemo = async (req, res) => {
 
       await Promise.all(expensePromises);
 
+      void notifyMemoWorkflow({
+        facilityId,
+        memoId: memo_id,
+        status,
+        actorUserId: user_id,
+        remark,
+        memoSnapshot: {
+          subject,
+          raise_by,
+          from_name,
+          amount,
+          total,
+          status,
+          facilityId,
+          user_id,
+        },
+      });
+
       return res.json({
         success: true,
         message: "Memo and expenses updated successfully",
@@ -7306,6 +7406,23 @@ exports.updateMemo = async (req, res) => {
     /** ------------------------------
      *  No expenses response
      * ------------------------------ */
+    void notifyMemoWorkflow({
+      facilityId,
+      memoId: memo_id,
+      status,
+      actorUserId: user_id,
+      remark,
+      memoSnapshot: {
+        subject,
+        raise_by,
+        from_name,
+        amount,
+        total,
+        status,
+        facilityId,
+        user_id,
+      },
+    });
     return res.json({
       success: true,
       message: "Memo updated successfully (no expenses to update)",
@@ -9066,8 +9183,42 @@ exports.updateServicePricing = (req, res) => {
 
   db.sequelize
     .query(updateQuery, { replacements })
-    .then((results) => {
+    .then(async (results) => {
       if (results[1] > 0) {
+        try {
+          const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+          const rows = await db.sequelize.query(
+            `SELECT name, sku FROM products WHERE id = :productId AND facility_id = :facilityId LIMIT 1`,
+            {
+              replacements: { productId, facilityId },
+              type: db.Sequelize.QueryTypes.SELECT,
+            },
+          );
+          const product = rows?.[0] || {};
+          void notifyWorkflowPosting({
+            facilityId,
+            actorUserId:
+              req.body?.userId ||
+              req.body?.user_id ||
+              req.user?.id ||
+              req.user?.user_id ||
+              null,
+            documentId: product.sku || product.name || String(productId),
+            documentType: "Price update",
+            eventLabel: "posted",
+            nextStep: WORKFLOW_NEXT.priceUpdate,
+            details: [
+              ["Item", product.name],
+              ["SKU", product.sku],
+              ["Selling price", sellingPrice],
+              ["Cost price", costPrice],
+              ["Markup", markUp],
+            ],
+            inAppType: "price_update",
+          });
+        } catch (mailErr) {
+          console.warn("Price update mail skipped:", mailErr?.message || mailErr);
+        }
         res.json({
           success: true,
           message: "Service pricing updated successfully",
@@ -9799,6 +9950,9 @@ exports.updatePayableCode = async (req, res) => {
   const { query_type } = req.query;
 
   try {
+    if (db.business?.ensureReconDefaultColumns) {
+      await db.business.ensureReconDefaultColumns();
+    }
     // Validate required parameters
     if (!query_type || !head || !facilityId || !user_id) {
       return res.status(400).json({
@@ -9855,6 +10009,16 @@ exports.updatePayableCode = async (req, res) => {
       case "VAT Recoverable":
         updateFields.vat_account_code = head;
         break;
+      case "Cash on Hand":
+      case "Cash / Till":
+        updateFields.recon_cash_account_code = head;
+        break;
+      case "Safe":
+        updateFields.recon_safe_account_code = head;
+        break;
+      case "Shortage":
+        updateFields.recon_shortage_account_code = head;
+        break;
       default:
         return res.status(400).json({
           success: false,
@@ -9903,6 +10067,9 @@ exports.updatePayableCode = async (req, res) => {
         "scrap_inventory_account",
         "vat_policy",
         "vat_account_code",
+        "recon_cash_account_code",
+        "recon_safe_account_code",
+        "recon_shortage_account_code",
       ],
     });
 
@@ -13306,6 +13473,25 @@ exports.insertRequisition = async (req, res) => {
         document_count: docsToSave.length,
       },
       remark: reason || "Purchase requisition created",
+    });
+
+    void notifyWorkflowPosting({
+      facilityId,
+      actorUserId: user_id || requisitor,
+      documentId: newCode,
+      documentType: "Purchase requisition",
+      eventLabel: "created",
+      nextStep: WORKFLOW_NEXT.purchaseApproval,
+      details: [
+        ["PR number", newCode],
+        ["Order ID", resolvedOrderId],
+        ["Branch", branch],
+        ["Requisitor", requisitor],
+        ["Supplier", supplier_name],
+        ["Reason", reason],
+        ["Amount", total],
+        ["Date", date],
+      ],
     });
 
     return res.json({
@@ -21003,7 +21189,7 @@ exports.getVatHeadPosition = async (req, res) => {
     const facilityId = req.query.facilityId || req.body.facilityId;
     const fromDate = req.query.fromDate || req.body.fromDate;
     const toDate = req.query.toDate || req.body.toDate;
-    let head = String(req.query.head || req.body.head || "").trim();
+    const head = String(req.query.head || req.body.head || "").trim();
 
     if (!facilityId) {
       return res.status(400).json({
@@ -21012,78 +21198,17 @@ exports.getVatHeadPosition = async (req, res) => {
       });
     }
 
-    if (!head) {
-      const business = await db.business.findOne({
-        where: { id: facilityId },
-        attributes: ["vat_account_code"],
-        raw: true,
-      });
-      head = String(business?.vat_account_code || "").trim();
-    }
-
-    if (!head) {
-      return res.json({
-        success: true,
-        head: "",
-        description: "",
-        input_vat: 0,
-        output_vat: 0,
-        amount_to_pay: 0,
-        recoverable: 0,
-        line_count: 0,
-      });
-    }
-
-    const fromDateStr = fromDate
-      ? moment(fromDate).format("YYYY-MM-DD")
-      : moment().startOf("month").format("YYYY-MM-DD");
-    const toDateStr = toDate
-      ? moment(toDate).format("YYYY-MM-DD")
-      : moment().format("YYYY-MM-DD");
-
-    const account = await db.AccountCategory.findOne({
-      where: { code: head, facilityId: String(facilityId) },
-      attributes: ["code", "description"],
-      raw: true,
+    const { computeVatHeadPosition } = require("../services/vatPaymentReminder");
+    const position = await computeVatHeadPosition({
+      facilityId,
+      head,
+      fromDate,
+      toDate,
     });
-
-    const totals = await db.sequelize.query(
-      `SELECT
-         COALESCE(SUM(gl.dr), 0) AS input_vat,
-         COALESCE(SUM(gl.cr), 0) AS output_vat,
-         COUNT(*) AS line_count
-       FROM general_ledger gl
-       WHERE gl.facility_id = :facilityId
-         AND TRIM(gl.account_code) = :head
-         AND DATE(gl.transaction_date) >= :fromDate
-         AND DATE(gl.transaction_date) <= :toDate`,
-      {
-        replacements: {
-          facilityId,
-          head,
-          fromDate: fromDateStr,
-          toDate: toDateStr,
-        },
-        type: db.sequelize.QueryTypes.SELECT,
-      },
-    );
-
-    const inputVat = parseFloat(totals[0]?.input_vat || 0) || 0;
-    const outputVat = parseFloat(totals[0]?.output_vat || 0) || 0;
-    const net = Number((outputVat - inputVat).toFixed(2));
 
     return res.json({
       success: true,
-      head,
-      description: account?.description || "VAT Recoverable",
-      fromDate: fromDateStr,
-      toDate: toDateStr,
-      input_vat: Number(inputVat.toFixed(2)),
-      output_vat: Number(outputVat.toFixed(2)),
-      net,
-      amount_to_pay: net > 0.005 ? net : 0,
-      recoverable: net < -0.005 ? Math.abs(net) : 0,
-      line_count: parseInt(totals[0]?.line_count || 0, 10),
+      ...position,
     });
   } catch (error) {
     console.error("getVatHeadPosition error:", error);

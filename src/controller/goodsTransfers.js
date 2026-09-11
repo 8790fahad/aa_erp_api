@@ -5,6 +5,7 @@ const moment = require("moment");
 const db = require("../models");
 const inventoryCtrl = require("./inventory");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
 
 /**
  * Goods Transfer flow:
@@ -227,6 +228,22 @@ exports.createGoodsTransfer = async (req, res) => {
     await db.GoodsTransferItem.bulkCreate(itemRows, { transaction: t });
 
     await t.commit();
+
+    void notifyWorkflowPosting({
+      facilityId,
+      actorUserId: initiatedBy,
+      documentId: transferNo,
+      documentType: "Goods transfer",
+      eventLabel: "created",
+      nextStep: WORKFLOW_NEXT.goodsTransferApproval,
+      details: [
+        ["Transfer no", transferNo],
+        ["Source branch", source_branch_id],
+        ["Destination branch", destination_branch_id],
+        ["Date", date],
+        ["Notes", notes],
+      ],
+    });
 
     return res.status(201).json({
       success: true,
@@ -673,6 +690,26 @@ exports.approveGoodsTransfer = async (req, res) => {
     await transfer.save({ transaction: t });
 
     await t.commit();
+
+    void notifyWorkflowPosting({
+      facilityId,
+      actorUserId: transfer.approved_by || approvedBy,
+      documentId: transfer.transfer_no,
+      documentType: "Goods transfer",
+      eventLabel: "posted",
+      extraUserIds: transfer.initiated_by ? [transfer.initiated_by] : [],
+      nextStep: {
+        moduleTitles: ["Goods", "Transfer History"],
+        nextLabel: "Transfer History",
+        actionPath: "/app/purchase/inventory?tab=goods-transfer",
+        actionVerb: "view",
+      },
+      details: [
+        ["Transfer no", transfer.transfer_no],
+        ["Status", "approved"],
+        ["Approved by", transfer.approved_by_name || transfer.approved_by],
+      ],
+    });
 
     return res.status(200).json({
       success: true,

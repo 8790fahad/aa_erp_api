@@ -18,6 +18,10 @@ const _getBusinessProfile = async (
       return error(new Error("Membership not found"));
     }
 
+    if (db.business?.ensureReconDefaultColumns) {
+      await db.business.ensureReconDefaultColumns();
+    }
+
     // Get business details for all businesses the user is a member of (WHERE id IN (...))
     const businessIds = membership.map((m) => m.business_id).filter(Boolean);
     const businesses = await db.business.findAll({
@@ -70,6 +74,9 @@ const _getBusinessProfile = async (
         "show_vat_on_sales_invoice",
         "sales_invoice_print_in_color",
         "vat_account_code",
+        "recon_cash_account_code",
+        "recon_safe_account_code",
+        "recon_shortage_account_code",
         "seal",
         "inv_ev_m",
         "default_valuation_source",

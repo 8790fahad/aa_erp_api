@@ -2092,6 +2092,30 @@ exports.moveSupplierDepositToGoodsInTransit = async (req, res) => {
       remark: desc,
     });
 
+    try {
+      const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
+      void notifyWorkflowPosting({
+        facilityId,
+        actorUserId: actor,
+        documentId: referenceNumber,
+        documentType: "Deposit to GIT",
+        eventLabel: "posted",
+        nextStep: WORKFLOW_NEXT.depositToGit,
+        details: [
+          ["Reference", referenceNumber],
+          ["Supplier", supplierName],
+          ["Supplier no", supplierNumber],
+          ["Amount", moveAmt],
+          ["Deposit remaining", depositAfter],
+          ["GIT balance", gitAfter],
+        ],
+        remark: desc,
+        inAppType: "deposit_to_git",
+      });
+    } catch (notifErr) {
+      console.warn("Deposit to GIT mail skipped:", notifErr?.message || notifErr);
+    }
+
     return res.status(201).json({
       success: true,
       message: `Moved ${moveAmt.toLocaleString()} from deposit to goods in transit`,

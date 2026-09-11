@@ -62,6 +62,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         defaultValue: null,
       },
+      last_reminder_pct: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+      },
       updated_by: {
         type: DataTypes.STRING(50),
         allowNull: true,

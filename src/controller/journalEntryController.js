@@ -5,6 +5,7 @@ const {
 const { PostingDateValidationError } = require("../utils/validatePostingDate");
 const { Parser } = require("json2csv");
 const db = require("../models");
+const { notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
 
 /**
  * Controller for Journal Entry API endpoints
@@ -33,6 +34,24 @@ exports.createJournalEntry = async (req, res) => {
       facility_id,
       user_id
     );
+
+    void notifyWorkflowPosting({
+      facilityId: facility_id,
+      actorUserId: user_id,
+      documentId:
+        journalEntry?.transaction_ref ||
+        journalEntry?.reference_number ||
+        req.body.reference_number,
+      documentType: "Journal entry",
+      eventLabel: "created",
+      nextStep: WORKFLOW_NEXT.journalPosting,
+      details: [
+        ["Reference", journalEntry?.reference_number || req.body.reference_number],
+        ["Date", journalEntry?.entry_date || req.body.entry_date],
+        ["Description", journalEntry?.description || req.body.description],
+        ["Status", journalEntry?.status || "draft"],
+      ],
+    });
 
     return res.status(201).json({
       success: true,
@@ -235,6 +254,26 @@ exports.postJournalEntry = async (req, res) => {
       facility_id,
       user_id
     );
+
+    void notifyWorkflowPosting({
+      facilityId: facility_id,
+      actorUserId: user_id,
+      documentId: transaction_ref,
+      documentType: "Journal entry",
+      eventLabel: "posted",
+      nextStep: {
+        moduleTitles: [],
+        nextLabel: null,
+        actionPath: "/app/account/journal-entries",
+        actionVerb: "view",
+      },
+      details: [
+        ["Reference", journalEntry?.reference_number || transaction_ref],
+        ["Date", journalEntry?.entry_date],
+        ["Description", journalEntry?.description],
+        ["Status", "posted"],
+      ],
+    });
 
     return res.status(200).json({
       success: true,
