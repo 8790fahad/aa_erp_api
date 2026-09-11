@@ -14,26 +14,42 @@ async function processFacility(business, now = new Date()) {
     now,
   );
 
-  console.log(
-    `[invoice-closing-cron] Running for ${business.business_name || facilityId} (close ${business.invoice_closing_time} ${business.invoice_closing_timezone || "Africa/Lagos"})`,
-  );
+  const lockTx = await db.sequelize.transaction();
+  try {
+    await db.business.findOne({
+      where: { id: facilityId },
+      lock: lockTx.LOCK.UPDATE,
+      transaction: lockTx,
+    });
 
-  const summary = await reverseUnpaidNonCreditInvoicesForFacility({
-    facilityId,
-    userId: "system",
-    reason: `Auto-reversed after daily closing time ${business.invoice_closing_time} (still on Verification Points, unpaid)`,
-  });
+    console.log(
+      `[invoice-closing-cron] Running for ${business.business_name || facilityId} (close ${business.invoice_closing_time} ${business.invoice_closing_timezone || "Africa/Lagos"})`,
+    );
 
-  await db.business.update(
-    { invoice_closing_last_run: parts.date },
-    { where: { id: facilityId } },
-  );
+    const summary = await reverseUnpaidNonCreditInvoicesForFacility({
+      facilityId,
+      userId: "system",
+      reason: `Auto-reversed after daily closing time ${business.invoice_closing_time} (still on Verification Points, unpaid)`,
+    });
 
-  console.log(
-    `[invoice-closing-cron] ${facilityId}: candidates=${summary.candidates} reversed=${summary.reversed} skipped=${summary.skipped || 0} failed=${summary.failed}`,
-  );
+    await db.business.update(
+      { invoice_closing_last_run: parts.date },
+      { where: { id: facilityId }, transaction: lockTx },
+    );
 
-  return summary;
+    await lockTx.commit();
+
+    if (summary.candidates > 0 || summary.reversed > 0) {
+      console.log(
+        `[invoice-closing-cron] ${facilityId}: candidates=${summary.candidates} reversed=${summary.reversed} skipped=${summary.skipped || 0} failed=${summary.failed}`,
+      );
+    }
+
+    return summary;
+  } catch (err) {
+    await lockTx.rollback().catch(() => {});
+    throw err;
+  }
 }
 
 async function runScheduledInvoiceClosing(now = new Date(), { verbose = false } = {}) {

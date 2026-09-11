@@ -21,6 +21,48 @@ const getBalance = async (customerNo, facilityId) => {
   return deposit;
 };
 const { CustomerEntry, Discount, Tax, Customer, CustomerCopy } = db;
+
+const LINE_DISCOUNT_MARK = /\s*\|d:(%|F):([0-9.]+)\|\s*$/i;
+
+function parseLineDiscountMarker(description) {
+  const raw = String(description || "");
+  const match = raw.match(LINE_DISCOUNT_MARK);
+  if (!match) {
+    return {
+      description: raw,
+      line_discount_mode: "%",
+      line_discount_value: "",
+    };
+  }
+  return {
+    description: raw.replace(LINE_DISCOUNT_MARK, "").trim(),
+    line_discount_mode: match[1].toUpperCase() === "F" ? "flat" : "%",
+    line_discount_value: match[2],
+  };
+}
+
+function formatLineDiscountMarker(mode, value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const tag = mode === "flat" || mode === "fixed" || mode === "ngn" ? "F" : "%";
+  return ` |d:${tag}:${n}|`;
+}
+
+function getItemExplicitLineDiscount(itm, lineTotal) {
+  if (!itm || !(lineTotal > 0)) return 0;
+  const explicit = Number(itm.line_discount_amount);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(lineTotal, Number(explicit.toFixed(2)));
+  }
+  const raw = Number(itm.line_discount_value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const mode = String(itm.line_discount_mode || itm.line_discount_type || "")
+    .toLowerCase();
+  if (mode === "flat" || mode === "fixed" || mode === "ngn") {
+    return Math.min(lineTotal, Number(raw.toFixed(2)));
+  }
+  return Math.min(lineTotal, Number(((lineTotal * Math.min(raw, 100)) / 100).toFixed(2)));
+}
 // const getTxnVersionId = require('./helpers').getTxnVersionId
 
 //INSERT into transactions (transaction_source,destination,debited,credited,enteredBy,receiptDateSN,receiptNo) VALUES ('2200-1','PSCPRIME',0,50000,'Mustapha','0910190001','0000001')
@@ -1403,6 +1445,7 @@ exports.getSaleByCode = async (req, res) => {
           })
         : null;
 
+      const parsedDisc = parseLineDiscountMarker(item.description);
       const quantity =
         Number(item.qty_out || 0) > 0
           ? Number(item.qty_out || 0)
@@ -1418,10 +1461,10 @@ exports.getSaleByCode = async (req, res) => {
         entry_id: item.entry_id,
         type: item.type,
         link_id: item.link_id,
-        item_name: product?.name || item.description,
+        item_name: product?.name || parsedDisc.description,
         taxable: product?.taxable,
         unit_of_measure: product?.unit_of_measure || null,
-        description: item.description,
+        description: parsedDisc.description,
         item_type:
           product?.item_type ||
           (entryType.includes("service") ? "Service" : "Finished Good"),
@@ -1434,6 +1477,8 @@ exports.getSaleByCode = async (req, res) => {
         created_at: item.created_at,
         branch_id: item.branch_id != null ? Number(item.branch_id) : null,
         branchId: item.branch_id != null ? Number(item.branch_id) : null,
+        line_discount_mode: parsedDisc.line_discount_mode,
+        line_discount_value: parsedDisc.line_discount_value,
       };
     };
 
@@ -3729,15 +3774,28 @@ exports.createSale = async (req, res) => {
     }
 
     let discountAccount = null;
-    if (discount_amount > 0 && discount_info?.discount_id) {
-      const disc = await db.Discount.findOne({
-        where: { discount_id: discount_info.discount_id, facilityId },
-      });
-      if (disc?.discount_account_head) {
-        discountAccount = await getAccountSafe(
-          disc.discount_account_head,
-          "Discount"
-        );
+    if (discount_amount > 0) {
+      if (discount_info?.discount_id) {
+        const disc = await db.Discount.findOne({
+          where: { discount_id: discount_info.discount_id, facilityId },
+        });
+        if (disc?.discount_account_head) {
+          discountAccount = await getAccountSafe(
+            disc.discount_account_head,
+            "Discount"
+          );
+        }
+      }
+      if (!discountAccount) {
+        const fallbackDisc = await db.Discount.findOne({
+          where: { facilityId, status: "active" },
+        });
+        if (fallbackDisc?.discount_account_head) {
+          discountAccount = await getAccountSafe(
+            fallbackDisc.discount_account_head,
+            "Discount"
+          );
+        }
       }
     }
 
@@ -4549,6 +4607,9 @@ exports.createSale = async (req, res) => {
       }
 
       const lineTotal = qty * price;
+      const explicitLineDiscount = isProBono
+        ? 0
+        : getItemExplicitLineDiscount(itm, lineTotal);
 
       // Only add to subtotal if NOT Pro-bono
       if (!isProBono) {
@@ -4567,6 +4628,7 @@ exports.createSale = async (req, res) => {
         item: itm,
         product,
         lineTotal,
+        explicitLineDiscount,
         qty,
         price,
         sku,
@@ -4639,6 +4701,12 @@ exports.createSale = async (req, res) => {
     const allItemTaxBreakdowns = [];
     let totalCalculatedVAT = 0;
     let totalRevenue = 0;
+    const lineDiscountSum = itemDetails.reduce(
+      (sum, d) => sum + (d.isProBono ? 0 : Number(d.explicitLineDiscount) || 0),
+      0,
+    );
+    const afterLineSubtotal = Math.max(0, subtotal - lineDiscountSum);
+    const headerRemainder = Math.max(0, discount_amount - lineDiscountSum);
 
     for (const itemDetail of itemDetails) {
       const {
@@ -4646,16 +4714,19 @@ exports.createSale = async (req, res) => {
         price,
         product,
         lineTotal,
+        explicitLineDiscount = 0,
         qty,
         sku,
         isProBono,
         isTaxable: itemIsTaxable,
       } = itemDetail;
 
-      let itemDiscount = 0;
-      if (discount_amount > 0 && !isProBono) {
-        itemDiscount = allocateDiscount(lineTotal, subtotal, discount_amount);
-      }
+      const afterLine = Math.max(0, lineTotal - explicitLineDiscount);
+      const headerShare =
+        !isProBono && headerRemainder > 0 && afterLineSubtotal > 0
+          ? allocateDiscount(afterLine, afterLineSubtotal, headerRemainder)
+          : 0;
+      let itemDiscount = isProBono ? 0 : explicitLineDiscount + headerShare;
 
       const discountedGross = lineTotal - itemDiscount;
 
@@ -4805,6 +4876,15 @@ exports.createSale = async (req, res) => {
         null;
 
       // Create CustomerEntry
+      const lineMode = itm.line_discount_mode === "flat" ? "flat" : "%";
+      const lineVal = Number(itm.line_discount_value);
+      const markerVal =
+        Number.isFinite(lineVal) && lineVal > 0
+          ? lineVal
+          : lineMode === "flat"
+            ? explicitLineDiscount
+            : 0;
+      const lineDiscMarker = formatLineDiscountMarker(lineMode, markerVal);
       await db.CustomerEntry.create(
         {
           customerNo: customer_id,
@@ -4813,7 +4893,7 @@ exports.createSale = async (req, res) => {
               itm.multiplier_type ? itm.multiplier_type : ""
             }:${itm.multiplier_value ? itm.multiplier_value : ""}${
               isProBono ? " (Pro-bono)" : ""
-            }` || product.name,
+            }${explicitLineDiscount > 0 ? lineDiscMarker : ""}` || product.name,
           qty_in: 0,
           qty_out: product.item_type === "Service" ? qty : qty,
           bank_account_id: "",

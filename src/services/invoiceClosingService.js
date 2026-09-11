@@ -393,16 +393,13 @@ function parseClosingTime(hhmm) {
   return { hour, minute };
 }
 
-/** Normalize DATEONLY / Date / ISO strings to YYYY-MM-DD. */
+/** Normalize DATEONLY / Date / ISO strings to YYYY-MM-DD without server TZ shift. */
 function toDateOnly(value) {
   if (value == null || value === "") return null;
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    const y = value.getFullYear();
-    const m = String(value.getMonth() + 1).padStart(2, "0");
-    const d = String(value.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  }
-  const m = String(value).match(/(\d{4}-\d{2}-\d{2})/);
+  const iso = value instanceof Date && !Number.isNaN(value.getTime())
+    ? value.toISOString()
+    : String(value);
+  const m = iso.match(/(\d{4}-\d{2}-\d{2})/);
   return m ? m[1] : null;
 }
 
@@ -453,11 +450,7 @@ function isPastClosingTime(business, now = new Date()) {
   );
   const nowMins = parts.hour * 60 + parts.minute;
   const closeMins = closeH * 60 + closeM;
-  if (nowMins < closeMins) return false;
-
-  const lastRun = toDateOnly(business.invoice_closing_last_run);
-  if (lastRun === parts.date) return false;
-  return true;
+  return nowMins >= closeMins;
 }
 
 module.exports = {

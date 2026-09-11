@@ -17,7 +17,7 @@ const {
 } = require("../services/creditNoteInventoryService");
 
 const PAYMENT_ADJUSTMENT_LABELS = {
-  offset_outstanding: "Offset against outstanding invoice",
+  offset_outstanding: "Posted to customer deposit",
   refund_bank: "Refund via bank transfer",
   account_adjustment: "Account adjustment",
 };
@@ -351,6 +351,7 @@ exports.createCreditNote = async (req, res) => {
 
     // Get customer or supplier account
     let receivablePayableAccount = null;
+    let depositLiabilityAccount = null;
     let entityId = null;
     let entityName = null;
 
@@ -417,6 +418,32 @@ exports.createCreditNote = async (req, res) => {
       }
 
       receivablePayableAccount = arAccount;
+
+      if (paymentAdjustmentMethod !== "refund_bank") {
+        const depositCode = String(
+          customer.receivable_accural_code ||
+            customer.deposit_code ||
+            "",
+        ).trim();
+        if (!depositCode) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              "This customer has no deposit / advance account. Set Receivable Accrual (deposit) on the customer record, then save the credit note again.",
+          });
+        }
+        depositLiabilityAccount = await db.AccountCategory.findOne({
+          where: { code: depositCode, facility_id: facilityId },
+        });
+        if (!depositLiabilityAccount) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Customer deposit account ${depositCode} was not found in Chart of Accounts.`,
+          });
+        }
+      }
     } else {
       const supplier = await db.SuppliersInfo.findOne({
         where: { supplier_number: supplierId, facilityId },
@@ -621,13 +648,14 @@ exports.createCreditNote = async (req, res) => {
     const glType = type === "customer" ? "discount" : "payable";
     const refNum = String(creditNoteNumber).slice(0, 100);
 
-    const pushGl = (account, dr, cr, desc, lineKey) => {
+    const pushGl = (account, dr, cr, desc, lineKey, extras = {}) => {
       const parent =
         account.parentCode ?? account.parent_code ?? account.code ?? "0";
       ledgerEntries.push({
         facility_id: facilityId,
         transaction_date: transactionDate,
-        transaction_ref: `${creditNoteNumber}-${lineKey}`,
+        transaction_ref:
+          extras.transaction_ref || `${creditNoteNumber}-${lineKey}`,
         reference_number: refNum,
         account_code: account.code,
         account_description: account.description,
@@ -637,9 +665,9 @@ exports.createCreditNote = async (req, res) => {
         transaction_description: String(desc).slice(0, 500),
         purpose_of_payment: purpose.slice(0, 150),
         payee: String(entityName || entityId || "").slice(0, 50),
-        mode_of_payment: "credit_note",
+        mode_of_payment: extras.mode_of_payment || "credit_note",
         bank_account_id: "",
-        type: glType,
+        type: extras.type || glType,
         status: "saved",
         created_by: userId,
       });
@@ -650,9 +678,12 @@ exports.createCreditNote = async (req, res) => {
         lineDesc ? ` - ${lineDesc}` : reason ? ` - ${reason}` : ""
       }${methodSuffix}`;
 
+    const postCustomerToDeposit =
+      type === "customer" && paymentAdjustmentMethod !== "refund_bank";
+
     // Create ledger entries — prefer Zoho line accounts when present
     if (type === "customer") {
-      // Dr line accounts (or Sales Returns) / Cr Accounts Receivable
+      // Dr line accounts (or Sales Returns) / Cr customer deposit (or A/R on refund)
       if (usableLines.length) {
         usableLines.forEach((line, i) => {
           pushGl(
@@ -673,13 +704,24 @@ exports.createCreditNote = async (req, res) => {
         );
       }
 
-      pushGl(
-        receivablePayableAccount,
-        0,
-        totalAmount,
-        `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
-        "AR",
-      );
+      if (postCustomerToDeposit) {
+        pushGl(
+          depositLiabilityAccount,
+          0,
+          totalAmount,
+          `Credit Note ${creditNoteNumber} posted to deposit - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
+          "DEP",
+          { type: "deposit", transaction_ref: entityId },
+        );
+      } else {
+        pushGl(
+          receivablePayableAccount,
+          0,
+          totalAmount,
+          `Credit Note ${creditNoteNumber} - ${entityName}${reference ? ` (Ref: ${reference})` : ""}${methodSuffix}`,
+          "AR",
+        );
+      }
 
       if (vatAmount > 0 && vatAccount) {
         pushGl(
@@ -795,19 +837,18 @@ exports.createCreditNote = async (req, res) => {
 
     // Create entry in customer_entries or supplier_entries
     if (type === "customer") {
-      // Customer credit note - reduce what customer owes (credit entry)
       await db.CustomerEntry.create(
         {
           customerNo: entityId,
           description: `Credit Note ${creditNoteNumber}${reference ? ` (Ref: ${reference})` : ""} - ${reason || "Credit adjustment"}${methodSuffix}${scenarioSuffix}`,
           qty_in: 0,
-          qty_out: totalAmount, // Credit to customer account (reduces receivable)
+          qty_out: postCustomerToDeposit ? 0 : totalAmount,
           cost: totalAmount,
           facilityId: facilityId,
-          mode_of_payment: "credit_note",
+          mode_of_payment: postCustomerToDeposit ? "deposit" : "credit_note",
           receiptNo: creditNoteNumber,
-          link_id: reference || null, // Link to original invoice
-          type: "discount", // Using 'discount' type for credit adjustments
+          link_id: reference || (postCustomerToDeposit ? creditNoteNumber : null),
+          type: postCustomerToDeposit ? "deposit" : "discount",
           bank_account_id: "",
           created_by: userId,
         },
@@ -839,6 +880,22 @@ exports.createCreditNote = async (req, res) => {
     let creditsAppliedOnCreate = 0;
     let creditsRemainingOnCreate = totalAmount;
     let docStatusOnCreate = "open";
+
+    if (postCustomerToDeposit) {
+      await db.CreditNoteApplication.create(
+        {
+          facility_id: facilityId,
+          credit_note_number: creditNoteNumber,
+          invoice_ref: "DEPOSIT",
+          amount: totalAmount,
+          created_by: userId,
+        },
+        { transaction },
+      );
+      creditsAppliedOnCreate = totalAmount;
+      creditsRemainingOnCreate = 0;
+      docStatusOnCreate = "closed";
+    }
 
     if (paymentAdjustmentMethod === "refund_bank") {
       const mode = ["cash", "bank", "cheque"].includes(refundModeOfPayment)
@@ -1104,11 +1161,13 @@ exports.createCreditNote = async (req, res) => {
       message:
         paymentAdjustmentMethod === "refund_bank"
           ? "Credit note created and refunded successfully"
-          : inventoryMovement.storeRows > 0
-            ? `Credit note created; inventory updated (${inventoryMovement.storeRows} line${
-                inventoryMovement.storeRows === 1 ? "" : "s"
-              })`
-            : "Credit note created successfully",
+          : type === "customer"
+            ? "Credit note posted to customer deposit. Apply it on Create Invoice with Apply Deposit."
+            : inventoryMovement.storeRows > 0
+              ? `Credit note created; inventory updated (${inventoryMovement.storeRows} line${
+                  inventoryMovement.storeRows === 1 ? "" : "s"
+                })`
+              : "Credit note created successfully",
       data: {
         creditNoteNumber,
         type,

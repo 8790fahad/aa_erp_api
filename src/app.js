@@ -537,17 +537,6 @@ const startServer = () => {
       }
       try {
         const {
-          startInvoiceClosingCron,
-        } = require("./jobs/invoiceClosingCron");
-        startInvoiceClosingCron();
-      } catch (err) {
-        console.error(
-          `[Worker ${process.pid}] Failed to start invoice closing cron:`,
-          err.message,
-        );
-      }
-      try {
-        const {
           startArApWeeklyDigestCron,
         } = require("./jobs/arApWeeklyDigestCron");
         startArApWeeklyDigestCron();
@@ -590,6 +579,17 @@ const startServer = () => {
           err.message,
         );
       }
+    }
+    try {
+      const {
+        startInvoiceClosingCron,
+      } = require("./jobs/invoiceClosingCron");
+      startInvoiceClosingCron();
+    } catch (err) {
+      console.error(
+        `[Worker ${process.pid}] Failed to start invoice closing cron:`,
+        err.message,
+      );
     }
   });
   return server;

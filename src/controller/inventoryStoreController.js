@@ -186,6 +186,45 @@ exports.getInventoryItemDetails = async (req, res) => {
       type: db.sequelize.QueryTypes.SELECT,
     });
 
+    const currentStock = parseFloat(product.current_stock) || 0;
+    const netShown = transactionHistory.reduce(
+      (sum, tx) =>
+        sum + (parseFloat(tx.qty_in) || 0) - (parseFloat(tx.qty_out) || 0),
+      0,
+    );
+
+    const stockAsOf = async (asOfDate, before = false) => {
+      const repl = { productId, facilityId, asOfDate };
+      let branchSql = "";
+      if (hasBranchFilter) {
+        branchSql = " AND se.branchId = :branchId";
+        repl.branchId = parsedBranchId;
+      }
+      const cmp = before ? "<" : "<=";
+      const rows = await db.sequelize.query(
+        `
+        SELECT COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS qty
+        FROM store_entries se
+        WHERE se.product_id = :productId
+          AND se.facilityId = :facilityId
+          AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) ${cmp} :asOfDate
+          ${branchSql}
+        `,
+        { replacements: repl, type: db.sequelize.QueryTypes.SELECT },
+      );
+      return parseFloat(rows[0]?.qty) || 0;
+    };
+
+    let balanceBroughtForward = 0;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      balanceBroughtForward = await stockAsOf(from, true);
+    } else if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      const closingAsOfTo = await stockAsOf(to, false);
+      balanceBroughtForward = closingAsOfTo - netShown;
+    } else {
+      balanceBroughtForward = currentStock - netShown;
+    }
+
     // Calculate summary statistics
     const summaryStats = {
       totalReceived: transactionHistory
@@ -288,6 +327,10 @@ exports.getInventoryItemDetails = async (req, res) => {
         summaryStats,
         groupedTransactions,
         balancesByType,
+        balanceBroughtForward,
+        balanceBroughtForwardDate: /^\d{4}-\d{2}-\d{2}$/.test(from)
+          ? from
+          : null,
       },
     });
   } catch (error) {

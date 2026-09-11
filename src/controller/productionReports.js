@@ -179,7 +179,16 @@ exports.getCOGSReport = async (req, res) => {
 // Inventory Valuation Report
 exports.getInventoryValuationReport = async (req, res) => {
   try {
-    const { facilityId, asOfDate, valuationMethod = "FIFO" } = req.body;
+    const {
+      facilityId,
+      asOfDate,
+      valuationMethod = "FIFO",
+      branchId,
+      warehouseId,
+      productId,
+      sku,
+      category,
+    } = req.body;
 
     if (!facilityId || !asOfDate) {
       return res.status(400).json({
@@ -187,6 +196,40 @@ exports.getInventoryValuationReport = async (req, res) => {
         message: "Missing required fields: facilityId, asOfDate",
       });
     }
+
+    const warehouseKey = branchId ?? warehouseId;
+    const warehouseIdNum = parseInt(warehouseKey, 10);
+    const hasWarehouse =
+      warehouseKey !== undefined &&
+      warehouseKey !== null &&
+      String(warehouseKey).trim() !== "" &&
+      String(warehouseKey).toLowerCase() !== "all" &&
+      Number.isFinite(warehouseIdNum) &&
+      warehouseIdNum > 0;
+    const productIdNum = parseInt(productId, 10);
+    const hasProductId = Number.isFinite(productIdNum) && productIdNum > 0;
+    const skuFilter = String(sku || "").trim();
+    const categoryFilter = String(category || "").trim();
+    const hasCategory =
+      categoryFilter !== "" && categoryFilter.toLowerCase() !== "all";
+
+    const warehouseJoinSql = hasWarehouse
+      ? "AND COALESCE(se.branchId, 0) = :branchId"
+      : "";
+    const productWhereSql = hasProductId
+      ? "AND p.id = :productId"
+      : skuFilter
+        ? "AND p.sku = :sku"
+        : "";
+    const categoryWhereSql = hasCategory
+      ? "AND TRIM(p.category) = :category"
+      : "";
+
+    const replacements = { facilityId, asOfDate };
+    if (hasWarehouse) replacements.branchId = warehouseIdNum;
+    if (hasProductId) replacements.productId = productIdNum;
+    else if (skuFilter) replacements.sku = skuFilter;
+    if (hasCategory) replacements.category = categoryFilter;
 
     // Raw Materials — AVCO cost computed from actual store_entries receipts.
     // Date filter uses receive_date (transaction date) not createdAt (entry date).
@@ -231,11 +274,14 @@ exports.getInventoryValuationReport = async (req, res) => {
             (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
             OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
           )
+          ${warehouseJoinSql}
         LEFT JOIN suppliersinfo s
           ON p.supplier_id = s.supplier_number
           AND p.facility_id = s.facilityId
         WHERE p.facility_id = :facilityId
           AND p.item_type = 'Raw Material'
+          ${productWhereSql}
+          ${categoryWhereSql}
         GROUP BY
           p.id, p.name, p.sku, p.unit_of_measure, p.cost_price,
           p.reorder_level, p.category, s.supplier_name
@@ -244,7 +290,7 @@ exports.getInventoryValuationReport = async (req, res) => {
     `;
 
     const rawMaterials = await db.sequelize.query(rawMaterialsQuery, {
-      replacements: { facilityId, asOfDate },
+      replacements,
       type: db.sequelize.QueryTypes.SELECT,
     });
 
@@ -289,8 +335,11 @@ exports.getInventoryValuationReport = async (req, res) => {
             (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
             OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
           )
+          ${warehouseJoinSql}
         WHERE p.facility_id = :facilityId
           AND p.item_type IN ('Finished Good', 'By-Product', 'Resalable', 'Semi Finished')
+          ${productWhereSql}
+          ${categoryWhereSql}
         GROUP BY
           p.id, p.name, p.sku, p.cost_price, p.unit_of_measure,
           p.category, p.item_type
@@ -299,7 +348,7 @@ exports.getInventoryValuationReport = async (req, res) => {
     `;
 
     const finishedGoods = await db.sequelize.query(finishedGoodsQuery, {
-      replacements: { facilityId, asOfDate },
+      replacements,
       type: db.sequelize.QueryTypes.SELECT,
     });
 
@@ -341,6 +390,10 @@ exports.getInventoryValuationReport = async (req, res) => {
           asOfDate,
           valuationMethod,
           generatedAt: moment().format("YYYY-MM-DD HH:mm:ss"),
+          branchId: hasWarehouse ? warehouseIdNum : null,
+          productId: hasProductId ? productIdNum : null,
+          sku: skuFilter || null,
+          category: hasCategory ? categoryFilter : null,
         },
       },
     });
@@ -2353,7 +2406,7 @@ exports.getSalesPerProductReport = async (req, res) => {
     const paymentType = String(rawPaymentType || "")
       .toLowerCase()
       .trim();
-    const hasPaymentFilter = ["cash", "transfer", "warehouse"].includes(
+    const hasPaymentFilter = ["cash", "transfer", "card", "pos", "warehouse"].includes(
       paymentType,
     );
 
@@ -2404,6 +2457,9 @@ exports.getSalesPerProductReport = async (req, res) => {
       } else if (paymentType === "transfer") {
         paymentFilter =
           "AND LOWER(TRIM(sw.payment_type)) IN ('transfer', 'bank', 'split')";
+      } else if (paymentType === "card" || paymentType === "pos") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('card', 'split')";
       } else {
         paymentFilter = "AND LOWER(TRIM(sw.payment_type)) = 'warehouse'";
       }
@@ -2589,7 +2645,7 @@ exports.getSalesBySupplierReport = async (req, res) => {
     const paymentType = String(rawPaymentType || "")
       .toLowerCase()
       .trim();
-    const hasPaymentFilter = ["cash", "transfer", "warehouse"].includes(
+    const hasPaymentFilter = ["cash", "transfer", "card", "pos", "warehouse"].includes(
       paymentType,
     );
 
@@ -2608,6 +2664,9 @@ exports.getSalesBySupplierReport = async (req, res) => {
       } else if (paymentType === "transfer") {
         paymentFilter =
           "AND LOWER(TRIM(sw.payment_type)) IN ('transfer', 'bank', 'split')";
+      } else if (paymentType === "card" || paymentType === "pos") {
+        paymentFilter =
+          "AND LOWER(TRIM(sw.payment_type)) IN ('card', 'split')";
       } else {
         paymentFilter = "AND LOWER(TRIM(sw.payment_type)) = 'warehouse'";
       }

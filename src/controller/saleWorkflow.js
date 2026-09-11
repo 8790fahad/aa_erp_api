@@ -593,6 +593,7 @@ async function applyPaymentTypeToWorkflow(
     "awaiting_credit_approval",
     "awaiting_discount_approval",
     "awaiting_payment_mode_approval",
+    "awaiting_payment_method",
   ]);
   const earlyWarehouse = new Set([
     "invoice_separation",
@@ -1714,22 +1715,46 @@ exports.listSaleWorkflows = async (req, res) => {
         where.status = status;
       }
     }
-    if (paymentType) where.payment_type = paymentType;
+    if (paymentType) {
+      const types = String(paymentType)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (types.length > 1) {
+        where.payment_type = { [Op.in]: types };
+      } else if (types.length === 1) {
+        where.payment_type = types[0];
+      }
+    }
+
+    const limit = Math.min(
+      500,
+      Math.max(1, parseInt(req.query.limit, 10) || 200),
+    );
 
     const rows = await db.SaleWorkflow.findAll({
       where,
       order: [["updated_at", "DESC"]],
-      limit: 200,
+      limit,
     });
 
     const results = rows.map((r) => {
       const plain = r.toJSON();
+      const history = normalizeHistory(plain.history);
       const next = nextStageFor(plain.status, plain.payment_type);
       const path = stagesForPaymentType(plain.payment_type);
       const meta = stageMeta(plain.status);
+      const split_progress = buildSplitProgressForRow({ ...plain, history });
+      const collected = Number(split_progress?.collected_total) || 0;
+      const remaining = Number(
+        Math.max(0, (Number(plain.amount) || 0) - collected).toFixed(2),
+      );
       return {
         ...plain,
-        history: normalizeHistory(plain.history),
+        history,
+        payment_modes: paymentModesFromHistory(history),
+        split_progress,
+        remaining,
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         next_status: next,
@@ -5214,6 +5239,119 @@ const SPECIAL_TREATMENT_TYPES = [
   "warehouse",
 ];
 
+const SPECIAL_TREATMENT_ACTIONS = new Set(["switch", "separation", "credit"]);
+
+function unpaidRemainingOnWorkflow(row) {
+  const amountDue = Number(row.amount) || 0;
+  const progress = getSplitCollectionProgress(row.history);
+  return Number(
+    Math.max(0, amountDue - (progress.collected_total || 0)).toFixed(2),
+  );
+}
+
+async function sendWorkflowToSeparation(
+  row,
+  { facilityId, updated_by, note },
+  transaction,
+) {
+  const statusNorm = String(row.status || "").toLowerCase();
+  if (["reversed", "cancelled"].includes(statusNorm)) {
+    return {
+      changed: false,
+      skipped: true,
+      reason: "Reversed invoices cannot go to separation",
+    };
+  }
+  if (
+    POST_COLLECTION_STATUSES.has(statusNorm) &&
+    statusNorm !== "payment_confirmed"
+  ) {
+    return {
+      changed: false,
+      skipped: true,
+      reason: "Invoice is already past collection",
+    };
+  }
+  if (statusNorm === "invoice_separation") {
+    return { changed: false, skipped: false };
+  }
+  row.status = "invoice_separation";
+  row.hold_overnight = false;
+  row.history = pushHistory(
+    row.history,
+    "invoice_separation",
+    updated_by,
+    note || "Special treatment — sent to Invoice Separation",
+  );
+  row.updated_by = updated_by || row.updated_by;
+  await ensureSaleFulfillments(
+    {
+      facilityId,
+      saleCode: row.sale_code,
+      createdBy: updated_by,
+    },
+    transaction,
+  );
+  return { changed: true, skipped: false };
+}
+
+async function sendWorkflowRemainingToCredit(
+  row,
+  { facilityId, updated_by, note },
+  transaction,
+) {
+  const statusNorm = String(row.status || "").toLowerCase();
+  if (
+    ["reversed", "cancelled"].includes(statusNorm) ||
+    POST_COLLECTION_STATUSES.has(statusNorm)
+  ) {
+    return {
+      changed: false,
+      skipped: true,
+      reason: "Invoice is not on Verification Points",
+    };
+  }
+  const unpaid = unpaidRemainingOnWorkflow(row);
+  if (unpaid <= 0.05) {
+    return {
+      changed: false,
+      skipped: true,
+      reason: "No remaining balance to send to credit",
+    };
+  }
+  const progress = getSplitCollectionProgress(row.history);
+  const amountDue = Number(row.amount) || 0;
+  const limitErr = await assertCreditLimitMessage(facilityId, row.customer_no, {
+    extraAmount: unpaid,
+    excludeInvoiceRef: row.sale_code,
+  });
+  if (limitErr) {
+    return { changed: false, skipped: true, reason: limitErr };
+  }
+  row.amount = unpaid;
+  row.payment_type = "credit";
+  row.status = "awaiting_credit_approval";
+  row.history = pushHistory(
+    row.history,
+    "awaiting_credit_approval",
+    updated_by,
+    note || `Remaining ₦${unpaid.toFixed(2)} sent to Credit Approval`,
+    {
+      credit_remainder: {
+        from: "special_treatment",
+        original_amount: amountDue,
+        cash_collected: progress.cash || 0,
+        transfer_collected: progress.transfer || 0,
+        card_collected: progress.card || 0,
+        remainder: unpaid,
+        credit: unpaid,
+      },
+    },
+  );
+  row.updated_by = updated_by || row.updated_by;
+  return { changed: true, skipped: false, remaining: unpaid };
+}
+
 /**
  * Switch payment mode on a sale (Verification Points / special treatment).
  * When requireApproval is true, unpaid sales queue as
@@ -5231,8 +5369,13 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
       note,
       requireApproval = false,
       payment_modes: rawPaymentModes,
+      action: rawAction,
+      verificationOnly = false,
     } = req.body;
 
+    const action = String(rawAction || "switch")
+      .toLowerCase()
+      .trim();
     const paymentType = normalizeSpecialPaymentType(rawType);
     const requestedModes = parseModeList(rawPaymentModes);
 
@@ -5247,12 +5390,22 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
         message: "facilityId and saleCodes are required",
       });
     }
-    if (!SPECIAL_TREATMENT_TYPES.includes(paymentType)) {
+    if (!SPECIAL_TREATMENT_ACTIONS.has(action)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "action must be switch, separation, or credit",
+      });
+    }
+    if (
+      action === "switch" &&
+      !SPECIAL_TREATMENT_TYPES.includes(paymentType)
+    ) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
         message:
-          "paymentType must be cash, transfer, split, credit, credit_split, deposit, or warehouse",
+          "paymentType must be cash, POS, transfer, split, credit, credit_split, deposit, or warehouse",
       });
     }
     if (!db.SaleWorkflow) {
@@ -5287,6 +5440,82 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
         ["reversed", "cancelled"].includes(statusNorm) ||
         POST_COLLECTION_STATUSES.has(statusNorm) ||
         historyHasPaymentConfirmed(row.history);
+
+      if (verificationOnly && isPostedOrVoid) {
+        updated.push({
+          sale_code: row.sale_code,
+          payment_type: row.payment_type,
+          status: row.status,
+          changed: false,
+          skipped: true,
+          reason: "Only invoices still on Verification Points can be treated here",
+        });
+        continue;
+      }
+
+      if (action === "separation") {
+        const applied = await sendWorkflowToSeparation(
+          row,
+          { facilityId, updated_by, note },
+          transaction,
+        );
+        if (applied.skipped) {
+          updated.push({
+            sale_code: row.sale_code,
+            payment_type: row.payment_type,
+            status: row.status,
+            changed: false,
+            skipped: true,
+            reason: applied.reason,
+          });
+          continue;
+        }
+        if (!applied.changed) {
+          updated.push({
+            sale_code: row.sale_code,
+            payment_type: row.payment_type,
+            status: row.status,
+            changed: false,
+          });
+          continue;
+        }
+        await persistLockedWorkflow(row, transaction);
+        updated.push({
+          sale_code: row.sale_code,
+          payment_type: row.payment_type,
+          status: row.status,
+          changed: true,
+        });
+        continue;
+      }
+
+      if (action === "credit") {
+        const applied = await sendWorkflowRemainingToCredit(
+          row,
+          { facilityId, updated_by, note },
+          transaction,
+        );
+        if (applied.skipped) {
+          updated.push({
+            sale_code: row.sale_code,
+            payment_type: row.payment_type,
+            status: row.status,
+            changed: false,
+            skipped: true,
+            reason: applied.reason,
+          });
+          continue;
+        }
+        await persistLockedWorkflow(row, transaction);
+        updated.push({
+          sale_code: row.sale_code,
+          payment_type: row.payment_type,
+          status: row.status,
+          changed: true,
+          remaining: applied.remaining,
+        });
+        continue;
+      }
 
       if (requireApproval && !isPostedOrVoid) {
         const nextModes = requestedModes.length
@@ -5424,13 +5653,18 @@ exports.applySpecialInvoiceTreatment = async (req, res) => {
         updated_by,
       );
     }
+    const successMessage = requireApproval
+      ? pendingCount
+        ? `Submitted ${pendingCount} payment mode switch(es) for approval`
+        : "No payment mode changes submitted"
+      : action === "separation"
+        ? `Sent ${appliedCount} invoice(s) to Invoice Separation`
+        : action === "credit"
+          ? `Sent remaining balance on ${appliedCount} invoice(s) to Credit`
+          : `Updated ${appliedCount} invoice(s) to ${paymentType}`;
     return res.json({
       success: true,
-      message: requireApproval
-        ? pendingCount
-          ? `Submitted ${pendingCount} payment mode switch(es) for approval`
-          : "No payment mode changes submitted"
-        : `Updated ${appliedCount} invoice(s) to ${paymentType}`,
+      message: successMessage,
       results: updated,
     });
   } catch (err) {
