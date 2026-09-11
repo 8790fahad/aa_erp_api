@@ -1606,8 +1606,9 @@ const VERIFICATION_EDIT_STATUSES = [
 const REVERSED_WORKFLOW_STATUSES = ["cancelled", "reversed"];
 
 /**
- * Invoices currently on Verification Points (unpaid) and not reversed.
- * Used by Edit Invoice so the picker never lists paid, warehouse, or voided sales.
+ * Invoices currently on Verification Points (unpaid) for today.
+ * Used by Edit Invoice so the picker matches the VP queue — today's
+ * invoices still in store, not paid, warehouse, or voided sales.
  */
 exports.listVerificationInvoices = async (req, res) => {
   try {
@@ -1625,14 +1626,28 @@ exports.listVerificationInvoices = async (req, res) => {
       });
     }
 
+    const dateParam = String(req.query.date || "").trim();
+    const todayYmd = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
+      ? dateParam
+      : moment().format("YYYY-MM-DD");
+    const createdToday = db.sequelize.where(
+      db.sequelize.fn("DATE", db.sequelize.col("created_at")),
+      todayYmd,
+    );
+    const updatedToday = db.sequelize.where(
+      db.sequelize.fn("DATE", db.sequelize.col("updated_at")),
+      todayYmd,
+    );
+
     const rows = await db.SaleWorkflow.findAll({
       where: {
         facility_id: facilityId,
         status: { [Op.in]: VERIFICATION_EDIT_STATUSES },
+        [Op.or]: [createdToday, updatedToday],
       },
       order: [
-        ["updated_at", "DESC"],
         ["created_at", "DESC"],
+        ["updated_at", "DESC"],
       ],
       limit: 500,
     });

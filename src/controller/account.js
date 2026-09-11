@@ -10951,7 +10951,10 @@ exports.runInvoiceClosingNow = async (req, res) => {
     return res.json({
       success: true,
       message: `Reversed ${summary.reversed} of ${summary.candidates} unpaid verification invoice(s)`,
-      data: summary,
+      data: {
+        ...summary,
+        last_run: parts.date,
+      },
     });
   } catch (err) {
     console.error("runInvoiceClosingNow:", err);

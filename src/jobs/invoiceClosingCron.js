@@ -1,6 +1,5 @@
 "use strict";
 
-const cron = require("node-cron");
 const db = require("../models");
 const {
   isPastClosingTime,
@@ -31,21 +30,23 @@ async function processFacility(business, now = new Date()) {
   );
 
   console.log(
-    `[invoice-closing-cron] ${facilityId}: candidates=${summary.candidates} reversed=${summary.reversed} failed=${summary.failed}`,
+    `[invoice-closing-cron] ${facilityId}: candidates=${summary.candidates} reversed=${summary.reversed} skipped=${summary.skipped || 0} failed=${summary.failed}`,
   );
 
   return summary;
 }
 
-async function runScheduledInvoiceClosing(now = new Date()) {
+async function runScheduledInvoiceClosing(now = new Date(), { verbose = false } = {}) {
   const businesses = await db.business.findAll({
     where: { invoice_closing_enabled: true },
   });
 
   const results = [];
+  let dueCount = 0;
   for (const business of businesses) {
     try {
       if (!isPastClosingTime(business, now)) continue;
+      dueCount += 1;
       const summary = await processFacility(business, now);
       results.push({ facilityId: business.id, success: true, ...summary });
     } catch (err) {
@@ -60,12 +61,20 @@ async function runScheduledInvoiceClosing(now = new Date()) {
       });
     }
   }
+
+  if (verbose || dueCount > 0) {
+    console.log(
+      `[invoice-closing-cron] ${businesses.length} enabled, ${dueCount} due`,
+    );
+  }
+
   return results;
 }
 
 /**
- * Poll every 5 minutes; each enabled business reverses once per local day
- * after its configured closing time.
+ * Poll on an interval (default 60s). node-cron v4 skips ticks that are >1s late,
+ * which silently never ran on this Windows/Sequelize server.
+ * Each enabled business reverses once per local day after its closing time.
  */
 function startInvoiceClosingCron() {
   if (process.env.ENABLE_INVOICE_CLOSING_CRON === "false") {
@@ -75,21 +84,24 @@ function startInvoiceClosingCron() {
     return null;
   }
 
-  const schedule =
-    process.env.INVOICE_CLOSING_CRON_SCHEDULE || "*/5 * * * *";
-
-  const task = cron.schedule(
-    schedule,
-    () => {
-      runScheduledInvoiceClosing().catch((err) =>
-        console.error("[invoice-closing-cron] Unhandled error:", err),
-      );
-    },
-    { scheduled: true },
+  const intervalMs = Math.max(
+    15000,
+    parseInt(process.env.INVOICE_CLOSING_POLL_MS, 10) || 60 * 1000,
   );
 
-  console.log(`[invoice-closing-cron] Scheduled (${schedule})`);
-  return task;
+  const tick = (verbose = false) => {
+    runScheduledInvoiceClosing(new Date(), { verbose }).catch((err) =>
+      console.error("[invoice-closing-cron] Unhandled error:", err),
+    );
+  };
+
+  tick(true);
+  const timer = setInterval(() => tick(false), intervalMs);
+
+  console.log(
+    `[invoice-closing-cron] Polling every ${Math.round(intervalMs / 1000)}s`,
+  );
+  return timer;
 }
 
 module.exports = {

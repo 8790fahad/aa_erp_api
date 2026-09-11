@@ -9,6 +9,7 @@ const VERIFICATION_STATUSES = [
   "awaiting_cashier_confirm",
   "awaiting_discount_approval",
   "awaiting_payment_mode_approval",
+  "awaiting_payment_method",
   "awaiting_credit_approval",
 ];
 
@@ -392,6 +393,19 @@ function parseClosingTime(hhmm) {
   return { hour, minute };
 }
 
+/** Normalize DATEONLY / Date / ISO strings to YYYY-MM-DD. */
+function toDateOnly(value) {
+  if (value == null || value === "") return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const y = value.getFullYear();
+    const m = String(value.getMonth() + 1).padStart(2, "0");
+    const d = String(value.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const m = String(value).match(/(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
 /** Current HH:mm and YYYY-MM-DD in a timezone (fallback: Africa/Lagos). */
 function getNowPartsInTimezone(timeZone = "Africa/Lagos", now = new Date()) {
   const tz = timeZone || "Africa/Lagos";
@@ -403,12 +417,15 @@ function getNowPartsInTimezone(timeZone = "Africa/Lagos", now = new Date()) {
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
+      hourCycle: "h23",
       hour12: false,
     }).formatToParts(now);
     const get = (type) => parts.find((p) => p.type === type)?.value;
+    let hour = parseInt(get("hour"), 10);
+    if (!Number.isFinite(hour) || hour === 24) hour = 0;
     return {
       date: `${get("year")}-${get("month")}-${get("day")}`,
-      hour: parseInt(get("hour"), 10) || 0,
+      hour,
       minute: parseInt(get("minute"), 10) || 0,
       timeZone: tz,
     };
@@ -438,9 +455,7 @@ function isPastClosingTime(business, now = new Date()) {
   const closeMins = closeH * 60 + closeM;
   if (nowMins < closeMins) return false;
 
-  const lastRun = business.invoice_closing_last_run
-    ? String(business.invoice_closing_last_run).slice(0, 10)
-    : null;
+  const lastRun = toDateOnly(business.invoice_closing_last_run);
   if (lastRun === parts.date) return false;
   return true;
 }
@@ -451,6 +466,7 @@ module.exports = {
   isPastClosingTime,
   getNowPartsInTimezone,
   parseClosingTime,
+  toDateOnly,
   collectedAmountFromHistory,
   saleHasAnyPayment,
   VERIFICATION_STATUSES,
