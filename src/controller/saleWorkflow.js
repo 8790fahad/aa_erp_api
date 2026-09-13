@@ -53,6 +53,9 @@ function paymentModesForType(paymentType) {
   if (pt === "deposit" || pt === "apply_deposit" || pt === "apply deposit") {
     return ["deposit"];
   }
+  if (pt === "apply_credit" || pt === "apply credit") {
+    return ["apply_credit"];
+  }
   if (pt === "card" || pt === "pos") return ["card"];
   if (pt === "transfer" || pt === "bank") return ["transfer"];
   if (pt === "credit") return ["credit"];
@@ -62,7 +65,13 @@ function paymentModesForType(paymentType) {
 
 function isDepositPaymentType(paymentType) {
   const t = String(paymentType || "").toLowerCase().trim();
-  return t === "deposit" || t === "apply_deposit" || t === "apply deposit";
+  return (
+    t === "deposit" ||
+    t === "apply_deposit" ||
+    t === "apply deposit" ||
+    t === "apply_credit" ||
+    t === "apply credit"
+  );
 }
 
 function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
@@ -73,15 +82,20 @@ function normalizePaymentType(modeOfPayment, isCashSale, paymentModes = []) {
     m === "deposit" ||
     m === "apply_deposit" ||
     m === "apply deposit" ||
-    m.includes("deposit");
+    (m.includes("deposit") && !m.includes("apply_credit"));
+  const hasApplyCredit =
+    modes.includes("apply_credit") ||
+    m === "apply_credit" ||
+    m === "apply credit";
   const hasCash = modes.includes("cash") || m === "cash";
   const hasTransfer =
     modes.includes("transfer") || m === "transfer" || m === "bank";
   const hasCard = modes.includes("card") || m === "card";
   const hasBankLike = hasTransfer || hasCard;
 
-  // Apply Deposit first whenever it is selected (including Cash / Transfer remainder).
+  // Apply Deposit / Apply Credit first whenever selected (including Cash / Transfer remainder).
   if (hasDeposit) return "deposit";
+  if (hasApplyCredit) return "apply_credit";
 
   if (!isCashSale) {
     return "credit";
@@ -139,14 +153,18 @@ function collectModeIdsFromRow(row) {
     const pt = String(row?.payment_type || "").toLowerCase().trim();
     if (pt === "credit_split") return ["credit", "cash", "transfer"];
     if (isSplitPaymentType(pt)) return ["cash", "transfer"];
-    if (isDepositPaymentType(pt)) return ["deposit"];
+    if (isDepositPaymentType(pt)) {
+      return pt === "apply_credit" || pt === "apply credit"
+        ? ["apply_credit"]
+        : ["deposit"];
+    }
     if (pt === "card") return ["card"];
     if (pt === "transfer" || pt === "bank") return ["transfer"];
     if (pt === "credit") return ["credit"];
     if (pt === "cash") return ["cash"];
   }
-  return ["cash", "transfer", "card", "credit", "deposit"].filter((id) =>
-    modes.includes(id),
+  return ["cash", "transfer", "card", "credit", "deposit", "apply_credit"].filter(
+    (id) => modes.includes(id),
   );
 }
 
@@ -229,7 +247,10 @@ function historyHasCreditAfterDeposit(history) {
   return normalizeHistory(history).some((h) => {
     if (h?.credit_after_deposit === true) return true;
     const modes = parseModeList(h?.payment_modes);
-    return modes.includes("credit") && modes.includes("deposit");
+    return (
+      modes.includes("credit") &&
+      (modes.includes("deposit") || modes.includes("apply_credit"))
+    );
   });
 }
 
@@ -238,7 +259,7 @@ function historyHasCollectAfterDeposit(history) {
     if (h?.collect_after_deposit === true) return true;
     const modes = parseModeList(h?.payment_modes);
     return (
-      modes.includes("deposit") &&
+      (modes.includes("deposit") || modes.includes("apply_credit")) &&
       (modes.includes("cash") ||
         modes.includes("transfer") ||
         modes.includes("card"))
@@ -651,16 +672,18 @@ async function applyPaymentTypeToWorkflow(
   }
 
   if (
-    paymentType === "deposit" &&
+    (paymentType === "deposit" || paymentType === "apply_credit") &&
     earlyCashier.has(row.status) &&
     !alreadyPaid
   ) {
+    const applyLabel =
+      paymentType === "apply_credit" ? "Apply Credit" : "Apply Deposit";
     row.status = "awaiting_payment";
     row.history = pushHistory(
       row.history,
       "awaiting_payment",
       updated_by,
-      "Switched to Apply Deposit — apply customer deposit before collection or credit approval",
+      `Switched to ${applyLabel} — apply customer balance before collection or credit approval`,
       modeMeta,
     );
   }
@@ -1467,22 +1490,27 @@ async function createSaleWorkflowRecord(
     initialStatus = "awaiting_discount_approval";
     statusNote = "Awaiting discount approval before collection";
   } else if (isDepositPaymentType(resolvedPaymentType)) {
+    const applyLabel =
+      resolvedPaymentType === "apply_credit" ||
+      resolvedPaymentType === "apply credit"
+        ? "Apply Credit"
+        : "Apply Deposit";
     if (depositFullyApplied || Number(amount) === 0) {
       initialStatus = "invoice_separation";
-      statusNote = "Deposit applied — ready for separation";
+      statusNote = `${applyLabel} applied — ready for separation`;
     } else {
-      // Always queue on Apply Deposit when that mode was selected — even if
-      // available deposit is ₦0. Verification Points shows the invoice; Apply
-      // is blocked until there is a balance.
+      // Always queue on Apply Deposit / Apply Credit when that mode was selected —
+      // even if available balance is ₦0. Verification Points shows the invoice;
+      // Apply is blocked until there is a balance.
       initialStatus = "awaiting_payment";
       statusNote =
         availableDeposit <= 0.05
-          ? "Awaiting Apply Deposit — no deposit available; Apply is blocked until a balance exists"
+          ? `Awaiting ${applyLabel} — no balance available; Apply is blocked until a balance exists`
           : creditAfterDeposit
-            ? "Awaiting Apply Deposit — apply customer deposit, remainder goes to Credit approval"
+            ? `Awaiting ${applyLabel} — apply customer balance, remainder goes to Credit approval`
             : collectAfterDeposit
-              ? "Awaiting Apply Deposit — apply customer deposit, then collect cash/transfer/card"
-              : "Awaiting Apply Deposit — apply customer deposit before separation or credit approval";
+              ? `Awaiting ${applyLabel} — apply customer balance, then collect cash/transfer/card`
+              : `Awaiting ${applyLabel} — apply customer balance before separation or credit approval`;
     }
   } else if (isPaid) {
     initialStatus = "awaiting_cashier_confirm";
@@ -2740,7 +2768,7 @@ exports.getCashierDashboard = async (req, res) => {
     const creditWhere = {
       facility_id: facilityId,
       status: "awaiting_credit_approval",
-      payment_type: ["credit", "deposit"],
+      payment_type: ["credit", "deposit", "apply_credit"],
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -2753,7 +2781,8 @@ exports.getCashierDashboard = async (req, res) => {
       ct === "split" ||
       ct === "discount" ||
       ct === "mode" ||
-      ct === "deposit"
+      ct === "deposit" ||
+      ct === "apply_credit"
         ? []
         : await db.SaleWorkflow.findAll({
             where: withActiveToday(creditWhere),
@@ -2786,35 +2815,42 @@ exports.getCashierDashboard = async (req, res) => {
       });
     }
 
-    // Restore invoices that selected Apply Deposit but were forced onto Credit
-    // when the customer had ₦0 deposit — they belong on the Apply Deposit tab.
+    // Restore invoices that selected Apply Deposit / Apply Credit but were forced
+    // onto Credit when the customer had ₦0 prepaid balance — they belong on the
+    // matching Apply tab.
     const remainingCredit = [];
     for (const row of creditRows) {
       const modes = Array.isArray(row.payment_modes)
         ? row.payment_modes
         : paymentModesFromHistory(row.history);
       // "modes" is the invoice's original payment method selection and keeps
-      // "deposit" forever, even after the deposit has been applied. Only
-      // restore to Apply Deposit when the deposit was NEVER applied (e.g. it
-      // was force-routed to Credit at ₦0 balance). Otherwise this is a
-      // genuine Credit remainder after a real deposit application and must
-      // stay on the Credit tab.
-      if (!modes.includes("deposit") || historyHasDepositApplied(row.history)) {
+      // "deposit" / "apply_credit" forever, even after the balance has been applied.
+      // Only restore when the prepaid amount was NEVER applied (e.g. it was
+      // force-routed to Credit at ₦0 balance). Otherwise this is a genuine Credit
+      // remainder after a real application and must stay on the Credit tab.
+      const hasPrepaidMode =
+        modes.includes("deposit") || modes.includes("apply_credit");
+      if (!hasPrepaidMode || historyHasDepositApplied(row.history)) {
         remainingCredit.push(row);
         continue;
       }
+      const restoreType = modes.includes("apply_credit")
+        ? "apply_credit"
+        : "deposit";
+      const applyLabel =
+        restoreType === "apply_credit" ? "Apply Credit" : "Apply Deposit";
       const nextStatus = "awaiting_payment";
       const nextHistory = pushHistory(
         row.history,
         nextStatus,
         null,
-        "Awaiting Apply Deposit — no deposit available; Apply is blocked until a balance exists",
+        `Awaiting ${applyLabel} — no balance available; Apply is blocked until a balance exists`,
         { payment_modes: modes },
       );
       try {
         await db.SaleWorkflow.update(
           {
-            payment_type: "deposit",
+            payment_type: restoreType,
             status: nextStatus,
             history: nextHistory,
           },
@@ -2873,7 +2909,7 @@ exports.getCashierDashboard = async (req, res) => {
     const depositWhere = {
       facility_id: facilityId,
       status: ["awaiting_payment", "awaiting_cashier_confirm"],
-      payment_type: ["deposit", "apply_deposit"],
+      payment_type: ["deposit", "apply_deposit", "apply_credit"],
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -3180,7 +3216,8 @@ exports.getCashierDashboard = async (req, res) => {
       ct !== "split" &&
       ct !== "discount" &&
       ct !== "mode" &&
-      ct !== "deposit"
+      ct !== "deposit" &&
+      ct !== "apply_credit"
     ) {
       for (const row of depositRows) {
         if (!listOnCreditTab(row)) continue;
@@ -3502,7 +3539,7 @@ exports.getCashierDashboard = async (req, res) => {
         "reversed",
         "cancelled",
       ],
-      payment_type: ["cash", "transfer", "bank", "card", "split", "credit", "credit_split", "deposit"],
+      payment_type: ["cash", "transfer", "bank", "card", "split", "credit", "credit_split", "deposit", "apply_credit"],
     };
     if (branchId && branchId !== "all") {
       const bid = parseInt(branchId, 10);
@@ -3516,6 +3553,7 @@ exports.getCashierDashboard = async (req, res) => {
     else if (ct === "split") historyWhere.payment_type = ["split", "credit_split"];
     else if (ct === "credit") historyWhere.payment_type = ["credit"];
     else if (ct === "deposit") historyWhere.payment_type = ["deposit"];
+    else if (ct === "apply_credit") historyWhere.payment_type = ["apply_credit"];
 
     // History is always date-scoped (default: today)
     historyWhere.updated_at = {
@@ -3922,12 +3960,17 @@ exports.cashierConfirmPayment = async (req, res) => {
       });
     }
     const mixedSplit = workflowCollectsAsSplit(row);
-    if (paymentType === "deposit" && !mixedSplit) {
+    if (
+      (paymentType === "deposit" || paymentType === "apply_credit") &&
+      !mixedSplit
+    ) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
         message:
-          "Deposit invoices must be settled on Apply Deposit — they cannot be collected as cash/transfer",
+          paymentType === "apply_credit"
+            ? "Apply Credit invoices must be settled on Apply Credit — they cannot be collected as cash/transfer"
+            : "Deposit invoices must be settled on Apply Deposit — they cannot be collected as cash/transfer",
       });
     }
     // collection_side / cashier_type here is the active collection tab for this request

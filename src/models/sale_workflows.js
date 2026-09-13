@@ -93,7 +93,9 @@ function nextStageFor(current, paymentType) {
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
   const isDeposit =
-    paymentType === "deposit" || paymentType === "apply_deposit";
+    paymentType === "deposit" ||
+    paymentType === "apply_deposit" ||
+    paymentType === "apply_credit";
 
   const map = {
     sales_order: "invoice_generated",
@@ -138,12 +140,14 @@ function stagesForPaymentType(paymentType) {
     paymentType === "bank";
   const isWarehouse = paymentType === "warehouse";
   const isDeposit =
-    paymentType === "deposit" || paymentType === "apply_deposit";
+    paymentType === "deposit" ||
+    paymentType === "apply_deposit" ||
+    paymentType === "apply_credit";
 
   // Cash/transfer: Invoice → Cashier → Separation → Warehouse → Done
   // Warehouse: Invoice → Separation → Warehouse → Done (no cashier)
   // Credit: Invoice → Credit approval → Separation → Warehouse → Done
-  // Deposit: Invoice → Apply Deposit → (Credit if remainder) → Separation → Warehouse → Done
+  // Deposit / Apply Credit: Invoice → Apply prepaid → (Credit if remainder) → Separation → Warehouse → Done
   const core = [
     { id: "invoice_generated", label: "Invoice generated", phase: "order", color: "slate" },
   ];
@@ -157,7 +161,8 @@ function stagesForPaymentType(paymentType) {
   } else if (isDeposit) {
     core.push({
       id: "awaiting_payment",
-      label: "Apply Deposit",
+      label:
+        paymentType === "apply_credit" ? "Apply Credit" : "Apply Deposit",
       phase: "payment_cash",
       color: "teal",
     });
@@ -235,6 +240,7 @@ module.exports = (sequelize, DataTypes) => {
           "credit_split",
           "deposit",
           "card",
+          "apply_credit",
         ),
         allowNull: false,
         defaultValue: "credit",

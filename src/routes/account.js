@@ -371,6 +371,14 @@ module.exports = (app) => {
     "/account/update-session-lock/:facilityId/:user_id",
     account.updateSessionLockSettings,
   );
+  app.get(
+    "/account/workflow-mail-settings/:facilityId",
+    account.getWorkflowMailSettings,
+  );
+  app.post(
+    "/account/update-workflow-mail/:facilityId/:user_id",
+    account.updateWorkflowMailSettings,
+  );
   app.post(
     "/account/update-login-hours/:facilityId/:user_id",
     account.updateLoginHoursSettings,

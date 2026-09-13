@@ -83,6 +83,19 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 10,
         comment: "Idle minutes before session lock (1–240) for this business",
       },
+      workflow_mail_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+        comment:
+          "When true, process workflow emails (invoice, memo, journal, etc.) are sent. In-app notifications still work when false.",
+      },
+      workflow_mail_processes: {
+        type: DataTypes.JSON,
+        allowNull: true,
+        comment:
+          "Per-process email toggles (invoice, memo, …). Missing key defaults to on when master is enabled.",
+      },
       login_hours_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,

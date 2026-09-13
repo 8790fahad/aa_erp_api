@@ -16,30 +16,379 @@ const { getPublicFrontendUrl } = require("../config/frontendUrl");
 
 const SUPERUSER_KEYS = ["Administrator", "Super Administrator", "Admin"];
 
+/**
+ * Process email channels (Settings → Process Emails).
+ * Each process has nested `steps` you can turn on/off independently.
+ * Storage keys are `processId.stepId` (e.g. invoice.verification).
+ */
+const WORKFLOW_MAIL_PROCESSES = [
+  {
+    id: "invoice",
+    label: "Sales invoices",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the invoice",
+        sentTo: "Confirmation email to the user who created or posted the invoice",
+      },
+      {
+        id: "discount",
+        label: "Discount approval",
+        sentTo: "Collection Reconciliation (Discount) / Verification Points users",
+      },
+      {
+        id: "credit",
+        label: "Credit approval",
+        sentTo: "Verification Points (Credit) users",
+      },
+      {
+        id: "deposit",
+        label: "Apply deposit",
+        sentTo: "Verification Points (Apply Deposit) users",
+      },
+      {
+        id: "payment_mode",
+        label: "Payment mode approval",
+        sentTo: "Verification Points (Payment Mode) users",
+      },
+      {
+        id: "verification",
+        label: "Verification Points / Cashier",
+        sentTo: "Cashiers and Verification Points collectors",
+      },
+      {
+        id: "separation",
+        label: "Invoice Separation",
+        sentTo: "Invoice Separation users",
+      },
+      {
+        id: "warehouse",
+        label: "Warehouse Collection",
+        sentTo: "Warehouse Collection / Warehouse Requests users",
+      },
+    ],
+  },
+  {
+    id: "memo",
+    label: "Memos",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the memo",
+        sentTo: "Confirmation email to the user who posted the memo",
+      },
+      {
+        id: "approval",
+        label: "Memo approval",
+        sentTo: "Internal Audit / Administrative Review / Pending Memos users",
+      },
+      {
+        id: "raiser",
+        label: "Memo raiser (returned / rejected / status)",
+        sentTo: "The staff member who originally raised the memo",
+      },
+      {
+        id: "bill",
+        label: "Bill (after approval)",
+        sentTo: "Bill / Create Bill / View Expenses Memos users",
+      },
+    ],
+  },
+  {
+    id: "purchase_requisition",
+    label: "Purchase requisitions",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the PR",
+        sentTo: "Confirmation email to the user who posted the requisition",
+      },
+      {
+        id: "approval",
+        label: "Purchase Order approval",
+        sentTo: "Approve Purchase Order / Goods received users",
+      },
+      {
+        id: "bill",
+        label: "Bill",
+        sentTo: "Bill / Create Bill users",
+      },
+    ],
+  },
+  {
+    id: "purchase_order",
+    label: "Purchase orders",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the PO",
+        sentTo: "Confirmation email to the user who posted the purchase order",
+      },
+      {
+        id: "approval",
+        label: "Approve Purchase Order",
+        sentTo: "Approve Purchase Order / Goods received users",
+      },
+    ],
+  },
+  {
+    id: "goods_transfer",
+    label: "Goods transfers",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the transfer",
+        sentTo: "Confirmation email to the user who posted the transfer",
+      },
+      {
+        id: "approval",
+        label: "Pending Approvals",
+        sentTo: "Pending Approvals / Goods users",
+      },
+    ],
+  },
+  {
+    id: "journal",
+    label: "Journal entries",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the journal",
+        sentTo: "Confirmation email to the user who posted the journal",
+      },
+      {
+        id: "next",
+        label: "Journal Entries queue",
+        sentTo: "Journal Entries users who need to post or view it",
+      },
+    ],
+  },
+  {
+    id: "production",
+    label: "Production",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted production",
+        sentTo: "Confirmation email to the user who posted production",
+      },
+      {
+        id: "price_setup",
+        label: "Price Setup",
+        sentTo: "Price Setup users for costing follow-up",
+      },
+    ],
+  },
+  {
+    id: "payroll",
+    label: "Payroll",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who ran payroll",
+        sentTo: "Confirmation email to the user who ran or posted payroll",
+      },
+      {
+        id: "confirm",
+        label: "Payroll History / confirm",
+        sentTo: "Payroll History / Processing users",
+      },
+      {
+        id: "payment",
+        label: "Payroll Payment",
+        sentTo: "Payroll Payment users",
+      },
+    ],
+  },
+  {
+    id: "credit_note",
+    label: "Credit notes",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the credit note",
+        sentTo: "Confirmation email to the user who posted the credit note",
+      },
+      {
+        id: "next",
+        label: "Credit Notes queue",
+        sentTo: "Credit Notes users",
+      },
+    ],
+  },
+  {
+    id: "price_update",
+    label: "Price updates",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who changed prices",
+        sentTo: "Confirmation email to the user who updated prices",
+      },
+      {
+        id: "next",
+        label: "Price Setup / Sales",
+        sentTo: "Price Setup, Make sales, Invoices, and Products users",
+      },
+    ],
+  },
+  {
+    id: "deposit_git",
+    label: "Deposit to GIT",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the deposit",
+        sentTo: "Confirmation email to the user who posted the deposit",
+      },
+      {
+        id: "pay_bills",
+        label: "Pay Bills",
+        sentTo: "Pay Bills / Create Bill users",
+      },
+    ],
+  },
+  {
+    id: "rebate",
+    label: "Rebates",
+    steps: [
+      {
+        id: "actor",
+        label: "Person who posted the rebate",
+        sentTo: "Confirmation email to the user who posted the rebate",
+      },
+      {
+        id: "next",
+        label: "Next rebate step",
+        sentTo: "Users on the next rebate action",
+      },
+    ],
+  },
+  {
+    id: "vat_return",
+    label: "VAT return reminders",
+    steps: [
+      {
+        id: "next",
+        label: "VAT return owners",
+        sentTo: "Users responsible for the VAT return / next VAT action",
+      },
+    ],
+  },
+];
+
+const PROCESS_IDS = new Set(WORKFLOW_MAIL_PROCESSES.map((p) => p.id));
+
+function allStepKeys() {
+  const keys = [];
+  for (const p of WORKFLOW_MAIL_PROCESSES) {
+    for (const s of p.steps || []) {
+      keys.push(`${p.id}.${s.id}`);
+    }
+  }
+  return keys;
+}
+
+const STEP_KEYS = new Set(allStepKeys());
+
+function documentTypeToProcessId(documentType) {
+  const t = String(documentType || "")
+    .trim()
+    .toLowerCase();
+  if (!t) return null;
+  if (t.includes("invoice")) return "invoice";
+  if (t.includes("memo")) return "memo";
+  if (t.includes("purchase requisition") || t === "pr") {
+    return "purchase_requisition";
+  }
+  if (t.includes("purchase order") || t === "po") return "purchase_order";
+  if (t.includes("goods transfer")) return "goods_transfer";
+  if (t.includes("journal")) return "journal";
+  if (t.includes("production")) return "production";
+  if (t.includes("payroll")) return "payroll";
+  if (t.includes("credit")) return "credit_note";
+  if (t.includes("price")) return "price_update";
+  if (t.includes("deposit") || t.includes("git")) return "deposit_git";
+  if (t.includes("rebate")) return "rebate";
+  if (t.includes("vat")) return "vat_return";
+  return null;
+}
+
+function defaultProcessMap() {
+  const map = {};
+  for (const key of STEP_KEYS) map[key] = true;
+  return map;
+}
+
+function isTruthyFlag(v) {
+  return !(v === false || v === 0 || v === "0" || v === "false");
+}
+
+function normalizeProcessMap(raw) {
+  const base = defaultProcessMap();
+  if (raw == null || raw === "") return base;
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      return base;
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return base;
+  }
+
+  // Legacy: parent process id alone → apply to every nested step
+  for (const process of WORKFLOW_MAIL_PROCESSES) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, process.id)) continue;
+    const parentOn = isTruthyFlag(parsed[process.id]);
+    for (const step of process.steps || []) {
+      base[`${process.id}.${step.id}`] = parentOn;
+    }
+  }
+
+  for (const key of STEP_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+      base[key] = isTruthyFlag(parsed[key]);
+    }
+  }
+  return base;
+}
+
+function stepStorageKey(processId, stepId) {
+  if (!processId || !stepId) return null;
+  return `${processId}.${stepId}`;
+}
+
 const NEXT_STEP_BY_STATUS = {
   pending: {
     moduleTitles: ["Initiate Memo", "Internal Audit", "Pending Memos"],
     nextLabel: "Memo approval",
     actionPath: "/app/account/initiate-memo",
     actionVerb: "review",
+    mailStepId: "approval",
   },
   requested: {
     moduleTitles: ["Initiate Memo", "Internal Audit", "Pending Memos"],
     nextLabel: "Memo approval",
     actionPath: "/app/account/initiate-memo",
     actionVerb: "review",
+    mailStepId: "approval",
   },
   reviewed: {
     moduleTitles: ["Initiate Memo", "Administrative Review"],
     nextLabel: "Memo approval",
     actionPath: "/app/account/initiate-memo",
     actionVerb: "approve",
+    mailStepId: "approval",
   },
   verified: {
     moduleTitles: ["Initiate Memo", "Administrative Review"],
     nextLabel: "Memo approval",
     actionPath: "/app/account/initiate-memo",
     actionVerb: "approve",
+    mailStepId: "approval",
   },
   returned: {
     moduleTitles: ["Initiate Memo"],
@@ -47,6 +396,7 @@ const NEXT_STEP_BY_STATUS = {
     actionPath: "/app/account/initiate-memo",
     actionVerb: "update",
     notifyRaiser: true,
+    mailStepId: "raiser",
   },
   rejected: {
     moduleTitles: ["Initiate Memo"],
@@ -54,6 +404,7 @@ const NEXT_STEP_BY_STATUS = {
     actionPath: "/app/account/initiate-memo",
     actionVerb: "review",
     notifyRaiser: true,
+    mailStepId: "raiser",
   },
   approved: {
     moduleTitles: ["Bill", "Billing Expense", "Create Bill", "View Expenses Memos"],
@@ -61,6 +412,7 @@ const NEXT_STEP_BY_STATUS = {
     actionPath: "/app/expenses/billing",
     actionVerb: "bill",
     notifyRaiser: true,
+    mailStepId: "bill",
   },
   completed: {
     moduleTitles: [],
@@ -68,6 +420,7 @@ const NEXT_STEP_BY_STATUS = {
     actionPath: "/app/account/initiate-memo",
     actionVerb: "view",
     notifyRaiser: true,
+    mailStepId: "raiser",
   },
 };
 
@@ -77,42 +430,49 @@ const WORKFLOW_NEXT = {
     nextLabel: "Price Setup",
     actionPath: "/app/sales/price-setup",
     actionVerb: "cost",
+    mailStepId: "price_setup",
   },
   purchaseBilling: {
     moduleTitles: ["Bill", "Billing Expense", "Create Bill"],
     nextLabel: "Bill",
     actionPath: "/app/expenses/billing",
     actionVerb: "bill",
+    mailStepId: "bill",
   },
   purchaseApproval: {
     moduleTitles: ["Approve Purchase Order", "Goods received"],
     nextLabel: "Approve Purchase Order",
     actionPath: "/app/purchase/purchase-requisition",
     actionVerb: "approve",
+    mailStepId: "approval",
   },
   goodsTransferApproval: {
     moduleTitles: ["Pending Approvals", "Goods"],
     nextLabel: "Pending Approvals",
     actionPath: "/app/purchase/inventory?tab=goods-transfer",
     actionVerb: "approve",
+    mailStepId: "approval",
   },
   journalPosting: {
     moduleTitles: ["Journal Entries"],
     nextLabel: "Journal Entries",
     actionPath: "/app/account/journal-entries",
     actionVerb: "post",
+    mailStepId: "next",
   },
   journalView: {
     moduleTitles: ["Journal Entries"],
     nextLabel: "Journal Entries",
     actionPath: "/app/account/journal-entries",
     actionVerb: "view",
+    mailStepId: "next",
   },
   invoiceList: {
     moduleTitles: ["Invoice List"],
     nextLabel: "Invoice List",
     actionPath: "/app/sales/invoices",
     actionVerb: "view",
+    mailStepId: "verification",
   },
   payrollConfirm: {
     moduleTitles: [
@@ -124,12 +484,14 @@ const WORKFLOW_NEXT = {
     nextLabel: "Payroll History",
     actionPath: "/app/admin/hr/payroll?tab=history",
     actionVerb: "confirm",
+    mailStepId: "confirm",
   },
   payrollPayment: {
     moduleTitles: ["Payroll Payment", "Payroll Processing"],
     nextLabel: "Payroll Payment",
     actionPath: "/app/admin/hr/payroll?tab=payment",
     actionVerb: "pay",
+    mailStepId: "payment",
   },
   payrollHistory: {
     moduleTitles: [
@@ -140,24 +502,28 @@ const WORKFLOW_NEXT = {
     nextLabel: "Payroll History",
     actionPath: "/app/admin/hr/payroll?tab=history",
     actionVerb: "view",
+    mailStepId: "confirm",
   },
   creditNote: {
     moduleTitles: ["Credit Notes", "Credit & Debit Note", "Credit Note"],
     nextLabel: "Credit Notes",
     actionPath: "/app/payments/credit-note/party-customer",
     actionVerb: "view",
+    mailStepId: "next",
   },
   priceUpdate: {
     moduleTitles: ["Price Setup", "Make sales", "Invoices", "Products"],
     nextLabel: "Price Setup",
     actionPath: "/app/sales/price-setup",
     actionVerb: "review",
+    mailStepId: "next",
   },
   depositToGit: {
     moduleTitles: ["Pay Bills", "Pay Bill", "See All Pay Bills", "Create Bill"],
     nextLabel: "Pay Bills",
     actionPath: "/app/payments/pay-bills",
     actionVerb: "review",
+    mailStepId: "pay_bills",
   },
 };
 
@@ -180,6 +546,7 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Collection Reconciliation (Discount)",
       actionPath: "/app/payments/collection-reconciliation?tab=discount",
       actionVerb: "approve the discount on",
+      mailStepId: "discount",
     };
   }
   if (s === "awaiting_credit_approval") {
@@ -192,9 +559,22 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Verification Points (Credit)",
       actionPath: "/app/payments/verification-points",
       actionVerb: "approve credit for",
+      mailStepId: "credit",
     };
   }
   if (s === "awaiting_payment") {
+    if (pt === "apply_credit" || pt === "apply credit") {
+      return {
+        moduleTitles: [
+          "Verification Points",
+          "Apply Credit",
+          "Collection Points",
+        ],
+        nextLabel: "Verification Points (Apply Credit)",
+        actionPath: "/app/payments/verification-points?tab=deposit",
+        actionVerb: "apply credit to",
+      };
+    }
     return {
       moduleTitles: [
         "Verification Points",
@@ -202,8 +582,9 @@ function nextStepForSaleStatus(status, paymentType) {
         "Collection Points",
       ],
       nextLabel: "Verification Points (Apply Deposit)",
-      actionPath: "/app/payments/verification-points",
+      actionPath: "/app/payments/verification-points?tab=deposit",
       actionVerb: "apply deposit to",
+      mailStepId: "deposit",
     };
   }
   if (s === "awaiting_payment_mode_approval") {
@@ -216,6 +597,7 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Verification Points (Payment Mode)",
       actionPath: "/app/payments/verification-points",
       actionVerb: "approve the payment mode for",
+      mailStepId: "payment_mode",
     };
   }
   if (s === "awaiting_cashier_confirm" || s === "awaiting_payment_method") {
@@ -240,6 +622,7 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Verification Points",
       actionPath: "/app/payments/verification-points",
       actionVerb: "collect payment for",
+      mailStepId: "verification",
     };
   }
   if (
@@ -252,6 +635,7 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Invoice Separation",
       actionPath: "/app/sales/separation",
       actionVerb: "separate",
+      mailStepId: "separation",
     };
   }
   if (
@@ -265,6 +649,7 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: "Warehouse Collection",
       actionPath: "/app/sales/warehouse-requests",
       actionVerb: "collect",
+      mailStepId: "warehouse",
     };
   }
   if (s === "completed") {
@@ -273,9 +658,10 @@ function nextStepForSaleStatus(status, paymentType) {
       nextLabel: null,
       actionPath: "/app/sales/invoices",
       actionVerb: "view",
+      mailStepId: null,
     };
   }
-  return WORKFLOW_NEXT.invoiceList;
+  return { ...WORKFLOW_NEXT.invoiceList, mailStepId: "verification" };
 }
 
 function escapeHtml(value) {
@@ -513,6 +899,76 @@ function buildDetailsTable(rows = []) {
   return `<table style="width:100%;border-collapse:collapse;margin:16px 0;">${html}</table>`;
 }
 
+let workflowMailColReady = false;
+async function ensureWorkflowMailColumn() {
+  if (workflowMailColReady) return;
+  try {
+    const cols = await db.sequelize.query("SHOW COLUMNS FROM business", {
+      type: QueryTypes.SELECT,
+    });
+    const have = new Set(
+      (cols || []).map((c) => String(c.Field || c.field || "")),
+    );
+    if (!have.has("workflow_mail_enabled")) {
+      await db.sequelize.query(
+        `ALTER TABLE business ADD COLUMN workflow_mail_enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT 'Process workflow emails on/off'`,
+      );
+    }
+    if (!have.has("workflow_mail_processes")) {
+      await db.sequelize.query(
+        `ALTER TABLE business ADD COLUMN workflow_mail_processes JSON NULL COMMENT 'Per-process email toggles (JSON object)'`,
+      );
+    }
+    workflowMailColReady = true;
+  } catch (err) {
+    console.warn("[workflowMail] ensureWorkflowMailColumn:", err.message);
+  }
+}
+
+/**
+ * Business setting: process emails.
+ * processKey can be a parent id (`invoice`) or a step key (`invoice.verification`).
+ * Master off disables all; missing step defaults to on when master is on.
+ */
+async function isWorkflowMailEnabled(facilityId, processKey = null) {
+  if (!facilityId) return true;
+  try {
+    await ensureWorkflowMailColumn();
+    const rows = await db.sequelize.query(
+      `SELECT workflow_mail_enabled, workflow_mail_processes
+       FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId: String(facilityId) },
+        type: QueryTypes.SELECT,
+      },
+    );
+    if (!rows?.length) return true;
+    const raw = rows[0].workflow_mail_enabled;
+    if (raw === false || raw === 0 || raw === "0") return false;
+    if (!processKey) return true;
+    const key = String(processKey).trim();
+    const map = normalizeProcessMap(rows[0].workflow_mail_processes);
+    if (STEP_KEYS.has(key)) return map[key] !== false;
+    if (PROCESS_IDS.has(key)) {
+      const process = WORKFLOW_MAIL_PROCESSES.find((p) => p.id === key);
+      const steps = process?.steps || [];
+      if (!steps.length) return true;
+      return steps.some((s) => map[`${key}.${s.id}`] !== false);
+    }
+    return true;
+  } catch (err) {
+    console.warn("[workflowMail] isWorkflowMailEnabled:", err.message);
+    return true;
+  }
+}
+
+async function isWorkflowMailStepEnabled(facilityId, processId, stepId) {
+  if (!processId || !stepId) {
+    return isWorkflowMailEnabled(facilityId, processId || null);
+  }
+  return isWorkflowMailEnabled(facilityId, stepStorageKey(processId, stepId));
+}
+
 async function sendHtmlMail({ to, subject, html, category }) {
   try {
     await sendLiveEmail({ to, subject, html, category });
@@ -594,6 +1050,19 @@ async function notifyWorkflowPosting({
   try {
     if (!facilityId || !documentId || !documentType) return;
 
+    const processId = documentTypeToProcessId(documentType);
+    const actorMailOn = await isWorkflowMailStepEnabled(
+      facilityId,
+      processId,
+      "actor",
+    );
+    const nextMailOn = nextStep?.mailStepId
+      ? await isWorkflowMailStepEnabled(
+          facilityId,
+          processId,
+          nextStep.mailStepId,
+        )
+      : false;
     const actor = await getUserById(actorUserId);
     const detailsTable = buildDetailsTable(details);
     const remarkHtml = remark
@@ -612,7 +1081,7 @@ async function notifyWorkflowPosting({
       nextIntro ||
       `A ${escapeHtml(typeLabel.toLowerCase())} is waiting in <strong>${escapeHtml(nextStep?.nextLabel || "your queue")}</strong>. Please ${escapeHtml(nextStep?.actionVerb || "action")} it.`;
 
-    if (actor?.email && !isSuspended(actor.status)) {
+    if (actorMailOn && actor?.email && !isSuspended(actor.status)) {
       await sendHtmlMail({
         to: actor.email,
         subject: `${typeLabel} ${documentId} ${verb}`,
@@ -637,36 +1106,38 @@ async function notifyWorkflowPosting({
         )
       : [];
 
-    const nextMails = nextRecipients
-      .filter((user) => {
-        const email = String(user.email || "")
-          .trim()
-          .toLowerCase();
-        return email && !actorEmailsSent.has(email);
-      })
-      .map((user) =>
-        sendHtmlMail({
-          to: user.email,
-          subject: `${typeLabel} ${documentId} needs your ${nextStep?.actionVerb || "action"}`,
-          category: `${typeLabel} Next Step`,
-          html: wrapMailHtml({
-            firstName: displayName(user),
-            intro: nextHtmlIntro,
-            body: detailsTable,
-            extra: remarkHtml,
-            ctaLabel: `Open ${nextStep?.nextLabel || typeLabel}`,
-            ctaUrl: actionUrl(nextStep?.actionPath || "/app"),
+    if (nextMailOn) {
+      const nextMails = nextRecipients
+        .filter((user) => {
+          const email = String(user.email || "")
+            .trim()
+            .toLowerCase();
+          return email && !actorEmailsSent.has(email);
+        })
+        .map((user) =>
+          sendHtmlMail({
+            to: user.email,
+            subject: `${typeLabel} ${documentId} needs your ${nextStep?.actionVerb || "action"}`,
+            category: `${typeLabel} Next Step`,
+            html: wrapMailHtml({
+              firstName: displayName(user),
+              intro: nextHtmlIntro,
+              body: detailsTable,
+              extra: remarkHtml,
+              ctaLabel: `Open ${nextStep?.nextLabel || typeLabel}`,
+              ctaUrl: actionUrl(nextStep?.actionPath || "/app"),
+            }),
           }),
-        }),
-      );
+        );
 
-    const results = await Promise.allSettled(nextMails);
-    const failed = results.filter((result) => result.status === "rejected");
-    if (failed.length) {
-      console.error(
-        `[workflowMail] ${failed.length} ${typeLabel} next-step email(s) failed for ${documentId}`,
-        failed.map((result) => result.reason?.message || result.reason),
-      );
+      const results = await Promise.allSettled(nextMails);
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length) {
+        console.error(
+          `[workflowMail] ${failed.length} ${typeLabel} next-step email(s) failed for ${documentId}`,
+          failed.map((result) => result.reason?.message || result.reason),
+        );
+      }
     }
 
     await notifyInAppNextStep({
@@ -789,9 +1260,25 @@ async function notifyMemoWorkflow({
       ? `<p style="margin:0 0 12px;font-size:14px;color:#333;line-height:1.6;"><strong>Remark:</strong> ${escapeHtml(remark)}</p>`
       : "";
 
+    const actorMailOn = await isWorkflowMailStepEnabled(
+      businessId,
+      "memo",
+      "actor",
+    );
+    const nextStepId = step?.mailStepId || "approval";
+    const nextMailOn = await isWorkflowMailStepEnabled(
+      businessId,
+      "memo",
+      nextStepId,
+    );
+    const raiserMailOn = await isWorkflowMailStepEnabled(
+      businessId,
+      "memo",
+      "raiser",
+    );
     const actorEmailsSent = new Set();
 
-    if (actor?.email && !isSuspended(actor.status)) {
+    if (actorMailOn && actor?.email && !isSuspended(actor.status)) {
       const nextLine = step?.nextLabel
         ? `It has been sent to <strong>${escapeHtml(step.nextLabel)}</strong> for the next action.`
         : "There is no further approval queue for this memo.";
@@ -815,35 +1302,46 @@ async function notifyMemoWorkflow({
       ? await getUsersWithPrivilegeAccess(businessId, step.moduleTitles)
       : [];
 
-    const nextMails = nextRecipients
-      .filter((user) => {
-        const email = String(user.email || "")
-          .trim()
-          .toLowerCase();
-        return email && !actorEmailsSent.has(email);
-      })
-      .map((user) =>
-        sendHtmlMail({
-          to: user.email,
-          subject: `Memo ${memo.memo_id} needs your ${step.actionVerb}`,
-          category: "Memo Next Step",
-          html: wrapMailHtml({
-            firstName: displayName(user),
-            intro: `A memo is waiting in <strong>${escapeHtml(step.nextLabel)}</strong>. Please ${escapeHtml(step.actionVerb)} it.`,
-            body: detailsTable,
-            extra: remarkHtml,
-            ctaLabel: `${step.actionVerb.charAt(0).toUpperCase()}${step.actionVerb.slice(1)} memo`,
-            ctaUrl: actionUrl(step.actionPath),
-          }),
-        }),
+    const nextMails = [];
+    if (nextMailOn) {
+      nextMails.push(
+        ...nextRecipients
+          .filter((user) => {
+            const email = String(user.email || "")
+              .trim()
+              .toLowerCase();
+            return email && !actorEmailsSent.has(email);
+          })
+          .map((user) =>
+            sendHtmlMail({
+              to: user.email,
+              subject: `Memo ${memo.memo_id} needs your ${step.actionVerb}`,
+              category: "Memo Next Step",
+              html: wrapMailHtml({
+                firstName: displayName(user),
+                intro: `A memo is waiting in <strong>${escapeHtml(step.nextLabel)}</strong>. Please ${escapeHtml(step.actionVerb)} it.`,
+                body: detailsTable,
+                extra: remarkHtml,
+                ctaLabel: `${step.actionVerb.charAt(0).toUpperCase()}${step.actionVerb.slice(1)} memo`,
+                ctaUrl: actionUrl(step.actionPath),
+              }),
+            }),
+          ),
       );
+    }
 
-    if (step?.notifyRaiser && raiser?.email && !isSuspended(raiser.status)) {
+    if (
+      raiserMailOn &&
+      step?.notifyRaiser &&
+      raiser?.email &&
+      !isSuspended(raiser.status)
+    ) {
       const raiserEmail = String(raiser.email).trim().toLowerCase();
       const alreadyNotified =
         actorEmailsSent.has(raiserEmail) ||
         nextRecipients.some(
-          (user) => String(user.email || "").trim().toLowerCase() === raiserEmail,
+          (user) =>
+            String(user.email || "").trim().toLowerCase() === raiserEmail,
         );
       if (!alreadyNotified) {
         const statusLabel = String(memo.status || "updated");
@@ -865,13 +1363,15 @@ async function notifyMemoWorkflow({
       }
     }
 
-    const results = await Promise.allSettled(nextMails);
-    const failed = results.filter((result) => result.status === "rejected");
-    if (failed.length) {
-      console.error(
-        `[workflowMail] ${failed.length} memo next-step email(s) failed for ${memo.memo_id}`,
-        failed.map((result) => result.reason?.message || result.reason),
-      );
+    if (nextMails.length) {
+      const results = await Promise.allSettled(nextMails);
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length) {
+        console.error(
+          `[workflowMail] ${failed.length} memo next-step email(s) failed for ${memo.memo_id}`,
+          failed.map((result) => result.reason?.message || result.reason),
+        );
+      }
     }
 
     await notifyInAppNextStep({
@@ -898,7 +1398,13 @@ module.exports = {
   notifySaleWorkflow,
   nextStepForSaleStatus,
   getUsersWithPrivilegeAccess,
+  isWorkflowMailEnabled,
+  isWorkflowMailStepEnabled,
   WORKFLOW_NEXT,
+  WORKFLOW_MAIL_PROCESSES,
+  documentTypeToProcessId,
+  normalizeProcessMap,
+  defaultProcessMap,
   sendHtmlMail,
   wrapMailHtml,
   escapeHtml,

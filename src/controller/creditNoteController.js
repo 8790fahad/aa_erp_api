@@ -1162,7 +1162,7 @@ exports.createCreditNote = async (req, res) => {
         paymentAdjustmentMethod === "refund_bank"
           ? "Credit note created and refunded successfully"
           : type === "customer"
-            ? "Credit note posted to customer deposit. Apply it on Create Invoice with Apply Deposit."
+            ? "Credit note posted to customer deposit. Apply it on Create Invoice with Apply Deposit or Apply Credit."
             : inventoryMovement.storeRows > 0
               ? `Credit note created; inventory updated (${inventoryMovement.storeRows} line${
                   inventoryMovement.storeRows === 1 ? "" : "s"
@@ -1643,6 +1643,113 @@ exports.getCreditNoteDetails = async (req, res) => {
       limit: 50,
     });
 
+    const StoreModel = db.StoreEntry || db.StoreEntries;
+    const storeRows = StoreModel
+      ? await StoreModel.findAll({
+          where: {
+            facilityId,
+            reference_number: creditNoteNumber,
+          },
+          order: [["createdAt", "ASC"]],
+          limit: 50,
+        }).catch(() => [])
+      : [];
+
+    const productIds = [
+      ...new Set(
+        (storeRows || [])
+          .map((r) => String(r.product_id || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    const productsBySku = {};
+    const ProductModel = db.products || db.Product || db.Products;
+    if (productIds.length && ProductModel) {
+      const products = await ProductModel.findAll({
+        where: { facility_id: facilityId, sku: { [Op.in]: productIds } },
+        attributes: ["sku", "name", "selling_price"],
+      }).catch(() => []);
+      for (const p of products || []) {
+        productsBySku[String(p.sku)] = p;
+      }
+    }
+
+    const lineItems = [];
+    const lineGl = (glEntries || []).filter((e) =>
+      /-L\d+$/i.test(String(e.transaction_ref || "")),
+    );
+    if (lineGl.length) {
+      lineGl.forEach((e, i) => {
+        const amount = Number(e.dr) || Number(e.cr) || 0;
+        let description = String(e.transaction_description || "").trim();
+        const entityMarker = entityName
+          ? ` - ${entityName} - `
+          : null;
+        if (entityMarker && description.includes(entityMarker)) {
+          description = description.split(entityMarker).slice(1).join(entityMarker);
+        } else {
+          description = description
+            .replace(new RegExp(`^Credit Note\\s+${creditNoteNumber}\\s*-\\s*`, "i"), "")
+            .trim();
+        }
+        description = description.split("|")[0].trim() || `Item ${i + 1}`;
+        const store = (storeRows || [])[i];
+        const sku = store?.product_id || null;
+        const qty =
+          Math.abs(Number(store?.qty_in) || 0) +
+            Math.abs(Number(store?.qty_out) || 0) ||
+          1;
+        const rate = qty > 0 ? Number((amount / qty).toFixed(2)) : amount;
+        lineItems.push({
+          sku,
+          item_name: productsBySku[sku]?.name || description,
+          description,
+          quantity: qty,
+          rate,
+          amount,
+          account_code: e.account_code,
+          account_description: e.account_description,
+        });
+      });
+    } else if ((storeRows || []).length) {
+      for (const store of storeRows) {
+        const sku = store.product_id;
+        const qty =
+          Math.abs(Number(store.qty_in) || 0) +
+            Math.abs(Number(store.qty_out) || 0) ||
+          1;
+        const rate =
+          Number(store.selling_price) ||
+          Number(productsBySku[sku]?.selling_price) ||
+          0;
+        lineItems.push({
+          sku,
+          item_name: productsBySku[sku]?.name || sku || "Item",
+          description: productsBySku[sku]?.name || sku || "Item",
+          quantity: qty,
+          rate,
+          amount: Number((rate * qty).toFixed(2)),
+          account_code: null,
+          account_description: null,
+        });
+      }
+    } else if (totalAmount > 0) {
+      lineItems.push({
+        sku: null,
+        item_name: "Credit note",
+        description:
+          String(invoice.description || "")
+            .split("|")[0]
+            .replace(/^Credit Note\s*-\s*/i, "")
+            .trim() || "Credit note",
+        quantity: 1,
+        rate: totalAmount,
+        amount: totalAmount,
+        account_code: null,
+        account_description: null,
+      });
+    }
+
     return res.status(200).json({
       success: true,
       data: {
@@ -1660,6 +1767,7 @@ exports.getCreditNoteDetails = async (req, res) => {
         creditsApplied,
         creditsRemaining,
         status: creditsRemaining <= 0.009 ? "closed" : "open",
+        lineItems,
         applications: applications.map((a) => ({
           id: a.id,
           invoiceRef: a.invoice_ref,
@@ -1667,6 +1775,7 @@ exports.getCreditNoteDetails = async (req, res) => {
           date: a.created_at,
           createdBy: a.created_by,
         })),
+        // Kept for API consumers that need GL; UI document no longer displays these.
         entries: glEntries.map((e) => ({
           account_code: e.account_code,
           account_description: e.account_description,

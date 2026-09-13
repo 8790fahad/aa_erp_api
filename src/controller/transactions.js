@@ -3636,9 +3636,11 @@ exports.createSale = async (req, res) => {
         rawMode === "credit_split";
       const hasDeposit =
         modes.includes("deposit") ||
+        modes.includes("apply_credit") ||
         apply_prepayment === true ||
         apply_prepayment === "true" ||
-        rawMode === "deposit";
+        rawMode === "deposit" ||
+        rawMode === "apply_credit";
 
       if (isWalkInCustomer(customer) && hasCredit) {
         await t.rollback();
@@ -5714,15 +5716,20 @@ exports.createSale = async (req, res) => {
             ? cashModeOfPayment
             : String(modeOfPayment || "").toLowerCase().includes("deposit")
               ? "deposit"
-              : "CREDIT",
+              : String(modeOfPayment || "").toLowerCase().includes("apply_credit")
+                ? "apply_credit"
+                : "CREDIT",
           isCashSale,
           payment_modes,
         ),
         paymentModes: Array.isArray(payment_modes) ? payment_modes : [],
         amount:
           String(modeOfPayment || "").toLowerCase().includes("deposit") ||
+          String(modeOfPayment || "").toLowerCase().includes("apply_credit") ||
           (Array.isArray(payment_modes) &&
-            payment_modes.map((m) => String(m).toLowerCase()).includes("deposit"))
+            payment_modes
+              .map((m) => String(m).toLowerCase())
+              .some((m) => m === "deposit" || m === "apply_credit"))
             ? amountToAR
             : netAmount,
         branchId: saleBranchId,

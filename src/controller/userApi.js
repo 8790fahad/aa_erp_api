@@ -63,6 +63,8 @@ const _getBusinessProfile = async (
         "invoice_closing_last_run",
         "session_lock_enabled",
         "session_lock_idle_minutes",
+        "workflow_mail_enabled",
+        "workflow_mail_processes",
         "login_hours_enabled",
         "login_opening_time",
         "login_closing_time",

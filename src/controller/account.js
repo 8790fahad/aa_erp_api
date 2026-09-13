@@ -10624,6 +10624,224 @@ exports.updateSessionLockSettings = async (req, res) => {
   }
 };
 
+/**
+ * GET /account/workflow-mail-settings/:facilityId
+ * Catalog of processes + current toggles for Settings → Process Emails.
+ */
+exports.getWorkflowMailSettings = async (req, res) => {
+  try {
+    const facilityId = req.params.facilityId || req.query.facilityId;
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const {
+      WORKFLOW_MAIL_PROCESSES,
+      normalizeProcessMap,
+      defaultProcessMap,
+    } = require("../services/workflowMail");
+
+    try {
+      const cols = await db.sequelize.query("SHOW COLUMNS FROM business", {
+        type: db.Sequelize.QueryTypes.SELECT,
+      });
+      const have = new Set(
+        (cols || []).map((c) => String(c.Field || c.field || "")),
+      );
+      if (!have.has("workflow_mail_enabled")) {
+        await db.sequelize.query(
+          `ALTER TABLE business ADD COLUMN workflow_mail_enabled TINYINT(1) NOT NULL DEFAULT 1`,
+        );
+      }
+      if (!have.has("workflow_mail_processes")) {
+        await db.sequelize.query(
+          `ALTER TABLE business ADD COLUMN workflow_mail_processes JSON NULL`,
+        );
+      }
+    } catch (colErr) {
+      console.warn("ensure workflow mail columns:", colErr.message);
+    }
+
+    const rows = await db.sequelize.query(
+      `SELECT workflow_mail_enabled, workflow_mail_processes
+       FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId: String(facilityId) },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    if (!rows?.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const raw = rows[0].workflow_mail_enabled;
+    const enabled = !(raw === false || raw === 0 || raw === "0");
+    const processes = normalizeProcessMap(rows[0].workflow_mail_processes);
+
+    return res.json({
+      success: true,
+      results: {
+        workflow_mail_enabled: enabled,
+        workflow_mail_processes: processes,
+        catalog: WORKFLOW_MAIL_PROCESSES,
+        defaults: defaultProcessMap(),
+      },
+    });
+  } catch (err) {
+    console.error("getWorkflowMailSettings:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Unable to load process email settings",
+    });
+  }
+};
+
+/**
+ * POST /account/update-workflow-mail/:facilityId/:user_id
+ * body: { workflow_mail_enabled, workflow_mail_processes? }
+ * Turns process workflow emails on/off for this business (master + per process).
+ */
+exports.updateWorkflowMailSettings = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const body = req.body || {};
+
+    if (body.workflow_mail_enabled === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "workflow_mail_enabled is required",
+      });
+    }
+
+    const { normalizeProcessMap } = require("../services/workflowMail");
+
+    try {
+      const cols = await db.sequelize.query("SHOW COLUMNS FROM business", {
+        type: db.Sequelize.QueryTypes.SELECT,
+      });
+      const have = new Set(
+        (cols || []).map((c) => String(c.Field || c.field || "")),
+      );
+      if (!have.has("workflow_mail_enabled")) {
+        await db.sequelize.query(
+          `ALTER TABLE business ADD COLUMN workflow_mail_enabled TINYINT(1) NOT NULL DEFAULT 1`,
+        );
+      }
+      if (!have.has("workflow_mail_processes")) {
+        await db.sequelize.query(
+          `ALTER TABLE business ADD COLUMN workflow_mail_processes JSON NULL`,
+        );
+      }
+    } catch (colErr) {
+      console.warn("ensure workflow_mail columns:", colErr.message);
+    }
+
+    const enabled =
+      body.workflow_mail_enabled === true ||
+      body.workflow_mail_enabled === "true" ||
+      body.workflow_mail_enabled === 1 ||
+      body.workflow_mail_enabled === "1";
+
+    const processes = normalizeProcessMap(body.workflow_mail_processes);
+    const updatePayload = {
+      workflow_mail_enabled: enabled,
+      workflow_mail_processes: processes,
+    };
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+    });
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.id,
+        b.business_name,
+        b.business_type,
+        b.business_logo,
+        b.primary_color,
+        b.secondary_color,
+        b.business_phone,
+        b.prefix,
+        b.payable_code,
+        b.receivable_code,
+        b.cost_of_sale,
+        b.payable_accural_code,
+        b.receivable_accural_code,
+        b.sale_revenue_code,
+        b.inv_ev_m,
+        b.costing_method,
+        b.depreciation_method,
+        b.auto_depreciation_enabled,
+        b.auto_depreciation_frequency,
+        b.auto_depreciation_day,
+        b.auto_depreciation_last_run,
+        b.invoice_closing_enabled,
+        b.invoice_closing_time,
+        b.invoice_closing_timezone,
+        b.invoice_closing_last_run,
+        b.session_lock_enabled,
+        b.session_lock_idle_minutes,
+        b.workflow_mail_enabled,
+        b.workflow_mail_processes,
+        b.login_hours_enabled,
+        b.login_opening_time,
+        b.login_closing_time,
+        b.login_hours_timezone,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Process emails",
+      after: updatePayload,
+      remark: "Process workflow email settings updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: enabled
+        ? "Process emails turned on"
+        : "Process emails turned off",
+    });
+  } catch (err) {
+    console.error("Error updating workflow mail settings:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
 function normalizeLoginHhMm(time, fieldName) {
   const raw = String(time || "").trim();
   if (!/^\d{1,2}:\d{2}$/.test(raw)) {
