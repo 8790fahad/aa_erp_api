@@ -62,6 +62,17 @@ async function runScheduledInvoiceClosing(now = new Date(), { verbose = false } 
   for (const business of businesses) {
     try {
       if (!isPastClosingTime(business, now)) continue;
+
+      const parts = getNowPartsInTimezone(
+        business.invoice_closing_timezone || "Africa/Lagos",
+        now,
+      );
+      const lastRun = business.invoice_closing_last_run
+        ? String(business.invoice_closing_last_run).slice(0, 10)
+        : null;
+      // Once per local calendar day after closing time.
+      if (lastRun === parts.date) continue;
+
       dueCount += 1;
       const summary = await processFacility(business, now);
       results.push({ facilityId: business.id, success: true, ...summary });
