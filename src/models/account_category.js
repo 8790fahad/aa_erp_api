@@ -3,6 +3,8 @@
 
 const { QueryTypes } = require("sequelize");
 
+
+
 module.exports = (sequelize, DataTypes) => {
   const AccountCategory = sequelize.define(
     "AccountCategory",

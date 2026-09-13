@@ -5,6 +5,8 @@ on:
     branches:
       - main
 
+
+
 jobs:
   deploy:
     name: 🔐 SSH & Deploy
