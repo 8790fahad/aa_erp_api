@@ -70,6 +70,13 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         comment: "Last date daily invoice auto-reverse ran",
       },
+      financial_year_start_month: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 1,
+        comment:
+          "Month the financial year starts (1=January … 12=December)",
+      },
       session_lock_enabled: {
         type: DataTypes.BOOLEAN,
         allowNull: false,

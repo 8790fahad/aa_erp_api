@@ -10503,6 +10503,98 @@ exports.updateInvoiceClosingSettings = async (req, res) => {
 };
 
 /**
+ * Update financial year start month (1–12).
+ * POST /account/update-financial-year/:facilityId/:user_id
+ * Body: { startMonth: number }
+ */
+exports.updateFinancialYear = async (req, res) => {
+  try {
+    const { facilityId, user_id } = req.params;
+    const startMonth = parseInt(
+      req.body?.startMonth ?? req.body?.financial_year_start_month,
+      10,
+    );
+
+    if (!Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "startMonth must be an integer from 1 (January) to 12 (December)",
+      });
+    }
+
+    try {
+      const cols = await db.sequelize.query("SHOW COLUMNS FROM business", {
+        type: db.Sequelize.QueryTypes.SELECT,
+      });
+      const have = new Set(
+        (cols || []).map((c) => String(c.Field || c.field || "")),
+      );
+      if (!have.has("financial_year_start_month")) {
+        await db.sequelize.query(
+          `ALTER TABLE business ADD COLUMN financial_year_start_month INT NOT NULL DEFAULT 1 COMMENT 'Month the financial year starts (1=January … 12=December)'`,
+        );
+      }
+    } catch (colErr) {
+      console.warn("ensure financial_year_start_month:", colErr.message);
+    }
+
+    const [updatedRowsCount] = await db.business.update(
+      { financial_year_start_month: startMonth },
+      { where: { id: facilityId } },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found or no changes made",
+      });
+    }
+
+    const updatedBusiness = await db.sequelize.query(
+      `SELECT
+        b.*,
+        m.access_to,
+        m.functionalities
+      FROM membership m
+      INNER JOIN business b ON m.business_id = b.id
+      WHERE m.user_id = :user_id AND b.id = :facilityId`,
+      {
+        replacements: { user_id, facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: user_id,
+      action: "update",
+      entityType: "business_settings",
+      entityId: facilityId,
+      entityLabel: "Financial year",
+      after: { financial_year_start_month: startMonth },
+      remark: "Financial year start month updated",
+    });
+
+    return res.json({
+      success: true,
+      results: updatedBusiness[0] || updatedBusiness,
+      message: "Financial year updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating financial year:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
+/**
  * POST /account/update-session-lock/:facilityId/:user_id
  * body: { session_lock_enabled, session_lock_idle_minutes }
  * Business-wide idle lock — applies to every user of this facility.

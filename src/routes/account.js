@@ -368,6 +368,10 @@ module.exports = (app) => {
     account.updateInvoiceClosingSettings,
   );
   app.post(
+    "/account/update-financial-year/:facilityId/:user_id",
+    account.updateFinancialYear,
+  );
+  app.post(
     "/account/update-session-lock/:facilityId/:user_id",
     account.updateSessionLockSettings,
   );
