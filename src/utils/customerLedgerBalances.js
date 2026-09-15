@@ -2,7 +2,11 @@
  * Customer money figures are derived only from general_ledger.
  * A/R (asset): SUM(dr) − SUM(cr) on type receivable.
  * Deposit (liability): SUM(cr) − SUM(dr) on type deposit.
- * Party key: transaction_ref = customerNo or customerNo-*.
+ *
+ * Party attribution:
+ * - transaction_ref = customerNo or customerNo-*
+ * - OR reference_number is a sales invoice for that customer (covers VOID
+ *   reversals that historically rewrote transaction_ref to VOID-…)
  */
 
 const AR_TYPE_SQL = `LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')`;
@@ -22,6 +26,20 @@ function customerRefJoinSql(customerExpr = "c.customerNo") {
   )`;
 }
 
+/** GL rows belonging to this customer (party ref or their sales invoices). */
+function customerOwnedGlSql(customerParam = ":customerNo") {
+  return `(
+    ${customerRefSql(customerParam)}
+    OR reference_number IN (
+      SELECT i.invoice_ref
+      FROM invoices i
+      WHERE i.facility_id = :facilityId
+        AND i.type = 'sales'
+        AND i.ref_number = ${customerParam}
+    )
+  )`;
+}
+
 function roundMoney(n) {
   const v = parseFloat(n);
   if (!Number.isFinite(v)) return 0;
@@ -30,15 +48,16 @@ function roundMoney(n) {
 
 async function getCustomerLedgerBalances(facilityId, customerNo) {
   const db = require("../models");
+  const cust = String(customerNo || "").trim();
   const rows = await db.sequelize.query(
     `SELECT
        COALESCE(SUM(CASE WHEN ${AR_TYPE_SQL} THEN dr - cr ELSE 0 END), 0) AS receivables,
        COALESCE(SUM(CASE WHEN ${DEPOSIT_TYPE_SQL} THEN cr - dr ELSE 0 END), 0) AS deposit
      FROM general_ledger
      WHERE facility_id = :facilityId
-       AND ${customerRefSql()}`,
+       AND ${customerOwnedGlSql()}`,
     {
-      replacements: { facilityId, customerNo: String(customerNo || "").trim() },
+      replacements: { facilityId, customerNo: cust },
       type: db.Sequelize.QueryTypes.SELECT,
     },
   );
@@ -56,6 +75,7 @@ module.exports = {
   DEPOSIT_TYPE_SQL,
   customerRefSql,
   customerRefJoinSql,
+  customerOwnedGlSql,
   getCustomerLedgerBalances,
   roundMoney,
 };

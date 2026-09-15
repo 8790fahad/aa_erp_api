@@ -205,12 +205,12 @@ exports.getReceivedPaymentHistory = async (req, res) => {
     const offset = (pageNum - 1) * limitNum;
 
     const replacements = { facilityId, limit: limitNum, offset };
-    // Group customer deposit receipts (AD-*) into one list row per payment.
+    // AD-* = cash/bank deposits received; AA-* = deposit applied to invoices.
     const whereParts = [
       "ce.facilityId = :facilityId",
       "ce.type = 'deposit'",
       "ce.cost > 0",
-      "ce.receiptNo LIKE 'AD-%'",
+      "(ce.receiptNo LIKE 'AD-%' OR ce.receiptNo LIKE 'AA-%')",
     ];
 
     if (branchId && String(branchId).trim() && String(branchId) !== "all") {
@@ -272,6 +272,7 @@ exports.getReceivedPaymentHistory = async (req, res) => {
          MAX(c.email) AS customer_email,
          MAX(COALESCE(b.branch_name, '')) AS branch_name,
          MAX(ce.description) AS description,
+         MAX(TRIM(COALESCE(ce.link_id, ''))) AS link_id,
          SUM(ce.cost) AS amount,
          SUM(
            CASE
@@ -315,24 +316,41 @@ exports.getReceivedPaymentHistory = async (req, res) => {
     const results = rows.map((e) => {
       const amount = parseFloat(e.amount) || 0;
       const applied = parseFloat(e.applied) || 0;
+      const receiptNo = String(e.receipt_no || "").trim();
+      const linkId = String(e.link_id || "").trim();
+      const mode = String(e.mode_of_payment || "").trim();
+      const desc = String(e.description || "");
+      const isApplied =
+        /^AA[-_]/i.test(receiptNo) ||
+        mode.toUpperCase() === "ADVANCE" ||
+        /advance applied/i.test(desc);
+      const invoiceRef =
+        /^INV[-_]/i.test(linkId)
+          ? linkId
+          : isApplied && /^INV[-_]/i.test(receiptNo)
+            ? receiptNo
+            : "";
       return {
-        receipt_no: String(e.receipt_no || "").trim(),
+        receipt_no: receiptNo,
         date: e.date,
         customer_no: e.customer_no,
         customer_name: e.customer_name || "",
         customer_phone: e.customer_phone || "",
         customer_email: e.customer_email || "",
-        description: e.description || "",
+        description: desc,
         amount,
-        applied,
-        remaining: Math.max(0, amount - applied),
-        mode_of_payment: e.mode_of_payment || "",
+        applied: isApplied ? amount : applied,
+        remaining: isApplied ? 0 : Math.max(0, amount - applied),
+        mode_of_payment: mode,
         cash_amount: parseFloat(e.cash_amount) || 0,
         transfer_amount: parseFloat(e.transfer_amount) || 0,
         card_amount: parseFloat(e.card_amount) || 0,
         branch_id: e.branch_id,
         branch_name: e.branch_name || "",
-        direction: "received",
+        link_id: linkId,
+        invoice_ref: invoiceRef,
+        direction: isApplied ? "applied" : "received",
+        status_label: isApplied ? "Deposit applied" : "Received",
       };
     });
 
@@ -3015,6 +3033,9 @@ export const createCustomerAdvancePayment = async (req, res) => {
     source,
   } = req.body;
 
+  // Only force pure advance for Collection Points (or explicit flag).
+  // Received Payment sends source=received_payment always — respect invoices /
+  // pure_advance from the client so partial invoice settlement works.
   const pureAdvance =
     pure_advance === true ||
     pure_advance === "true" ||
@@ -5498,6 +5519,10 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
             }
             leftover = leftoverAfterCollections(wf);
           }
+        }
+        if (wf) {
+          const { flushPendingSaleLedger } = require("./saleWorkflow");
+          await flushPendingSaleLedger(wf, t);
         }
         const applyAmt = Math.min(amount, remainingPool, leftover);
         if (applyAmt <= 0.05) {

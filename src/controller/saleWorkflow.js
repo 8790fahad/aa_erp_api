@@ -377,6 +377,65 @@ function pushHistory(history, status, userId, note, extra = null) {
   return list;
 }
 
+function pendingSaleLedgerIndex(history) {
+  const list = normalizeHistory(history);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const rows = list[i]?.pending_sale_ledger;
+    if (Array.isArray(rows) && rows.length && !list[i].sale_gl_posted) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function queuePendingSaleLedger(history, ledgerEntries, userId) {
+  if (!Array.isArray(ledgerEntries) || !ledgerEntries.length) return history;
+  return pushHistory(
+    history,
+    "pending_sale_ledger",
+    userId,
+    "Sale ledger queued until verification is done",
+    { pending_sale_ledger: ledgerEntries, sale_gl_posted: false },
+  );
+}
+
+/**
+ * Create Invoice does not post GL. Post the queued sale ledger the first time
+ * verification completes (cashier confirm, credit approval, or apply deposit).
+ */
+async function flushPendingSaleLedger(row, transaction) {
+  if (!row) return { posted: false };
+  const list = [...normalizeHistory(row.history)];
+  const idx = pendingSaleLedgerIndex(list);
+  if (idx < 0) return { posted: false };
+
+  const existing = await db.GeneralLedger.findOne({
+    where: {
+      facility_id: row.facility_id,
+      reference_number: row.sale_code,
+    },
+    transaction,
+  });
+  if (existing) {
+    list[idx] = { ...list[idx], sale_gl_posted: true, pending_sale_ledger: [] };
+    row.history = list;
+    if (typeof row.changed === "function") row.changed("history", true);
+    return { posted: false, already: true };
+  }
+
+  const entries = list[idx].pending_sale_ledger;
+  await db.GeneralLedger.bulkCreate(entries, { transaction });
+  list[idx] = { ...list[idx], sale_gl_posted: true, pending_sale_ledger: [] };
+  row.history = pushHistory(
+    list,
+    row.status,
+    row.updated_by || row.created_by,
+    "Sale ledger posted after verification",
+  );
+  if (typeof row.changed === "function") row.changed("history", true);
+  return { posted: true, count: entries.length };
+}
+
 /** AR outstanding vs customer.credit_limit. Null = not enforced. 0 = no credit. */
 async function invoiceReceivableOnLedger(facilityId, invoiceRef) {
   if (!invoiceRef) return 0;
@@ -1443,6 +1502,7 @@ async function createSaleWorkflowRecord(
     assignedCashierId = null,
     assignedCashierName = null,
     paymentModes = [],
+    pendingSaleLedger = null,
   },
   transaction,
 ) {
@@ -1544,6 +1604,7 @@ async function createSaleWorkflowRecord(
     statusNote,
     Object.keys(historyExtra).length ? historyExtra : null,
   );
+  history = queuePendingSaleLedger(history, pendingSaleLedger, createdBy);
   if (cashierId && isPaid) {
     history = pushHistory(
       history,
@@ -1596,8 +1657,27 @@ async function createSaleWorkflowRecord(
     await persistLockedWorkflow(row, transaction);
   }
 
+  if (
+    !created &&
+    Array.isArray(pendingSaleLedger) &&
+    pendingSaleLedger.length &&
+    pendingSaleLedgerIndex(row.history) < 0
+  ) {
+    row.history = queuePendingSaleLedger(
+      row.history,
+      pendingSaleLedger,
+      createdBy,
+    );
+    row.updated_by = createdBy || row.updated_by;
+    await persistLockedWorkflow(row, transaction);
+  }
+
   // Packs for warehouse treatment / separation; credit packs created after approval
   if (initialStatus === "invoice_separation") {
+    await flushPendingSaleLedger(row, transaction);
+    if (typeof row.changed === "function" && row.changed("history")) {
+      await persistLockedWorkflow(row, transaction);
+    }
     await ensureSaleFulfillments(
       { facilityId, saleCode, createdBy },
       transaction,
@@ -1609,6 +1689,7 @@ async function createSaleWorkflowRecord(
 
 exports.SALE_WORKFLOW_STAGES = SALE_WORKFLOW_STAGES;
 exports.createSaleWorkflowRecord = createSaleWorkflowRecord;
+exports.flushPendingSaleLedger = flushPendingSaleLedger;
 exports.normalizePaymentType = normalizePaymentType;
 exports.paymentModesFromHistory = paymentModesFromHistory;
 exports.getSplitCollectionProgress = getSplitCollectionProgress;
@@ -2149,6 +2230,7 @@ exports.advanceSaleWorkflow = async (req, res) => {
           message: limitErr,
         });
       }
+      await flushPendingSaleLedger(row, transaction);
       row.history = pushHistory(
         row.history,
         "credit_approved",
@@ -4173,6 +4255,8 @@ exports.cashierConfirmPayment = async (req, res) => {
     const customerCodeLabel = row.customer_no || "";
     const branchId = row.branch_id || null;
     const ledgerEntries = [];
+
+    await flushPendingSaleLedger(row, transaction);
 
     for (const split of rawSplits) {
       const modeRaw = String(split.mode || "").toLowerCase().trim();

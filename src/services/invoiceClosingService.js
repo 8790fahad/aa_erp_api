@@ -197,10 +197,9 @@ async function voidUnpaidNonCreditSale({
       );
       clone.purpose_of_payment =
         plain.purpose_of_payment || "Void unpaid invoice";
-      clone.transaction_ref = `VOID-${plain.transaction_id || Date.now()}-${normalizedRef}`.slice(
-        0,
-        100,
-      );
+      // Keep original party ref so customer A/R and deposit nets reverse correctly.
+      // VOID marker stays in the description / purpose only.
+      clone.transaction_ref = plain.transaction_ref;
       await db.GeneralLedger.create(clone, { transaction });
       reversedLedgerCount += 1;
     }

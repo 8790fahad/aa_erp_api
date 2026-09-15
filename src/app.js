@@ -411,6 +411,7 @@ require("./routes/supplier")(app);
 require("./routes/accountingReports")(app);
 require("./routes/products")(app); // Temporarily commented out to avoid route conflicts
 require("./routes/productGroups")(app);
+require("./routes/productCategories")(app);
 require("./routes/productsRoutes")(app);
 require("./routes/procurement")(app);
 require("./routes/production")(app);

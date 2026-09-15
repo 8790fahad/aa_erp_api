@@ -5606,10 +5606,8 @@ exports.createSale = async (req, res) => {
       );
     }
 
-    // ===================================================================
-    // SAVE ALL LEDGER ENTRIES
-    // ===================================================================
-    await db.GeneralLedger.bulkCreate(ledgerEntries, { transaction: t });
+    // Do not post GL here. Verification Points (cashier confirm, credit
+    // approval, or apply deposit) posts the queued sale ledger.
 
     // ===================================================================
     // CREATE INVOICE RECORD
@@ -5737,6 +5735,7 @@ exports.createSale = async (req, res) => {
         discountAmount: discount_amount,
         assignedCashierId: assigned_cashier_id || cashier_user_id || null,
         assignedCashierName: assigned_cashier_name || cashier_name || null,
+        pendingSaleLedger: ledgerEntries,
       });
     } catch (wfErr) {
       console.error("Sale workflow create skipped:", wfErr?.message || wfErr, wfErr?.stack || "");
@@ -6747,7 +6746,7 @@ exports.getAllTransactionsData = async (req, res) => {
 
 /**
  * Flat sales line report — one row per store_entries sale line (qty_out).
- * GET /api/v1/transactions/sales-line-report?facilityId=&userId=&fromDate=&toDate=&branchId=&search=&category=
+ * GET /api/v1/transactions/sales-line-report?facilityId=&userId=&fromDate=&toDate=&branchId=&search=&category=&productSku=
  */
 exports.getSalesLineReport = async (req, res) => {
   try {
@@ -6759,6 +6758,7 @@ exports.getSalesLineReport = async (req, res) => {
       branchId,
       search = "",
       category = "",
+      productSku = "",
       page,
       pageSize,
     } = req.query;
@@ -6866,11 +6866,29 @@ exports.getSalesLineReport = async (req, res) => {
           "(p.category IS NULL OR TRIM(p.category) = '')",
         );
       } else {
-        whereParts.push(
-          "LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:category))",
-        );
-        replacements.category = categoryTerm;
+        // Match canonical brand and legacy "… Product" / "… Products" labels
+        const canonical = categoryTerm
+          .replace(/\s+products?$/i, "")
+          .trim();
+        whereParts.push(`(
+          LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:categoryCanonical))
+          OR LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:categoryProduct))
+          OR LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:categoryProducts))
+          OR LOWER(TRIM(COALESCE(p.category, ''))) = LOWER(TRIM(:categoryRaw))
+        )`);
+        replacements.categoryCanonical = canonical;
+        replacements.categoryProduct = `${canonical} Product`;
+        replacements.categoryProducts = `${canonical} Products`;
+        replacements.categoryRaw = categoryTerm;
       }
+    }
+
+    const productSkuTerm = String(productSku || "").trim();
+    if (productSkuTerm) {
+      whereParts.push(
+        "(COALESCE(p.sku, se.product_id, '') = :productSku)",
+      );
+      replacements.productSku = productSkuTerm;
     }
 
     const whereSql = whereParts.join(" AND ");

@@ -1141,6 +1141,14 @@ function brandLabelFromCoaDescription(description) {
   return raw;
 }
 
+/** Collapse "Bua Product" / "IRS Products" → "Bua" / "IRS" (same as migration). */
+function canonicalizeCategoryName(name) {
+  return String(name || "")
+    .trim()
+    .replace(/\s+products?$/i, "")
+    .trim();
+}
+
 // Get product categories (product.category + CoA brand groups e.g. BUA, Dangote)
 exports.getCategories = async (req, res) => {
   try {
@@ -1199,6 +1207,13 @@ exports.getCategories = async (req, res) => {
                       ELSE TRIM(ac.description)
                     END
                   ))
+                  OR LOWER(TRIM(IFNULL(p.category, ''))) = LOWER(CONCAT(TRIM(
+                    CASE
+                      WHEN UPPER(TRIM(ac.description)) LIKE '% PRODUCTS'
+                      THEN TRIM(SUBSTRING(TRIM(ac.description), 1, CHAR_LENGTH(TRIM(ac.description)) - 9))
+                      ELSE TRIM(ac.description)
+                    END
+                  ), ' Product'))
                   OR CAST(p.revenue_account AS CHAR) IN (
                     SELECT CAST(c.code AS CHAR)
                     FROM account_category c
@@ -1230,15 +1245,20 @@ exports.getCategories = async (req, res) => {
     const map = new Map();
 
     const upsert = (name, count, source) => {
-      const key = String(name || "").trim();
+      const key = canonicalizeCategoryName(name);
       if (!key) return;
-      const prev = map.get(key.toLowerCase());
+      const mapKey = key.toLowerCase();
+      const prev = map.get(mapKey);
       if (prev) {
-        prev.count = Math.max(prev.count, parseInt(count, 10) || 0);
-        if (source === "category" || source === "coa") prev.source = source;
+        prev.count += parseInt(count, 10) || 0;
+        // Prefer CoA brand label (e.g. BUA) over "Bua Product" remnants
+        if (source === "coa") {
+          prev.category = key;
+          prev.source = "coa";
+        }
         return;
       }
-      map.set(key.toLowerCase(), {
+      map.set(mapKey, {
         category: key,
         count: parseInt(count, 10) || 0,
         source,

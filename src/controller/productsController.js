@@ -606,6 +606,12 @@ exports.getProductCategories = async (req, res) => {
         : raw;
     };
 
+    const canonicalize = (name) =>
+      String(name || "")
+        .trim()
+        .replace(/\s+products?$/i, "")
+        .trim();
+
     const [byCategory, coaBrandRows] = await Promise.all([
       db.Product.findAll({
         where: {
@@ -643,11 +649,11 @@ exports.getProductCategories = async (req, res) => {
 
     const map = new Map();
     (byCategory || []).forEach((c) => {
-      const key = String(c.category || "").trim();
+      const key = canonicalize(c.category);
       if (key) map.set(key.toLowerCase(), key);
     });
     (coaBrandRows || []).forEach((row) => {
-      const label = brandLabel(row.description);
+      const label = canonicalize(brandLabel(row.description));
       if (label) map.set(label.toLowerCase(), label);
     });
 

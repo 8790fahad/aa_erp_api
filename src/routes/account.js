@@ -791,6 +791,10 @@ module.exports = (app) => {
     account.getCustomerDepositsReport,
   );
   app.post(
+    "/account/customer-credits-report",
+    account.getCustomerCreditsReport,
+  );
+  app.post(
     "/account/supplier-advances-report",
     account.getSupplierAdvancesReport,
   );

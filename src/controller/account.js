@@ -19440,6 +19440,8 @@ exports.getReceivableLedger = async (req, res) => {
 
     // A/R only — bank/cash/deposit/tax/revenue on the same customer ref
     // must not inflate this report (customers list uses the same rule).
+    // Also include GL on this customer's sales invoices even when
+    // transaction_ref was rewritten (e.g. historical VOID-… lines).
     const receivableTypeLiteral = db.sequelize.literal(
       `LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')`,
     );
@@ -19448,6 +19450,17 @@ exports.getReceivableLedger = async (req, res) => {
           [Op.or]: [
             { transaction_ref: customerId },
             { transaction_ref: { [Op.like]: `${customerId}-%` } },
+            {
+              reference_number: {
+                [Op.in]: db.sequelize.literal(
+                  `(SELECT invoice_ref FROM invoices WHERE facility_id = ${db.sequelize.escape(
+                    facilityId,
+                  )} AND type = 'sales' AND ref_number = ${db.sequelize.escape(
+                    customerId,
+                  )})`,
+                ),
+              },
+            },
           ],
         }
       : null;
@@ -19902,6 +19915,139 @@ exports.getCustomerDepositsReport = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error generating customer deposits report",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Customer credit (A/R) summary — one row per customer.
+ * Balance = sum of open invoice A/R, excluding credit sales still awaiting
+ * credit approval (AR is posted when credit is approved at Verification Points, but Credit Summary should only
+ * reflect approved / progressed credit).
+ */
+exports.getCustomerCreditsReport = async (req, res) => {
+  try {
+    const { facilityId, asAtDate } = req.body;
+    if (!facilityId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "facilityId is required" });
+    }
+
+    const asAt = asAtDate || null;
+
+    const invoiceRows = await db.sequelize.query(
+      `
+      SELECT
+        i.invoice_ref,
+        i.ref_number AS party_id,
+        COALESCE(
+          NULLIF(TRIM(c.fullname), ''),
+          NULLIF(TRIM(c.store_name), ''),
+          NULLIF(TRIM(c.company_name), ''),
+          NULLIF(TRIM(CONCAT(IFNULL(c.first_name, ''), ' ', IFNULL(c.last_name, ''))), ''),
+          i.ref_number
+        ) AS party_name,
+        GREATEST(COALESCE(se_tot.ar_outstanding, 0), 0) AS balance
+      FROM invoices i
+      INNER JOIN customers c
+        ON c.customerNo = i.ref_number
+        AND c.facilityId = i.facility_id
+      LEFT JOIN (
+        SELECT
+          reference_number AS invoice_ref,
+          facility_id,
+          GREATEST(
+            SUM(
+              CASE
+                WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
+                ELSE 0
+              END
+            ),
+            0
+          ) AS ar_outstanding
+        FROM general_ledger
+        WHERE facility_id = :facilityId
+          AND reference_number IS NOT NULL
+          AND reference_number != ''
+          AND (:asAtDate IS NULL OR transaction_date <= :asAtDate)
+        GROUP BY reference_number, facility_id
+      ) se_tot
+        ON se_tot.invoice_ref = i.invoice_ref
+        AND se_tot.facility_id = i.facility_id
+      WHERE i.type = 'sales'
+        AND i.facility_id = :facilityId
+        AND (:asAtDate IS NULL OR i.transaction_date <= :asAtDate)
+      HAVING balance > 0.0001
+      ORDER BY i.invoice_ref ASC
+      `,
+      {
+        replacements: { facilityId, asAtDate: asAt },
+        type: QueryTypes.SELECT,
+      },
+    );
+
+    const refs = invoiceRows.map((r) => r.invoice_ref).filter(Boolean);
+    const pendingApproval = new Set();
+    if (refs.length && db.SaleWorkflow) {
+      const wfs = await db.SaleWorkflow.findAll({
+        where: {
+          facility_id: facilityId,
+          sale_code: { [Op.in]: refs },
+          status: {
+            [Op.in]: [
+              "awaiting_credit_approval",
+              "awaiting_discount_approval",
+            ],
+          },
+        },
+        attributes: ["sale_code", "status"],
+        raw: true,
+      });
+      for (const wf of wfs) {
+        if (wf?.sale_code) pendingApproval.add(String(wf.sale_code));
+      }
+    }
+
+    const byCustomer = new Map();
+    for (const row of invoiceRows) {
+      if (pendingApproval.has(String(row.invoice_ref))) continue;
+      const bal = parseFloat(row.balance || 0) || 0;
+      if (bal <= 0.0001) continue;
+      const key = row.party_id;
+      const cur = byCustomer.get(key) || {
+        party_type: "customer",
+        party_id: row.party_id,
+        party_name: row.party_name,
+        balance: 0,
+        invoice_count: 0,
+      };
+      cur.balance = Number((cur.balance + bal).toFixed(2));
+      cur.invoice_count += 1;
+      byCustomer.set(key, cur);
+    }
+
+    const mapped = Array.from(byCustomer.values()).sort(
+      (a, b) => b.balance - a.balance || String(a.party_name).localeCompare(String(b.party_name)),
+    );
+    const totalBalance = mapped.reduce((sum, row) => sum + row.balance, 0);
+
+    return res.json({
+      success: true,
+      data: {
+        asAtDate: asAt,
+        rows: mapped,
+        totalBalance,
+        count: mapped.length,
+        mode: "customer",
+      },
+    });
+  } catch (error) {
+    console.error("Customer Credits Report Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error generating customer credits report",
       error: error.message,
     });
   }
