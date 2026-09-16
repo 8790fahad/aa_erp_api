@@ -172,11 +172,9 @@ const corsOptions = {
     console.warn(
       `CORS blocked request from origin: ${requestOrigin}. Update CORS_ALLOWED_ORIGINS if this is expected.`,
     );
-    return callback(
-      new Error(
-        "Not allowed by CORS. Contact administrator to whitelist origin.",
-      ),
-    );
+    // Deny without throwing — a thrown Error becomes a 500 with no ACAO header,
+    // which browsers report as a CORS failure instead of a clean block.
+    return callback(null, false);
   },
   // JWT lives in Authorization header, not cookies — do not send
   // Access-Control-Allow-Credentials: true unless fetch() uses credentials: "include",

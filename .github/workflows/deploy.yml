@@ -167,15 +167,45 @@ jobs:
             npm install --legacy-peer-deps
             npm run migrate
             npm run build
-            pm2 restart flowbooks || pm2 start build/app.js --name=flowbooks
+
+            APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+            APP_PORT="${APP_PORT:-42843}"
+
+            if pm2 describe flowbooks >/dev/null 2>&1; then
+              pm2 restart flowbooks --update-env
+            else
+              pm2 start build/app.js --name=flowbooks
+            fi
             pm2 save
+
+            echo "Waiting for flowbooks to listen on ${APP_PORT} ..."
+            healthy=""
+            for attempt in 1 2 3 4 5 6 7 8; do
+              sleep 2
+              if curl -sf "http://127.0.0.1:${APP_PORT}/flowbooks/health" >/dev/null \
+                || curl -sf "http://127.0.0.1:${APP_PORT}/health" >/dev/null; then
+                healthy="yes"
+                echo "Health check passed (attempt ${attempt})."
+                break
+              fi
+              echo "Health check failed (attempt ${attempt}); retrying ..."
+            done
+
+            if [ -z "$healthy" ]; then
+              echo "::warning::Health check still failing — deleting and starting a fresh pm2 process."
+              pm2 delete flowbooks >/dev/null 2>&1 || true
+              pm2 start build/app.js --name=flowbooks
+              pm2 save
+              sleep 4
+              curl -sf "http://127.0.0.1:${APP_PORT}/flowbooks/health" \
+                || curl -sf "http://127.0.0.1:${APP_PORT}/health" \
+                || echo "::error::flowbooks is still not serving /health after restart."
+            fi
 
             echo "✅ App deploy finished (install / migrate / build / pm2)."
 
             # Apache proxy is optional — sudo often needs a password on this VPS,
             # and must not fail the deploy after a successful pm2 restart.
-            APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
-            APP_PORT="${APP_PORT:-42843}"
             CONF_DIR="/etc/apache2/conf-available"
             CONF_FILE="${CONF_DIR}/flowbooks-proxy.conf"
 
