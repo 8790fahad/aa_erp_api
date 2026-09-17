@@ -12,6 +12,12 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
+
+/** Mixed dump collations (utf8mb4_unicode_ci vs utf8mb4_general_ci) break JOIN '='. */
+const sqlEq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+const sqlCol = (expr) =>
+  `CONVERT(${expr} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
@@ -6790,7 +6796,7 @@ exports.getSalesLineReport = async (req, res) => {
     const salesTypes = salesTypesSqlList();
 
     const whereParts = [
-      "se.facilityId = :facilityId",
+      `${sqlCol("se.facilityId")} = ${sqlCol(":facilityId")}`,
       "se.qty_out > 0",
       `(
         se.type IN (${salesTypes})
@@ -6886,7 +6892,7 @@ exports.getSalesLineReport = async (req, res) => {
     const productSkuTerm = String(productSku || "").trim();
     if (productSkuTerm) {
       whereParts.push(
-        "(COALESCE(p.sku, se.product_id, '') = :productSku)",
+        `(COALESCE(${sqlCol("p.sku")}, ${sqlCol("se.product_id")}, '') = ${sqlCol(":productSku")})`,
       );
       replacements.productSku = productSkuTerm;
     }
@@ -6898,12 +6904,12 @@ exports.getSalesLineReport = async (req, res) => {
     const fromSql = `
       FROM store_entries se
       LEFT JOIN invoices i
-        ON i.facility_id = se.facilityId
+        ON ${sqlEq("i.facility_id", "se.facilityId")}
        AND i.type = 'sales'
-       AND i.invoice_ref = se.reference_number
+       AND ${sqlEq("i.invoice_ref", "se.reference_number")}
       LEFT JOIN customers c_inv
-        ON c_inv.facilityId = se.facilityId
-       AND c_inv.customerNo = i.ref_number
+        ON ${sqlEq("c_inv.facilityId", "se.facilityId")}
+       AND ${sqlEq("c_inv.customerNo", "i.ref_number")}
       LEFT JOIN (
         SELECT ce.receiptNo, ce.facilityId, MIN(ce.customerNo) AS customerNo
         FROM customer_entries ce
@@ -6912,11 +6918,11 @@ exports.getSalesLineReport = async (req, res) => {
           AND TRIM(ce.customerNo) != ''
         GROUP BY ce.receiptNo, ce.facilityId
       ) ce_sales
-        ON ce_sales.receiptNo = se.reference_number
-       AND ce_sales.facilityId = se.facilityId
+        ON ${sqlEq("ce_sales.receiptNo", "se.reference_number")}
+       AND ${sqlEq("ce_sales.facilityId", "se.facilityId")}
       LEFT JOIN customers c_ce
-        ON c_ce.facilityId = se.facilityId
-       AND c_ce.customerNo = ce_sales.customerNo
+        ON ${sqlEq("c_ce.facilityId", "se.facilityId")}
+       AND ${sqlEq("c_ce.customerNo", "ce_sales.customerNo")}
       LEFT JOIN (
         SELECT gl.reference_number,
                gl.facility_id,
@@ -6926,18 +6932,21 @@ exports.getSalesLineReport = async (req, res) => {
         WHERE LOWER(gl.type) IN ('receivable', 'recevable')
         GROUP BY gl.reference_number, gl.facility_id
       ) gl_recv
-        ON gl_recv.reference_number = se.reference_number
-       AND gl_recv.facility_id = se.facilityId
+        ON ${sqlEq("gl_recv.reference_number", "se.reference_number")}
+       AND ${sqlEq("gl_recv.facility_id", "se.facilityId")}
       LEFT JOIN customers c_gl
-        ON c_gl.facilityId = se.facilityId
-       AND c_gl.customerNo = gl_recv.customer_no
+        ON ${sqlEq("c_gl.facilityId", "se.facilityId")}
+       AND ${sqlEq("c_gl.customerNo", "gl_recv.customer_no")}
       LEFT JOIN products p
-        ON p.facility_id = se.facilityId
-       AND p.sku = se.product_id
+        ON ${sqlEq("p.facility_id", "se.facilityId")}
+       AND ${sqlEq("p.sku", "se.product_id")}
       LEFT JOIN branches b
         ON b.id = COALESCE(NULLIF(se.branchId, 0), NULLIF(i.branchId, 0))
       LEFT JOIN users u_sp
-        ON CAST(u_sp.id AS CHAR) = CAST(COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), '')) AS CHAR)
+        ON ${sqlEq(
+          "CAST(u_sp.id AS CHAR)",
+          "CAST(COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), '')) AS CHAR)",
+        )}
       LEFT JOIN (
         SELECT
           ce.receiptNo,
@@ -6947,8 +6956,8 @@ exports.getSalesLineReport = async (req, res) => {
         WHERE LOWER(TRIM(ce.type)) = 'tax'
         GROUP BY ce.receiptNo, ce.facilityId
       ) inv_vat
-        ON inv_vat.receiptNo = se.reference_number
-       AND inv_vat.facilityId = se.facilityId
+        ON ${sqlEq("inv_vat.receiptNo", "se.reference_number")}
+       AND ${sqlEq("inv_vat.facilityId", "se.facilityId")}
       LEFT JOIN (
         SELECT
           ce.receiptNo,
@@ -6968,8 +6977,8 @@ exports.getSalesLineReport = async (req, res) => {
           AND TRIM(ce.receiptNo) != ''
         GROUP BY ce.receiptNo, ce.facilityId
       ) ce_mode
-        ON ce_mode.receiptNo = se.reference_number
-       AND ce_mode.facilityId = se.facilityId
+        ON ${sqlEq("ce_mode.receiptNo", "se.reference_number")}
+       AND ${sqlEq("ce_mode.facilityId", "se.facilityId")}
       LEFT JOIN (
         SELECT
           gl.reference_number,
@@ -6980,8 +6989,8 @@ exports.getSalesLineReport = async (req, res) => {
           AND TRIM(gl.reference_number) != ''
         GROUP BY gl.reference_number, gl.facility_id
       ) gl_pay
-        ON gl_pay.reference_number = se.reference_number
-       AND gl_pay.facility_id = se.facilityId
+        ON ${sqlEq("gl_pay.reference_number", "se.reference_number")}
+       AND ${sqlEq("gl_pay.facility_id", "se.facilityId")}
       LEFT JOIN (
         SELECT
           se2.reference_number,
@@ -6995,8 +7004,8 @@ exports.getSalesLineReport = async (req, res) => {
           AND TRIM(se2.reference_number) != ''
         GROUP BY se2.reference_number, se2.facilityId
       ) inv_goods
-        ON inv_goods.reference_number = se.reference_number
-       AND inv_goods.facilityId = se.facilityId
+        ON ${sqlEq("inv_goods.reference_number", "se.reference_number")}
+       AND ${sqlEq("inv_goods.facilityId", "se.facilityId")}
     `;
 
     const countRows = await db.sequelize.query(
@@ -7180,7 +7189,7 @@ exports.getPurchaseLineReport = async (req, res) => {
     };
 
     const whereParts = [
-      "se.facilityId = :facilityId",
+      `${sqlCol("se.facilityId")} = ${sqlCol(":facilityId")}`,
       "se.qty_in > 0",
       `(
         LOWER(TRIM(COALESCE(se.type, ''))) = 'purchase'
@@ -7251,18 +7260,18 @@ exports.getPurchaseLineReport = async (req, res) => {
     const fromSql = `
       FROM store_entries se
       LEFT JOIN invoices i
-        ON i.facility_id = se.facilityId
+        ON ${sqlEq("i.facility_id", "se.facilityId")}
        AND i.type = 'purchase'
-       AND i.invoice_ref = se.reference_number
+       AND ${sqlEq("i.invoice_ref", "se.reference_number")}
       LEFT JOIN suppliersinfo s_inv
-        ON s_inv.facilityId = se.facilityId
-       AND s_inv.supplier_number = i.ref_number
+        ON ${sqlEq("s_inv.facilityId", "se.facilityId")}
+       AND ${sqlEq("s_inv.supplier_number", "i.ref_number")}
       LEFT JOIN suppliersinfo s_code
-        ON s_code.facilityId = se.facilityId
-       AND s_code.supplier_number = se.supplier_code
+        ON ${sqlEq("s_code.facilityId", "se.facilityId")}
+       AND ${sqlEq("s_code.supplier_number", "se.supplier_code")}
       LEFT JOIN products p
-        ON p.facility_id = se.facilityId
-       AND p.sku = se.product_id
+        ON ${sqlEq("p.facility_id", "se.facilityId")}
+       AND ${sqlEq("p.sku", "se.product_id")}
       LEFT JOIN branches b
         ON b.id = COALESCE(NULLIF(se.branchId, 0), NULLIF(i.branchId, 0))
     `;
@@ -7410,7 +7419,7 @@ exports.getInputVatReport = async (req, res) => {
     END`;
 
     const whereParts = [
-      "se.facilityId = :facilityId",
+      `${sqlCol("se.facilityId")} = ${sqlCol(":facilityId")}`,
       "LOWER(TRIM(COALESCE(se.type, ''))) IN ('purchase', 'service')",
       "se.receiptNo IS NOT NULL",
       "TRIM(se.receiptNo) != ''",
@@ -7446,12 +7455,12 @@ exports.getInputVatReport = async (req, res) => {
     const fromSql = `
       FROM supplier_entries se
       LEFT JOIN invoices i
-        ON i.facility_id = se.facilityId
-       AND i.invoice_ref = se.receiptNo
+        ON ${sqlEq("i.facility_id", "se.facilityId")}
+       AND ${sqlEq("i.invoice_ref", "se.receiptNo")}
        AND LOWER(TRIM(COALESCE(i.type, ''))) IN ('purchase', 'expenses')
       LEFT JOIN suppliersinfo s
-        ON s.facilityId = se.facilityId
-       AND s.supplier_number = se.supplier_number
+        ON ${sqlEq("s.facilityId", "se.facilityId")}
+       AND ${sqlEq("s.supplier_number", "se.supplier_number")}
       LEFT JOIN (
         SELECT
           receiptNo,
@@ -7461,8 +7470,8 @@ exports.getInputVatReport = async (req, res) => {
         WHERE LOWER(TRIM(COALESCE(type, ''))) = 'tax'
         GROUP BY receiptNo, facilityId
       ) inv_tax
-        ON inv_tax.receiptNo = se.receiptNo
-       AND inv_tax.facilityId = se.facilityId
+        ON ${sqlEq("inv_tax.receiptNo", "se.receiptNo")}
+       AND ${sqlEq("inv_tax.facilityId", "se.facilityId")}
       LEFT JOIN (
         SELECT
           receiptNo,
@@ -7477,8 +7486,8 @@ exports.getInputVatReport = async (req, res) => {
         WHERE LOWER(TRIM(COALESCE(type, ''))) IN ('purchase', 'service')
         GROUP BY receiptNo, facilityId
       ) inv_goods
-        ON inv_goods.receiptNo = se.receiptNo
-       AND inv_goods.facilityId = se.facilityId
+        ON ${sqlEq("inv_goods.receiptNo", "se.receiptNo")}
+       AND ${sqlEq("inv_goods.facilityId", "se.facilityId")}
     `;
 
     const vatSql = `CASE
