@@ -1,3 +1,5 @@
+const { QueryTypes } = require("sequelize");
+
 function buildAddressLine(addr = {}) {
   return [
     addr.attention,
@@ -10,6 +12,29 @@ function buildAddressLine(addr = {}) {
   ]
     .filter(Boolean)
     .join(", ");
+}
+
+async function nextIntId(sequelize, table, transaction) {
+  const row = await sequelize.query(
+    `SELECT COALESCE(MAX(\`id\`), 0) AS m FROM \`${table}\``,
+    { transaction, type: QueryTypes.SELECT, plain: true },
+  );
+  return Number(row?.m || 0) + 1;
+}
+
+async function insertRowsWithIds(sequelize, table, rows, transaction) {
+  if (!rows.length) return;
+  let nextId = await nextIntId(sequelize, table, transaction);
+  for (const row of rows) {
+    const cols = ["id", ...Object.keys(row)];
+    const placeholders = cols.map(() => "?").join(", ");
+    const values = [nextId, ...Object.values(row)];
+    nextId += 1;
+    await sequelize.query(
+      `INSERT INTO \`${table}\` (${cols.map((c) => `\`${c}\``).join(", ")}) VALUES (${placeholders})`,
+      { replacements: values, transaction },
+    );
+  }
 }
 
 async function syncSupplierContacts(
@@ -67,9 +92,8 @@ async function syncSupplierContacts(
 
   if (rows.length) {
     const now = new Date();
-    // Do not send `id` — Sequelize bulkCreate inserts NULL for autoIncrement PKs
-    // and MariaDB rejects that when AUTO_INCREMENT is missing or STRICT.
-    await db.sequelize.getQueryInterface().bulkInsert(
+    await insertRowsWithIds(
+      db.sequelize,
       "supplier_contacts",
       rows.map((r) => ({
         facility_id: r.facility_id,
@@ -84,7 +108,7 @@ async function syncSupplierContacts(
         created_at: now,
         updated_at: now,
       })),
-      { transaction },
+      transaction,
     );
   }
 }
@@ -137,7 +161,8 @@ async function syncSupplierAddresses(
 
   if (rows.length) {
     const now = new Date();
-    await db.sequelize.getQueryInterface().bulkInsert(
+    await insertRowsWithIds(
+      db.sequelize,
       "supplier_addresses",
       rows.map((r) => ({
         facility_id: r.facility_id,
@@ -155,7 +180,7 @@ async function syncSupplierAddresses(
         created_at: now,
         updated_at: now,
       })),
-      { transaction },
+      transaction,
     );
   }
 }
