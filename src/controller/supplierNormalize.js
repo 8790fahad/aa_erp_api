@@ -1,5 +1,3 @@
-const { QueryTypes } = require("sequelize");
-
 function buildAddressLine(addr = {}) {
   return [
     addr.attention,
@@ -12,29 +10,6 @@ function buildAddressLine(addr = {}) {
   ]
     .filter(Boolean)
     .join(", ");
-}
-
-async function nextIntId(sequelize, table, transaction) {
-  const row = await sequelize.query(
-    `SELECT COALESCE(MAX(\`id\`), 0) AS m FROM \`${table}\``,
-    { transaction, type: QueryTypes.SELECT, plain: true },
-  );
-  return Number(row?.m || 0) + 1;
-}
-
-async function insertRowsWithIds(sequelize, table, rows, transaction) {
-  if (!rows.length) return;
-  let nextId = await nextIntId(sequelize, table, transaction);
-  for (const row of rows) {
-    const cols = ["id", ...Object.keys(row)];
-    const placeholders = cols.map(() => "?").join(", ");
-    const values = [nextId, ...Object.values(row)];
-    nextId += 1;
-    await sequelize.query(
-      `INSERT INTO \`${table}\` (${cols.map((c) => `\`${c}\``).join(", ")}) VALUES (${placeholders})`,
-      { replacements: values, transaction },
-    );
-  }
 }
 
 async function syncSupplierContacts(
@@ -90,26 +65,19 @@ async function syncSupplierContacts(
     });
   }
 
-  if (rows.length) {
-    const now = new Date();
-    await insertRowsWithIds(
-      db.sequelize,
-      "supplier_contacts",
-      rows.map((r) => ({
-        facility_id: r.facility_id,
-        supplier_number: r.supplier_number,
-        salutation: r.salutation,
-        first_name: r.first_name,
-        last_name: r.last_name,
-        email: r.email,
-        work_phone: r.work_phone,
-        mobile: r.mobile,
-        is_primary: r.is_primary ? 1 : 0,
-        created_at: now,
-        updated_at: now,
-      })),
-      transaction,
-    );
+  const contactFields = [
+    "facility_id",
+    "supplier_number",
+    "salutation",
+    "first_name",
+    "last_name",
+    "email",
+    "work_phone",
+    "mobile",
+    "is_primary",
+  ];
+  for (const row of rows) {
+    await db.SupplierContact.create(row, { transaction, fields: contactFields });
   }
 }
 
@@ -159,29 +127,22 @@ async function syncSupplierAddresses(
     });
   }
 
-  if (rows.length) {
-    const now = new Date();
-    await insertRowsWithIds(
-      db.sequelize,
-      "supplier_addresses",
-      rows.map((r) => ({
-        facility_id: r.facility_id,
-        supplier_number: r.supplier_number,
-        address_type: r.address_type,
-        attention: r.attention,
-        country: r.country,
-        street1: r.street1,
-        street2: r.street2,
-        city: r.city,
-        state: r.state,
-        zip: r.zip,
-        phone: r.phone,
-        fax: r.fax,
-        created_at: now,
-        updated_at: now,
-      })),
-      transaction,
-    );
+  const addressFields = [
+    "facility_id",
+    "supplier_number",
+    "address_type",
+    "attention",
+    "country",
+    "street1",
+    "street2",
+    "city",
+    "state",
+    "zip",
+    "phone",
+    "fax",
+  ];
+  for (const row of rows) {
+    await db.SupplierAddress.create(row, { transaction, fields: addressFields });
   }
 }
 
