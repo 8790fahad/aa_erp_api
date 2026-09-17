@@ -66,22 +66,26 @@ async function syncSupplierContacts(
   }
 
   if (rows.length) {
-    await db.SupplierContact.bulkCreate(rows, {
-      transaction,
-      fields: [
-        "facility_id",
-        "supplier_number",
-        "salutation",
-        "first_name",
-        "last_name",
-        "email",
-        "work_phone",
-        "mobile",
-        "is_primary",
-        "created_at",
-        "updated_at",
-      ],
-    });
+    const now = new Date();
+    // Do not send `id` — Sequelize bulkCreate inserts NULL for autoIncrement PKs
+    // and MariaDB rejects that when AUTO_INCREMENT is missing or STRICT.
+    await db.sequelize.getQueryInterface().bulkInsert(
+      "supplier_contacts",
+      rows.map((r) => ({
+        facility_id: r.facility_id,
+        supplier_number: r.supplier_number,
+        salutation: r.salutation,
+        first_name: r.first_name,
+        last_name: r.last_name,
+        email: r.email,
+        work_phone: r.work_phone,
+        mobile: r.mobile,
+        is_primary: r.is_primary ? 1 : 0,
+        created_at: now,
+        updated_at: now,
+      })),
+      { transaction },
+    );
   }
 }
 
@@ -132,25 +136,27 @@ async function syncSupplierAddresses(
   }
 
   if (rows.length) {
-    await db.SupplierAddress.bulkCreate(rows, {
-      transaction,
-      fields: [
-        "facility_id",
-        "supplier_number",
-        "address_type",
-        "attention",
-        "country",
-        "street1",
-        "street2",
-        "city",
-        "state",
-        "zip",
-        "phone",
-        "fax",
-        "created_at",
-        "updated_at",
-      ],
-    });
+    const now = new Date();
+    await db.sequelize.getQueryInterface().bulkInsert(
+      "supplier_addresses",
+      rows.map((r) => ({
+        facility_id: r.facility_id,
+        supplier_number: r.supplier_number,
+        address_type: r.address_type,
+        attention: r.attention,
+        country: r.country,
+        street1: r.street1,
+        street2: r.street2,
+        city: r.city,
+        state: r.state,
+        zip: r.zip,
+        phone: r.phone,
+        fax: r.fax,
+        created_at: now,
+        updated_at: now,
+      })),
+      { transaction },
+    );
   }
 }
 
