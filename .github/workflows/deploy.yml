@@ -134,7 +134,7 @@ jobs:
             # nvm refuses to switch when ~/.npmrc has prefix/globalconfig.
             # Strip those keys (keep a backup) so deploy can use the nvm Node.
             if [ -f "$HOME/.npmrc" ]; then
-              cp "$HOME/.npmrc" "$HOME/.npmrc.bak-flowbooks-deploy" 2>/dev/null || true
+              cp "$HOME/.npmrc" "$HOME/.npmrc.bak-aa-erp-api-deploy" 2>/dev/null || true
               grep -vE '^(prefix|globalconfig)[[:space:]]*=' "$HOME/.npmrc" > "$HOME/.npmrc.tmp" \
                 && mv "$HOME/.npmrc.tmp" "$HOME/.npmrc" \
                 || rm -f "$HOME/.npmrc.tmp"
@@ -171,19 +171,20 @@ jobs:
             APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
             APP_PORT="${APP_PORT:-42843}"
 
-            if pm2 describe flowbooks >/dev/null 2>&1; then
-              pm2 restart flowbooks --update-env
+            pm2 delete flowbooks >/dev/null 2>&1 || true
+
+            if pm2 describe aa_erp_api >/dev/null 2>&1; then
+              pm2 restart aa_erp_api --update-env
             else
-              pm2 start build/app.js --name=flowbooks
+              pm2 start build/app.js --name=aa_erp_api
             fi
             pm2 save
 
-            echo "Waiting for flowbooks to listen on ${APP_PORT} ..."
+            echo "Waiting for aa_erp_api to listen on ${APP_PORT} ..."
             healthy=""
             for attempt in 1 2 3 4 5 6 7 8; do
               sleep 2
-              if curl -sf "http://127.0.0.1:${APP_PORT}/flowbooks/health" >/dev/null \
-                || curl -sf "http://127.0.0.1:${APP_PORT}/health" >/dev/null; then
+              if curl -sf "http://127.0.0.1:${APP_PORT}/health" >/dev/null; then
                 healthy="yes"
                 echo "Health check passed (attempt ${attempt})."
                 break
@@ -193,53 +194,12 @@ jobs:
 
             if [ -z "$healthy" ]; then
               echo "::warning::Health check still failing — deleting and starting a fresh pm2 process."
-              pm2 delete flowbooks >/dev/null 2>&1 || true
-              pm2 start build/app.js --name=flowbooks
+              pm2 delete aa_erp_api >/dev/null 2>&1 || true
+              pm2 start build/app.js --name=aa_erp_api
               pm2 save
               sleep 4
-              curl -sf "http://127.0.0.1:${APP_PORT}/flowbooks/health" \
-                || curl -sf "http://127.0.0.1:${APP_PORT}/health" \
-                || echo "::error::flowbooks is still not serving /health after restart."
+              curl -sf "http://127.0.0.1:${APP_PORT}/health" \
+                || echo "::error::aa_erp_api is still not serving /health after restart."
             fi
 
             echo "✅ App deploy finished (install / migrate / build / pm2)."
-
-            # Apache proxy is optional — sudo often needs a password on this VPS,
-            # and must not fail the deploy after a successful pm2 restart.
-            CONF_DIR="/etc/apache2/conf-available"
-            CONF_FILE="${CONF_DIR}/flowbooks-proxy.conf"
-
-            configure_apache_proxy() {
-              if [ ! -d "$CONF_DIR" ]; then
-                echo "::warning::Apache conf-available not found; skip /flowbooks proxy."
-                return 0
-              fi
-              if ! command -v sudo >/dev/null 2>&1; then
-                echo "::warning::sudo not available; skip /flowbooks proxy."
-                return 0
-              fi
-              # Non-interactive only — never prompt for a password in CI.
-              if ! sudo -n true 2>/dev/null; then
-                echo "::warning::Passwordless sudo not available; skip Apache /flowbooks proxy."
-                echo "On the VPS, either grant passwordless sudo for apache2, or create ${CONF_FILE} once manually."
-                return 0
-              fi
-              printf '%s\n' \
-                '# Managed by aa_erp_api GitHub Actions deploy' \
-                'ProxyPreserveHost On' \
-                'RequestHeader set X-Forwarded-Proto "expr=%{REQUEST_SCHEME}"' \
-                "ProxyPass /flowbooks http://127.0.0.1:${APP_PORT}/flowbooks" \
-                "ProxyPassReverse /flowbooks http://127.0.0.1:${APP_PORT}/flowbooks" \
-                "ProxyPass /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
-                "ProxyPassReverse /flowbooks/ http://127.0.0.1:${APP_PORT}/flowbooks/" \
-                | sudo -n tee "$CONF_FILE" >/dev/null
-              sudo -n a2enmod proxy proxy_http headers >/dev/null 2>&1 || true
-              sudo -n a2enconf flowbooks-proxy >/dev/null 2>&1 || true
-              if sudo -n apache2ctl configtest && sudo -n systemctl reload apache2; then
-                echo "Apache /flowbooks proxy enabled → 127.0.0.1:${APP_PORT}"
-              else
-                echo "::warning::Apache configtest/reload failed; app is still running via pm2."
-              fi
-            }
-
-            configure_apache_proxy
