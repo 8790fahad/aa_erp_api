@@ -66,7 +66,22 @@ async function syncSupplierContacts(
   }
 
   if (rows.length) {
-    await db.SupplierContact.bulkCreate(rows, { transaction });
+    await db.SupplierContact.bulkCreate(rows, {
+      transaction,
+      fields: [
+        "facility_id",
+        "supplier_number",
+        "salutation",
+        "first_name",
+        "last_name",
+        "email",
+        "work_phone",
+        "mobile",
+        "is_primary",
+        "created_at",
+        "updated_at",
+      ],
+    });
   }
 }
 
@@ -117,7 +132,25 @@ async function syncSupplierAddresses(
   }
 
   if (rows.length) {
-    await db.SupplierAddress.bulkCreate(rows, { transaction });
+    await db.SupplierAddress.bulkCreate(rows, {
+      transaction,
+      fields: [
+        "facility_id",
+        "supplier_number",
+        "address_type",
+        "attention",
+        "country",
+        "street1",
+        "street2",
+        "city",
+        "state",
+        "zip",
+        "phone",
+        "fax",
+        "created_at",
+        "updated_at",
+      ],
+    });
   }
 }
 

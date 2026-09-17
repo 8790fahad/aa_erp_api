@@ -102,7 +102,7 @@ jobs:
               -o ConnectTimeout=30 \
               -o ServerAliveInterval=15 \
               -o ServerAliveCountMax=3" \
-            ./ "${VPS_USER}@${host}:/var/www/html/flowbooks/"
+            ./ "${VPS_USER}@${host}:/home/dev/aa_erp_api/"
 
       - name: 🔐 SSH to VPS and Deploy
         uses: appleboy/ssh-action@v1.0.0
@@ -113,7 +113,7 @@ jobs:
           port: ${{ secrets.VPS_PORT || 22 }}
           command_timeout: 20m
           script: |
-            cd /var/www/html/flowbooks/
+            cd /home/dev/aa_erp_api/
             set -e
 
             # rsync already uploaded this GitHub commit (and excludes .git/).
@@ -125,7 +125,7 @@ jobs:
               git pull --ff-only origin main \
                 || echo "git pull skipped; continuing with rsync'd files from this Actions run."
             else
-              echo "No .git on VPS — deploy is rsync only to /var/www/html/flowbooks/"
+              echo "No .git on VPS — deploy is rsync only to /home/dev/aa_erp_api/"
             fi
 
             export NVM_DIR="$HOME/.nvm"
