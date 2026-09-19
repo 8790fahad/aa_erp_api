@@ -76,8 +76,8 @@ exports.getInventoryItemDetails = async (req, res) => {
         -- Calculate total value based on current stock and cost price
         (COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0)) * p.cost_price as total_value
       FROM products p
-      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId${stockBranchJoin}
-      WHERE p.sku = :productId AND p.facility_id = :facilityId
+      LEFT JOIN store_entries se ON ${sqlEq("p.sku", "se.product_id")} AND ${sqlEq("se.facilityId", ":facilityId")}${stockBranchJoin}
+      WHERE ${sqlEq("p.sku", ":productId")} AND ${sqlEq("p.facility_id", ":facilityId")}
       GROUP BY
         p.id, p.sku, p.name, p.facility_id, p.category, p.item_type, p.unit_of_measure,
         p.cost_price, p.selling_price, p.reorder_level, p.status, p.created_at,
@@ -175,8 +175,8 @@ exports.getInventoryItemDetails = async (req, res) => {
       FROM store_entries se
       LEFT JOIN branches br
         ON br.id = se.branchId
-        AND br.facilityId = se.facilityId
-      WHERE se.product_id = :productId AND se.facilityId = :facilityId ${salesTypeCondition}${dateCondition}${branchCondition}
+        AND ${sqlEq("br.facilityId", "se.facilityId")}
+      WHERE ${sqlEq("se.product_id", ":productId")} AND ${sqlEq("se.facilityId", ":facilityId")} ${salesTypeCondition}${dateCondition}${branchCondition}
       ORDER BY se.createdAt DESC
       LIMIT 500
     `;
@@ -205,8 +205,8 @@ exports.getInventoryItemDetails = async (req, res) => {
         `
         SELECT COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS qty
         FROM store_entries se
-        WHERE se.product_id = :productId
-          AND se.facilityId = :facilityId
+        WHERE ${sqlEq("se.product_id", ":productId")}
+          AND ${sqlEq("se.facilityId", ":facilityId")}
           AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) ${cmp} :asOfDate
           ${branchSql}
         `,
@@ -368,8 +368,8 @@ exports.getLowStockAlerts = async (req, res) => {
         COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) as current_stock,
         (COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0)) * p.cost_price as stock_value
       FROM products p
-      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId
-      WHERE p.facility_id = :facilityId
+      LEFT JOIN store_entries se ON ${sqlEq("p.sku", "se.product_id")} AND ${sqlEq("se.facilityId", ":facilityId")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
       GROUP BY
         p.id, p.sku, p.name, p.category, p.unit_of_measure,
         p.reorder_level, p.cost_price
@@ -420,8 +420,8 @@ exports.getOutOfStockItems = async (req, res) => {
         p.cost_price,
         p.reorder_level
       FROM products p
-      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId
-      WHERE p.facility_id = :facilityId
+      LEFT JOIN store_entries se ON ${sqlEq("p.sku", "se.product_id")} AND ${sqlEq("se.facilityId", ":facilityId")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
       GROUP BY
         p.id, p.sku, p.name, p.category, p.unit_of_measure,
         p.cost_price, p.reorder_level
@@ -466,7 +466,7 @@ exports.getInventoryBalancesBySalesType = async (req, res) => {
     let replacements = { facilityId };
 
     if (productId) {
-      productCondition = "AND p.sku = :productId";
+      productCondition = `AND ${sqlEq("p.sku", ":productId")}`;
       replacements.productId = productId;
     }
 
@@ -486,8 +486,8 @@ exports.getInventoryBalancesBySalesType = async (req, res) => {
         -- Count transactions for each sales_type
         COUNT(se.id) as transaction_count
       FROM products p
-      LEFT JOIN store_entries se ON p.sku = se.product_id AND se.facilityId = :facilityId
-      WHERE p.facility_id = :facilityId ${productCondition}
+      LEFT JOIN store_entries se ON ${sqlEq("p.sku", "se.product_id")} AND ${sqlEq("se.facilityId", ":facilityId")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")} ${productCondition}
       GROUP BY
         p.id, p.sku, p.name, p.category, p.unit_of_measure,
         p.cost_price, se.sales_type
@@ -589,8 +589,8 @@ exports.getTransactionHistoryBySalesType = async (req, res) => {
           ELSE 0
         END as transaction_value
       FROM store_entries se
-      LEFT JOIN products p ON se.product_id = p.sku
-      WHERE se.facilityId = :facilityId
+      LEFT JOIN products p ON ${sqlEq("se.product_id", "p.sku")}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
         AND se.sales_type = :salesType
       ORDER BY se.createdAt DESC
       LIMIT :limit
@@ -639,7 +639,7 @@ exports.getRawMaterialInventoryForCostingTemplate = async (req, res) => {
         cost_price,
         reorder_level
       FROM products
-      WHERE facility_id = :facilityId and  item_type = 'Raw Material'
+      WHERE ${sqlEq("facility_id", ":facilityId")} and  item_type = 'Raw Material'
     `;
 
     let replacements = { facilityId };
@@ -680,13 +680,13 @@ exports.getRawMaterialInventory = async (req, res) => {
     }
 
     const replacements = { facilityId };
-    let branchCondition = " AND se.facilityId = :facilityId";
+    let branchCondition = ` AND ${sqlEq("se.facilityId", ":facilityId")}`;
 
     if (branch_name && branch_name !== "all") {
-      branchCondition += " AND se.branch_name = :branch_name";
+      branchCondition += ` AND ${sqlEq("se.branch_name", ":branch_name")}`;
       replacements.branch_name = branch_name;
     } else {
-      branchCondition = " AND se.facilityId = :facilityId";
+      branchCondition = ` AND ${sqlEq("se.facilityId", ":facilityId")}`;
     }
 
     const query = `
@@ -701,10 +701,10 @@ exports.getRawMaterialInventory = async (req, res) => {
         se.location,
         se.status
       FROM store_entries se
-      JOIN products p ON se.product_id = p.sku
-      WHERE se.facilityId = :facilityId
-        ${branch_name && branch_name !== "all" ? "AND se.branch_name = :branch_name" : ""}
-        AND p.facility_id = :facilityId
+      JOIN products p ON ${sqlEq("se.product_id", "p.sku")}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
+        ${branch_name && branch_name !== "all" ? `AND ${sqlEq("se.branch_name", ":branch_name")}` : ""}
+        AND ${sqlEq("p.facility_id", ":facilityId")}
         AND p.item_type = 'Raw Material'
       GROUP BY
         se.branch_name,
@@ -765,9 +765,9 @@ exports.getInventoryListAll = async (req, res) => {
         MAX(se.location) AS location,
         MAX(se.status) AS status
       FROM store_entries se
-      JOIN products p ON se.product_id = p.sku
-      WHERE se.facilityId = :facilityId
-        AND p.facility_id = :facilityId
+      JOIN products p ON ${sqlEq("se.product_id", "p.sku")}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
+        AND ${sqlEq("p.facility_id", ":facilityId")}
         AND p.item_type = 'Raw Material'
         AND LOWER(TRIM(se.branch_name)) = 'raw material'
       GROUP BY
@@ -833,8 +833,8 @@ exports.getInventoryForGoodsTransferByBranch = async (req, res) => {
         se.location,
         se.status
       FROM store_entries se
-      JOIN products p ON se.product_id = p.sku
-      WHERE se.facilityId = :facilityId
+      JOIN products p ON ${sqlEq("se.product_id", "p.sku")}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
         ${branchCondition}
       GROUP BY
         se.branch_name,
@@ -939,7 +939,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       INNER JOIN products p
         ON ${sqlEq("se.product_id", "p.sku")}
         AND ${sqlEq("se.facilityId", "p.facility_id")}
-      WHERE se.facilityId = :facilityId
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
         ${branchCondition}
       GROUP BY se.product_id, se.branchId
     `;
@@ -964,7 +964,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
         LEFT JOIN sale_workflows sw
           ON ${sqlEq("sw.facility_id", "se.facilityId")}
           AND ${sqlEq("sw.sale_code", "se.reference_number")}
-        WHERE se.facilityId = :facilityId
+        WHERE ${sqlEq("se.facilityId", ":facilityId")}
           AND se.qty_out > 0
           AND LOWER(TRIM(IFNULL(se.branch_name, ''))) IN (${zoneList})
           AND (
@@ -995,7 +995,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
         FROM sale_fulfillments f
         INNER JOIN sale_fulfillment_lines l
           ON l.fulfillment_id = f.id
-        WHERE f.facility_id = :facilityId
+        WHERE ${sqlEq("f.facility_id", ":facilityId")}
           AND (:branchId = 0 OR f.branch_id = :branchId)
         GROUP BY f.branch_id, l.product_id
       ) col
@@ -1037,7 +1037,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       ) item_keys
       INNER JOIN products p
         ON ${sqlEq("item_keys.product_id", "p.sku")}
-       AND p.facility_id = :facilityId
+       AND ${sqlEq("p.facility_id", ":facilityId")}
       LEFT JOIN (${stockAgg}) st
         ON ${sqlEq("st.product_id", "item_keys.product_id")}
        AND st.branch_id <=> item_keys.branch_id
@@ -1143,7 +1143,7 @@ exports.getSalesTypeSummaryReport = async (req, res) => {
           ELSE 0
         END) as total_value
       FROM store_entries se
-      WHERE se.facilityId = :facilityId ${dateCondition}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")} ${dateCondition}
       GROUP BY se.sales_type
       ORDER BY total_value DESC
     `;
@@ -1238,11 +1238,11 @@ exports.getRawMaterialInventoryByDepartment = async (req, res) => {
         (SUM(COALESCE(se.qty_in, 0)) - SUM(COALESCE(se.qty_out, 0))) * p.cost_price AS total_value
       FROM store_entries se
       JOIN products p
-        ON se.product_id = p.sku
-        AND p.facility_id = :facilityId
+        ON ${sqlEq("se.product_id", "p.sku")}
+        AND ${sqlEq("p.facility_id", ":facilityId")}
         AND p.item_type = 'Raw Material'
       LEFT JOIN Departments d ON se.departmentId = d.id
-      WHERE se.facilityId = :facilityId
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
         ${deptCondition}
       GROUP BY
         p.sku, p.name, p.category, p.item_type, p.unit_of_measure,
@@ -1329,10 +1329,10 @@ exports.getWipInventoryDirect = async (req, res) => {
         (SUM(COALESCE(se.qty_in, 0)) - SUM(COALESCE(se.qty_out, 0))) * p.cost_price AS total_value
       FROM store_entries se
       JOIN products p
-        ON se.product_id = p.sku
-        AND p.facility_id = :facilityId
+        ON ${sqlEq("se.product_id", "p.sku")}
+        AND ${sqlEq("p.facility_id", ":facilityId")}
       LEFT JOIN Departments d ON se.departmentId = d.id
-      WHERE se.facilityId = :facilityId
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
         AND se.branch_name = 'Work in Progress'
         AND (se.expiry_date IS NULL OR se.expiry_date >= CURDATE())
         ${deptCondition}
