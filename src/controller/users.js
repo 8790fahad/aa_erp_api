@@ -63,6 +63,7 @@ const moment = require("moment");
 const { response } = require("express");
 const userApi = require("./userApi");
 const { assertUserCanLoginNow } = require("../services/loginHours");
+const { sqlEq } = require("../utils/sqlCollate");
 
 // ========================================
 // HELPER FUNCTIONS
@@ -3093,15 +3094,24 @@ exports.verifyUserToken = (req, res) => {
       });
     }
     const { id, email, facilityId, username } = decoded;
-    User.findAll({
-      where: { id, email, facilityId },
-    })
+    return db.sequelize
+      .query(
+        `SELECT * FROM \`users\` AS \`users\`
+         WHERE ${sqlEq("`users`.`id`", ":id")}
+           AND ${sqlEq("`users`.`email`", ":email")}
+           AND ${sqlEq("`users`.`facilityId`", ":facilityId")}`,
+        {
+          replacements: { id, email, facilityId },
+          model: User,
+          mapToModel: true,
+        },
+      )
       .then((user) => {
         if (!user.length) {
           return res.json({ success: false, msg: "user not found" });
         }
 
-        userApi.getBusinessProfile(
+        return userApi.getBusinessProfile(
           async (business, businessesList = []) => {
             const userRole = user[0].dataValues.role;
             const designation = mapRoleToDesignation(userRole);

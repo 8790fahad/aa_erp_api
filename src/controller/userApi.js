@@ -1,5 +1,6 @@
 const db = require("../models");
 const moment = require("moment");
+const { sqlEq } = require("../utils/sqlCollate");
 
 const _getBusinessProfile = async (
   callback = (f) => f,
@@ -9,10 +10,15 @@ const _getBusinessProfile = async (
   try {
     console.log();
     // Find membership to get business_id from user_id
-    const membership = await db.membership.findAll({
-      where: { email: email },
-      attributes: ["business_id", "access_to", "functionalities"],
-    });
+    const membership = await db.sequelize.query(
+      `SELECT \`business_id\`, \`access_to\`, \`functionalities\`, \`branch_id\`
+       FROM \`membership\`
+       WHERE ${sqlEq("`email`", ":email")}`,
+      {
+        replacements: { email },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
 
     if (!membership.length) {
       return error(new Error("Membership not found"));
