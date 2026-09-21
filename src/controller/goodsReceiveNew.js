@@ -12,6 +12,7 @@ const {
 } = require("../models");
 const { getBalance } = require("./supplier");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { parseQty, parseAmount } = require("../utils/parseAmount");
 // Helper functions for number generation (assuming these exist in your system)
 async function numberGenerator(
   { query_type = "", facilityId = "" },
@@ -254,9 +255,13 @@ exports.generateGoodReceive = async (req, res) => {
     let storeEntries = [];
 
     for (const item of items) {
-      const receivedQuantity = Number(item.receivedQuantity) || 0;
-      const unitCost = Number(item.averageCostPerUom) || 0;
-      const additionalCost = Number(item.additionalCostValue) || 0;
+      const receivedQuantity =
+        parseQty(item.receivedQuantity) || parseQty(item.quantity);
+      const unitCost =
+        parseAmount(item.averageCostPerUom) ||
+        parseAmount(item.est_cost) ||
+        0;
+      const additionalCost = parseAmount(item.additionalCostValue) || 0;
       const itemTotal = receivedQuantity * unitCost + additionalCost;
 
       totalAmount += itemTotal;
@@ -341,8 +346,8 @@ exports.generateGoodReceive = async (req, res) => {
         {
           supplier_number: supplier_code,
           description: item.item_name,
-          cost: item.est_cost,
-          qty_out: item.quantity,
+          cost: unitCost,
+          qty_out: receivedQuantity,
           facilityId,
           mode_of_payment: "credit",
           receiptNo: grnCode,

@@ -9,4 +9,10 @@ function parseAmount(value) {
   return n;
 }
 
-module.exports = { parseAmount };
+/** Quantity / units: same comma stripping as money ("4,000" → 4000). */
+function parseQty(value) {
+  const n = parseAmount(value);
+  return n == null ? 0 : n;
+}
+
+module.exports = { parseAmount, parseQty };

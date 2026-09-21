@@ -989,6 +989,8 @@ function extractBatchSummary(rec) {
   };
 }
 
+exports.extractBatchSummary = extractBatchSummary;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/reports/production/daily-batch-log
 // ─────────────────────────────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ const {
   resolveSignedPoDocumentUrl,
 } = require("../config/cloudinary");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { parseAmount, parseQty } = require("../utils/parseAmount");
 const { collectPurchaseRequisitionRefs } = require("../utils/purchaseRequisitionRefs");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { notifyMemoWorkflow, notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
@@ -14410,8 +14411,8 @@ exports.generateGoodReceive1 = async (req, res) => {
           {
             replacements: {
               item_name: item?.item_name || "",
-              qty_in: item?.quantity || 0,
-              qty_out: item?.qty_out || 0,
+              qty_in: parseQty(item?.receivedQuantity) || parseQty(item?.quantity),
+              qty_out: parseQty(item?.qty_out),
               store_type: store_type,
               grn_no: grnCode,
               query_type,
@@ -14497,7 +14498,7 @@ exports.generateGoodReceive1 = async (req, res) => {
             replacements: {
               query_type: "tax",
               entries_date: date,
-              amount: Number(item.est_cost) * Number(item.quantity),
+              amount: (parseAmount(item.est_cost) || 0) * (parseQty(item.receivedQuantity) || parseQty(item.quantity)),
               destination_name: item.item_name,
               head: item.item_code,
               account_description: item.item_name,
@@ -14704,8 +14705,8 @@ exports.generateGoodReceive = async (req, res) => {
           {
             replacements: {
               item_name: item?.item_name || "",
-              qty_in: item?.quantity || 0,
-              qty_out: item?.qty_out || 0,
+              qty_in: parseQty(item?.receivedQuantity) || parseQty(item?.quantity),
+              qty_out: parseQty(item?.qty_out),
               store_type: store_type,
               grn_no: grnCode,
               query_type,
@@ -14791,7 +14792,7 @@ exports.generateGoodReceive = async (req, res) => {
             replacements: {
               query_type: "tax",
               entries_date: date,
-              amount: Number(item.est_cost) * Number(item.quantity),
+              amount: (parseAmount(item.est_cost) || 0) * (parseQty(item.receivedQuantity) || parseQty(item.quantity)),
               destination_name: item.item_name,
               head: item.item_code,
               account_description: item.item_name,
@@ -15057,8 +15058,8 @@ exports.directPurchaseConsumables = async (req, res) => {
     let totalTaxableAmount = 0; // Track total of only taxable items
 
     for (const item of data) {
-      const qty = parseFloat(item.quantity || item.qty || 0);
-      const cost = parseFloat(item.cost || 0);
+      const qty = parseQty(item.qty) || parseQty(item.quantity);
+      const cost = parseAmount(item.cost) || 0;
       const itemTotal = qty * cost;
 
       if (qty <= 0 || cost <= 0 || itemTotal <= 0) continue;
@@ -16146,7 +16147,7 @@ exports.directPurchaseExpenses = async (req, res) => {
 
     // === PROCESS EACH EXPENSE ITEM ===
     for (const item of data) {
-      const qty = parseFloat(item.quantity || item.qty || 1);
+      const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
       const cost = parseFloat(item.cost || 0);
       const itemTotal = qty * cost;
 
@@ -16259,7 +16260,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     const taxArray = Array.isArray(taxes) ? taxes : [];
     const taxableItems = data.filter((item) => isProductTaxable(item.taxable));
     const totalTaxableAmount = taxableItems.reduce((sum, item) => {
-      const qty = parseFloat(item.quantity || item.qty || 1);
+      const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
       const cost = parseFloat(item.cost || 0);
       return sum + qty * cost;
     }, 0);
@@ -16325,7 +16326,7 @@ exports.directPurchaseExpenses = async (req, res) => {
       taxAccountMap.size > 0
     ) {
       for (const item of taxableItems) {
-        const qty = parseFloat(item.quantity || item.qty || 1);
+        const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
         const cost = parseFloat(item.cost || 0);
         const itemTotal = qty * cost;
 
@@ -16701,7 +16702,7 @@ exports.directExpenses = async (req, res) => {
     const normalizedLines = [];
     for (let i = 0; i < data.length; i++) {
       const item = data[i];
-      const qty = parseFloat(item.quantity || item.qty || 1);
+      const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
       const rate = parseFloat(item.cost || item.rate || 0);
       const amount = qty * rate;
       const head = item.head || item.item_type || item.account_head;
@@ -17955,8 +17956,8 @@ exports.directConsumables = async (req, res) => {
 
     // === PROCESS EACH CONSUMABLE ITEM ===
     for (const item of data) {
-      const qty = parseFloat(item.quantity || item.qty || 0);
-      const cost = parseFloat(item.cost || 0);
+      const qty = parseQty(item.qty) || parseQty(item.quantity);
+      const cost = parseAmount(item.cost) || 0;
       const amount = qty * cost;
 
       if (qty <= 0 || cost <= 0) continue;

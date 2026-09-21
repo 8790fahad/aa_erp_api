@@ -6,6 +6,7 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 const { resolveBranchId, resolveBranchIds, validateBranchIdById } = require("../services/branchResolver");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
+const { parseQty } = require("../utils/parseAmount");
 async function numberGenerator(
   { query_type = "", facilityId = "" },
   callback = (f) => f,
@@ -3543,7 +3544,7 @@ const createProductionProductEntry = async (
       });
     }
 
-    const qty = parseFloat(quantity);
+    const qty = parseQty(quantity);
     const unitCost = parseFloat(cost_price);
     if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(unitCost) || unitCost < 0) {
       await transaction.rollback();
@@ -3870,7 +3871,7 @@ exports.createMixture = async (req, res) => {
       if (!Array.isArray(ingredients) || ingredients.length === 0)
         fail(400, "At least one ingredient is required");
 
-      const qtyProduced = parseFloat(quantity);
+      const qtyProduced = parseQty(quantity);
       if (!qtyProduced || qtyProduced <= 0)
         fail(400, "quantity must be greater than 0");
 

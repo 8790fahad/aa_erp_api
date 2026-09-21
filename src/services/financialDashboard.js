@@ -1,5 +1,6 @@
 const moment = require("moment");
 const { QueryTypes } = require("sequelize");
+const { sqlEq, sqlCol } = require("../utils/sqlCollate");
 
 const EXPENSE_COLORS = [
   "#CC4D3D",
@@ -78,8 +79,8 @@ function isOperatingExpensesTypeSql(column = "ac.type") {
  */
 const COA_LEFT_JOIN = `
   LEFT JOIN account_category ac
-    ON ac.code = gl.account_code
-    AND ac.facility_id = gl.facility_id
+    ON ${sqlEq("ac.code", "gl.account_code")}
+    AND ${sqlEq("ac.facility_id", "gl.facility_id")}
 `;
 
 function isRevenueSql() {
@@ -331,8 +332,8 @@ async function fetchOperatingExpenseBreakdown(
         COALESCE(SUM(gl.dr - gl.cr), 0) AS amount
       FROM account_category ac
       LEFT JOIN general_ledger gl
-        ON gl.account_code = ac.code
-        AND gl.facility_id = ac.facility_id
+        ON ${sqlEq("gl.account_code", "ac.code")}
+        AND ${sqlEq("gl.facility_id", "ac.facility_id")}
         AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
         AND IFNULL(gl.type, '') != 'opening_balance'
       WHERE ac.facility_id = :facilityId
@@ -366,8 +367,8 @@ async function fetchOperatingExpenseBreakdown(
           COALESCE(SUM(gl.dr - gl.cr), 0) AS amount
         FROM general_ledger gl
         INNER JOIN account_category ac
-          ON ac.code = gl.account_code
-          AND ac.facility_id = gl.facility_id
+          ON ${sqlEq("ac.code", "gl.account_code")}
+          AND ${sqlEq("ac.facility_id", "gl.facility_id")}
         WHERE gl.facility_id = :facilityId
           AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
           AND IFNULL(gl.type, '') != 'opening_balance'
@@ -457,9 +458,9 @@ async function fetchRecentActivity(sequelize, facilityId, limit = 5) {
         COALESCE(se_tot.has_receivable_activity, 0) AS has_receivable_activity
       FROM invoices i
       LEFT JOIN customers c
-        ON c.customerNo = i.customerNo AND c.facilityId = i.facility_id
+        ON ${sqlEq("c.customerNo", "i.customerNo")} AND ${sqlEq("c.facilityId", "i.facility_id")}
       LEFT JOIN suppliersinfo sup
-        ON sup.supplier_number = i.ref_number AND sup.facilityId = i.facility_id
+        ON ${sqlEq("sup.supplier_number", "i.ref_number")} AND ${sqlEq("sup.facilityId", "i.facility_id")}
       LEFT JOIN (
         SELECT
           reference_number AS invoice_ref,
@@ -472,7 +473,7 @@ async function fetchRecentActivity(sequelize, facilityId, limit = 5) {
           AND reference_number IS NOT NULL
           AND reference_number != ''
         GROUP BY reference_number, facility_id
-      ) se_tot ON se_tot.invoice_ref = i.invoice_ref AND se_tot.facility_id = i.facility_id
+      ) se_tot ON ${sqlEq("se_tot.invoice_ref", "i.invoice_ref")} AND ${sqlEq("se_tot.facility_id", "i.facility_id")}
       WHERE i.facility_id = :facilityId
       ORDER BY COALESCE(i.transaction_date, i.created_at) DESC, i.invoice_id DESC
       LIMIT :limit
@@ -632,10 +633,10 @@ async function fetchBankAccountBalances(sequelize, facilityId, asOfDate) {
         FROM bank_accounts ba
         LEFT JOIN general_ledger gl
           ON (
-            CAST(gl.bank_account_id AS CHAR) = CAST(ba.id AS CHAR)
-            OR gl.account_code = ba.head
+            ${sqlEq("CAST(gl.bank_account_id AS CHAR)", "CAST(ba.id AS CHAR)")}
+            OR ${sqlEq("gl.account_code", "ba.head")}
           )
-          AND gl.facility_id = ba.facility_id
+          AND ${sqlEq("gl.facility_id", "ba.facility_id")}
           AND DATE(gl.transaction_date) <= DATE(:asOfDate)
           AND IFNULL(gl.type, '') != 'opening_balance'
         WHERE ba.facility_id = :facilityId
@@ -685,8 +686,8 @@ async function fetchTopProducts(sequelize, facilityId, fromDate, toDate) {
         COALESCE(SUM(s.total), 0) AS revenue,
         COALESCE(SUM(s.quantity * COALESCE(p.cost_price, 0)), 0) AS cogs
       FROM sales s
-      INNER JOIN products p ON p.id = s.productId
-      WHERE p.facility_id = :facilityId
+      INNER JOIN products p ON ${sqlEq("p.id", "s.productId")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
       GROUP BY s.productId, product_name, product_sku, category
@@ -733,13 +734,19 @@ async function fetchTopCustomers(sequelize, facilityId, fromDate, toDate) {
     `
       SELECT
         s.customerId AS id,
-        COALESCE(NULLIF(c.fullname, ''), NULLIF(c.store_name, ''), s.customerId) AS customer_name,
-        COUNT(DISTINCT CONCAT(s.customerId, '-', DATE(s.saleDate))) AS order_count,
+        COALESCE(
+          NULLIF(${sqlCol("c.fullname")}, ''),
+          NULLIF(${sqlCol("c.store_name")}, ''),
+          ${sqlCol("s.customerId")}
+        ) AS customer_name,
+        COUNT(DISTINCT CONCAT(${sqlCol("s.customerId")}, '-', DATE(s.saleDate))) AS order_count,
         COALESCE(SUM(s.total), 0) AS revenue
       FROM sales s
-      INNER JOIN products p ON p.id = s.productId
-      LEFT JOIN customers c ON c.customerNo = s.customerId AND c.facilityId = p.facility_id
-      WHERE p.facility_id = :facilityId
+      INNER JOIN products p ON ${sqlEq("p.id", "s.productId")}
+      LEFT JOIN customers c
+        ON ${sqlEq("c.customerNo", "s.customerId")}
+        AND ${sqlEq("c.facilityId", "p.facility_id")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
       GROUP BY s.customerId, customer_name
@@ -817,8 +824,8 @@ async function fetchReceivablePayableSummary(sequelize, facilityId, asOfDate) {
           AND reference_number != ''
         GROUP BY reference_number, facility_id
       ) payments
-        ON payments.transaction_ref = i.invoice_ref
-        AND payments.facility_id = i.facility_id
+        ON ${sqlEq("payments.transaction_ref", "i.invoice_ref")}
+        AND ${sqlEq("payments.facility_id", "i.facility_id")}
       WHERE i.type = 'sales'
         AND i.facility_id = :facilityId
     `,
@@ -851,8 +858,8 @@ async function fetchReceivablePayableSummary(sequelize, facilityId, asOfDate) {
           AND reference_number != ''
         GROUP BY reference_number, facility_id
       ) payments
-        ON payments.transaction_ref = i.invoice_ref
-        AND payments.facility_id = i.facility_id
+        ON ${sqlEq("payments.transaction_ref", "i.invoice_ref")}
+        AND ${sqlEq("payments.facility_id", "i.facility_id")}
       WHERE i.type = 'purchase'
         AND i.facility_id = :facilityId
     `,
@@ -910,16 +917,16 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
       SELECT
         gl.transaction_ref AS party_no,
         COALESCE(
-          NULLIF(TRIM(c.fullname), ''),
-          NULLIF(TRIM(c.store_name), ''),
-          NULLIF(TRIM(c.company_name), ''),
-          gl.transaction_ref
+          NULLIF(${sqlCol("TRIM(c.fullname)")}, ''),
+          NULLIF(${sqlCol("TRIM(c.store_name)")}, ''),
+          NULLIF(${sqlCol("TRIM(c.company_name)")}, ''),
+          ${sqlCol("gl.transaction_ref")}
         ) AS party_name,
         GREATEST(COALESCE(SUM(gl.cr) - SUM(gl.dr), 0), 0) AS balance
       FROM general_ledger gl
       LEFT JOIN customers c
-        ON c.customerNo = gl.transaction_ref
-        AND c.facilityId = gl.facility_id
+        ON ${sqlEq("c.customerNo", "gl.transaction_ref")}
+        AND ${sqlEq("c.facilityId", "gl.facility_id")}
       WHERE gl.facility_id = :facilityId
         AND LOWER(gl.type) = 'deposit'
         AND gl.transaction_ref IS NOT NULL
@@ -966,15 +973,15 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
       SELECT
         gl.transaction_ref AS party_no,
         COALESCE(
-          NULLIF(TRIM(si.supplier_name), ''),
-          NULLIF(TRIM(si.company_name), ''),
-          gl.transaction_ref
+          NULLIF(${sqlCol("TRIM(si.supplier_name)")}, ''),
+          NULLIF(${sqlCol("TRIM(si.company_name)")}, ''),
+          ${sqlCol("gl.transaction_ref")}
         ) AS party_name,
         GREATEST(COALESCE(SUM(gl.dr) - SUM(gl.cr), 0), 0) AS balance
       FROM general_ledger gl
       LEFT JOIN suppliersinfo si
-        ON CAST(si.supplier_number AS CHAR) = CAST(gl.transaction_ref AS CHAR)
-        AND si.facilityId = gl.facility_id
+        ON ${sqlEq("CAST(si.supplier_number AS CHAR)", "CAST(gl.transaction_ref AS CHAR)")}
+        AND ${sqlEq("si.facilityId", "gl.facility_id")}
       WHERE gl.facility_id = :facilityId
         AND LOWER(gl.type) IN ('accrued', 'advance')
         AND gl.transaction_ref IS NOT NULL
@@ -1050,8 +1057,8 @@ async function fetchSalesByCategoryAndSupplier(
         COALESCE(SUM(s.total), 0) AS revenue,
         COALESCE(SUM(s.quantity * COALESCE(p.cost_price, 0)), 0) AS cogs
       FROM sales s
-      INNER JOIN products p ON p.id = s.productId
-      WHERE p.facility_id = :facilityId
+      INNER JOIN products p ON ${sqlEq("p.id", "s.productId")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
       GROUP BY COALESCE(NULLIF(TRIM(p.category), ''), 'Uncategorized')
@@ -1069,24 +1076,24 @@ async function fetchSalesByCategoryAndSupplier(
     `
       SELECT
         COALESCE(
-          NULLIF(TRIM(si.supplier_name), ''),
-          NULLIF(TRIM(si.company_name), ''),
+          NULLIF(${sqlCol("TRIM(si.supplier_name)")}, ''),
+          NULLIF(${sqlCol("TRIM(si.company_name)")}, ''),
           NULLIF(CONCAT('Supplier ', p.supplier_id), 'Supplier '),
           'No Supplier'
         ) AS name,
         COALESCE(SUM(s.quantity), 0) AS units,
         COALESCE(SUM(s.total), 0) AS revenue
       FROM sales s
-      INNER JOIN products p ON p.id = s.productId
+      INNER JOIN products p ON ${sqlEq("p.id", "s.productId")}
       LEFT JOIN suppliersinfo si
-        ON CAST(si.supplier_number AS CHAR) = CAST(p.supplier_id AS CHAR)
-        AND si.facilityId = p.facility_id
-      WHERE p.facility_id = :facilityId
+        ON ${sqlEq("CAST(si.supplier_number AS CHAR)", "CAST(p.supplier_id AS CHAR)")}
+        AND ${sqlEq("si.facilityId", "p.facility_id")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
         AND s.status = 'completed'
         AND DATE(s.saleDate) BETWEEN DATE(:fromDate) AND DATE(:toDate)
       GROUP BY COALESCE(
-          NULLIF(TRIM(si.supplier_name), ''),
-          NULLIF(TRIM(si.company_name), ''),
+          NULLIF(${sqlCol("TRIM(si.supplier_name)")}, ''),
+          NULLIF(${sqlCol("TRIM(si.company_name)")}, ''),
           NULLIF(CONCAT('Supplier ', p.supplier_id), 'Supplier '),
           'No Supplier'
         )
@@ -1129,8 +1136,8 @@ async function fetchOutstandingBills(sequelize, facilityId) {
         i.created_at AS bill_date
       FROM invoices i
       LEFT JOIN suppliersinfo si
-        ON si.supplier_number = i.customerNo
-        AND si.facilityId = i.facility_id
+        ON ${sqlEq("si.supplier_number", "i.customerNo")}
+        AND ${sqlEq("si.facilityId", "i.facility_id")}
       LEFT JOIN (
         SELECT
           reference_number AS transaction_ref,
@@ -1149,8 +1156,8 @@ async function fetchOutstandingBills(sequelize, facilityId) {
           AND reference_number != ''
         GROUP BY reference_number, facility_id
       ) payments
-        ON payments.transaction_ref = i.invoice_ref
-        AND payments.facility_id = i.facility_id
+        ON ${sqlEq("payments.transaction_ref", "i.invoice_ref")}
+        AND ${sqlEq("payments.facility_id", "i.facility_id")}
       WHERE i.type = 'purchase'
         AND i.facility_id = :facilityId
       ORDER BY i.due_date ASC
@@ -1210,6 +1217,23 @@ async function fetchOutstandingBills(sequelize, facilityId) {
   };
 }
 
+function withDashboardFallback(label, fallback, promise) {
+  return Promise.resolve(promise).catch((err) => {
+    console.error(`[FinancialDashboard] ${label} failed:`, err.message);
+    return fallback;
+  });
+}
+
+const EMPTY_PERIOD_TOTALS = {
+  totalRevenue: 0,
+  totalIncome: 0,
+  totalExpenses: 0,
+  cogs: 0,
+  grossProfit: 0,
+  operatingExpenses: 0,
+  netProfit: 0,
+};
+
 async function buildFinancialDashboardOverview(sequelize, options) {
   const { facilityId, from, to } = options;
   const defaults = getDefaultPeriod();
@@ -1234,21 +1258,85 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     outstandingBills,
     advanceDepositBalances,
   ] = await Promise.all([
-    fetchPeriodTotals(sequelize, facilityId, fromDate, toDate),
-    fetchPeriodTotals(sequelize, facilityId, prior.fromDate, prior.toDate),
-    fetchCashInBank(sequelize, facilityId, toDate),
-    fetchCashInBank(sequelize, facilityId, prior.toDate),
-    fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate),
-    fetchOperatingExpenseBreakdown(sequelize, facilityId, fromDate, toDate),
-    fetchRecentActivity(sequelize, facilityId, 5),
-    fetchRecentProduction(sequelize, facilityId, 5),
-    fetchBankAccountBalances(sequelize, facilityId, toDate),
-    fetchTopProducts(sequelize, facilityId, fromDate, toDate),
-    fetchTopCustomers(sequelize, facilityId, fromDate, toDate),
-    fetchReceivablePayableSummary(sequelize, facilityId, toDate),
-    fetchSalesByCategoryAndSupplier(sequelize, facilityId, fromDate, toDate),
-    fetchOutstandingBills(sequelize, facilityId),
-    fetchAdvanceDepositBalances(sequelize, facilityId, 8),
+    withDashboardFallback(
+      "period totals",
+      EMPTY_PERIOD_TOTALS,
+      fetchPeriodTotals(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback(
+      "prior period totals",
+      EMPTY_PERIOD_TOTALS,
+      fetchPeriodTotals(sequelize, facilityId, prior.fromDate, prior.toDate),
+    ),
+    withDashboardFallback("cash in bank", 0, fetchCashInBank(sequelize, facilityId, toDate)),
+    withDashboardFallback(
+      "prior cash in bank",
+      0,
+      fetchCashInBank(sequelize, facilityId, prior.toDate),
+    ),
+    withDashboardFallback(
+      "profit and loss trend",
+      [],
+      fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback(
+      "operating expenses",
+      { source: "operating_expenses", items: [] },
+      fetchOperatingExpenseBreakdown(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback("recent activity", [], fetchRecentActivity(sequelize, facilityId, 5)),
+    withDashboardFallback(
+      "recent production",
+      [],
+      fetchRecentProduction(sequelize, facilityId, 5),
+    ),
+    withDashboardFallback(
+      "bank accounts",
+      [],
+      fetchBankAccountBalances(sequelize, facilityId, toDate),
+    ),
+    withDashboardFallback(
+      "top products",
+      { byPrice: [], byUnit: [], all: [] },
+      fetchTopProducts(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback(
+      "top customers",
+      { byPrice: [], byUnit: [] },
+      fetchTopCustomers(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback(
+      "receivables payables",
+      {
+        totalReceivable: 0,
+        totalPayable: 0,
+        receivableAging: EMPTY_AGING(),
+        payableAging: EMPTY_AGING(),
+        receivableOpenCount: 0,
+        payableOpenCount: 0,
+        receivableOverdue: 0,
+        payableOverdue: 0,
+      },
+      fetchReceivablePayableSummary(sequelize, facilityId, toDate),
+    ),
+    withDashboardFallback(
+      "sales breakdown",
+      { byCategory: [], bySupplier: [] },
+      fetchSalesByCategoryAndSupplier(sequelize, facilityId, fromDate, toDate),
+    ),
+    withDashboardFallback(
+      "outstanding bills",
+      { purchases: [], expenses: [], purchasesTotal: 0, expensesTotal: 0 },
+      fetchOutstandingBills(sequelize, facilityId),
+    ),
+    withDashboardFallback(
+      "advance deposit balances",
+      {
+        customerDeposits: { total: 0, count: 0, parties: [] },
+        supplierAdvances: { total: 0, count: 0, parties: [] },
+      },
+      fetchAdvanceDepositBalances(sequelize, facilityId, 8),
+    ),
   ]);
 
   const operatingExpenses = operatingExpenseResult.items || [];
