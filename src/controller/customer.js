@@ -3726,6 +3726,127 @@ export const getCustomerBalance = async (req, res) => {
   }
 };
 
+function isCashDepositMode(modeOfPayment) {
+  const mode = String(modeOfPayment || "")
+    .toLowerCase()
+    .trim();
+  return mode === "cash" || mode === "cash payment";
+}
+
+function mapDepositAccountInfo(row, kind, paidThrough) {
+  if (!row) return null;
+  const r = typeof row.get === "function" ? row.get({ plain: true }) : row;
+  const name =
+    r.account_name || r.bank_name || r.description || r.category || "";
+  return {
+    kind: kind || null,
+    code: r.code || r.head || paidThrough || null,
+    name: name || null,
+    account_number: r.account_number || null,
+    bank_code: r.bank_code || null,
+    bank_name: r.bank_name || null,
+  };
+}
+
+/**
+ * Cash deposits store the COA head in bank_account_id.
+ * Bank / cheque / card deposits store bank_accounts.id.
+ * Legacy rows may store the COA head instead of the bank id.
+ */
+async function resolveDepositAccountInfo({
+  modeOfPayment,
+  bankAccountId,
+  facilityId,
+  receiptNo,
+}) {
+  const isCash = isCashDepositMode(modeOfPayment);
+  const paidThrough =
+    bankAccountId != null && String(bankAccountId).trim() !== ""
+      ? String(bankAccountId).trim()
+      : "";
+
+  if (isCash && paidThrough) {
+    const cashHead = await db.AccountCategory.findOne({
+      where: { code: paidThrough, facilityId },
+    });
+    if (cashHead) return mapDepositAccountInfo(cashHead, "cash", paidThrough);
+    const account = await Account.findOne({
+      where: { head: paidThrough, facilityId },
+    });
+    if (account) return mapDepositAccountInfo(account, "cash", paidThrough);
+  }
+
+  if (paidThrough) {
+    const idNum = Number(paidThrough);
+    let bank = null;
+    if (Number.isFinite(idNum) && String(idNum) === paidThrough) {
+      bank = await db.bank_account.findOne({
+        where: { id: idNum, facilityId },
+      });
+    }
+    if (!bank) {
+      bank = await db.bank_account.findOne({
+        where: { head: paidThrough, facilityId },
+      });
+    }
+    if (bank) {
+      const info = mapDepositAccountInfo(bank, "bank", paidThrough);
+      if (info && !info.bank_name && info.bank_code && db.BankList) {
+        try {
+          const listed = await db.BankList.findOne({
+            where: { bank_code: info.bank_code, facilityId },
+          });
+          if (listed?.bank_name) info.bank_name = listed.bank_name;
+        } catch (err) {
+          console.warn("resolveDepositAccountInfo bank_list:", err.message);
+        }
+      }
+      return info;
+    }
+
+    const coa = await db.AccountCategory.findOne({
+      where: { code: paidThrough, facilityId },
+    });
+    if (coa) {
+      return mapDepositAccountInfo(
+        coa,
+        isCash ? "cash" : "bank",
+        paidThrough,
+      );
+    }
+  }
+
+  if (receiptNo) {
+    const bankLedger = await GeneralLedger.findOne({
+      where: {
+        reference_number: receiptNo,
+        facility_id: facilityId,
+        type: "bank",
+      },
+      order: [["transaction_id", "ASC"]],
+    });
+    if (bankLedger?.bank_account_id) {
+      return resolveDepositAccountInfo({
+        modeOfPayment: isCash ? "cash" : "bank",
+        bankAccountId: bankLedger.bank_account_id,
+        facilityId,
+      });
+    }
+    if (bankLedger?.account_code) {
+      return mapDepositAccountInfo(
+        {
+          code: bankLedger.account_code,
+          description: bankLedger.account_description,
+        },
+        isCash ? "cash" : "bank",
+        bankLedger.account_code,
+      );
+    }
+  }
+
+  return null;
+}
+
 export const getCustomerDeposit = async (req, res) => {
   const { facilityId, invoice_ref, customerNo } = req.params;
   console.log(
@@ -3743,7 +3864,11 @@ export const getCustomerDeposit = async (req, res) => {
   try {
     const result = await db.sequelize.query(
       `
-      SELECT * FROM customer_entries where customerNo = :customerNo and receiptNo = :link_id and facilityId=:facilityId
+      SELECT * FROM customer_entries
+      WHERE customerNo = :customerNo
+        AND receiptNo = :link_id
+        AND facilityId = :facilityId
+      ORDER BY entry_id ASC
       `,
       {
         replacements: { customerNo, facilityId, link_id: invoice_ref },
@@ -3775,24 +3900,48 @@ export const getCustomerDeposit = async (req, res) => {
         error: `Customer not found for invoice_ref: ${invoice_ref}, facilityId: ${facilityId}`,
       });
     }
-    // Get account information based on mode of payment
-    let accountInfo = null;
-    if (result[0].mode_of_payment === "cash" && result[0].bank_account_id) {
-      accountInfo = await db.AccountCategory.findOne({
-        where: {
-          code: result[0].bank_account_id,
-          facilityId: facilityId,
-        },
+
+    const paymentLegs = [];
+    for (const entry of result) {
+      const accountInfo = await resolveDepositAccountInfo({
+        modeOfPayment: entry.mode_of_payment,
+        bankAccountId: entry.bank_account_id,
+        facilityId,
+        receiptNo: invoice_ref,
       });
-    } else if (result[0].bank_account_id) {
-      // Model is defined as \"bank_account\" in Sequelize, so it is registered on db as db.bank_account
-      accountInfo = await db.bank_account.findOne({
-        where: {
-          head: result[0].bank_account_id,
-          facilityId: facilityId,
-        },
+      paymentLegs.push({
+        mode_of_payment: entry.mode_of_payment,
+        amount: parseFloat(entry.cost || entry.amount_paid || 0) || 0,
+        bank_account_id: entry.bank_account_id || null,
+        account_info: accountInfo,
       });
     }
+
+    const uniqueModes = [
+      ...new Set(
+        result
+          .map((entry) => String(entry.mode_of_payment || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    const combinedMode =
+      uniqueModes.length > 1
+        ? uniqueModes.join(" + ")
+        : result[0].mode_of_payment;
+    const totalAmount = result.reduce(
+      (sum, entry) =>
+        sum + (parseFloat(entry.cost || entry.amount_paid || 0) || 0),
+      0,
+    );
+
+    const chequeLedger = await GeneralLedger.findOne({
+      where: {
+        reference_number: invoice_ref,
+        facility_id: facilityId,
+        cheque_no: { [Op.ne]: null },
+      },
+      order: [["transaction_id", "ASC"]],
+    });
 
     // Get user information (created by)
     const createdBy = await db.users.findOne({
@@ -3805,11 +3954,17 @@ export const getCustomerDeposit = async (req, res) => {
     // 🔑 Call balance function
     const outstandingBalance = await getBalance(customerNo, facilityId);
     console.log(outstandingBalance, "=====================>result");
+    res.set("Cache-Control", "no-store");
     return res.status(200).json({
       success: true,
 
       data: {
         ...result[0],
+        mode_of_payment: combinedMode,
+        cost: totalAmount,
+        amount_paid: totalAmount,
+        cheque_number:
+          result[0].cheque_number || chequeLedger?.cheque_no || null,
         createdBy: createdBy
           ? {
               name: `${createdBy.firstname || ""} ${
@@ -3818,17 +3973,8 @@ export const getCustomerDeposit = async (req, res) => {
               signature: createdBy.signature,
             }
           : null,
-        account_info: accountInfo
-          ? {
-              code: accountInfo.code || accountInfo.head,
-              name:
-                accountInfo.account_name ||
-                accountInfo.description ||
-                accountInfo.category,
-              account_number: accountInfo.account_number,
-              bank_code: accountInfo.bank_code,
-            }
-          : null,
+        account_info: paymentLegs[0]?.account_info || null,
+        payment_legs: paymentLegs,
       },
       customer: {
         customerNo: customer.customerNo,

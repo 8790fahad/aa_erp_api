@@ -2499,7 +2499,8 @@ exports.getReviewedMemosWithItems = async (req, res) => {
       // Calculate total item cost
       const totalItemCost = items.reduce((sum, item) => {
         return (
-          sum + parseFloat(item.unit_cost || 0) * parseInt(item.quantity || 1)
+          sum +
+          (parseAmount(item.unit_cost) || 0) * (parseQty(item.quantity) || 1)
         );
       }, 0);
 
@@ -6684,8 +6685,8 @@ exports.insertMemo = async (req, res) => {
                   memo_id: newCode,
                   item_name: expense.item,
                   description: expense.description,
-                  unit_cost: expense.unitCost,
-                  quantity: expense.quantity || 1,
+                  unit_cost: parseAmount(expense.unitCost ?? expense.unit_cost) || 0,
+                  quantity: parseQty(expense.quantity) || 1,
                   item_code: expense.item_code,
                   item_subhead: expense.chart_code,
                   facilityId,
@@ -6937,8 +6938,8 @@ exports.updateMemoNew = async (req, res) => {
                 memo_id,
                 item_name: expense.item,
                 description: expense.description,
-                unit_cost: expense.unitCost,
-                quantity: expense.quantity || 0,
+                unit_cost: parseAmount(expense.unitCost ?? expense.unit_cost) || 0,
+                quantity: parseQty(expense.quantity) || 1,
                 item_code: expense.item_code,
                 item_subhead: expense.chart_code,
                 facilityId,
@@ -7337,8 +7338,8 @@ exports.updateMemo = async (req, res) => {
               replacements: {
                 item_list_id: expense.item_list_id,
                 item_name: expense.item_name,
-                unit_cost: expense.unit_cost,
-                quantity: expense.quantity,
+                unit_cost: parseAmount(expense.unit_cost ?? expense.unitCost) || 0,
+                quantity: parseQty(expense.quantity) || 1,
               },
             },
           );
@@ -7367,8 +7368,8 @@ exports.updateMemo = async (req, res) => {
                 memo_id,
                 item_name: expense.item_name,
                 description: expense.description,
-                unit_cost: expense.unit_cost,
-                quantity: expense.quantity,
+                unit_cost: parseAmount(expense.unit_cost ?? expense.unitCost) || 0,
+                quantity: parseQty(expense.quantity) || 1,
                 item_code: expense.item_code,
                 item_subhead: expense.item_subhead,
               },
@@ -16148,7 +16149,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     // === PROCESS EACH EXPENSE ITEM ===
     for (const item of data) {
       const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
-      const cost = parseFloat(item.cost || 0);
+      const cost = parseAmount(item.cost) || 0;
       const itemTotal = qty * cost;
 
       if (itemTotal <= 0) continue;
@@ -16261,7 +16262,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     const taxableItems = data.filter((item) => isProductTaxable(item.taxable));
     const totalTaxableAmount = taxableItems.reduce((sum, item) => {
       const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
-      const cost = parseFloat(item.cost || 0);
+      const cost = parseAmount(item.cost) || 0;
       return sum + qty * cost;
     }, 0);
 
@@ -16327,7 +16328,7 @@ exports.directPurchaseExpenses = async (req, res) => {
     ) {
       for (const item of taxableItems) {
         const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
-        const cost = parseFloat(item.cost || 0);
+        const cost = parseAmount(item.cost) || 0;
         const itemTotal = qty * cost;
 
         if (itemTotal <= 0) continue;
@@ -16703,7 +16704,7 @@ exports.directExpenses = async (req, res) => {
     for (let i = 0; i < data.length; i++) {
       const item = data[i];
       const qty = parseQty(item.qty) || parseQty(item.quantity) || 1;
-      const rate = parseFloat(item.cost || item.rate || 0);
+      const rate = parseAmount(item.cost) || parseAmount(item.rate) || 0;
       const amount = qty * rate;
       const head = item.head || item.item_type || item.account_head;
       if (!head) {
