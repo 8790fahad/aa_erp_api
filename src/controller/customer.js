@@ -3789,6 +3789,25 @@ async function resolveDepositAccountInfo({
         where: { head: paidThrough, facilityId },
       });
     }
+    if (!bank) {
+      try {
+        const rows = await db.sequelize.query(
+          `SELECT id, account_name, account_number, bank_code,
+                  account_code AS head, facility_id
+           FROM bank_list_data
+           WHERE CAST(id AS CHAR) = :paidThrough
+             AND facility_id = :facilityId
+           LIMIT 1`,
+          {
+            replacements: { paidThrough, facilityId },
+            type: db.Sequelize.QueryTypes.SELECT,
+          },
+        );
+        if (rows?.[0]) bank = rows[0];
+      } catch (err) {
+        console.warn("resolveDepositAccountInfo bank_list_data:", err.message);
+      }
+    }
     if (bank) {
       const info = mapDepositAccountInfo(bank, "bank", paidThrough);
       if (info && !info.bank_name && info.bank_code && db.BankList) {
@@ -3825,22 +3844,28 @@ async function resolveDepositAccountInfo({
       },
       order: [["transaction_id", "ASC"]],
     });
-    if (bankLedger?.bank_account_id) {
-      return resolveDepositAccountInfo({
-        modeOfPayment: isCash ? "cash" : "bank",
-        bankAccountId: bankLedger.bank_account_id,
-        facilityId,
-      });
-    }
-    if (bankLedger?.account_code) {
-      return mapDepositAccountInfo(
-        {
-          code: bankLedger.account_code,
-          description: bankLedger.account_description,
-        },
-        isCash ? "cash" : "bank",
-        bankLedger.account_code,
-      );
+    if (bankLedger) {
+      const glBankId = bankLedger.bank_account_id
+        ? String(bankLedger.bank_account_id).trim()
+        : "";
+      if (glBankId && glBankId !== paidThrough) {
+        const fromGlBank = await resolveDepositAccountInfo({
+          modeOfPayment: isCash ? "cash" : "bank",
+          bankAccountId: glBankId,
+          facilityId,
+        });
+        if (fromGlBank) return fromGlBank;
+      }
+      if (bankLedger.account_code || bankLedger.account_description) {
+        return mapDepositAccountInfo(
+          {
+            code: bankLedger.account_code,
+            description: bankLedger.account_description,
+          },
+          isCash ? "cash" : "bank",
+          bankLedger.account_code,
+        );
+      }
     }
   }
 
