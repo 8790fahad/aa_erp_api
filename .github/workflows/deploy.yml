@@ -171,6 +171,39 @@ jobs:
             APP_PORT="$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
             APP_PORT="${APP_PORT:-42843}"
 
+            # node/npm come with the nvm Node. pm2 is a global package and is
+            # often installed under another Node version or the npm prefix this
+            # script strips so nvm can switch. Find that binary, or install it
+            # into the active Node, before any pm2 command (set -e would exit 127).
+            if ! command -v pm2 >/dev/null 2>&1; then
+              PM2_BIN=""
+              if [ -f "$HOME/.npmrc.bak-aa-erp-api-deploy" ]; then
+                OLD_PREFIX="$(grep -E '^prefix[[:space:]]*=' "$HOME/.npmrc.bak-aa-erp-api-deploy" | tail -1 | cut -d= -f2- | tr -d " \"'" || true)"
+                if [ -n "$OLD_PREFIX" ] && [ -x "$OLD_PREFIX/bin/pm2" ]; then
+                  PM2_BIN="$OLD_PREFIX/bin/pm2"
+                fi
+              fi
+              if [ -z "$PM2_BIN" ]; then
+                PM2_BIN="$(ls -1d "$NVM_DIR"/versions/node/v*/bin/pm2 2>/dev/null | sort -V | tail -1 || true)"
+              fi
+              for candidate in /usr/local/bin/pm2 /usr/bin/pm2 "$HOME/.npm-global/bin/pm2" "$HOME/.local/bin/pm2"; do
+                if [ -z "$PM2_BIN" ] && [ -x "$candidate" ]; then
+                  PM2_BIN="$candidate"
+                fi
+              done
+              if [ -n "$PM2_BIN" ] && [ -x "$PM2_BIN" ]; then
+                export PATH="$(dirname "$PM2_BIN"):$PATH"
+                hash -r || true
+                echo "Using existing pm2 at $PM2_BIN"
+              else
+                echo "pm2 not on PATH; installing it for the active Node ..."
+                npm install -g pm2
+                hash -r || true
+              fi
+            fi
+            command -v pm2
+            pm2 -v
+
             pm2 delete flowbooks >/dev/null 2>&1 || true
 
             if pm2 describe aa_erp_api >/dev/null 2>&1; then
