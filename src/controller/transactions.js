@@ -1759,7 +1759,7 @@ exports.getSaleByCode = async (req, res) => {
           .filter((id) => id && /^\d+$/.test(id)),
       ),
     ];
-    const bankNameById = {};
+    const bankById = {};
     if (bankIds.length && db.bank_account) {
       try {
         const banks = await db.bank_account.findAll({
@@ -1768,8 +1768,11 @@ exports.getSaleByCode = async (req, res) => {
           raw: true,
         });
         banks.forEach((b) => {
-          bankNameById[String(b.id)] =
-            b.account_name || b.bank_code || b.account_number || `Bank #${b.id}`;
+          bankById[String(b.id)] = {
+            bank_name:
+              b.account_name || b.bank_code || b.account_number || `Bank #${b.id}`,
+            account_number: b.account_number || null,
+          };
         });
       } catch (bankErr) {
         console.warn("getSaleByCode bank resolve:", bankErr.message);
@@ -1815,15 +1818,18 @@ exports.getSaleByCode = async (req, res) => {
           mode = modeRaw;
         }
         const bankId = String(p.bank_account_id || "").trim();
-        const bankName =
-          mode === "transfer" || mode === "bank" || mode === "cheque"
-            ? bankNameById[bankId] || null
-            : null;
+        const bank = bankById[bankId] || null;
+        const wantsBank =
+          mode === "transfer" ||
+          mode === "bank" ||
+          mode === "cheque" ||
+          mode === "card";
         return {
           mode,
           amount: Number(p.cost || p.amount_paid || 0),
           bank_account_id: bankId || null,
-          bank_name: bankName,
+          bank_name: wantsBank ? bank?.bank_name || null : null,
+          account_number: wantsBank ? bank?.account_number || null : null,
           description: p.description || null,
         };
       })
@@ -1846,6 +1852,14 @@ exports.getSaleByCode = async (req, res) => {
         paymentBreakdown
           .filter((p) => (p.mode === "transfer" || p.mode === "bank") && p.bank_name)
           .map((p) => p.bank_name),
+      ),
+    ];
+    const cardAccounts = [
+      ...new Set(
+        paymentBreakdown
+          .filter((p) => p.mode === "card")
+          .map((p) => p.account_number || p.bank_name)
+          .filter(Boolean),
       ),
     ];
 
@@ -2069,6 +2083,7 @@ exports.getSaleByCode = async (req, res) => {
         amount: cardPaid,
         bank_account_id: null,
         bank_name: null,
+        account_number: null,
         description: "Card",
       });
     }
@@ -2086,6 +2101,7 @@ exports.getSaleByCode = async (req, res) => {
       credit_paid: creditPaid,
       deposit_paid: depositPaid,
       transfer_banks: transferBanks,
+      card_accounts: cardAccounts,
       payment_breakdown: paymentBreakdown,
       invoice_total_amount:
         originalInvoiceFromWorkflow != null &&
@@ -2127,6 +2143,7 @@ exports.getSaleByCode = async (req, res) => {
         credit_paid: creditPaid,
         deposit_paid: depositPaid,
         transfer_banks: transferBanks,
+        card_accounts: cardAccounts,
         payment_breakdown: paymentBreakdown,
         invoice_total_amount: transaction.invoice_total_amount,
         transaction,
