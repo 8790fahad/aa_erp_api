@@ -449,6 +449,10 @@ module.exports = (app) => {
     account.updatePriceSetupResalableOnPurchase,
   );
   app.post(
+    "/account/update-filter-products-by-default-supplier/:enabled/:facilityId/:user_id",
+    account.updateFilterProductsByDefaultSupplier,
+  );
+  app.post(
     "/account/update-enable-production-correction/:enabled/:facilityId/:user_id",
     account.updateEnableProductionCorrection,
   );
@@ -797,6 +801,10 @@ module.exports = (app) => {
   app.post(
     "/account/supplier-advances-report",
     account.getSupplierAdvancesReport,
+  );
+  app.post(
+    "/account/supplier-balance-statement",
+    account.getSupplierBalanceStatement,
   );
   app.post(
     "/account/deposit-advance-ledger",

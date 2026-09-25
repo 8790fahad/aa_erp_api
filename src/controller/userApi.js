@@ -90,6 +90,7 @@ const _getBusinessProfile = async (
         "inv_ev_m",
         "default_valuation_source",
         "allow_sales_without_stock",
+        "filter_products_by_default_supplier",
         "paye_auto_calculation",
         "pro_bono_code",
         "valuation_date",

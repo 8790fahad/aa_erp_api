@@ -347,6 +347,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: false,
       },
+      /** When true, bills and goods received only offer products for the selected default supplier. */
+      filter_products_by_default_supplier: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
       paye_auto_calculation: {
         type: DataTypes.BOOLEAN,
         allowNull: false,

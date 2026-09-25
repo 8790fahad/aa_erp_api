@@ -11395,6 +11395,49 @@ exports.updatePriceSetupResalableOnPurchase = async (req, res) => {
   }
 };
 
+/** When on, product bills and goods received only list items for the selected default supplier. */
+exports.updateFilterProductsByDefaultSupplier = async (req, res) => {
+  try {
+    const { enabled, facilityId } = req.params;
+    const enableFlag =
+      enabled === "true" || enabled === "1" || enabled === "yes";
+
+    const [updatedRowsCount] = await db.business.update(
+      { filter_products_by_default_supplier: enableFlag },
+      { where: { id: facilityId }, returning: true },
+    );
+
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Filter products by default supplier ${
+        enableFlag ? "enabled" : "disabled"
+      }`,
+    });
+  } catch (err) {
+    console.error("Error updating filter_products_by_default_supplier:", err);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
 const parseEnableFlag = (enabled) =>
   enabled === "true" || enabled === "1" || enabled === "yes" || enabled === true;
 
@@ -19322,45 +19365,72 @@ exports.getPayableLedger = async (req, res) => {
       });
     }
 
-    // Build where clause for transaction_ref
-    // transaction_ref can be in format "supplierId" or "supplierId-xxx"
-    const whereClause = {
-      facility_id: facilityId,
-      transaction_date: {
-        [Op.between]: [fromDate, toDate],
-      },
-      [Op.or]: [
-        { transaction_ref: supplierId },
-        { transaction_ref: { [Op.like]: `${supplierId}-%` } },
-      ],
-    };
+    // Bills and the payments that settle those same bill numbers.
+    // Unmatched payments and supplier advances stay on the Advance ledger.
+    const apLineFilter = `
+      (
+        LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables')
+        OR (
+          LOWER(COALESCE(gl.type, '')) = 'payment'
+          AND EXISTS (
+            SELECT 1
+            FROM general_ledger bill
+            WHERE bill.facility_id = gl.facility_id
+              AND bill.reference_number = gl.reference_number
+              AND bill.reference_number IS NOT NULL
+              AND TRIM(bill.reference_number) <> ''
+              AND LOWER(COALESCE(bill.type, '')) IN ('payable', 'payables')
+              AND COALESCE(bill.cr, 0) > 0.0001
+              AND (
+                bill.transaction_ref = :supplierId
+                OR bill.transaction_ref LIKE CONCAT(:supplierId, '-%')
+              )
+          )
+        )
+      )
+    `;
+    const supplierRef = `
+      (gl.transaction_ref = :supplierId OR gl.transaction_ref LIKE CONCAT(:supplierId, '-%'))
+    `;
 
-    // Fetch transactions
-    const transactions = await GeneralLedger.findAll({
-      where: whereClause,
-      order: [
-        ["transaction_date", "ASC"],
-        ["created_at", "ASC"],
-      ],
-      raw: true,
-    });
-
-    // Calculate opening balance (transactions before fromDate)
-    const openingBalanceTxns = await GeneralLedger.findAll({
-      where: {
-        facility_id: facilityId,
-        transaction_date: { [Op.lt]: fromDate },
-        [Op.or]: [
-          { transaction_ref: supplierId },
-          { transaction_ref: { [Op.like]: `${supplierId}-%` } },
-        ],
+    const transactions = await db.sequelize.query(
+      `
+      SELECT
+        gl.transaction_date,
+        gl.reference_number,
+        gl.transaction_ref,
+        gl.dr,
+        gl.cr,
+        gl.transaction_description,
+        gl.purpose_of_payment,
+        gl.account_description
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND gl.transaction_date BETWEEN :fromDate AND :toDate
+        AND ${supplierRef}
+        AND ${apLineFilter}
+      ORDER BY gl.transaction_date ASC, gl.transaction_id ASC
+      `,
+      {
+        replacements: { facilityId, fromDate, toDate, supplierId },
+        type: QueryTypes.SELECT,
       },
-      order: [
-        ["transaction_date", "ASC"],
-        ["created_at", "ASC"],
-      ],
-      raw: true,
-    });
+    );
+
+    const openingBalanceTxns = await db.sequelize.query(
+      `
+      SELECT gl.dr, gl.cr
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND gl.transaction_date < :fromDate
+        AND ${supplierRef}
+        AND ${apLineFilter}
+      `,
+      {
+        replacements: { facilityId, fromDate, supplierId },
+        type: QueryTypes.SELECT,
+      },
+    );
 
     let openingBalance = 0;
     openingBalanceTxns.forEach((t) => {
@@ -19578,7 +19648,8 @@ exports.getReceivableLedger = async (req, res) => {
 /**
  * Party balances for customers + suppliers from general_ledger.
  * Customer A/R = SUM(dr)-SUM(cr) on type receivable (same as customers list).
- * Supplier A/P = SUM(dr)-SUM(cr) on type payable.
+ * Supplier A/P is the open amount on each bill. A payment reduces only the bill
+ * with the same reference. Unmatched payments are vendor advances.
  * Party keys match exact ref or suffix (CUS-1795 / CUS-1795-*).
  * DR (balance > 0) → receivables/debtors; CR (balance < 0) → payables/creditors.
  */
@@ -19629,19 +19700,32 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
         s.address,
         s.phone,
         s.email,
-        COALESCE((
-          SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
-          FROM general_ledger gl
-          WHERE gl.facility_id = :facilityId
-            AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
-            AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables')
-            AND (
-              gl.transaction_ref = s.supplier_number
-              OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')
-            )
-        ), 0) AS balance
+        COALESCE(SUM(open_ap.ref_net), 0) AS balance
       FROM suppliersinfo s
+      LEFT JOIN (
+        SELECT
+          gl.transaction_ref AS party_ref,
+          LEAST(
+            0,
+            COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+          ) AS ref_net
+        FROM general_ledger gl
+        WHERE gl.facility_id = :facilityId
+          AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+          AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
+          AND gl.transaction_ref IS NOT NULL
+          AND gl.transaction_ref != ''
+        GROUP BY gl.transaction_ref, gl.reference_number
+      ) open_ap
+        ON open_ap.party_ref = s.supplier_number
+        OR open_ap.party_ref LIKE CONCAT(s.supplier_number, '-%')
       WHERE s.facilityId = :facilityId
+      GROUP BY
+        s.supplier_number,
+        s.supplier_name,
+        s.address,
+        s.phone,
+        s.email
     ) parties
     WHERE ABS(COALESCE(balance, 0)) > 0.0001
     ORDER BY party_name ASC
@@ -19734,7 +19818,9 @@ exports.getDebtorsReport = async (req, res) => {
 /**
  * Single API: customers + suppliers split by ledger net.
  * Debtors / Receivables: net DR (SUM(dr)-SUM(cr) > 0).
- * Creditors / Payables: net CR (SUM(dr)-SUM(cr) < 0).
+ * Creditors / Payables: open supplier bills. A payment reduces only the
+ * bill with the same reference. Cash paid with no matching bill stays on
+ * the Advance Report.
  */
 exports.getDebtorsCreditorsCombinedReport = async (req, res) => {
   try {
@@ -19796,7 +19882,8 @@ exports.getDebtorsCreditorsCombinedReport = async (req, res) => {
  * Deposit Report / Advance Report pages.
  *
  * Customer deposit balance: GL type = 'deposit', SUM(cr) - SUM(dr) per party.
- * Supplier advance balance: GL type IN ('accrued', 'advance'), SUM(dr) - SUM(cr) per party.
+ * Supplier advance balance: GL type IN ('accrued', 'advance'), SUM(dr) - SUM(cr),
+ * plus payment debits that are not matched to a bill on the same reference.
  */
 async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
   const customerDepositRows = await db.sequelize.query(
@@ -19846,19 +19933,46 @@ async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
       s.address,
       s.phone,
       s.email,
-      COALESCE((
-        SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
-        FROM general_ledger gl
-        WHERE gl.facility_id = :facilityId
-          AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
-          AND LOWER(COALESCE(gl.type, '')) IN ('accrued', 'advance')
-          AND (
-            gl.transaction_ref = s.supplier_number
-            OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')
-          )
-      ), 0) AS balance
+      (
+        COALESCE((
+          SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+          FROM general_ledger gl
+          WHERE gl.facility_id = :facilityId
+            AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+            AND LOWER(COALESCE(gl.type, '')) IN ('accrued', 'advance')
+            AND (
+              gl.transaction_ref = s.supplier_number
+              OR gl.transaction_ref LIKE CONCAT(s.supplier_number, '-%')
+            )
+        ), 0)
+        + COALESCE(SUM(prepaid.ref_net), 0)
+      ) AS balance
     FROM suppliersinfo s
+    LEFT JOIN (
+      SELECT
+        gl.transaction_ref AS party_ref,
+        GREATEST(
+          0,
+          COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+        ) AS ref_net
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+        AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
+        AND gl.transaction_ref IS NOT NULL
+        AND gl.transaction_ref != ''
+      GROUP BY gl.transaction_ref, gl.reference_number
+    ) prepaid
+      ON prepaid.party_ref = s.supplier_number
+      OR prepaid.party_ref LIKE CONCAT(s.supplier_number, '-%')
     WHERE s.facilityId = :facilityId
+    GROUP BY
+      s.supplier_number,
+      s.supplier_name,
+      s.company_name,
+      s.address,
+      s.phone,
+      s.email
     HAVING balance > 0.0001
     ORDER BY party_name ASC
     `,
@@ -20104,18 +20218,40 @@ exports.getPartyDepositAdvanceLedger = async (req, res) => {
       });
     }
     const isSupplier = String(partyType).trim().toLowerCase() === "supplier";
-    const typeFilter = isSupplier ? "IN ('accrued', 'advance')" : "= 'deposit'";
+    const typeFilter = isSupplier
+      ? `IN ('accrued', 'advance')
+        OR (
+          LOWER(COALESCE(gl.type, '')) = 'payment'
+          AND COALESCE(gl.dr, 0) > 0.0001
+          AND NOT EXISTS (
+            SELECT 1
+            FROM general_ledger bill
+            WHERE bill.facility_id = gl.facility_id
+              AND bill.reference_number = gl.reference_number
+              AND bill.reference_number IS NOT NULL
+              AND TRIM(bill.reference_number) <> ''
+              AND LOWER(COALESCE(bill.type, '')) IN ('payable', 'payables')
+              AND COALESCE(bill.cr, 0) > 0.0001
+              AND (
+                bill.transaction_ref = :partyNo
+                OR bill.transaction_ref LIKE CONCAT(:partyNo, '-%')
+              )
+          )
+        )`
+      : "= 'deposit'";
     const from = fromDate ? moment(fromDate).format("YYYY-MM-DD") : null;
     const to = toDate ? moment(toDate).format("YYYY-MM-DD") : null;
 
     const openingRows = await db.sequelize.query(
       `
-      SELECT COALESCE(SUM(dr), 0) AS total_dr, COALESCE(SUM(cr), 0) AS total_cr
-      FROM general_ledger
-      WHERE facility_id = :facilityId
-        AND LOWER(COALESCE(type, '')) ${typeFilter}
-        AND (transaction_ref = :partyNo OR transaction_ref LIKE CONCAT(:partyNo, '-%'))
-        AND (:from IS NULL OR transaction_date < :from)
+      SELECT COALESCE(SUM(gl.dr), 0) AS total_dr, COALESCE(SUM(gl.cr), 0) AS total_cr
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND (
+          LOWER(COALESCE(gl.type, '')) ${typeFilter}
+        )
+        AND (gl.transaction_ref = :partyNo OR gl.transaction_ref LIKE CONCAT(:partyNo, '-%'))
+        AND (:from IS NULL OR gl.transaction_date < :from)
       `,
       {
         replacements: { facilityId, partyNo, from },
@@ -20131,19 +20267,21 @@ exports.getPartyDepositAdvanceLedger = async (req, res) => {
     const transactions = await db.sequelize.query(
       `
       SELECT
-        transaction_date,
-        reference_number,
-        transaction_ref,
-        dr,
-        cr,
-        COALESCE(transaction_description, account_description, purpose_of_payment, '') AS description
-      FROM general_ledger
-      WHERE facility_id = :facilityId
-        AND LOWER(COALESCE(type, '')) ${typeFilter}
-        AND (transaction_ref = :partyNo OR transaction_ref LIKE CONCAT(:partyNo, '-%'))
-        AND (:from IS NULL OR transaction_date >= :from)
-        AND (:to IS NULL OR transaction_date <= :to)
-      ORDER BY transaction_date ASC, transaction_id ASC
+        gl.transaction_date,
+        gl.reference_number,
+        gl.transaction_ref,
+        gl.dr,
+        gl.cr,
+        COALESCE(gl.transaction_description, gl.account_description, gl.purpose_of_payment, '') AS description
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND (
+          LOWER(COALESCE(gl.type, '')) ${typeFilter}
+        )
+        AND (gl.transaction_ref = :partyNo OR gl.transaction_ref LIKE CONCAT(:partyNo, '-%'))
+        AND (:from IS NULL OR gl.transaction_date >= :from)
+        AND (:to IS NULL OR gl.transaction_date <= :to)
+      ORDER BY gl.transaction_date ASC, gl.transaction_id ASC
       `,
       {
         replacements: { facilityId, partyNo, from, to },
@@ -20192,6 +20330,157 @@ exports.getPartyDepositAdvanceLedger = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error generating party ledger",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Printable supplier balance: advance already paid, open bills, and the net
+ * still payable after that advance. Same shape as the customer balance statement.
+ */
+exports.getSupplierBalanceStatement = async (req, res) => {
+  try {
+    const { facilityId, supplierNo, asAtDate } = req.body || {};
+    const supplierKey = String(supplierNo || "").trim();
+    if (!facilityId || !supplierKey) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and supplierNo are required",
+      });
+    }
+    const asAt = asAtDate || null;
+
+    const suppliers = await db.sequelize.query(
+      `
+      SELECT supplier_number, supplier_name, phone, address, email
+      FROM suppliersinfo
+      WHERE facilityId = :facilityId
+        AND supplier_number = :supplierNo
+      LIMIT 1
+      `,
+      {
+        replacements: { facilityId, supplierNo: supplierKey },
+        type: QueryTypes.SELECT,
+      },
+    );
+    const supplier = suppliers[0] || {
+      supplier_number: supplierKey,
+      supplier_name: supplierKey,
+      phone: "",
+      address: "",
+      email: "",
+    };
+
+    const advanceRows = await db.sequelize.query(
+      `
+      SELECT
+        (
+          COALESCE((
+            SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+            FROM general_ledger gl
+            WHERE gl.facility_id = :facilityId
+              AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+              AND LOWER(COALESCE(gl.type, '')) IN ('accrued', 'advance')
+              AND (
+                gl.transaction_ref = :supplierNo
+                OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
+              )
+          ), 0)
+          + COALESCE((
+            SELECT SUM(ref_net)
+            FROM (
+              SELECT GREATEST(
+                0,
+                COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+              ) AS ref_net
+              FROM general_ledger gl
+              WHERE gl.facility_id = :facilityId
+                AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+                AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
+                AND (
+                  gl.transaction_ref = :supplierNo
+                  OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
+                )
+                AND gl.reference_number IS NOT NULL
+                AND TRIM(gl.reference_number) <> ''
+              GROUP BY gl.reference_number
+            ) prepaid
+          ), 0)
+        ) AS advance
+      `,
+      {
+        replacements: { facilityId, supplierNo: supplierKey, asAtDate: asAt },
+        type: QueryTypes.SELECT,
+      },
+    );
+
+    const billRows = await db.sequelize.query(
+      `
+      SELECT
+        gl.reference_number,
+        MIN(gl.transaction_date) AS transaction_date,
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables') THEN COALESCE(gl.cr, 0)
+            ELSE 0
+          END
+        ) AS amount,
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(gl.type, '')) = 'payment' THEN COALESCE(gl.dr, 0)
+            ELSE 0
+          END
+        ) AS paid
+      FROM general_ledger gl
+      WHERE gl.facility_id = :facilityId
+        AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+        AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
+        AND (
+          gl.transaction_ref = :supplierNo
+          OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
+        )
+        AND gl.reference_number IS NOT NULL
+        AND TRIM(gl.reference_number) <> ''
+      GROUP BY gl.reference_number
+      HAVING amount > 0.0001 AND (amount - paid) > 0.0001
+      ORDER BY transaction_date ASC, gl.reference_number ASC
+      `,
+      {
+        replacements: { facilityId, supplierNo: supplierKey, asAtDate: asAt },
+        type: QueryTypes.SELECT,
+      },
+    );
+
+    const bills = billRows.map((row) => {
+      const amount = parseFloat(row.amount || 0) || 0;
+      const paid = parseFloat(row.paid || 0) || 0;
+      return {
+        reference: row.reference_number,
+        transactionDate: row.transaction_date,
+        amount,
+        paid,
+        due: Math.max(0, amount - paid),
+      };
+    });
+    const billsDue = bills.reduce((sum, row) => sum + row.due, 0);
+    const advance = parseFloat(advanceRows[0]?.advance || 0) || 0;
+
+    return res.json({
+      success: true,
+      data: {
+        supplier,
+        asAtDate: asAt,
+        advance,
+        billsDue,
+        bills,
+      },
+    });
+  } catch (error) {
+    console.error("Supplier balance statement error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error generating supplier balance statement",
       error: error.message,
     });
   }

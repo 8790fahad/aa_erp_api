@@ -530,6 +530,7 @@ exports.getNewProductList3 = async (req, res) => {
           "status",
           "image_url",
           "reorder_level",
+          "supplier_id",
           "created_at",
           "updated_at",
         ],
@@ -554,6 +555,7 @@ exports.getNewProductList3 = async (req, res) => {
       stock_quantity: product.get("available_balance"), // 👈 now correct
       item_type: product.item_type,
       status: product.status,
+      supplier_id: product.supplier_id || "",
       image_url: product.image_url,
       sales_description: product.sales_description,
       purchase_description: product.purchase_description,
