@@ -175,6 +175,60 @@ function emptyTillBucket() {
   return { cash: 0, card: 0, transfer: 0, lines: [] };
 }
 
+/** Till left after collections, spend, and a confirmed hand-in. */
+function retireAfterHandIn(collected, spent, handed) {
+  return money(Math.max(0, money(collected) - money(spent) - money(handed)));
+}
+
+/**
+ * Amounts already confirmed on Collection Reconciliation for the date range.
+ * Uses the greater of expected and received so a shortage still clears the till.
+ */
+async function loadHandedToSafe({
+  facilityId,
+  fromDate,
+  toDate,
+  cashierUserId = null,
+}) {
+  const empty = { cash: 0, card: 0, transfer: 0 };
+  if (!facilityId || !fromDate || !toDate) return empty;
+  const where = [
+    "facility_id = :facilityId",
+    "recon_date BETWEEN :fromDate AND :toDate",
+    "status IN ('confirmed', 'variance')",
+  ];
+  const replacements = {
+    facilityId: String(facilityId),
+    fromDate,
+    toDate,
+  };
+  if (cashierUserId) {
+    where.push("cashier_user_id = :cashierUserId");
+    replacements.cashierUserId = String(cashierUserId);
+  }
+  const sql = `SELECT
+         COALESCE(SUM(GREATEST(IFNULL(expected_cash, 0), IFNULL(received_cash, 0))), 0) AS cash,
+         COALESCE(SUM(GREATEST(IFNULL(expected_card, 0), IFNULL(received_card, 0))), 0) AS card,
+         COALESCE(SUM(GREATEST(IFNULL(expected_transfer, 0), IFNULL(received_transfer, 0))), 0) AS transfer
+       FROM collection_reconciliations
+       WHERE ${where.join(" AND ")}`;
+  try {
+    const rows = await db.sequelize.query(sql, {
+      replacements,
+      type: db.Sequelize.QueryTypes.SELECT,
+    });
+    const row = rows?.[0] || {};
+    return {
+      cash: money(row.cash),
+      card: money(row.card),
+      transfer: money(row.transfer),
+    };
+  } catch (err) {
+    console.warn("loadHandedToSafe:", err.message);
+    return empty;
+  }
+}
+
 /**
  * Imprest + Pay Bill spend for a till, optionally limited to one cashier.
  */
@@ -213,5 +267,7 @@ module.exports = {
   loadTillExpenses,
   loadTillPayBills,
   loadTillSpend,
+  loadHandedToSafe,
+  retireAfterHandIn,
   emptyTillBucket,
 };

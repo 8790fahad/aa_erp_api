@@ -118,8 +118,7 @@ module.exports = {
       "collection_reconciliations",
       ["facility_id", "recon_date", "cashier_user_id", "branch_id"],
       {
-        unique: true,
-        name: "collection_recon_facility_date_cashier_branch_uq",
+        name: "collection_recon_facility_date_cashier_branch",
       },
     );
     await queryInterface.addIndex("collection_reconciliations", ["facility_id", "recon_date"], {

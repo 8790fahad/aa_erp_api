@@ -268,7 +268,7 @@ exports.getInventoryValuationReport = async (req, res) => {
           END AS avco_cost
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           AND (
             (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
@@ -276,8 +276,8 @@ exports.getInventoryValuationReport = async (req, res) => {
           )
           ${warehouseJoinSql}
         LEFT JOIN suppliersinfo s
-          ON p.supplier_id = s.supplier_number
-          AND p.facility_id = s.facilityId
+          ON ${skuEq("p.supplier_id", "s.supplier_number")}
+          AND ${skuEq("p.facility_id", "s.facilityId")}
         WHERE p.facility_id = :facilityId
           AND p.item_type = 'Raw Material'
           ${productWhereSql}
@@ -329,7 +329,7 @@ exports.getInventoryValuationReport = async (req, res) => {
           MAX(se.expiry_date) AS expiry_date
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           AND (
             (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
@@ -1573,7 +1573,7 @@ async function queryRawMaterialsInventory({
           END AS avco_cost
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           AND ${warehouseSql}
         WHERE p.facility_id = :facilityId
@@ -1652,7 +1652,7 @@ async function queryRawMaterialsInventory({
           ), 0) AS stock_qty
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           AND ${warehouseSql}
         WHERE p.facility_id = :facilityId
@@ -1807,7 +1807,7 @@ async function queryFinishedGoodsInventory({
           MAX(se.expiry_date) AS expiry_date
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           ${branchFilter}
         ${locationJoin}
@@ -1912,7 +1912,7 @@ async function queryFinishedGoodsInventory({
           MAX(se.expiry_date) AS expiry_date
         FROM products p
         LEFT JOIN store_entries se
-          ON se.product_id = p.sku
+          ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           ${branchFilter}
         ${locationJoin}

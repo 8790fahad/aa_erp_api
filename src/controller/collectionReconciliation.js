@@ -33,6 +33,17 @@ function branchClause(branchIdKey = "branchId") {
   return `AND (:${branchIdKey} = 0 OR ce.branch_id = :${branchIdKey})`;
 }
 
+function isLockedStatus(status) {
+  return status === "confirmed" || status === "variance";
+}
+
+/** Amount already taken off the till by a confirmed hand-in order. */
+function clearedMode(row, mode) {
+  const expected = Number(row[`expected_${mode}`]) || 0;
+  const received = Number(row[`received_${mode}`]) || 0;
+  return Math.max(expected, received);
+}
+
 function displayName(user) {
   if (!user) return null;
   return (
@@ -334,6 +345,32 @@ async function loadCreditAndDepositByCashier(facilityId, reconDate, branchId) {
     c.deposit = money(c.deposit);
   });
   return byCashier;
+}
+
+let reconOrdersReady = false;
+async function ensureReconOrders() {
+  if (reconOrdersReady) return;
+  try {
+    const rows = await db.sequelize.query(
+      `SELECT INDEX_NAME AS name
+       FROM INFORMATION_SCHEMA.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'collection_reconciliations'
+         AND INDEX_NAME = 'collection_recon_facility_date_cashier_branch_uq'
+         AND NON_UNIQUE = 0
+       LIMIT 1`,
+      { type: db.Sequelize.QueryTypes.SELECT },
+    );
+    if (rows?.length) {
+      await db.sequelize.query(
+        `ALTER TABLE collection_reconciliations
+         DROP INDEX collection_recon_facility_date_cashier_branch_uq`,
+      );
+    }
+    reconOrdersReady = true;
+  } catch (err) {
+    console.warn("ensureReconOrders:", err.message);
+  }
 }
 
 let cardColumnsReady = false;
@@ -679,6 +716,7 @@ exports.getSummary = async (req, res) => {
 
     await ensureCardColumns();
     await ensureCashSafeColumns();
+    await ensureReconOrders();
     const { expectedMap } = await expectedAfterExpenses(
       facilityId,
       reconDate,
@@ -696,9 +734,19 @@ exports.getSummary = async (req, res) => {
         branch_id: branchId,
       },
     });
-    const savedByCashier = {};
+    const priorByCashier = {};
     saved.forEach((row) => {
-      savedByCashier[String(row.cashier_user_id)] = row.toJSON();
+      const j = row.toJSON();
+      const id = String(j.cashier_user_id);
+      if (!priorByCashier[id]) {
+        priorByCashier[id] = { cash: 0, card: 0, transfer: 0, locked: null };
+      }
+      if (!isLockedStatus(j.status)) return;
+      const bucket = priorByCashier[id];
+      bucket.cash = money(bucket.cash + clearedMode(j, "cash"));
+      bucket.card = money(bucket.card + clearedMode(j, "card"));
+      bucket.transfer = money(bucket.transfer + clearedMode(j, "transfer"));
+      bucket.locked = j;
     });
 
     const cashierRoleUsers = await loadCashierRoleUsers(facilityId);
@@ -714,7 +762,7 @@ exports.getSummary = async (req, res) => {
     // confirmation for this date — not every Cashier-role user.
     const cashierIds = new Set([
       ...Object.keys(expectedMap),
-      ...Object.keys(savedByCashier),
+      ...Object.keys(priorByCashier),
       ...Object.keys(creditDepositMap),
     ]);
     const nameMap = await resolveUserNames([...cashierIds]);
@@ -728,7 +776,18 @@ exports.getSummary = async (req, res) => {
           expected_transfer: 0,
           expected_total: 0,
         };
-        const recon = savedByCashier[id] || null;
+        const prior = priorByCashier[id] || null;
+        const liveCash = money(expected.expected_cash);
+        const liveCard = money(expected.expected_card);
+        const liveTransfer = money(expected.expected_transfer);
+        const openCash = money(Math.max(0, liveCash - (prior?.cash || 0)));
+        const openCard = money(Math.max(0, liveCard - (prior?.card || 0)));
+        const openTransfer = money(
+          Math.max(0, liveTransfer - (prior?.transfer || 0)),
+        );
+        const openTotal = money(openCash + openCard + openTransfer);
+        const hasOpen = openTotal > 0.05;
+        const recon = hasOpen ? null : prior?.locked || null;
         const cashierName =
           recon?.cashier_name ||
           cashierRoleNameMap[id] ||
@@ -747,15 +806,12 @@ exports.getSummary = async (req, res) => {
           expenses_cash: money(expected.expenses_cash),
           expenses_card: money(expected.expenses_card),
           expenses_transfer: money(expected.expenses_transfer),
-          expected_cash: money(expected.expected_cash),
-          expected_card: money(expected.expected_card),
-          expected_transfer: money(expected.expected_transfer),
-          expected_total: money(
-            expected.expected_total ||
-              (Number(expected.expected_cash) || 0) +
-                (Number(expected.expected_card) || 0) +
-                (Number(expected.expected_transfer) || 0),
-          ),
+          expected_cash: hasOpen ? openCash : money(recon?.expected_cash),
+          expected_card: hasOpen ? openCard : money(recon?.expected_card),
+          expected_transfer: hasOpen
+            ? openTransfer
+            : money(recon?.expected_transfer),
+          expected_total: hasOpen ? openTotal : money(recon?.expected_total),
           credit_total: money(creditDeposit.credit),
           deposit_total: money(creditDeposit.deposit),
           received_cash: recon ? money(recon.received_cash) : null,
@@ -766,7 +822,7 @@ exports.getSummary = async (req, res) => {
           variance_card: recon ? money(recon.variance_card) : null,
           variance_transfer: recon ? money(recon.variance_transfer) : null,
           variance_total: recon ? money(recon.variance_total) : null,
-          status: recon?.status || "open",
+          status: hasOpen ? "open" : recon?.status || "open",
           note: recon?.note || null,
           confirmed_by: recon?.confirmed_by || null,
           confirmed_by_name: recon?.confirmed_by_name || null,
@@ -1093,7 +1149,7 @@ exports.getCashierLines = async (req, res) => {
 
 /**
  * GET /api/v1/collection-reconciliation/history
- * Cash-to-safe moves and shortage postings.
+ * Confirmed hand-ins, including cash moved to Safe and POS / transfer.
  */
 exports.getHistory = async (req, res) => {
   try {
@@ -1125,11 +1181,7 @@ exports.getHistory = async (req, res) => {
     const where = {
       facility_id: String(facilityId),
       recon_date: { [db.Sequelize.Op.between]: [fromDate, toDate] },
-      [db.Sequelize.Op.or]: [
-        { cash_transfer_id: { [db.Sequelize.Op.ne]: null } },
-        { cash_to_safe_amount: { [db.Sequelize.Op.gt]: 0 } },
-        { shortage_amount: { [db.Sequelize.Op.ne]: 0 } },
-      ],
+      status: { [db.Sequelize.Op.in]: ["confirmed", "variance"] },
     };
     if (branchId) where.branch_id = branchId;
 
@@ -1147,7 +1199,11 @@ exports.getHistory = async (req, res) => {
       return {
         ...j,
         expected_cash: money(j.expected_cash),
+        expected_card: money(j.expected_card),
+        expected_transfer: money(j.expected_transfer),
         received_cash: money(j.received_cash),
+        received_card: money(j.received_card),
+        received_transfer: money(j.received_transfer),
         cash_to_safe_amount: money(j.cash_to_safe_amount),
         shortage_amount: money(j.shortage_amount),
         variance_cash: money(j.variance_cash),
@@ -1225,6 +1281,7 @@ exports.confirmHandIn = async (req, res) => {
 
     await ensureCardColumns();
     await ensureCashSafeColumns();
+    await ensureReconOrders();
     const { expectedMap } = await expectedAfterExpenses(
       facilityId,
       reconDate,
@@ -1239,9 +1296,36 @@ exports.confirmHandIn = async (req, res) => {
     const nameMap = await resolveUserNames([cashierUserId, confirmedBy]);
     const cashierName = nameMap[cashierUserId] || cashierUserId;
 
-    const expectedCash = money(expected.expected_cash);
-    const expectedCard = money(expected.expected_card);
-    const expectedTransfer = money(expected.expected_transfer);
+    const priorRows = await db.CollectionReconciliation.findAll({
+      where: {
+        facility_id: String(facilityId),
+        recon_date: reconDate,
+        cashier_user_id: cashierUserId,
+        branch_id: branchId,
+      },
+    });
+    const lockedRows = priorRows.filter((row) => isLockedStatus(row.status));
+    const draftRow =
+      priorRows.find((row) => !isLockedStatus(row.status)) || null;
+    const priorCash = money(
+      lockedRows.reduce((sum, row) => sum + clearedMode(row, "cash"), 0),
+    );
+    const priorCard = money(
+      lockedRows.reduce((sum, row) => sum + clearedMode(row, "card"), 0),
+    );
+    const priorTransfer = money(
+      lockedRows.reduce((sum, row) => sum + clearedMode(row, "transfer"), 0),
+    );
+
+    const expectedCash = money(
+      Math.max(0, money(expected.expected_cash) - priorCash),
+    );
+    const expectedCard = money(
+      Math.max(0, money(expected.expected_card) - priorCard),
+    );
+    const expectedTransfer = money(
+      Math.max(0, money(expected.expected_transfer) - priorTransfer),
+    );
     const expectedTotal = money(expectedCash + expectedCard + expectedTransfer);
     const receivedTotal = money(receivedCash + receivedCard + receivedTransfer);
     const varianceCash = money(receivedCash - expectedCash);
@@ -1306,30 +1390,14 @@ exports.confirmHandIn = async (req, res) => {
       }
     }
 
-    const existing = await db.CollectionReconciliation.findOne({
-      where: {
-        facility_id: String(facilityId),
-        recon_date: reconDate,
-        cashier_user_id: cashierUserId,
-        branch_id: branchId,
-      },
-    });
+    if (expectedTotal <= 0.05) {
+      return res.status(409).json({
+        success: false,
+        message: "This hand-in is already on History",
+      });
+    }
 
-    if (existing?.cash_transfer_id) {
-      return res.status(409).json({
-        success: false,
-        message: "Cash for this cashier has already been moved to Safe",
-      });
-    }
-    if (
-      existing &&
-      (existing.status === "confirmed" || existing.status === "variance")
-    ) {
-      return res.status(409).json({
-        success: false,
-        message: "This cashier hand-in is already confirmed",
-      });
-    }
+    const existing = draftRow;
 
     const t = await db.sequelize.transaction();
     try {

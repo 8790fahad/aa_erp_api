@@ -92,6 +92,10 @@ module.exports = (app) => {
     "/api/v1/apply-customer-advance",
     customer.applyCustomerAdvanceToInvoices,
   );
+  app.post(
+    "/api/v1/reverse-customer-deposit",
+    customer.reverseCustomerDeposit,
+  );
   app.get(
     "/api/v1/get-customer-nos-by-branch",
     customer.getCustomerNosByBranch

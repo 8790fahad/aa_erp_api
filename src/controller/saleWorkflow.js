@@ -4,6 +4,8 @@ const moment = require("moment");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const {
   loadTillSpend,
+  loadHandedToSafe,
+  retireAfterHandIn,
   money: tillMoney,
   classifyCollectionMode,
 } = require("../utils/tillCollections");
@@ -2644,6 +2646,13 @@ exports.getTillReport = async (req, res) => {
     const payBillTotal = tillMoney(
       payBillLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
     );
+    const handed = await loadHandedToSafe({
+      facilityId,
+      fromDate: histFrom,
+      toDate: histTo,
+      cashierUserId: cashierUserId || null,
+    });
+    const handedTotal = tillMoney(handed[mode] || 0);
 
     return res.json({
       success: true,
@@ -2663,8 +2672,11 @@ exports.getTillReport = async (req, res) => {
           total: payBillTotal,
           lines: withNames(payBillLines),
         },
-        retire: tillMoney(
-          Math.max(0, collectedTotal - imprestTotal - payBillTotal),
+        handed_to_safe: handedTotal,
+        retire: retireAfterHandIn(
+          collectedTotal,
+          imprestTotal + payBillTotal,
+          handedTotal,
         ),
       },
     });
@@ -3474,10 +3486,29 @@ exports.getCashierDashboard = async (req, res) => {
     const expenses_cash = tillMoney(tillSpend.cash);
     const expenses_card = tillMoney(tillSpend.card);
     const expenses_transfer = tillMoney(tillSpend.transfer);
-    const retire_cash = tillMoney(Math.max(0, collected_cash - expenses_cash));
-    const retire_card = tillMoney(Math.max(0, collected_card - expenses_card));
-    const retire_transfer = tillMoney(
-      Math.max(0, collected_transfer - expenses_transfer),
+    const handed = await loadHandedToSafe({
+      facilityId,
+      fromDate: histFrom,
+      toDate: histTo,
+      cashierUserId: cashierUserId || null,
+    });
+    const handed_cash = tillMoney(handed.cash);
+    const handed_card = tillMoney(handed.card);
+    const handed_transfer = tillMoney(handed.transfer);
+    const retire_cash = retireAfterHandIn(
+      collected_cash,
+      expenses_cash,
+      handed_cash,
+    );
+    const retire_card = retireAfterHandIn(
+      collected_card,
+      expenses_card,
+      handed_card,
+    );
+    const retire_transfer = retireAfterHandIn(
+      collected_transfer,
+      expenses_transfer,
+      handed_transfer,
     );
 
     // Credit invoices approved today (left awaiting_credit_approval)
@@ -3800,6 +3831,9 @@ exports.getCashierDashboard = async (req, res) => {
           pay_bills_cash_today: pay_bills_cash,
           pay_bills_card_today: pay_bills_card,
           pay_bills_transfer_today: pay_bills_transfer,
+          handed_cash_today: handed_cash,
+          handed_card_today: handed_card,
+          handed_transfer_today: handed_transfer,
           retire_cash_today: retire_cash,
           retire_card_today: retire_card,
           retire_transfer_today: retire_transfer,

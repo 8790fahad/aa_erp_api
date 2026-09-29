@@ -210,7 +210,7 @@ exports.getReceivedPaymentHistory = async (req, res) => {
       "ce.facilityId = :facilityId",
       "ce.type = 'deposit'",
       "ce.cost > 0",
-      "(ce.receiptNo LIKE 'AD-%' OR ce.receiptNo LIKE 'AA-%')",
+      "(ce.receiptNo LIKE 'AD-%' OR ce.receiptNo LIKE 'AA-%' OR ce.receiptNo LIKE 'RD-%')",
     ];
 
     if (branchId && String(branchId).trim() && String(branchId) !== "all") {
@@ -320,10 +320,12 @@ exports.getReceivedPaymentHistory = async (req, res) => {
       const linkId = String(e.link_id || "").trim();
       const mode = String(e.mode_of_payment || "").trim();
       const desc = String(e.description || "");
+      const isReversed = /^RD[-_]/i.test(receiptNo);
       const isApplied =
-        /^AA[-_]/i.test(receiptNo) ||
-        mode.toUpperCase() === "ADVANCE" ||
-        /advance applied/i.test(desc);
+        !isReversed &&
+        (/^AA[-_]/i.test(receiptNo) ||
+          mode.toUpperCase() === "ADVANCE" ||
+          /advance applied/i.test(desc));
       const invoiceRef =
         /^INV[-_]/i.test(linkId)
           ? linkId
@@ -349,8 +351,12 @@ exports.getReceivedPaymentHistory = async (req, res) => {
         branch_name: e.branch_name || "",
         link_id: linkId,
         invoice_ref: invoiceRef,
-        direction: isApplied ? "applied" : "received",
-        status_label: isApplied ? "Deposit applied" : "Received",
+        direction: isReversed ? "reversed" : isApplied ? "applied" : "received",
+        status_label: isReversed
+          ? "Reversed"
+          : isApplied
+            ? "Deposit applied"
+            : "Received",
       };
     });
 
@@ -2800,6 +2806,272 @@ export const createDeposit = async (req, res) => {
         status === 400
           ? error.message
           : "Failed to create deposit",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+};
+
+/**
+ * Pay a received customer deposit back.
+ * Dr customer deposit (reduces available advance), Cr cash or bank.
+ * POST /api/v1/reverse-customer-deposit
+ */
+exports.reverseCustomerDeposit = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    customer_no,
+    amount,
+    mode_of_payment,
+    transaction_date,
+    narration,
+    accountHead,
+    bankAccount,
+    branchId = null,
+  } = req.body;
+
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!customer_no) {
+    return res.status(400).json({ success: false, error: "customer_no is required" });
+  }
+
+  const mode = String(mode_of_payment || "").toLowerCase().trim();
+  if (mode !== "cash" && mode !== "transfer") {
+    return res.status(400).json({
+      success: false,
+      error: "mode_of_payment must be cash or transfer",
+    });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(transaction_date || new Date(), {
+      field: "transaction_date",
+    });
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+
+  try {
+    const customer = await Customer.findOne({
+      where: { customerNo: customer_no, facilityId },
+    });
+    if (!customer) {
+      return res.status(404).json({ success: false, error: "Customer not found" });
+    }
+    const customerName = customer.fullname || customer_no;
+
+    const balRows = await db.sequelize.query(
+      `SELECT COALESCE(SUM(cr) - SUM(dr), 0) AS available_deposit
+       FROM general_ledger
+       WHERE LOWER(type) = 'deposit'
+         AND facility_id = :facilityId
+         AND (
+           transaction_ref = :customerNo
+           OR transaction_ref LIKE CONCAT(:customerNo, '-%')
+         )`,
+      {
+        replacements: { facilityId, customerNo: customer_no },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    const availableDeposit = Math.max(
+      0,
+      parseFloat(balRows[0]?.available_deposit) || 0,
+    );
+    const reverseAmount = parseAmount(amount);
+
+    if (availableDeposit <= 0.009) {
+      return res.status(400).json({
+        success: false,
+        error: "This customer has no available deposit to reverse.",
+        available_deposit: 0,
+      });
+    }
+    if (reverseAmount == null || reverseAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Enter an amount to reverse",
+        available_deposit: availableDeposit,
+      });
+    }
+    if (reverseAmount > availableDeposit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Amount cannot exceed the available deposit of ₦${availableDeposit.toLocaleString()}.`,
+        available_deposit: availableDeposit,
+      });
+    }
+
+    const depositCode = customer.receivable_accural_code;
+    if (!depositCode) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "This customer has no deposit account. Set the deposit account on the customer record first.",
+      });
+    }
+    const depositAccount = await db.AccountCategory.findOne({
+      where: { code: depositCode, facility_id: facilityId },
+    });
+    if (!depositAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Deposit account not found: ${depositCode}`,
+      });
+    }
+
+    let codeData = null;
+    let bankAccountId = null;
+    if (mode === "cash") {
+      const head = accountHead?.head || accountHead?.code;
+      if (!head) {
+        return res.status(400).json({
+          success: false,
+          error: "Select a cash account",
+        });
+      }
+      codeData = { head };
+    } else {
+      if (!bankAccount?.id) {
+        return res.status(400).json({
+          success: false,
+          error: "Select a bank account",
+        });
+      }
+      const getBankAccount = await db.bank_account.findOne({
+        where: { id: bankAccount.id, facilityId, status: "active" },
+      });
+      if (!getBankAccount) {
+        return res.status(404).json({
+          success: false,
+          error: "Bank account not found or inactive",
+        });
+      }
+      codeData = { head: getBankAccount.head };
+      bankAccountId = getBankAccount.id;
+    }
+
+    const cashBankAccount = await db.AccountCategory.findOne({
+      where: { code: codeData.head, facility_id: facilityId },
+    });
+    if (!cashBankAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Cash/Bank account not found: ${codeData.head}`,
+      });
+    }
+
+    const reverseBranchId = (() => {
+      if (branchId == null || branchId === "" || branchId === "all") return null;
+      const n = parseInt(branchId, 10);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    })();
+
+    const note =
+      String(narration || "").trim() ||
+      `Reverse deposit — ${customerName}`;
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const payee = String(customerName).slice(0, 50);
+
+    const result = await db.sequelize.transaction(async (t) => {
+      const referenceNumber = `RD-${await getAndUpdateNumber("RD", facilityId, t)}`;
+
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: depositAccount.code,
+          account_subhead:
+            depositAccount.subhead || depositAccount.parent_code || 0,
+          dr: reverseAmount,
+          cr: 0,
+          account_description: depositAccount.description,
+          transaction_description: note,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Reverse deposit",
+          payee,
+          mode_of_payment: mode,
+          bank_account_id: bankAccountId,
+          created_by: userId,
+          facility_id: facilityId,
+          branch_id: reverseBranchId,
+          status: "posted",
+          type: "deposit",
+          transaction_ref: customer_no,
+        },
+        { transaction: t },
+      );
+
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: cashBankAccount.code,
+          account_subhead: cashBankAccount.parent_code || 0,
+          dr: 0,
+          cr: reverseAmount,
+          account_description:
+            accountHead?.description || cashBankAccount.description,
+          transaction_description: note,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Reverse deposit",
+          payee,
+          mode_of_payment: mode,
+          bank_account_id: bankAccountId,
+          created_by: userId,
+          facility_id: facilityId,
+          branch_id: reverseBranchId,
+          status: "posted",
+          type: "bank",
+          transaction_ref: "",
+        },
+        { transaction: t },
+      );
+
+      await CustomerEntry.create(
+        {
+          customerNo: customer_no,
+          description: note.slice(0, 255),
+          qty_in: 0,
+          qty_out: 0,
+          cost: reverseAmount,
+          amount_paid: reverseAmount,
+          facilityId,
+          branch_id: reverseBranchId,
+          link_id: "",
+          mode_of_payment: mode,
+          type: "deposit",
+          receiptNo: referenceNumber,
+          bank_account_id: bankAccountId || codeData.head || "",
+          created_by: userId,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+
+      return {
+        reference_number: referenceNumber,
+        amount: reverseAmount,
+        available_deposit: Number((availableDeposit - reverseAmount).toFixed(2)),
+      };
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `${result.reference_number} reversed ₦${Number(result.amount).toLocaleString()} of ${customerName}'s deposit.`,
+      data: result,
+    });
+  } catch (error) {
+    console.error("Error reversing customer deposit:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to reverse deposit",
       details:
         process.env.NODE_ENV === "development" ? error.message : undefined,
     });
