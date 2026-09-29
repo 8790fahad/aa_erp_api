@@ -65,7 +65,9 @@ function getItemExplicitLineDiscount(itm, lineTotal) {
   const mode = String(itm.line_discount_mode || itm.line_discount_type || "")
     .toLowerCase();
   if (mode === "flat" || mode === "fixed" || mode === "ngn") {
-    return Math.min(lineTotal, Number(raw.toFixed(2)));
+    const qty = Number(itm.quantity_sold ?? itm.quantity ?? itm.qty_out) || 0;
+    const extended = qty > 0 ? raw * qty : raw;
+    return Math.min(lineTotal, Number(extended.toFixed(2)));
   }
   return Math.min(lineTotal, Number(((lineTotal * Math.min(raw, 100)) / 100).toFixed(2)));
 }
@@ -4883,11 +4885,16 @@ exports.createSale = async (req, res) => {
             : `Sales revenue [${pcode}] – ${product.name} (after line discount)`;
         }
 
+        // Revenue is measured before the discount. The discount is its own
+        // debit, so the customer balance stays at the invoice total.
+        const revenueCredit = Number(
+          (revenueAmount + itemDiscount).toFixed(2),
+        );
         ledgerEntries.push(
           createLedgerEntry(
             revenueAccount,
             0,
-            revenueAmount,
+            revenueCredit,
             "revenue",
             revenueDesc,
             pcode
@@ -5275,37 +5282,8 @@ exports.createSale = async (req, res) => {
         )
       );
 
-      // Cr A/R for discount (to reduce A/R for discount amount)
-      // This is the other leg of the discount entry - MUST happen
-      const discountItemNames = itemDetails
-        .filter((item) => !item.isProBono)
-        .map((item) => {
-          const name = item.product?.name || item.item?.item_name || "";
-          const pcode = item.product
-            ? productCodeLabel(item.product, item.sku)
-            : "";
-          if (name && pcode) return `${name} [${pcode}]`;
-          return name || pcode || "";
-        })
-        .filter(Boolean)
-        .slice(0, 3)
-        .join(", ");
-      const discountDescription = discountItemNames
-        ? `Discount to AR [${customerCodeLabel}] — ${discountItemNames}${
-            itemDetails.filter((i) => !i.isProBono).length > 3 ? "..." : ""
-          }`
-        : `Discount to AR [${customerCodeLabel}] — ${saleRef}`;
-
-      ledgerEntries.push(
-        createLedgerEntry(
-          receivableAccount,
-          0,
-          discount_amount,
-          "receivable",
-          discountDescription,
-          customerCodeLabel
-        )
-      );
+      // Receivables is already the invoice total after discount.
+      // Crediting it again would take the discount off the customer twice.
 
       // Create CustomerEntry for discount tracking
       await db.CustomerEntry.create(
