@@ -502,6 +502,7 @@ module.exports = (app) => {
 
   app.get("/account/get-account-head/:head/:facilityId", account.getAccByHead);
   app.get("/account/get-expense-bill", account.getExpenseBill);
+  app.post("/account/update-purchase-bill-costs", account.updatePurchaseBillCosts);
   app.post("/account/generate-good-receive", generateGoodReceive);
   app.post("/account/purchase-stock", account.directPurchaseConsumables);
   app.post("/account/post-bulk-production", account.completeProduction);

@@ -15879,6 +15879,304 @@ exports.getExpenseBill = async (req, res) => {
   }
 };
 
+function money2(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+/**
+ * Change unit costs on a posted product purchase bill (PB-…).
+ * Updates the supplier line, the stock receipt, the purchase ledger,
+ * the supplier payable, and sales that were costed at the old unit price.
+ */
+exports.updatePurchaseBillCosts = async (req, res) => {
+  const facilityId = req.body?.facilityId;
+  const invoiceRef = String(req.body?.invoice_ref || "").trim();
+  const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+
+  if (!facilityId || !invoiceRef) {
+    return res.status(400).json({
+      success: false,
+      message: "facilityId and invoice_ref are required",
+    });
+  }
+  if (!lines.length) {
+    return res.status(400).json({
+      success: false,
+      message: "At least one line cost is required",
+    });
+  }
+
+  const transaction = await db.sequelize.transaction();
+  try {
+    const invoice = await db.Invoice.findOne({
+      where: {
+        invoice_ref: invoiceRef,
+        facility_id: facilityId,
+        type: "purchase",
+      },
+      transaction,
+    });
+    if (!invoice) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Purchase bill not found",
+      });
+    }
+
+    let billDelta = 0;
+    let payableDelta = 0;
+    const saleRestatements = [];
+
+    for (const line of lines) {
+      const sku = String(line?.sku || "").trim();
+      const newCost = money2(line?.cost);
+      if (!sku || sku === "N/A" || !(newCost >= 0)) continue;
+
+      const supplierLines = await db.sequelize.query(
+        `SELECT entry_id, cost, qty_out, qty_in, description, link_id
+         FROM supplier_entries
+         WHERE receiptNo = :invoiceRef
+           AND facilityId = :facilityId
+           AND type = 'purchase'
+           AND link_id = :sku`,
+        {
+          type: db.sequelize.QueryTypes.SELECT,
+          replacements: { invoiceRef, facilityId, sku },
+          transaction,
+        },
+      );
+      if (!supplierLines.length) continue;
+
+      const qty = supplierLines.reduce(
+        (sum, entry) => sum + Number(entry.qty_out || entry.qty_in || 0),
+        0,
+      );
+      const oldCost = money2(supplierLines[0].cost);
+      if (oldCost === newCost) continue;
+
+      billDelta = money2(billDelta + (newCost - oldCost) * qty);
+
+      for (const entry of supplierLines) {
+        await db.sequelize.query(
+          `UPDATE supplier_entries SET cost = :newCost WHERE entry_id = :entryId`,
+          {
+            replacements: { newCost, entryId: entry.entry_id },
+            transaction,
+          },
+        );
+      }
+
+      await db.sequelize.query(
+        `UPDATE store_entries
+         SET cost_price = :newCost
+         WHERE facilityId = :facilityId
+           AND reference_number = :invoiceRef
+           AND product_id = :sku
+           AND qty_in > 0`,
+        {
+          replacements: { newCost, facilityId, invoiceRef, sku },
+          transaction,
+        },
+      );
+
+      const productRows = await db.sequelize.query(
+        `SELECT name FROM products
+         WHERE facility_id = :facilityId AND sku = :sku
+         LIMIT 1`,
+        {
+          type: db.sequelize.QueryTypes.SELECT,
+          replacements: { facilityId, sku },
+          transaction,
+        },
+      );
+      const productName = productRows[0]?.name || supplierLines[0].description || sku;
+      const glRows = await db.sequelize.query(
+        `SELECT transaction_id, dr
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND reference_number = :invoiceRef
+           AND dr > 0
+           AND LOWER(transaction_description) LIKE LOWER(:desc)`,
+        {
+          type: db.sequelize.QueryTypes.SELECT,
+          replacements: {
+            facilityId,
+            invoiceRef,
+            desc: `purchase of ${productName}%`,
+          },
+          transaction,
+        },
+      );
+
+      if (!glRows.length) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `No purchase ledger line was found for ${productName} on ${invoiceRef}, so the cost was left unchanged.`,
+        });
+      }
+
+      const targetDr = money2(qty * newCost);
+      const currentDr = money2(glRows.reduce((sum, row) => sum + Number(row.dr || 0), 0));
+      if (glRows.length === 1) {
+        await db.sequelize.query(
+          `UPDATE general_ledger SET dr = :targetDr WHERE transaction_id = :transactionId`,
+          {
+            replacements: { targetDr, transactionId: glRows[0].transaction_id },
+            transaction,
+          },
+        );
+        payableDelta = money2(payableDelta + (targetDr - currentDr));
+      } else if (glRows.length > 1 && currentDr > 0) {
+        let assigned = 0;
+        for (let i = 0; i < glRows.length; i += 1) {
+          const row = glRows[i];
+          const next =
+            i === glRows.length - 1
+              ? money2(targetDr - assigned)
+              : money2((Number(row.dr) / currentDr) * targetDr);
+          assigned = money2(assigned + next);
+          await db.sequelize.query(
+            `UPDATE general_ledger SET dr = :next WHERE transaction_id = :transactionId`,
+            {
+              replacements: { next, transactionId: row.transaction_id },
+              transaction,
+            },
+          );
+        }
+        payableDelta = money2(payableDelta + (targetDr - currentDr));
+      }
+
+      const saleLines = await db.sequelize.query(
+        `SELECT id, reference_number, qty_out
+         FROM store_entries
+         WHERE facilityId = :facilityId
+           AND product_id = :sku
+           AND qty_out > 0
+           AND ABS(cost_price - :oldCost) < 0.02`,
+        {
+          type: db.sequelize.QueryTypes.SELECT,
+          replacements: { facilityId, sku, oldCost },
+          transaction,
+        },
+      );
+      if (saleLines.length) {
+        await db.sequelize.query(
+          `UPDATE store_entries
+           SET cost_price = :newCost
+           WHERE facilityId = :facilityId
+             AND product_id = :sku
+             AND qty_out > 0
+             AND ABS(cost_price - :oldCost) < 0.02`,
+          {
+            replacements: { newCost, facilityId, sku, oldCost },
+            transaction,
+          },
+        );
+        const byRef = new Map();
+        for (const sale of saleLines) {
+          const ref = String(sale.reference_number || "");
+          byRef.set(ref, (byRef.get(ref) || 0) + Number(sale.qty_out || 0));
+        }
+        for (const [saleRef, saleQty] of byRef) {
+          if (!saleRef) continue;
+          const saleAmount = money2(saleQty * newCost);
+          await db.sequelize.query(
+            `UPDATE general_ledger
+             SET dr = :saleAmount
+             WHERE facility_id = :facilityId
+               AND reference_number = :saleRef
+               AND transaction_ref = :sku
+               AND dr > 0
+               AND transaction_description LIKE 'COGS [%'`,
+            {
+              replacements: { saleAmount, facilityId, saleRef, sku },
+              transaction,
+            },
+          );
+          await db.sequelize.query(
+            `UPDATE general_ledger
+             SET cr = :saleAmount
+             WHERE facility_id = :facilityId
+               AND reference_number = :saleRef
+               AND transaction_ref = :sku
+               AND cr > 0
+               AND transaction_description LIKE 'Inventory reduction [%'`,
+            {
+              replacements: { saleAmount, facilityId, saleRef, sku },
+              transaction,
+            },
+          );
+          saleRestatements.push(saleRef);
+        }
+      }
+    }
+
+    if (payableDelta !== 0) {
+      const payableRows = await db.sequelize.query(
+        `SELECT transaction_id, cr
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND reference_number = :invoiceRef
+           AND cr > 0
+           AND transaction_description LIKE 'Direct Purchase%'
+         ORDER BY cr DESC
+         LIMIT 1`,
+        {
+          type: db.sequelize.QueryTypes.SELECT,
+          replacements: { facilityId, invoiceRef },
+          transaction,
+        },
+      );
+      if (!payableRows.length) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "This bill has no supplier payable line to update, so the cost was left unchanged.",
+        });
+      }
+      await db.sequelize.query(
+        `UPDATE general_ledger
+         SET cr = :nextCr
+         WHERE transaction_id = :transactionId`,
+        {
+          replacements: {
+            nextCr: money2(Number(payableRows[0].cr) + payableDelta),
+            transactionId: payableRows[0].transaction_id,
+          },
+          transaction,
+        },
+      );
+    }
+
+    if (billDelta !== 0) {
+      await invoice.update(
+        {
+          amount: money2(Number(invoice.amount || 0) + billDelta),
+        },
+        { transaction },
+      );
+    }
+
+    await transaction.commit();
+    return res.json({
+      success: true,
+      message: "Purchase bill cost updated",
+      billDelta,
+      salesUpdated: saleRestatements.length,
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("Error updating purchase bill costs:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to update purchase bill costs",
+    });
+  }
+};
+
 function isCashTransferSplitPaymentMode(mode) {
   const m = String(mode || "")
     .toLowerCase()
