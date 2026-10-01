@@ -23,6 +23,7 @@ const getAccountEntriesVersionId =
   require("./helpers").getAccountEntriesVersionId;
 const { QueryTypes, Op, Sequelize } = require("sequelize");
 const { findAccountCategoryForFacility } = require("./accountCategory");
+const { assertLedgerAccountNature } = require("../services/productAccountValidation");
 const {
   viewablePoDocumentUrl,
   downloadablePoDocumentUrl,
@@ -15132,6 +15133,11 @@ exports.directPurchaseConsumables = async (req, res) => {
         transaction,
       });
       if (!inventoryAccount) throw new Error(`Inventory account not found`);
+      assertLedgerAccountNature(
+        inventoryAccount,
+        "ASSET",
+        `Inventory account for ${product.name}`,
+      );
 
       // Check if item is taxable
       const isTaxable = isProductTaxable(product.taxable);
@@ -18026,6 +18032,11 @@ exports.directConsumables = async (req, res) => {
         throw new Error(
           `Inventory account not found for head: ${product.inventory_account}`,
         );
+      assertLedgerAccountNature(
+        inventoryAccount,
+        "ASSET",
+        `Inventory account for ${product.name}`,
+      );
 
       const itemName = item.description || product.name || sku;
 

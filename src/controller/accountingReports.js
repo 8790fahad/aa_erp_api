@@ -5,6 +5,12 @@ const {
   signedBalance,
   resolveAccountNature,
 } = require("../utils/accountBalance");
+const {
+  revenueLineSql,
+  expenseLineSql,
+  plAccountAmountSql,
+  misplacedPlSql,
+} = require("../utils/plAmountSql");
 
 /** SOFP: treat Assets = Liabilities + Equity as balanced if |difference| ≤ this (₦). Warn only above. */
 const SOFP_BALANCE_TOLERANCE_NAIRA = 10;
@@ -1746,6 +1752,7 @@ exports.getIncomeStatement = async (req, res) => {
     );
 
     // ── 3. Fetch line-item balances for the period (one query) ───────────────
+    const plAmount = plAccountAmountSql();
     const lineItems = await db.sequelize.query(
       `SELECT
          ac.code                              AS account_code,
@@ -1754,8 +1761,8 @@ exports.getIncomeStatement = async (req, res) => {
          ac.subcategory,
          ac.account_nature,
          ac.pl_line,
-         COALESCE(SUM(gl.cr - gl.dr), 0)     AS cr_net,
-         COALESCE(SUM(gl.dr - gl.cr), 0)     AS dr_net
+         ${plAmount.crNet}                   AS cr_net,
+         ${plAmount.drNet}                   AS dr_net
        FROM account_category ac
        LEFT JOIN general_ledger gl
          ON  gl.account_code     = ac.code
@@ -1849,6 +1856,66 @@ exports.getIncomeStatement = async (req, res) => {
     for (const grp of Object.values(noteGroupMap)) {
       const bucket = sections[grp.isSection];
       if (bucket) bucket.push(grp);
+    }
+
+    const misplacedAmount = misplacedPlSql();
+    const [misplaced] = await db.sequelize.query(
+      `SELECT
+         ${misplacedAmount.sales} AS sales_on_other,
+         ${misplacedAmount.cogs} AS cogs_on_other
+       FROM general_ledger gl
+       LEFT JOIN account_category ac
+         ON ac.code = gl.account_code
+        AND ac.facility_id = gl.facility_id
+       WHERE gl.facility_id = :facilityId
+         AND gl.transaction_date BETWEEN :startDate AND :endDate
+         AND IFNULL(gl.type, '') != 'opening_balance'`,
+      {
+        replacements: { facilityId, startDate, endDate },
+        type: QueryTypes.SELECT,
+      },
+    );
+    const salesOnOther = parseFloat(misplaced?.sales_on_other || 0);
+    const cogsOnOther = parseFloat(misplaced?.cogs_on_other || 0);
+    if (Math.abs(salesOnOther) > 0.005) {
+      sections.turnover.push({
+        noteGroupCode: "sales-on-other",
+        description: "Sales recorded on other accounts",
+        accountType: "Operating revenue",
+        taxonomyKey: "operating_revenue",
+        subcategory: "",
+        accountNature: "REVENUE",
+        isSection: "turnover",
+        items: [
+          {
+            accountCode: "",
+            name: "Sales recorded on other accounts",
+            amount: salesOnOther,
+          },
+        ],
+        total: salesOnOther,
+        noteRef: null,
+      });
+    }
+    if (Math.abs(cogsOnOther) > 0.005) {
+      sections.cost_of_sales.push({
+        noteGroupCode: "cogs-on-other",
+        description: "Cost of sales recorded on other accounts",
+        accountType: "Cost of sales",
+        taxonomyKey: "cost_of_sales",
+        subcategory: "",
+        accountNature: "EXPENSE",
+        isSection: "cost_of_sales",
+        items: [
+          {
+            accountCode: "",
+            name: "Cost of sales recorded on other accounts",
+            amount: cogsOnOther,
+          },
+        ],
+        total: cogsOnOther,
+        noteRef: null,
+      });
     }
 
     // Stable ordering within each section
@@ -2174,20 +2241,15 @@ exports.getStatementOfFinancialPosition = async (req, res) => {
     const netIncomeQuery = `
       SELECT
         COALESCE(SUM(
-          CASE
-            WHEN ac.account_nature = 'REVENUE' THEN (gl.cr - gl.dr)
-            WHEN ac.account_nature = 'EXPENSE' THEN -(gl.dr - gl.cr)
-            ELSE 0
-          END
+          ${revenueLineSql("UPPER(ac.account_nature) = 'REVENUE'")}
+          - ${expenseLineSql("UPPER(ac.account_nature) = 'EXPENSE'")}
         ), 0) AS net_income
-      FROM account_category ac
-      LEFT JOIN general_ledger gl
-        ON  ac.code        = gl.account_code
-        AND gl.facility_id = :facilityId
+      FROM general_ledger gl
+      LEFT JOIN account_category ac
+        ON ac.code = gl.account_code
+       AND ac.facility_id = gl.facility_id
+      WHERE gl.facility_id = :facilityId
         AND gl.transaction_date <= :asOfDate
-      WHERE ac.facility_id = :facilityId
-        AND ac.account_nature IN ('REVENUE', 'EXPENSE')
-        AND ac.is_active = 1
     `;
 
     const [[ni1Raw], [ni2Raw]] = await Promise.all([
@@ -2449,19 +2511,25 @@ exports.getCashFlowStatement = async (req, res) => {
     //    Revenue (cr - dr)  minus  Expense (dr - cr) — no GL status filter
     // ════════════════════════════════════════════════════════════════════════
     const netProfitQuery = `
-      SELECT
-        ac.account_nature,
-        COALESCE(SUM(gl.cr), 0) AS total_cr,
-        COALESCE(SUM(gl.dr), 0) AS total_dr
-      FROM account_category ac
-      LEFT JOIN general_ledger gl
-             ON ac.code = gl.account_code
-            AND gl.facility_id    = :facilityId
-            AND gl.transaction_date BETWEEN :startDate AND :endDate
-      WHERE ac.facility_id    = :facilityId
-        AND ac.account_nature IN ('REVENUE','EXPENSE')
-        AND ac.is_active = 1
-      GROUP BY ac.account_nature
+      SELECT 'REVENUE' AS account_nature,
+             COALESCE(SUM(${revenueLineSql("UPPER(ac.account_nature) = 'REVENUE'")}), 0) AS total_cr,
+             0 AS total_dr
+      FROM general_ledger gl
+      LEFT JOIN account_category ac
+        ON ac.code = gl.account_code
+       AND ac.facility_id = gl.facility_id
+      WHERE gl.facility_id = :facilityId
+        AND gl.transaction_date BETWEEN :startDate AND :endDate
+      UNION ALL
+      SELECT 'EXPENSE',
+             0,
+             COALESCE(SUM(${expenseLineSql("UPPER(ac.account_nature) = 'EXPENSE'")}), 0)
+      FROM general_ledger gl
+      LEFT JOIN account_category ac
+        ON ac.code = gl.account_code
+       AND ac.facility_id = gl.facility_id
+      WHERE gl.facility_id = :facilityId
+        AND gl.transaction_date BETWEEN :startDate AND :endDate
     `;
 
     // ════════════════════════════════════════════════════════════════════════

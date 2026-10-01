@@ -40,6 +40,29 @@ async function findAccountCategory(facilityId, code, transaction) {
   });
 }
 
+function accountNatureOf(account) {
+  return String(
+    account?.accountNature || account?.account_nature || "",
+  ).toUpperCase();
+}
+
+/**
+ * Purchases and cost of sales posted to a REVENUE head show as negative revenue.
+ * Revenue posted to an ASSET head never reaches the profit and loss.
+ */
+function ledgerNatureError(role, account, expected) {
+  const actual = accountNatureOf(account);
+  if (actual === expected) return null;
+  const code = account?.code || account?.head || "";
+  const name = account?.description || "";
+  return `${role} ${code} (${name}) is ${actual || "not classified"}. Use a ${expected} account so the profit and loss stays correct.`;
+}
+
+function assertLedgerAccountNature(account, expected, role) {
+  const message = ledgerNatureError(role, account, expected);
+  if (message) throw new Error(message);
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.facilityId
@@ -92,6 +115,8 @@ async function verifyProductAccountsAndBranch({
         message: `Revenue Account "${revenueAccount}" was not found in account categories for this business`,
       };
     }
+    const revNature = ledgerNatureError("Revenue account", rev, "REVENUE");
+    if (revNature) return { ok: false, message: revNature };
   }
 
   if (isInventory) {
@@ -109,6 +134,8 @@ async function verifyProductAccountsAndBranch({
         message: `Inventory Account "${inventoryAccount}" was not found in account categories for this business`,
       };
     }
+    const invNature = ledgerNatureError("Inventory account", inv, "ASSET");
+    if (invNature) return { ok: false, message: invNature };
 
     if (!cogsAccount || String(cogsAccount).trim() === "") {
       return { ok: false, message: "COGS Account is required" };
@@ -124,6 +151,8 @@ async function verifyProductAccountsAndBranch({
         message: `COGS Account "${cogsAccount}" was not found in account categories for this business`,
       };
     }
+    const cogsNature = ledgerNatureError("Cost of sales account", cogs, "EXPENSE");
+    if (cogsNature) return { ok: false, message: cogsNature };
   }
 
   // Optional: if a non-required account is provided, still verify it exists
@@ -143,6 +172,8 @@ async function verifyProductAccountsAndBranch({
         message: `Revenue Account "${revenueAccount}" was not found in account categories for this business`,
       };
     }
+    const revNature = ledgerNatureError("Revenue account", rev, "REVENUE");
+    if (revNature) return { ok: false, message: revNature };
   }
 
   const parsedBranch =
@@ -188,6 +219,7 @@ async function verifyProductAccountsAndBranch({
 module.exports = {
   findAccountCategory,
   verifyProductAccountsAndBranch,
+  assertLedgerAccountNature,
   INVENTORY_ITEM_TYPES,
   SELLABLE_ITEM_TYPES,
 };

@@ -1,6 +1,11 @@
 const moment = require("moment");
 const { QueryTypes } = require("sequelize");
 const { sqlEq, sqlCol } = require("../utils/sqlCollate");
+const {
+  revenueLineSql,
+  expenseLineSql,
+  cogsLineSql,
+} = require("../utils/plAmountSql");
 
 const EXPENSE_COLORS = [
   "#CC4D3D",
@@ -128,24 +133,9 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
   const rows = await sequelize.query(
     `
       SELECT
-        COALESCE(SUM(
-          CASE
-            WHEN ${isRevenueSql()} THEN gl.cr - gl.dr
-            ELSE 0
-          END
-        ), 0) AS total_revenue,
-        COALESCE(SUM(
-          CASE
-            WHEN ${isExpenseSql()} THEN gl.dr - gl.cr
-            ELSE 0
-          END
-        ), 0) AS total_expenses,
-        COALESCE(SUM(
-          CASE
-            WHEN ${isCogsSql("ac")} THEN gl.dr - gl.cr
-            ELSE 0
-          END
-        ), 0) AS cogs
+        COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS total_revenue,
+        COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS total_expenses,
+        COALESCE(SUM(${cogsLineSql(isCogsSql("ac"))}), 0) AS cogs
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId
@@ -237,24 +227,9 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
       SELECT
         DATE_FORMAT(gl.transaction_date, '%Y-%m') AS month_key,
         DATE_FORMAT(gl.transaction_date, '%b') AS month_label,
-        COALESCE(SUM(
-          CASE
-            WHEN ${isRevenueSql()} THEN gl.cr - gl.dr
-            ELSE 0
-          END
-        ), 0) AS revenue,
-        COALESCE(SUM(
-          CASE
-            WHEN ${isExpenseSql()} THEN gl.dr - gl.cr
-            ELSE 0
-          END
-        ), 0) AS expenses,
-        COALESCE(SUM(
-          CASE
-            WHEN ${isCogsSql("ac")} THEN gl.dr - gl.cr
-            ELSE 0
-          END
-        ), 0) AS cogs
+        COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS revenue,
+        COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS expenses,
+        COALESCE(SUM(${cogsLineSql(isCogsSql("ac"))}), 0) AS cogs
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId

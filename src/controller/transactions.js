@@ -22,6 +22,7 @@ const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const { inferTaxInclusiveType } = require("../utils/saleVat");
+const { assertLedgerAccountNature } = require("../services/productAccountValidation");
 const getBalance = async (customerNo, facilityId) => {
   const { deposit } = await getCustomerLedgerBalances(facilityId, customerNo);
   return deposit;
@@ -4310,9 +4311,21 @@ exports.createSale = async (req, res) => {
         product.inventory_account,
         "Inventory"
       );
+      assertLedgerAccountNature(
+        inventoryAccount,
+        "ASSET",
+        `Inventory account for ${product.name}`,
+      );
       const cogsAccount = !isProBono
         ? await getAccountSafe(product.cogs_head, "COGS")
         : null;
+      if (cogsAccount) {
+        assertLedgerAccountNature(
+          cogsAccount,
+          "EXPENSE",
+          `Cost of sales account for ${product.name}`,
+        );
+      }
 
       if (isProBono) {
         // PRO-BONO: Dr Pro-bono Expense, Cr Inventory (NO COGS)
@@ -4868,6 +4881,11 @@ exports.createSale = async (req, res) => {
         const revenueAccount = await getAccountSafe(
           product.revenue_account,
           "Revenue"
+        );
+        assertLedgerAccountNature(
+          revenueAccount,
+          "REVENUE",
+          `Revenue account for ${product.name}`,
         );
 
         let revenueDesc;

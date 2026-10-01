@@ -9,6 +9,10 @@ module.exports = (app) => {
     productionReports.getInventoryValuationReport
   );
   app.post(
+    "/api/reports/inventory-valuation/cost-layers",
+    productionReports.getInventoryValuationCostLayers
+  );
+  app.post(
     "/api/reports/production-efficiency",
     productionReports.getProductionEfficiencyReport
   );

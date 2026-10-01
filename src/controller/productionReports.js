@@ -407,6 +407,169 @@ exports.getInventoryValuationReport = async (req, res) => {
   }
 };
 
+exports.getInventoryValuationCostLayers = async (req, res) => {
+  try {
+    const { facilityId, asOfDate, sku, branchId, warehouseId } = req.body;
+
+    if (!facilityId || !asOfDate || !sku) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing required fields: facilityId, asOfDate, sku",
+      });
+    }
+
+    const warehouseKey = branchId ?? warehouseId;
+    const warehouseIdNum = parseInt(warehouseKey, 10);
+    const hasWarehouse =
+      warehouseKey !== undefined &&
+      warehouseKey !== null &&
+      String(warehouseKey).trim() !== "" &&
+      String(warehouseKey).toLowerCase() !== "all" &&
+      Number.isFinite(warehouseIdNum) &&
+      warehouseIdNum > 0;
+    const warehouseSql = hasWarehouse
+      ? "AND COALESCE(se.branchId, 0) = :branchId"
+      : "";
+    const asOfSql = `
+      (
+        (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
+        OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
+      )
+    `;
+    const replacements = { facilityId, asOfDate, sku };
+    if (hasWarehouse) replacements.branchId = warehouseIdNum;
+
+    const itemQuery = `
+      SELECT
+        p.id,
+        p.name,
+        p.sku,
+        p.unit_of_measure AS unit,
+        p.item_type,
+        COALESCE(p.cost_price, 0) AS list_cost,
+        COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS stock_qty,
+        SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END) AS receipt_qty,
+        SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * se.cost_price ELSE 0 END) AS receipt_value
+      FROM products p
+      LEFT JOIN store_entries se
+        ON ${skuEq("se.product_id", "p.sku")}
+        AND se.facilityId = :facilityId
+        AND ${asOfSql}
+        ${warehouseSql}
+      WHERE ${skuEq("p.sku", ":sku")}
+        AND p.facility_id = :facilityId
+      GROUP BY p.id, p.name, p.sku, p.unit_of_measure, p.item_type, p.cost_price
+    `;
+
+    const layersQuery = `
+      SELECT
+        se.id,
+        COALESCE(se.receive_date, DATE(se.createdAt)) AS txn_date,
+        se.type,
+        se.reference_number,
+        se.qty_in,
+        se.cost_price,
+        se.qty_in * se.cost_price AS line_value,
+        se.branch_name,
+        se.source,
+        se.supplier_code
+      FROM store_entries se
+      WHERE ${skuEq("se.product_id", ":sku")}
+        AND se.facilityId = :facilityId
+        AND se.qty_in > 0
+        AND ${asOfSql}
+        ${warehouseSql}
+      ORDER BY COALESCE(se.receive_date, DATE(se.createdAt)) ASC, se.id ASC
+    `;
+
+    const byCostQuery = `
+      SELECT
+        se.type,
+        se.cost_price,
+        COUNT(*) AS line_count,
+        SUM(se.qty_in) AS qty,
+        SUM(se.qty_in * se.cost_price) AS value
+      FROM store_entries se
+      WHERE ${skuEq("se.product_id", ":sku")}
+        AND se.facilityId = :facilityId
+        AND se.qty_in > 0
+        AND ${asOfSql}
+        ${warehouseSql}
+      GROUP BY se.type, se.cost_price
+      ORDER BY se.cost_price ASC, se.type ASC
+    `;
+
+    const [itemRows, layers, byCost] = await Promise.all([
+      db.sequelize.query(itemQuery, {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      }),
+      db.sequelize.query(layersQuery, {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      }),
+      db.sequelize.query(byCostQuery, {
+        replacements,
+        type: db.sequelize.QueryTypes.SELECT,
+      }),
+    ]);
+
+    const item = itemRows[0] || null;
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        message: "Item not found",
+      });
+    }
+
+    const receiptQty = parseFloat(item.receipt_qty || 0);
+    const receiptValue = parseFloat(item.receipt_value || 0);
+    const avcoCost =
+      receiptQty > 0
+        ? receiptValue / receiptQty
+        : parseFloat(item.list_cost || 0);
+    const stockQty = parseFloat(item.stock_qty || 0);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        item: {
+          id: item.id,
+          name: item.name,
+          sku: item.sku,
+          unit: item.unit,
+          itemType: item.item_type,
+          stockQty,
+          unitCost: avcoCost,
+          totalValue: stockQty * avcoCost,
+        },
+        layers,
+        byCost,
+        totals: {
+          receiptQty,
+          receiptValue,
+          avcoCost,
+          stockQty,
+          totalValue: stockQty * avcoCost,
+        },
+        formula: {
+          method: "AVCO",
+          expression:
+            "SUM(receipt qty × unit cost) ÷ SUM(receipt qty). Every quantity received up to this date is included.",
+          asOfDate,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching inventory valuation cost layers:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching inventory valuation cost layers",
+      error: error.message,
+    });
+  }
+};
+
 // Production Efficiency Report
 exports.getProductionEfficiencyReport = async (req, res) => {
   try {
@@ -2514,7 +2677,7 @@ exports.getSalesPerProductReport = async (req, res) => {
       LEFT JOIN invoices inv
         ON inv.facility_id = :facilityId
         AND inv.type = 'sales'
-        AND inv.invoice_ref = se.reference_number
+        AND ${skuEq("inv.invoice_ref", "se.reference_number")}
       ${paymentJoin}
       ${locationJoin}
       WHERE se.facilityId = :facilityId
@@ -2696,7 +2859,7 @@ exports.getSalesBySupplierReport = async (req, res) => {
         AND ${skuEq("se.product_id", "p.sku")}
       LEFT JOIN suppliersinfo s
         ON s.facilityId = :facilityId
-        AND s.supplier_number = p.supplier_id
+        AND ${skuEq("s.supplier_number", "p.supplier_id")}
       ${paymentJoin}
       WHERE se.facilityId = :facilityId
         AND se.qty_out > 0
