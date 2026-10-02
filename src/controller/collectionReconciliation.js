@@ -373,6 +373,38 @@ async function ensureReconOrders() {
   }
 }
 
+const CREDIT_DEPOSIT_COLUMNS = [
+  ["credit_total", "DECIMAL(18,2) NOT NULL DEFAULT 0"],
+  ["deposit_total", "DECIMAL(18,2) NOT NULL DEFAULT 0"],
+];
+
+let creditDepositColumnsReady = false;
+async function ensureCreditDepositColumns() {
+  if (creditDepositColumnsReady) return;
+  try {
+    const cols = await db.sequelize.query(
+      `SELECT COLUMN_NAME AS name
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'collection_reconciliations'
+         AND COLUMN_NAME IN (${CREDIT_DEPOSIT_COLUMNS.map(([n]) => `'${n}'`).join(", ")})`,
+      { type: db.Sequelize.QueryTypes.SELECT },
+    );
+    const have = new Set((cols || []).map((c) => String(c.name || c.COLUMN_NAME)));
+    const adds = CREDIT_DEPOSIT_COLUMNS.filter(([n]) => !have.has(n)).map(
+      ([n, def]) => `ADD COLUMN ${n} ${def}`,
+    );
+    if (adds.length) {
+      await db.sequelize.query(
+        `ALTER TABLE collection_reconciliations ${adds.join(", ")}`,
+      );
+    }
+    creditDepositColumnsReady = true;
+  } catch (err) {
+    console.warn("ensureCreditDepositColumns:", err.message);
+  }
+}
+
 let cardColumnsReady = false;
 async function ensureCardColumns() {
   if (cardColumnsReady) return;
@@ -716,6 +748,7 @@ exports.getSummary = async (req, res) => {
 
     await ensureCardColumns();
     await ensureCashSafeColumns();
+    await ensureCreditDepositColumns();
     await ensureReconOrders();
     const { expectedMap } = await expectedAfterExpenses(
       facilityId,
@@ -739,13 +772,22 @@ exports.getSummary = async (req, res) => {
       const j = row.toJSON();
       const id = String(j.cashier_user_id);
       if (!priorByCashier[id]) {
-        priorByCashier[id] = { cash: 0, card: 0, transfer: 0, locked: null };
+        priorByCashier[id] = {
+          cash: 0,
+          card: 0,
+          transfer: 0,
+          credit: 0,
+          deposit: 0,
+          locked: null,
+        };
       }
       if (!isLockedStatus(j.status)) return;
       const bucket = priorByCashier[id];
       bucket.cash = money(bucket.cash + clearedMode(j, "cash"));
       bucket.card = money(bucket.card + clearedMode(j, "card"));
       bucket.transfer = money(bucket.transfer + clearedMode(j, "transfer"));
+      bucket.credit = money(bucket.credit + money(j.credit_total));
+      bucket.deposit = money(bucket.deposit + money(j.deposit_total));
       bucket.locked = j;
     });
 
@@ -786,7 +828,15 @@ exports.getSummary = async (req, res) => {
           Math.max(0, liveTransfer - (prior?.transfer || 0)),
         );
         const openTotal = money(openCash + openCard + openTransfer);
-        const hasOpen = openTotal > 0.05;
+        const creditDeposit = creditDepositMap[id] || { credit: 0, deposit: 0 };
+        const creditUnsaved = money(
+          Math.max(0, money(creditDeposit.credit) - (prior?.credit || 0)),
+        );
+        const depositUnsaved = money(
+          Math.max(0, money(creditDeposit.deposit) - (prior?.deposit || 0)),
+        );
+        const hasOpen =
+          openTotal > 0.05 || creditUnsaved > 0.05 || depositUnsaved > 0.05;
         const recon = hasOpen ? null : prior?.locked || null;
         const cashierName =
           recon?.cashier_name ||
@@ -794,7 +844,6 @@ exports.getSummary = async (req, res) => {
           nameMap[id] ||
           expected.cashier_name ||
           id;
-        const creditDeposit = creditDepositMap[id] || { credit: 0, deposit: 0 };
         return {
           cashier_user_id: id,
           cashier_name: cashierName,
@@ -814,6 +863,8 @@ exports.getSummary = async (req, res) => {
           expected_total: hasOpen ? openTotal : money(recon?.expected_total),
           credit_total: money(creditDeposit.credit),
           deposit_total: money(creditDeposit.deposit),
+          credit_pending: creditUnsaved,
+          deposit_pending: depositUnsaved,
           received_cash: recon ? money(recon.received_cash) : null,
           received_card: recon ? money(recon.received_card) : null,
           received_transfer: recon ? money(recon.received_transfer) : null,
@@ -1178,6 +1229,7 @@ exports.getHistory = async (req, res) => {
     }
 
     await ensureCashSafeColumns();
+    await ensureCreditDepositColumns();
     const where = {
       facility_id: String(facilityId),
       recon_date: { [db.Sequelize.Op.between]: [fromDate, toDate] },
@@ -1207,6 +1259,8 @@ exports.getHistory = async (req, res) => {
         cash_to_safe_amount: money(j.cash_to_safe_amount),
         shortage_amount: money(j.shortage_amount),
         variance_cash: money(j.variance_cash),
+        credit_total: money(j.credit_total),
+        deposit_total: money(j.deposit_total),
       };
     });
 
@@ -1281,6 +1335,7 @@ exports.confirmHandIn = async (req, res) => {
 
     await ensureCardColumns();
     await ensureCashSafeColumns();
+    await ensureCreditDepositColumns();
     await ensureReconOrders();
     const { expectedMap } = await expectedAfterExpenses(
       facilityId,
@@ -1315,6 +1370,27 @@ exports.confirmHandIn = async (req, res) => {
     );
     const priorTransfer = money(
       lockedRows.reduce((sum, row) => sum + clearedMode(row, "transfer"), 0),
+    );
+    const priorCredit = money(
+      lockedRows.reduce((sum, row) => sum + money(row.credit_total), 0),
+    );
+    const priorDeposit = money(
+      lockedRows.reduce((sum, row) => sum + money(row.deposit_total), 0),
+    );
+    const creditDepositMap = await loadCreditAndDepositByCashier(
+      facilityId,
+      reconDate,
+      branchId,
+    );
+    const liveCreditDeposit = creditDepositMap[cashierUserId] || {
+      credit: 0,
+      deposit: 0,
+    };
+    const creditToSave = money(
+      Math.max(0, money(liveCreditDeposit.credit) - priorCredit),
+    );
+    const depositToSave = money(
+      Math.max(0, money(liveCreditDeposit.deposit) - priorDeposit),
     );
 
     const expectedCash = money(
@@ -1390,7 +1466,11 @@ exports.confirmHandIn = async (req, res) => {
       }
     }
 
-    if (expectedTotal <= 0.05) {
+    if (
+      expectedTotal <= 0.05 &&
+      creditToSave <= 0.05 &&
+      depositToSave <= 0.05
+    ) {
       return res.status(409).json({
         success: false,
         message: "This hand-in is already on History",
@@ -1532,6 +1612,8 @@ exports.confirmHandIn = async (req, res) => {
           : null,
         shortage_amount: Math.abs(shortageAmt) > 0.05 ? shortageAmt : 0,
         cash_transfer_id: transferId,
+        credit_total: creditToSave,
+        deposit_total: depositToSave,
       };
 
       let row;
@@ -1554,9 +1636,11 @@ exports.confirmHandIn = async (req, res) => {
             : shortageAmt < -0.05
               ? "Cash moved to Safe and overage posted"
               : "Cash moved to Safe"
-          : status === "confirmed"
-            ? "Hand-in confirmed — amounts match"
-            : "Hand-in saved with variance",
+          : creditToSave > 0.05 || depositToSave > 0.05
+            ? "Credit and Apply Deposit saved to History"
+            : status === "confirmed"
+              ? "Hand-in confirmed — amounts match"
+              : "Hand-in saved with variance",
         data: row.toJSON(),
       });
     } catch (inner) {

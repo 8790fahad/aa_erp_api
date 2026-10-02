@@ -6300,6 +6300,7 @@ exports.getAllTransactionsData = async (req, res) => {
       branchId,
       fromDate,
       toDate,
+      createdBy,
     } = req.query;
     const { Op } = db.Sequelize;
 
@@ -6403,6 +6404,11 @@ exports.getAllTransactionsData = async (req, res) => {
       whereClause.invoice_ref = { [Op.regexp]: "^INV-[0-9]+$" };
     }
 
+    const createdByFilter = String(createdBy || "").trim();
+    if (createdByFilter) {
+      whereClause.created_by = createdByFilter;
+    }
+
     // Optional transaction_date range (YYYY-MM-DD) — compare by calendar date
     const fromDateStr =
       fromDate && String(fromDate).trim()
@@ -6460,6 +6466,7 @@ exports.getAllTransactionsData = async (req, res) => {
       branchId: hasBranchFilter ? branchIdList : null,
       fromDate: fromDateStr,
       toDate: toDateStr,
+      createdBy: createdByFilter || null,
       page: pageNum,
       pageSize: limitNum,
     });
@@ -6709,6 +6716,64 @@ exports.getAllTransactionsData = async (req, res) => {
       }
     }
 
+    // Users who created sales invoices in this same date/branch window.
+    let creators = [];
+    const creatorNameById = {};
+    if (salesOnlyList) {
+      try {
+        const creatorWhere = ["i.facility_id = :facilityId", "i.type = 'sales'"];
+        const creatorReplacements = { facilityId };
+        creatorWhere.push("i.invoice_ref REGEXP '^INV-[0-9]+$'");
+        creatorWhere.push(
+          "i.created_by IS NOT NULL AND TRIM(i.created_by) <> ''",
+        );
+        if (fromDateStr) {
+          creatorWhere.push("DATE(i.transaction_date) >= DATE(:fromDate)");
+          creatorReplacements.fromDate = fromDateStr;
+        }
+        if (toDateStr) {
+          creatorWhere.push("DATE(i.transaction_date) <= DATE(:toDate)");
+          creatorReplacements.toDate = toDateStr;
+        }
+        if (hasBranchFilter) {
+          creatorWhere.push("i.branchId IN (:branchIds)");
+          creatorReplacements.branchIds = branchIdList;
+        }
+        const creatorRows = await db.sequelize.query(
+          `SELECT
+             d.created_by AS id,
+             u.firstname,
+             u.lastname,
+             u.username,
+             u.email
+           FROM (
+             SELECT DISTINCT i.created_by
+             FROM invoices i
+             WHERE ${creatorWhere.join(" AND ")}
+           ) d
+           LEFT JOIN users u
+             ON ${sqlEq("u.id", "d.created_by")}
+           ORDER BY u.firstname, u.lastname, d.created_by`,
+          {
+            replacements: creatorReplacements,
+            type: db.Sequelize.QueryTypes.SELECT,
+          },
+        );
+        creators = (creatorRows || []).map((row) => {
+          const id = String(row.id || "").trim();
+          const name = [row.firstname, row.lastname]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+          const label = name || row.username || row.email || id;
+          if (id) creatorNameById[id] = label;
+          return { id, name: label };
+        });
+      } catch (err) {
+        console.error("Error fetching invoice creators:", err);
+      }
+    }
+
     // Transform data to match frontend expectations
     const formattedInvoices = invoices.map((invoice) => {
       const wf = workflowBySaleCode[invoice.invoice_ref] || null;
@@ -6738,6 +6803,10 @@ exports.getAllTransactionsData = async (req, res) => {
         warehouse_names: warehouseNames,
         warehouse_name: warehouseNames.join(", ") || null,
         created_by: invoice.created_by,
+        created_by_name:
+          creatorNameById[String(invoice.created_by || "").trim()] ||
+          invoice.created_by ||
+          null,
         created_at: invoice.created_at,
         workflow_status: wf?.workflow_status || null,
         workflow_status_label: wf?.workflow_status_label || null,
@@ -6750,6 +6819,7 @@ exports.getAllTransactionsData = async (req, res) => {
     return res.json({
       success: true,
       results: formattedInvoices,
+      creators,
       count: formattedInvoices.length,
       totalCount: totalCount,
     });

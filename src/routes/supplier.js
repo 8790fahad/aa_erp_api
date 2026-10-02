@@ -27,6 +27,7 @@ const {
 
 const upload = require("../config/new_multer");
 const supplierAdvancePayment = require("../controller/supplierAdvancePayment");
+const { checkSimilarPayment } = require("../controller/paymentSimilarity");
 
 module.exports = (app) => {
   // ============================================
@@ -97,6 +98,7 @@ module.exports = (app) => {
     "/api/v1/suppliers-for-apply-deposit",
     supplierAdvancePayment.listSuppliersForApplyDeposit,
   );
+  app.post("/api/v1/check-similar-payment", checkSimilarPayment);
   app.post(
     "/api/v1/supplier-advance-payment",
     supplierAdvancePayment.createSupplierAdvancePayment,
