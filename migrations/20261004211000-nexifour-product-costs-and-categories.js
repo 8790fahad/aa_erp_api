@@ -42,6 +42,14 @@ const CATEGORIES = [
 const NORM_SQL =
   "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(`name`, ' ', ''), '(', ''), ')', ''), '-', ''), '.', ''), '/', ''))";
 
+/** Bound strings and CAST(id AS CHAR) use the connection collation. Match the column. */
+const SAME_CODE =
+  "CONVERT(? USING utf8mb4) COLLATE utf8mb4_general_ci";
+
+function codeEq(column, valueSql) {
+  return `${SAME_CODE.replace("?", column)} = ${SAME_CODE.replace("?", valueSql)}`;
+}
+
 function norm(value) {
   return String(value || "")
     .toLowerCase()
@@ -215,11 +223,10 @@ async function applyProduct(sequelize, transaction, product) {
   await sequelize.query(
     `UPDATE store_entries se
      INNER JOIN products p
-       ON p.facility_id = se.facilityId
+       ON ${codeEq("p.facility_id", "se.facilityId")}
       AND (
-        CONVERT(se.product_id USING utf8mb4) COLLATE utf8mb4_general_ci
-          = CONVERT(p.sku USING utf8mb4) COLLATE utf8mb4_general_ci
-        OR se.product_id = CAST(p.id AS CHAR)
+        ${codeEq("se.product_id", "p.sku")}
+        OR ${codeEq("se.product_id", "CAST(p.id AS CHAR)")}
       )
      SET se.cost_price = :cost
      WHERE p.facility_id = :facilityId
@@ -275,8 +282,8 @@ async function setSellableQty(sequelize, transaction, product, qty) {
      FROM store_entries
      WHERE facilityId = :facilityId
        AND (
-         product_id = :sku
-         OR product_id = CAST(:productId AS CHAR)
+         ${codeEq("product_id", "CAST(:sku AS CHAR)")}
+         OR ${codeEq("product_id", "CAST(:productId AS CHAR)")}
        )
        AND LOWER(TRIM(branch_name)) IN ('for sales', 'for sale')`,
     {
@@ -298,8 +305,8 @@ async function setSellableQty(sequelize, transaction, product, qty) {
      FROM store_entries
      WHERE facilityId = :facilityId
        AND (
-         product_id = :sku
-         OR product_id = CAST(:productId AS CHAR)
+         ${codeEq("product_id", "CAST(:sku AS CHAR)")}
+         OR ${codeEq("product_id", "CAST(:productId AS CHAR)")}
        )
        AND LOWER(TRIM(branch_name)) IN ('for sales', 'for sale')
      ORDER BY id DESC
