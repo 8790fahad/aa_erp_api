@@ -3,6 +3,10 @@ const moment = require("moment");
 const { Op } = require("sequelize");
 const { getAndUpdateNumber } = require("../services/numberGen");
 const {
+  validatePostingDate,
+  normalizePostingDate,
+} = require("../utils/validatePostingDate");
+const {
   buildAddressLine,
   syncSupplierContacts,
   syncSupplierAddresses,
@@ -411,6 +415,336 @@ exports.createSupplier = async (req, res) => {
       success: false,
       message: "Error creating/updating supplier",
       error: error.message,
+    });
+  }
+};
+
+function openingBalanceDateBounds(startMonth) {
+  const month = parseInt(startMonth, 10);
+  const fyMonth = Number.isInteger(month) && month >= 1 && month <= 12 ? month : 1;
+  const today = moment();
+  let startYear = today.year();
+  if (today.month() + 1 < fyMonth) startYear -= 1;
+  return {
+    minDate: moment({ year: startYear, month: fyMonth - 1, day: 1 }).format(
+      "YYYY-MM-DD",
+    ),
+    maxDate: today.clone().add(1, "day").format("YYYY-MM-DD"),
+  };
+}
+
+function isOpeningBalancePurpose(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, " ")
+    .startsWith("opening balance");
+}
+
+/**
+ * Record or replace a supplier opening balance.
+ * Positive: Dr Opening Balance Equity, Cr Accounts Payable.
+ * Negative: Dr supplier advance, Cr Opening Balance Equity.
+ */
+exports.setSupplierOpeningBalance = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      supplier_number: supplierNo,
+      opening_balance,
+      obdate,
+      created_by,
+      opening_balance_equity: equityFromBody,
+      kind,
+    } = req.body || {};
+
+    if (!facilityId || !supplierNo) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and supplier_number are required",
+      });
+    }
+
+    const OB = parseFloat(opening_balance);
+    if (!Number.isFinite(OB) || Math.abs(OB) < 0.005) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter an opening balance amount",
+      });
+    }
+
+    const supplier = await db.SuppliersInfo.findOne({
+      where: { supplier_number: supplierNo, facilityId },
+      transaction,
+    });
+    if (!supplier) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Supplier not found",
+      });
+    }
+
+    const business = await db.business.findOne({
+      where: { id: facilityId },
+      attributes: ["opening_balance_equity", "financial_year_start_month"],
+      transaction,
+    });
+    const dateBounds = openingBalanceDateBounds(
+      business?.financial_year_start_month,
+    );
+    let transactionDate;
+    try {
+      transactionDate = validatePostingDate(obdate, {
+        field: "obdate",
+        allowFuture: true,
+        minDate: dateBounds.minDate,
+        maxDate: dateBounds.maxDate,
+      });
+    } catch (err) {
+      await transaction.rollback();
+      const formatted = normalizePostingDate(obdate);
+      return res.status(400).json({
+        success: false,
+        message: formatted
+          ? `As of date must be from ${dateBounds.minDate} (start of the financial year) through ${dateBounds.maxDate} (tomorrow).`
+          : "Enter a valid as of date",
+      });
+    }
+
+    const equityCode = String(
+      equityFromBody || business?.opening_balance_equity || "",
+    ).trim();
+    const payableCode = String(supplier.payable_code || "").trim();
+    const advanceCode = String(supplier.payable_accural_code || "").trim();
+    if (!equityCode || !payableCode || !advanceCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Set payable, advance, and opening balance equity accounts before recording an opening balance.",
+      });
+    }
+
+    const ap = await db.AccountCategory.findOne({
+      where: { code: payableCode, facility_id: facilityId },
+      transaction,
+    });
+    const advance = await db.AccountCategory.findOne({
+      where: { code: advanceCode, facility_id: facilityId },
+      transaction,
+    });
+    const obe = await db.AccountCategory.findOne({
+      where: { code: equityCode, facility_id: facilityId },
+      transaction,
+    });
+    if (!ap || !advance || !obe) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Payable, advance, or Opening Balance Equity account not found",
+      });
+    }
+
+    const requestedKind = String(kind || "").trim().toLowerCase();
+    const entryKind =
+      requestedKind === "advance" || OB < 0 ? "advance" : "payable";
+    const existing = await db.SupplierEntry.findOne({
+      where: {
+        supplier_number: supplierNo,
+        facilityId,
+        type: "opening_balance",
+        description:
+          entryKind === "advance"
+            ? "Opening Balance (Advance)"
+            : "Opening Balance (Payable)",
+      },
+      order: [["entry_id", "DESC"]],
+      transaction,
+    });
+    if (existing?.receiptNo) {
+      const linkedRows = await db.GeneralLedger.findAll({
+        where: { facility_id: facilityId, reference_number: existing.receiptNo },
+        attributes: ["purpose_of_payment"],
+        transaction,
+      });
+      const hasOtherPostings = linkedRows.some(
+        (row) => !isOpeningBalancePurpose(row.purpose_of_payment),
+      );
+      if (hasOtherPostings) {
+        await transaction.rollback();
+        return res.status(409).json({
+          success: false,
+          message:
+            "This opening balance already has payments against it, so it cannot be replaced.",
+        });
+      }
+      await db.GeneralLedger.destroy({
+        where: { facility_id: facilityId, reference_number: existing.receiptNo },
+        transaction,
+      });
+      await db.Invoice.destroy({
+        where: { facility_id: facilityId, invoice_ref: existing.receiptNo },
+        transaction,
+      });
+      await existing.destroy({ transaction });
+    }
+
+    const userId = created_by || req.user?.id;
+    const displayName = supplier.supplier_name || supplierNo;
+    const absOB = Math.abs(OB);
+    const postAdvance = entryKind === "advance";
+    const billRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
+    const subhead = (account) =>
+      account.parentCode || account.parent_code || 0;
+
+    if (!postAdvance) {
+      await db.GeneralLedger.bulkCreate(
+        [
+          {
+            transaction_date: transactionDate,
+            account_code: ap.code,
+            account_subhead: subhead(ap),
+            account_description: ap.description,
+            dr: 0,
+            cr: absOB,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: billRef,
+            mode_of_payment: "opening_balance",
+            created_by: userId,
+            facility_id: facilityId,
+            type: "payable",
+            transaction_ref: supplierNo,
+          },
+          {
+            transaction_date: transactionDate,
+            account_code: obe.code,
+            account_subhead: subhead(obe),
+            account_description: obe.description,
+            dr: absOB,
+            cr: 0,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: billRef,
+            mode_of_payment: "opening_balance",
+            created_by: userId,
+            facility_id: facilityId,
+            type: "opening_balance",
+            transaction_ref: "",
+          },
+        ],
+        { transaction },
+      );
+      await db.Invoice.create(
+        {
+          ref_number: supplierNo,
+          invoice_ref: billRef,
+          description: "Opening Balance",
+          transaction_date: transactionDate,
+          due_date: transactionDate,
+          amount: absOB,
+          created_by: userId,
+          facility_id: facilityId,
+          type: "purchase",
+        },
+        { transaction },
+      );
+      await db.SupplierEntry.create(
+        {
+          supplier_number: supplierNo,
+          description: "Opening Balance (Payable)",
+          qty_in: 1,
+          qty_out: 0,
+          cost: absOB,
+          facilityId,
+          mode_of_payment: "opening_balance",
+          receiptNo: billRef,
+          link_id: supplierNo,
+          created_by: userId,
+          type: "opening_balance",
+          transaction_date: transactionDate,
+        },
+        { transaction },
+      );
+    } else {
+      await db.GeneralLedger.bulkCreate(
+        [
+          {
+            transaction_date: transactionDate,
+            account_code: advance.code,
+            account_subhead: subhead(advance),
+            account_description: advance.description,
+            dr: absOB,
+            cr: 0,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: billRef,
+            mode_of_payment: "opening_balance",
+            created_by: userId,
+            facility_id: facilityId,
+            type: "payable",
+            transaction_ref: supplierNo,
+          },
+          {
+            transaction_date: transactionDate,
+            account_code: obe.code,
+            account_subhead: subhead(obe),
+            account_description: obe.description,
+            dr: 0,
+            cr: absOB,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: billRef,
+            mode_of_payment: "opening_balance",
+            created_by: userId,
+            facility_id: facilityId,
+            type: "opening_balance",
+            transaction_ref: "",
+          },
+        ],
+        { transaction },
+      );
+      await db.SupplierEntry.create(
+        {
+          supplier_number: supplierNo,
+          description: "Opening Balance (Advance)",
+          qty_in: 0,
+          qty_out: 1,
+          cost: absOB,
+          facilityId,
+          mode_of_payment: "opening_balance",
+          type: "opening_balance",
+          receiptNo: billRef,
+          link_id: billRef,
+          created_by: userId,
+          transaction_date: transactionDate,
+        },
+        { transaction },
+      );
+    }
+
+    await transaction.commit();
+    return res.json({
+      success: true,
+      message: "Opening balance saved",
+      data: {
+        supplier_number: supplierNo,
+        invoice_ref: billRef,
+        opening_balance: postAdvance ? -absOB : absOB,
+        kind: entryKind,
+      },
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("setSupplierOpeningBalance:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to save opening balance",
     });
   }
 };

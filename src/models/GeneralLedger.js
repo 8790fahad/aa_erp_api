@@ -183,7 +183,8 @@ module.exports = (sequelize, DataTypes) => {
     const { validatePostingDate } = require("../utils/validatePostingDate");
     const purpose = String(instance.purpose_of_payment || "")
       .trim()
-      .toLowerCase();
+      .toLowerCase()
+      .replace(/_/g, " ");
     const isOpeningBalance = purpose.startsWith("opening balance");
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);

@@ -23,6 +23,7 @@ const {
   deleteSupplier,
   getSupplierStats,
   bulkCreateSuppliers,
+  setSupplierOpeningBalance,
 } = require("../controller/supplierController");
 
 const upload = require("../config/new_multer");
@@ -36,6 +37,7 @@ module.exports = (app) => {
 
   // Create a new supplier
   app.post("/api/suppliers", createSupplier);
+  app.post("/api/v1/supplier-opening-balance", setSupplierOpeningBalance);
 
   // Bulk create suppliers
   app.post("/api/suppliers/bulk", bulkCreateSuppliers);

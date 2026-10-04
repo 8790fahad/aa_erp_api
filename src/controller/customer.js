@@ -1322,6 +1322,7 @@ exports.setCustomerOpeningBalance = async (req, res) => {
       obdate,
       created_by,
       opening_balance_equity: equityFromBody,
+      kind,
     } = req.body || {};
 
     if (!facilityId || !customerNo) {
@@ -1417,8 +1418,28 @@ exports.setCustomerOpeningBalance = async (req, res) => {
       });
     }
 
+    const requestedKind = String(kind || "").trim().toLowerCase();
+    const entryKind =
+      requestedKind === "deposit" || OB < 0 ? "deposit" : "receivable";
     const existing = await db.CustomerEntry.findOne({
-      where: { customerNo, facilityId, type: "opening_balance" },
+      where:
+        entryKind === "deposit"
+          ? {
+              customerNo,
+              facilityId,
+              type: "opening_balance",
+              [Op.or]: [
+                { description: "Opening Balance (Deposit)" },
+                { description: "Opening Balance", qty_out: { [Op.gt]: 0 } },
+              ],
+            }
+          : {
+              customerNo,
+              facilityId,
+              type: "opening_balance",
+              description: "Opening Balance",
+              qty_in: { [Op.gt]: 0 },
+            },
       order: [["entry_id", "DESC"]],
       transaction,
     });
@@ -1470,9 +1491,10 @@ exports.setCustomerOpeningBalance = async (req, res) => {
 
     const displayName = customer.fullname || customer.company_name || customerNo;
     const absOB = Math.abs(OB);
+    const postDeposit = entryKind === "deposit";
     const invoiceRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
 
-    if (OB > 0) {
+    if (!postDeposit) {
       await db.GeneralLedger.bulkCreate(
         [
           {
@@ -1571,10 +1593,12 @@ exports.setCustomerOpeningBalance = async (req, res) => {
     await db.CustomerEntry.create(
       {
         customerNo,
-        description: "Opening Balance",
+        description: postDeposit
+          ? "Opening Balance (Deposit)"
+          : "Opening Balance",
         cost: absOB,
-        qty_in: OB > 0 ? 1 : 0,
-        qty_out: OB < 0 ? 1 : 0,
+        qty_in: postDeposit ? 0 : 1,
+        qty_out: postDeposit ? 1 : 0,
         type: "opening_balance",
         link_id: invoiceRef,
         bank_account_id: 0,
@@ -1590,7 +1614,12 @@ exports.setCustomerOpeningBalance = async (req, res) => {
     return res.json({
       success: true,
       message: "Opening balance saved",
-      data: { customerNo, invoice_ref: invoiceRef, opening_balance: OB },
+      data: {
+        customerNo,
+        invoice_ref: invoiceRef,
+        opening_balance: postDeposit ? -absOB : absOB,
+        kind: entryKind,
+      },
     });
   } catch (error) {
     await transaction.rollback();
