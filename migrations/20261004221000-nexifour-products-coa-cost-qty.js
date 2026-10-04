@@ -419,6 +419,106 @@ async function setSellableQty(sequelize, transaction, product) {
       transaction,
     },
   );
+  await postOpeningTreatment(sequelize, transaction, {
+    ref: `ADJ-${product.sku}`.slice(0, 20),
+    sku: saved.sku || product.sku,
+    name: product.name,
+    inventory: product.inventory,
+    qty: Math.abs(delta),
+    cost: product.cost,
+    increase: delta > 0,
+  });
+}
+
+async function postOpeningTreatment(sequelize, transaction, entry) {
+  if (!entry.cost || !entry.qty) return;
+  const existing = await sequelize.query(
+    `SELECT id FROM general_ledger
+     WHERE facility_id = :facilityId
+       AND reference_number = :ref
+       AND purpose_of_payment = 'Opening Balance'
+     LIMIT 1`,
+    {
+      replacements: { facilityId: FACILITY_ID, ref: entry.ref },
+      type: sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  if (existing.length) return;
+
+  const [business] = await sequelize.query(
+    `SELECT opening_balance_equity AS equity
+     FROM business WHERE id = :facilityId LIMIT 1`,
+    {
+      replacements: { facilityId: FACILITY_ID },
+      type: sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  const equity = business?.equity;
+  if (!equity) return;
+
+  const accounts = await sequelize.query(
+    `SELECT code, parent_code AS parentCode, description
+     FROM account_category
+     WHERE facility_id = :facilityId AND code IN (:inventory, :equity)`,
+    {
+      replacements: {
+        facilityId: FACILITY_ID,
+        inventory: entry.inventory,
+        equity,
+      },
+      type: sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  const byCode = new Map(accounts.map((row) => [String(row.code), row]));
+  const inventoryAccount = byCode.get(String(entry.inventory));
+  const equityAccount = byCode.get(String(equity));
+  if (!inventoryAccount || !equityAccount) return;
+
+  const amount = Math.round(entry.qty * entry.cost * 100) / 100;
+  const narration = `Opening Balance - ${entry.name} - Qty: ${entry.qty} @ ${entry.cost}`;
+  const lines = entry.increase
+    ? [
+        ["inventory", inventoryAccount, amount, 0],
+        ["opening_balance", equityAccount, 0, amount],
+      ]
+    : [
+        ["opening_balance", equityAccount, amount, 0],
+        ["inventory", inventoryAccount, 0, amount],
+      ];
+
+  for (const [type, account, dr, cr] of lines) {
+    await sequelize.query(
+      `INSERT INTO general_ledger (
+         transaction_date, account_code, account_subhead, dr, cr,
+         account_description, transaction_description, reference_number,
+         purpose_of_payment, created_by, facility_id, status, reconciled,
+         type, transaction_ref, created_at, updated_at
+       ) VALUES (
+         CURDATE(), :code, :subhead, :dr, :cr,
+         :description, :narration, :ref,
+         'Opening Balance', 'migration', :facilityId, 'posted', 'unmatched',
+         :type, :sku, NOW(), NOW()
+       )`,
+      {
+        replacements: {
+          code: account.code,
+          subhead: account.parentCode || "0",
+          dr,
+          cr,
+          description: account.description || entry.name,
+          narration,
+          ref: entry.ref,
+          facilityId: FACILITY_ID,
+          type,
+          sku: entry.sku,
+        },
+        transaction,
+      },
+    );
+  }
 }
 
 module.exports = {
