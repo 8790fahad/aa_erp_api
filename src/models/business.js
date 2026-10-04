@@ -347,6 +347,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: false,
       },
+      /** When false, invoice lines keep the product selling price and cannot be typed over. */
+      allow_invoice_selling_price: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: true,
+      },
       /** When true, bills and goods received only offer products for the selected default supplier. */
       filter_products_by_default_supplier: {
         type: DataTypes.BOOLEAN,

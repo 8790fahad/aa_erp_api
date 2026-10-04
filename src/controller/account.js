@@ -11349,6 +11349,46 @@ exports.updateDefaultValuationSource = async (req, res) => {
   }
 };
 
+/** Allow or block typing a different selling price on a sales invoice. */
+exports.updateAllowInvoiceSellingPrice = async (req, res) => {
+  try {
+    const { enabled, facilityId } = req.params;
+    const enableFlag =
+      enabled === "true" || enabled === "1" || enabled === "yes";
+
+    const business = await db.business.findOne({ where: { id: facilityId } });
+    if (!business) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    await business.update({ allow_invoice_selling_price: enableFlag });
+    const updatedBusiness = await db.business.findOne({
+      where: { id: facilityId },
+    });
+
+    res.json({
+      success: true,
+      results: updatedBusiness,
+      message: `Invoice selling price changes ${
+        enableFlag ? "allowed" : "blocked"
+      }`,
+    });
+  } catch (err) {
+    console.error("Error updating allow_invoice_selling_price:", err);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error:
+        process.env.NODE_ENV === "development"
+          ? err.message
+          : "Something went wrong",
+    });
+  }
+};
+
 /** Toggle: set selling_price on Finished Good / Resalable / By-Product supplier-bill stock-in (for sales zone). */
 exports.updatePriceSetupResalableOnPurchase = async (req, res) => {
   try {

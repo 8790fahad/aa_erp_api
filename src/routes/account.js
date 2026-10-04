@@ -449,6 +449,10 @@ module.exports = (app) => {
     account.updatePriceSetupResalableOnPurchase,
   );
   app.post(
+    "/account/update-allow-invoice-selling-price/:enabled/:facilityId/:user_id",
+    account.updateAllowInvoiceSellingPrice,
+  );
+  app.post(
     "/account/update-filter-products-by-default-supplier/:enabled/:facilityId/:user_id",
     account.updateFilterProductsByDefaultSupplier,
   );
