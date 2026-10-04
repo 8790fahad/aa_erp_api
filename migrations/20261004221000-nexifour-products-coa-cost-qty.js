@@ -433,7 +433,7 @@ async function setSellableQty(sequelize, transaction, product) {
 async function postOpeningTreatment(sequelize, transaction, entry) {
   if (!entry.cost || !entry.qty) return;
   const existing = await sequelize.query(
-    `SELECT id FROM general_ledger
+    `SELECT transaction_id FROM general_ledger
      WHERE facility_id = :facilityId
        AND reference_number = :ref
        AND purpose_of_payment = 'Opening Balance'

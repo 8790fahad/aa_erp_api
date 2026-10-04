@@ -35,7 +35,7 @@ async function postLine(sequelize, transaction, line, equity) {
   const [sku, name, inventory, cost] = line;
   const ref = `ADJ-${sku}`;
   const existing = await sequelize.query(
-    `SELECT id FROM general_ledger
+    `SELECT transaction_id FROM general_ledger
      WHERE facility_id = :facilityId
        AND reference_number = :ref
        AND purpose_of_payment = 'Opening Balance'
