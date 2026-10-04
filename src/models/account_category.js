@@ -146,8 +146,11 @@ module.exports = (sequelize, DataTypes) => {
 
   /**
    * Next code (must match MySQL `generate_account_code`):
-   * - parent "1".."5" OR any six-digit [1-5]xxxxx → next flat six-digit code for that nature (100001, 100002, …).
-   * Source: migrations/20260418120000-generate-account-code-flat-six-digit-only.js
+   * - parent "1".."5" → next flat six-digit code for that nature (100001, 100002, …).
+   * - six-digit group ending in 00 that already has children in the same first-four digits
+   *   (120400 → 120407) → next code in that group.
+   * - any other six-digit parent → next flat code for that nature.
+   * Source: migrations/20261004203000-fix-grouped-account-codes.js
    */
   AccountCategory.generateNextCode = async function (parentCode, facilityId) {
     const pc =
@@ -169,6 +172,30 @@ module.exports = (sequelize, DataTypes) => {
       throw new Error(
         "parentCode must be nature 1–5 or a six-digit account code (e.g. 100001)",
       );
+    }
+
+    if (/^[1-5]\d{3}00$/.test(pc)) {
+      const prefix = pc.slice(0, 4);
+      const grouped = await sequelize.query(
+        `SELECT COALESCE(MAX(CAST(code AS UNSIGNED)), 0) AS maxcode
+         FROM account_category
+         WHERE facility_id = :facilityId
+           AND code REGEXP '^[1-5][0-9]{5}$'
+           AND LEFT(code, 4) = :prefix
+           AND code <> :parentCode`,
+        {
+          replacements: { facilityId, prefix, parentCode: pc },
+          type: QueryTypes.SELECT,
+        },
+      );
+      const maxcode = parseInt(grouped[0]?.maxcode, 10);
+      if (Number.isFinite(maxcode) && maxcode > 0) {
+        const nextCode = String(maxcode + 1);
+        if (nextCode.length !== 6 || nextCode.slice(0, 4) !== prefix) {
+          throw new Error("No room left in this account group");
+        }
+        return nextCode;
+      }
     }
 
     const rows = await sequelize.query(
