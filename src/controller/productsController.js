@@ -12,6 +12,10 @@ const {
   normalizeTaxableStatus,
   isValidTaxableStatus,
 } = require("../constants/taxableStatus");
+const {
+  validatePostingDate,
+  PostingDateValidationError,
+} = require("../utils/validatePostingDate");
 
 /** Sellable goods (Resalable / FG / by-product) stock in the sales-floor zone. */
 const SALES_FLOOR_ITEM_TYPES = new Set([
@@ -1813,6 +1817,431 @@ exports.checkProductName = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error.message || "Failed to check product name",
+    });
+  }
+};
+
+const STOCK_OPENING_ITEM_TYPES = new Set([
+  "Raw Material",
+  "Semi Finished",
+  "Finished Good",
+  "Resalable",
+  "By-Product",
+]);
+
+function money2(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function qty4(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
+}
+
+function openingBalanceDateBounds(startMonth) {
+  const month = parseInt(startMonth, 10);
+  const fyMonth = Number.isInteger(month) && month >= 1 && month <= 12 ? month : 1;
+  const today = moment();
+  let startYear = today.year();
+  if (today.month() + 1 < fyMonth) startYear -= 1;
+  return {
+    minDate: moment({ year: startYear, month: fyMonth - 1, day: 1 }).format(
+      "YYYY-MM-DD",
+    ),
+    maxDate: today.clone().add(1, "day").format("YYYY-MM-DD"),
+  };
+}
+
+function isOpeningBalancePurpose(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, " ")
+    .startsWith("opening balance");
+}
+
+async function findProductOpeningEntry({
+  facilityId,
+  sku,
+  branchId,
+  transaction,
+}) {
+  return db.StoreEntry.findOne({
+    where: {
+      facilityId,
+      product_id: sku,
+      branchId,
+      type: STORE_ENTRY_TYPE.OPENING_BALANCE,
+    },
+    order: [["id", "DESC"]],
+    transaction,
+  });
+}
+
+/**
+ * Opening stock already recorded for this product in one store.
+ */
+exports.getProductOpeningBalance = async (req, res) => {
+  try {
+    const facilityId = req.query.facilityId || req.query.facility_id;
+    const productId = req.query.productId || req.query.product_id;
+    const branchId = parseInt(req.query.branchId || req.query.branch_id, 10);
+    if (!facilityId || !productId || !Number.isFinite(branchId) || branchId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId, productId, and branchId are required",
+      });
+    }
+    const product = await db.Product.findOne({
+      where: { id: productId, facility_id: facilityId },
+      attributes: ["id", "sku", "name", "item_type", "unit_of_measure"],
+    });
+    if (!product) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    const entry = await findProductOpeningEntry({
+      facilityId,
+      sku: product.sku,
+      branchId,
+    });
+    return res.json({
+      success: true,
+      data: entry
+        ? {
+            reference_number: entry.reference_number,
+            quantity: Number(entry.qty_in) || 0,
+            cost_price: Number(entry.cost_price) || 0,
+            receive_date: entry.receive_date || null,
+            expiry_date: entry.expiry_date || null,
+            branchId,
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error("getProductOpeningBalance:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Could not load opening balance",
+    });
+  }
+};
+
+/**
+ * Record or replace stock opening balance for one product in one store.
+ * Dr inventory asset, Cr Opening Balance Equity, for quantity × unit cost.
+ */
+exports.setProductOpeningBalance = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      productId,
+      product_id: productIdAlt,
+      sku,
+      branchId,
+      branch_id: branchIdAlt,
+      quantity,
+      qty,
+      cost_price: costFromBody,
+      cost,
+      obdate,
+      as_of_date: asOfDate,
+      expiry_date: expiryDate,
+      created_by: createdBy,
+      opening_balance_equity: equityFromBody,
+    } = req.body || {};
+
+    const resolvedProductId = productId ?? productIdAlt;
+    const resolvedSku = String(sku || "").trim();
+    const hasProductId =
+      resolvedProductId !== undefined &&
+      resolvedProductId !== null &&
+      resolvedProductId !== "";
+    const resolvedBranchId = parseInt(branchId || branchIdAlt, 10);
+    const qtyIn = qty4(quantity ?? qty);
+    const unitCost = money2(costFromBody ?? cost);
+    const userId = createdBy || req.user?.id || null;
+
+    if (!facilityId || (!hasProductId && !resolvedSku)) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and productId are required",
+      });
+    }
+    if (!Number.isFinite(resolvedBranchId) || resolvedBranchId <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Select a store, warehouse, or branch",
+      });
+    }
+    if (!Number.isFinite(qtyIn) || qtyIn <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter a quantity greater than zero",
+      });
+    }
+    if (!Number.isFinite(unitCost) || unitCost <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter a unit cost greater than zero",
+      });
+    }
+    if (!userId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "created_by is required",
+      });
+    }
+
+    const product = await db.Product.findOne({
+      where: resolvedSku
+        ? { sku: resolvedSku, facility_id: facilityId }
+        : { id: resolvedProductId, facility_id: facilityId },
+      transaction,
+    });
+    if (!product) {
+      await transaction.rollback();
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    if (!STOCK_OPENING_ITEM_TYPES.has(String(product.item_type || "").trim())) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Opening stock is only for goods, not services",
+      });
+    }
+    const inventoryCode = String(product.inventory_account || "").trim();
+    if (!inventoryCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Set an inventory account on this product before recording opening stock.",
+      });
+    }
+
+    const business = await db.business.findOne({
+      where: { id: facilityId },
+      attributes: ["opening_balance_equity", "financial_year_start_month"],
+      transaction,
+    });
+    const dateBounds = openingBalanceDateBounds(
+      business?.financial_year_start_month,
+    );
+    let openingDate;
+    try {
+      openingDate = validatePostingDate(obdate || asOfDate, {
+        field: "obdate",
+        allowFuture: true,
+        minDate: dateBounds.minDate,
+        maxDate: dateBounds.maxDate,
+      });
+    } catch (error) {
+      await transaction.rollback();
+      if (error instanceof PostingDateValidationError) {
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      throw error;
+    }
+
+    const branch = await db.Branch.findOne({
+      where: { id: resolvedBranchId, facilityId },
+      transaction,
+    });
+    if (!branch) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Store not found",
+      });
+    }
+
+    const equityCode = String(
+      equityFromBody || business?.opening_balance_equity || "",
+    ).trim();
+    const [inventoryAccount, equityAccount] = await Promise.all([
+      db.AccountCategory.findOne({
+        where: { code: inventoryCode, facilityId },
+        transaction,
+      }),
+      equityCode
+        ? db.AccountCategory.findOne({
+            where: { code: equityCode, facilityId },
+            transaction,
+          })
+        : null,
+    ]);
+    if (!inventoryAccount || !equityAccount) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Set the product inventory account and Opening Balance Equity before recording opening stock.",
+      });
+    }
+
+    const existing = await findProductOpeningEntry({
+      facilityId,
+      sku: product.sku,
+      branchId: resolvedBranchId,
+      transaction,
+    });
+    if (existing && Number(existing.qty_out) > 0) {
+      await transaction.rollback();
+      return res.status(409).json({
+        success: false,
+        message:
+          "Stock from this opening balance has already moved, so it cannot be replaced.",
+      });
+    }
+    if (existing?.reference_number) {
+      const linkedRows = await db.GeneralLedger.findAll({
+        where: {
+          facility_id: facilityId,
+          reference_number: existing.reference_number,
+        },
+        attributes: ["purpose_of_payment"],
+        transaction,
+      });
+      const hasOtherPostings = linkedRows.some(
+        (row) => !isOpeningBalancePurpose(row.purpose_of_payment),
+      );
+      if (hasOtherPostings) {
+        await transaction.rollback();
+        return res.status(409).json({
+          success: false,
+          message:
+            "This opening balance already has other postings, so it cannot be replaced.",
+        });
+      }
+    }
+
+    const amount = money2(qtyIn * unitCost);
+    const obRef = existing?.reference_number
+      ? existing.reference_number
+      : `OB-${await getAndUpdateNumber("OB", facilityId, transaction)}`;
+    const narration = `Opening Balance - ${product.name} - Qty: ${qtyIn} @ ${unitCost}`;
+    const zone = storeZoneForItemType(product.item_type);
+    const expiry =
+      expiryDate && String(expiryDate).trim()
+        ? String(expiryDate).slice(0, 10)
+        : null;
+
+    if (existing) {
+      await db.GeneralLedger.destroy({
+        where: { facility_id: facilityId, reference_number: obRef },
+        transaction,
+      });
+      await existing.update(
+        {
+          qty_in: qtyIn,
+          qty_out: 0,
+          cost_price: unitCost,
+          selling_price: product.selling_price || 0,
+          receive_date: openingDate,
+          expiry_date: expiry,
+          reference_number: obRef,
+          branch_name: zone,
+          branchId: resolvedBranchId,
+          source: "Initial Stock",
+          destination: zone,
+          status: "Active",
+          inserted_by: String(userId),
+        },
+        { transaction },
+      );
+    } else {
+      await db.StoreEntry.create(
+        {
+          product_id: product.sku,
+          qty_in: qtyIn,
+          qty_out: 0,
+          cost_price: unitCost,
+          selling_price: product.selling_price || 0,
+          supplier_code: "",
+          branch_name: zone,
+          branchId: resolvedBranchId,
+          source: "Initial Stock",
+          destination: zone,
+          facilityId,
+          status: "Active",
+          inserted_by: String(userId),
+          type: STORE_ENTRY_TYPE.OPENING_BALANCE,
+          receive_date: openingDate,
+          reference_number: obRef,
+          truckNo: "",
+          waybillNo: "",
+          expiry_date: expiry,
+        },
+        { transaction },
+      );
+    }
+
+    const subhead = (account) => account.parentCode || account.parent_code || 0;
+    await db.GeneralLedger.bulkCreate(
+      [
+        {
+          transaction_date: openingDate,
+          account_code: inventoryAccount.code,
+          account_subhead: subhead(inventoryAccount),
+          dr: amount,
+          cr: 0,
+          account_description: inventoryAccount.description,
+          transaction_description: narration,
+          reference_number: obRef,
+          purpose_of_payment: "Opening Balance",
+          created_by: String(userId),
+          facility_id: facilityId,
+          type: "inventory",
+          transaction_ref: product.sku,
+        },
+        {
+          transaction_date: openingDate,
+          account_code: equityAccount.code,
+          account_subhead: subhead(equityAccount),
+          dr: 0,
+          cr: amount,
+          account_description: equityAccount.description,
+          transaction_description: narration,
+          reference_number: obRef,
+          purpose_of_payment: "Opening Balance",
+          created_by: String(userId),
+          facility_id: facilityId,
+          type: "opening_balance",
+          transaction_ref: product.sku,
+        },
+      ],
+      { transaction },
+    );
+
+    await transaction.commit();
+    return res.json({
+      success: true,
+      message: "Opening balance saved",
+      data: {
+        reference_number: obRef,
+        sku: product.sku,
+        name: product.name,
+        branchId: resolvedBranchId,
+        branch_name: branch.branch_name,
+        quantity: qtyIn,
+        cost_price: unitCost,
+        amount,
+        inventory_account: inventoryAccount.code,
+        opening_balance_equity: equityAccount.code,
+        obdate: openingDate,
+        replaced: Boolean(existing),
+      },
+    });
+  } catch (error) {
+    if (transaction && !transaction.finished) await transaction.rollback();
+    console.error("setProductOpeningBalance:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Could not save opening balance",
     });
   }
 };

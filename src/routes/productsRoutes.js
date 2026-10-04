@@ -37,6 +37,14 @@ module.exports = (app) => {
     "/api/products/create",
     productsController.createProductWithStoreEntry
   );
+  app.get(
+    "/api/products/opening-balance",
+    productsController.getProductOpeningBalance
+  );
+  app.post(
+    "/api/products/opening-balance",
+    productsController.setProductOpeningBalance
+  );
   app.post(
     "/api/products/bulk-create-finished-good-and-resalable",
     productsController.bulkCreateProductsFinishedGoodAndResalable
