@@ -308,7 +308,12 @@ exports.getInventoryValuationReport = async (req, res) => {
         t.quantity,
         t.avco_cost AS cost_per_unit,
         t.quantity * t.avco_cost AS total_value,
+        t.quantity * t.selling_price AS selling_amount,
+        t.branch_id,
+        t.warehouse_name,
         t.warehouse_location,
+        t.selling_price,
+        t.last_update,
         t.expiry_date
       FROM (
         SELECT
@@ -318,6 +323,17 @@ exports.getInventoryValuationReport = async (req, res) => {
           p.unit_of_measure AS unit,
           p.category,
           p.item_type AS status,
+          se.branchId AS branch_id,
+          COALESCE(MAX(br.branch_name), '') AS warehouse_name,
+          COALESCE(MAX(br.branch_name), '') AS warehouse_location,
+          COALESCE(MAX(p.selling_price), 0) AS selling_price,
+          MAX(
+            CASE
+              WHEN se.receive_date IS NOT NULL AND se.receive_date > '2000-01-01'
+              THEN se.receive_date
+              ELSE DATE(se.createdAt)
+            END
+          ) AS last_update,
           COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS quantity,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END) > 0
@@ -325,10 +341,9 @@ exports.getInventoryValuationReport = async (req, res) => {
                  / SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost,
-          MAX(se.branch_name) AS warehouse_location,
           MAX(se.expiry_date) AS expiry_date
         FROM products p
-        LEFT JOIN store_entries se
+        INNER JOIN store_entries se
           ON ${skuEq("se.product_id", "p.sku")}
           AND se.facilityId = :facilityId
           AND (
@@ -336,21 +351,56 @@ exports.getInventoryValuationReport = async (req, res) => {
             OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
           )
           ${warehouseJoinSql}
+        LEFT JOIN branches br
+          ON br.id = se.branchId
+          AND ${skuEq("br.facilityId", "se.facilityId")}
         WHERE p.facility_id = :facilityId
           AND p.item_type IN ('Finished Good', 'By-Product', 'Resalable', 'Semi Finished')
           ${productWhereSql}
           ${categoryWhereSql}
         GROUP BY
           p.id, p.name, p.sku, p.cost_price, p.unit_of_measure,
-          p.category, p.item_type
+          p.category, p.item_type, se.branchId
+        HAVING quantity > 0
       ) t
-      ORDER BY t.product_name
+      ORDER BY t.warehouse_name, t.product_name
     `;
 
     const finishedGoods = await db.sequelize.query(finishedGoodsQuery, {
       replacements,
       type: db.sequelize.QueryTypes.SELECT,
     });
+
+    // Stores with no quantity as of this date are omitted from the filter.
+    const stockedWarehouses = await db.sequelize.query(
+      `
+      SELECT
+        se.branchId AS id,
+        COALESCE(MAX(br.branch_name), '') AS branch_name
+      FROM store_entries se
+      INNER JOIN products p
+        ON ${skuEq("se.product_id", "p.sku")}
+        AND ${skuEq("p.facility_id", "se.facilityId")}
+      INNER JOIN branches br
+        ON br.id = se.branchId
+        AND ${skuEq("br.facilityId", "se.facilityId")}
+      WHERE se.facilityId = :facilityId
+        AND p.item_type IN ('Finished Good', 'By-Product', 'Resalable', 'Semi Finished')
+        AND se.branchId IS NOT NULL
+        AND se.branchId > 0
+        AND (
+          (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
+          OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
+        )
+      GROUP BY se.branchId
+      HAVING COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) > 0
+      ORDER BY branch_name
+      `,
+      {
+        replacements: { facilityId, asOfDate },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
 
     const rawMaterialsTotal = rawMaterials.reduce(
       (sum, item) => sum + parseFloat(item.total_value || 0),
@@ -386,6 +436,7 @@ exports.getInventoryValuationReport = async (req, res) => {
           lowStockItems: lowStockItems.length,
           lowStockAlerts: lowStockItems,
         },
+        stockedWarehouses,
         reportInfo: {
           asOfDate,
           valuationMethod,
