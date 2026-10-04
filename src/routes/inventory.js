@@ -95,6 +95,7 @@ module.exports = (app) => {
     `/inventory/store-entries/low-stock`,
     inventoryStore.getLowStockAlerts,
   );
+  app.get(`/inventory/stock-alerts`, inventoryStore.getStockAlerts);
   app.get(
     `/inventory/store-entries/out-of-stock`,
     inventoryStore.getOutOfStockItems,

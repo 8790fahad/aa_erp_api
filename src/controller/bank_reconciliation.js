@@ -663,15 +663,36 @@ exports.createBankAccount = async (req, res) => {
       currency = "NGN",
     } = req.body;
     console.log(req.body, "==========");
+    const headCode = String(head || "").trim();
+    const accountDigits = String(account_number || "").replace(/\D/g, "");
     // === VALIDATIONS ===
+    if (!headCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Please select an Account Head",
+      });
+    }
+    if (headCode.replace(/\D/g, "").length <= 1) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Account Head must be more than one digit",
+      });
+    }
+    if (accountDigits.length <= 1) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Account number must be more than one digit",
+      });
+    }
     if (
-      !account_number ||
       !bank_code ||
       !bank_name ||
       !account_bank_type ||
       !facilityId ||
-      !user_id ||
-      !head
+      !user_id
     ) {
       await transaction.rollback();
       return res.status(400).json({
@@ -1170,6 +1191,27 @@ exports.updateBankAccount = async (req, res) => {
       return res.json({
         success: false,
         message: "Bank account not found",
+      });
+    }
+
+    const nextHead = head != null && String(head).trim() !== "" ? String(head).trim() : String(bankAccount.head || "");
+    const nextAccount = account_number != null && String(account_number).trim() !== ""
+      ? String(account_number)
+      : String(bankAccount.account_number || "");
+    if (!nextHead || nextHead.replace(/\D/g, "").length <= 1) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: nextHead
+          ? "Account Head must be more than one digit"
+          : "Please select an Account Head",
+      });
+    }
+    if (nextAccount.replace(/\D/g, "").length <= 1) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Account number must be more than one digit",
       });
     }
 

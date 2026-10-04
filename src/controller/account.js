@@ -32,6 +32,10 @@ const {
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { parseAmount, parseQty } = require("../utils/parseAmount");
 const { collectPurchaseRequisitionRefs } = require("../utils/purchaseRequisitionRefs");
+const {
+  requestUserId,
+  omitUnassignedBranches,
+} = require("../services/branchResolver");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { notifyMemoWorkflow, notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
 const {
@@ -2850,6 +2854,7 @@ exports.getApprovedPRsWithItems = async (req, res) => {
             "unit_measure",
             "quantity",
             "approved_qty",
+            "expiry_date",
             "created_at",
           ],
         },
@@ -2877,26 +2882,77 @@ exports.getApprovedPRsWithItems = async (req, res) => {
       order: [["date", "DESC"]],
     });
 
+    const orderRefs = [
+      ...new Set(
+        prs.flatMap((pr) =>
+          [pr.po_no, pr.order_id, pr.pr_no].filter(Boolean).map(String),
+        ),
+      ),
+    ];
+    const expiryByKey = new Map();
+    if (orderRefs.length) {
+      const expiryRows = await db.sequelize.query(
+        `SELECT po_no AS poNo, product_id AS sku, MIN(expiry_date) AS expiryDate
+         FROM store_entries
+         WHERE facilityId = :facilityId
+           AND po_no IN (:orderRefs)
+           AND expiry_date IS NOT NULL
+           AND expiry_date > '2000-01-01'
+         GROUP BY po_no, product_id`,
+        {
+          replacements: { facilityId, orderRefs },
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+      for (const row of expiryRows) {
+        const day = row.expiryDate ? String(row.expiryDate).slice(0, 10) : "";
+        if (day && day !== "0000-00-00") {
+          expiryByKey.set(`${row.poNo}|${row.sku}`, day);
+        }
+      }
+    }
+
     // Transform the data to include item count and total item cost
     const prsWithMetadata = prs.map((pr) => {
       const prData = pr.toJSON();
       const items = prData.requisition_details || [];
 
       // Map items to include product information and rename for consistency
-      const mappedItems = items.map((item) => ({
-        id: item.id,
-        item_code: item.item_code,
-        item_name: item.product?.name || item.item_name || item.item_code,
-        quantity: item.approved_qty ?? item.quantity,
-        requested_qty: item.quantity,
-        approved_qty: item.approved_qty,
-        unit_measure: item.unit_measure,
-        unit_cost: item.est_cost || item.product?.cost_price,
-        inventory_account: item.product?.inventory_account,
-        uom: item.product?.unit_of_measure,
-        cogs_head: item.product?.cogs_head,
-        revenue_account: item.product?.revenue_account,
-      }));
+      const mappedItems = items.map((item) => {
+        const sku = item.item_code || item.product?.sku || "";
+        const refs = [prData.po_no, prData.order_id, prData.pr_no].filter(Boolean);
+        const lineDay = item.expiry_date
+          ? moment(item.expiry_date).format("YYYY-MM-DD")
+          : "";
+        let expiryDate =
+          /^\d{4}-\d{2}-\d{2}$/.test(lineDay) && lineDay > "2000-01-01"
+            ? lineDay
+            : "";
+        if (!expiryDate) {
+          for (const ref of refs) {
+            const hit = expiryByKey.get(`${ref}|${sku}`);
+            if (hit) {
+              expiryDate = hit;
+              break;
+            }
+          }
+        }
+        return {
+          id: item.id,
+          item_code: item.item_code,
+          item_name: item.product?.name || item.item_name || item.item_code,
+          quantity: item.approved_qty ?? item.quantity,
+          requested_qty: item.quantity,
+          approved_qty: item.approved_qty,
+          unit_measure: item.unit_measure,
+          unit_cost: item.est_cost || item.product?.cost_price,
+          inventory_account: item.product?.inventory_account,
+          uom: item.product?.unit_of_measure,
+          cogs_head: item.product?.cogs_head,
+          revenue_account: item.product?.revenue_account,
+          expiry_date: expiryDate,
+        };
+      });
 
       // Calculate total item cost
       const totalItemCost = mappedItems.reduce((sum, item) => {
@@ -8732,26 +8788,29 @@ exports.getAllBranches = (req, res) => {
     });
 };
 
-exports.getBranches = (req, res) => {
-  const { facilityId } = req.query;
-  db.sequelize
-    .query(
+exports.getBranches = async (req, res) => {
+  const { facilityId, includeAll } = req.query;
+  try {
+    const results = await db.sequelize.query(
       `SELECT *, branch_name as storeName FROM branches WHERE facilityId = :facilityId`,
       {
         replacements: { facilityId },
         type: db.Sequelize.QueryTypes.SELECT,
       },
-    )
-    .then((results) => {
-      res.json({
-        success: true,
-        results: results,
-      });
-    })
-    .catch((err) => {
-      console.error(err);
-      res.status(500).json({ success: false, err });
+    );
+    const visible = await omitUnassignedBranches(results, {
+      userId: requestUserId(req),
+      facilityId,
+      includeAll,
     });
+    res.json({
+      success: true,
+      results: visible,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, err });
+  }
 };
 
 exports.deleteBranche = async (req, res) => {
@@ -8959,9 +9018,14 @@ exports.getReadyForSalesItems = async (req, res) => {
 
     await attachSalesLimitInfo(results, facilityId);
 
+    const visible = await omitUnassignedBranches(results, {
+      userId: requestUserId(req),
+      facilityId,
+    });
+
     res.json({
       success: true,
-      results: omitStoppedUnlessIncluded(results, includeStopped),
+      results: omitStoppedUnlessIncluded(visible, includeStopped),
     });
   } catch (err) {
     console.error("Error fetching ready for sales items:", err);
@@ -13430,6 +13494,7 @@ async function runPurchaseRequisitionQuery({
          a.id,
          a.est_cost,
          a.unit_category,
+         a.expiry_date,
          a.chart_code,
          b.unit_of_measure AS uom,
          b.cogs_head,
@@ -13635,6 +13700,13 @@ async function resolveUniqueOrderId({
   );
 }
 
+function requisitionExpiryDate(value) {
+  if (!value) return null;
+  const day = String(value).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day <= "2000-01-01") return null;
+  return day;
+}
+
 exports.insertRequisition = async (req, res) => {
   // Support JSON body (legacy) and multipart FormData (with po_documents).
   let body = req.body || {};
@@ -13757,6 +13829,9 @@ exports.insertRequisition = async (req, res) => {
             unit_measure:
               expense.unit || expense.unit_measure || expense.uom || "",
             quantity: Math.round(Number(expense.quantity) || 0) || 1,
+            expiry_date: requisitionExpiryDate(
+              expense.expiry_date || expense.expiryDate,
+            ),
             created_at: new Date(),
           },
           { transaction },
@@ -15219,7 +15294,7 @@ exports.directPurchaseConsumables = async (req, res) => {
             ...(salesSellingPrice != null
               ? { selling_price: salesSellingPrice }
               : {}),
-            expiry_date: item.expiry_date || null,
+            expiry_date: item.expiry_date || item.expiryDate || null,
             inserted_by: userId,
             facilityId,
             transaction_ref: pvCode,

@@ -294,7 +294,7 @@ exports.generateGoodReceive = async (req, res) => {
           reference_number: grnCode,
           qty_in: receivedQuantity,
           qty_out: 0,
-          expiry_date: item.expiryDate || null,
+          expiry_date: item.expiryDate || item.expiry_date || null,
           cost_price: unitCost,
           selling_price: unitCost,
           branch_name: receiving_branch || "Main Warehouse",

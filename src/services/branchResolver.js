@@ -175,6 +175,81 @@ function clearBranchCache() {
   _cache.clear();
 }
 
+function isHeadOfficeName(name) {
+  return String(name || "").trim().toLowerCase() === "head office";
+}
+
+function isHeadOfficeBranch(branch) {
+  return [branch?.branch_name, branch?.storeName, branch?.location_name].some(
+    isHeadOfficeName,
+  );
+}
+
+function branchRowId(row) {
+  const id = Number(row?.id);
+  if (Number.isInteger(id) && id > 0) return id;
+  const branchId = Number(row?.branchId);
+  if (Number.isFinite(branchId) && branchId > 0) return branchId;
+  return NaN;
+}
+
+function requestUserId(req) {
+  const header = req?.headers?.authorization || req?.headers?.Authorization || "";
+  const raw = String(header).replace(/^Bearer\s+/i, "").trim();
+  if (raw) {
+    try {
+      const jwt = require("jsonwebtoken");
+      const secret =
+        process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret";
+      const decoded = jwt.verify(raw, secret);
+      if (decoded?.id) return String(decoded.id);
+    } catch (_err) {
+      /* fall through */
+    }
+  }
+  return req?.user?.id || req?.query?.userId || null;
+}
+
+async function assignedBranchIds(userId, facilityId) {
+  if (!userId || !facilityId) return [];
+  const rows = await db.sequelize.query(
+    `SELECT branch_id
+     FROM user_branches
+     WHERE user_id = :userId
+       AND facility_id = :facilityId
+     UNION
+     SELECT u.branchId AS branch_id
+     FROM users u
+     INNER JOIN branches b
+       ON b.id = u.branchId
+      AND b.facilityId = :facilityId
+     WHERE u.id = :userId
+       AND u.branchId IS NOT NULL`,
+    {
+      replacements: { userId: String(userId), facilityId: String(facilityId) },
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+  return [
+    ...new Set(
+      rows
+        .map((row) => Number(row.branch_id))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  ];
+}
+
+/**
+ * A branch is visible only after it is assigned on the user.
+ * includeAll keeps the full list on staff and branch setup, where access is granted.
+ */
+async function omitUnassignedBranches(rows, { userId, facilityId, includeAll }) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (String(includeAll) === "1") return list;
+  const allowed = new Set(await assignedBranchIds(userId, facilityId));
+  return list.filter((row) => allowed.has(branchRowId(row)));
+}
+
 module.exports = {
   resolveBranchId,
   resolveBranchIds,
@@ -182,4 +257,8 @@ module.exports = {
   resolveDefaultBranchId,
   resolveRequiredBranchId,
   clearBranchCache,
+  isHeadOfficeBranch,
+  requestUserId,
+  assignedBranchIds,
+  omitUnassignedBranches,
 };

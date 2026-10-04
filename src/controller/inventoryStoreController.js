@@ -343,6 +343,113 @@ exports.getInventoryItemDetails = async (req, res) => {
   }
 };
 
+exports.getStockAlerts = async (req, res) => {
+  try {
+    const { facilityId, branchId, kind } = req.query;
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    const parsedBranchId = parseInt(branchId, 10);
+    const hasBranch = Number.isInteger(parsedBranchId) && parsedBranchId > 0;
+    const replacements = { facilityId, days };
+    if (hasBranch) replacements.branchId = parsedBranchId;
+    const goodsTypes =
+      "AND p.item_type IN ('Resalable', 'Finished Good', 'By-Product') AND p.status = 'Active'";
+    const salesZone =
+      "LOWER(TRIM(IFNULL(se.branch_name, ''))) IN ('for sales', 'for sale')";
+    // Same warehouse rule as the goods list: this branch, plus by-product
+    // stock that was received without a branch.
+    const branchMatch = hasBranch
+      ? `AND (
+          se.branchId = :branchId
+          OR (
+            p.item_type = 'By-Product'
+            AND (se.branchId = 0 OR se.branchId IS NULL)
+          )
+        )`
+      : "";
+
+    const query =
+      kind === "reorder"
+        ? `
+      SELECT
+        p.sku,
+        p.name AS item_name,
+        p.item_type,
+        p.unit_of_measure,
+        p.reorder_level,
+        se.branchId AS branch_id,
+        COALESCE(MAX(br.branch_name), '') AS warehouse,
+        COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS balance
+      FROM products p
+      LEFT JOIN store_entries se
+        ON ${sqlEq("se.product_id", "p.sku")}
+        AND ${sqlEq("se.facilityId", "p.facility_id")}
+        AND ${salesZone}
+        ${branchMatch}
+      LEFT JOIN branches br
+        ON br.id = se.branchId
+        AND ${sqlEq("br.facilityId", "p.facility_id")}
+      WHERE ${sqlEq("p.facility_id", ":facilityId")}
+        ${goodsTypes}
+        AND COALESCE(p.reorder_level, 0) > 0
+      GROUP BY p.sku, p.name, p.item_type, p.unit_of_measure, p.reorder_level, se.branchId
+      HAVING balance <= p.reorder_level
+      ORDER BY balance ASC, p.name ASC
+    `
+        : `
+      SELECT
+        p.sku,
+        p.name AS item_name,
+        p.item_type,
+        p.unit_of_measure,
+        se.expiry_date,
+        se.branchId AS branch_id,
+        COALESCE(MAX(br.branch_name), MAX(se.location), '') AS warehouse,
+        SUM(COALESCE(se.qty_in, 0) - COALESCE(se.qty_out, 0)) AS balance,
+        DATEDIFF(se.expiry_date, CURDATE()) AS days_left
+      FROM store_entries se
+      INNER JOIN products p
+        ON ${sqlEq("se.product_id", "p.sku")}
+        AND ${sqlEq("se.facilityId", "p.facility_id")}
+      LEFT JOIN branches br
+        ON br.id = se.branchId
+        AND ${sqlEq("br.facilityId", "se.facilityId")}
+      WHERE ${sqlEq("se.facilityId", ":facilityId")}
+        AND ${salesZone}
+        ${branchMatch}
+        ${goodsTypes}
+        AND se.expiry_date IS NOT NULL
+        AND se.expiry_date > '2000-01-01'
+        ${
+          kind === "expired"
+            ? "AND se.expiry_date < CURDATE()"
+            : "AND se.expiry_date >= CURDATE() AND se.expiry_date <= DATE_ADD(CURDATE(), INTERVAL :days DAY)"
+        }
+      GROUP BY p.sku, p.name, p.item_type, p.unit_of_measure, se.expiry_date, se.branchId
+      HAVING balance > 0
+      ORDER BY se.expiry_date ASC, p.name ASC
+    `;
+
+    const results = await db.sequelize.query(query, {
+      replacements,
+      type: db.sequelize.QueryTypes.SELECT,
+    });
+    return res.json({ success: true, results, count: results.length });
+  } catch (error) {
+    console.error("getStockAlerts:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load stock alerts",
+      error: error.message,
+    });
+  }
+};
+
 // Get low stock alerts
 exports.getLowStockAlerts = async (req, res) => {
   try {
