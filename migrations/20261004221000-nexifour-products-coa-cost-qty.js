@@ -379,20 +379,20 @@ async function setSellableQty(sequelize, transaction, product) {
   const delta = product.qty - Number(balanceRow?.balance || 0);
   if (!Number.isFinite(delta) || Math.abs(delta) < 0.0001) return;
 
-  const places = await sequelize.query(
-    `SELECT branchId, location, destination, source
-     FROM store_entries
-     WHERE ${codeEq("facilityId", "CAST(:facilityId AS CHAR)")}
-       AND LOWER(TRIM(branch_name)) IN ('for sales', 'for sale')
-     ORDER BY id DESC LIMIT 1`,
+  const [dawanau] = await sequelize.query(
+    `SELECT id, branch_name AS name
+     FROM branches
+     WHERE facilityId = :facilityId
+       AND UPPER(TRIM(branch_name)) LIKE '%DAWANAU%'
+     ORDER BY id ASC
+     LIMIT 1`,
     {
       replacements: { facilityId: FACILITY_ID },
       type: sequelize.QueryTypes.SELECT,
       transaction,
     },
   );
-  const place = places[0] || {};
-  const location = place.location || place.destination || "store";
+  const location = dawanau?.name || "DAWANAU STORE";
   await sequelize.query(
     `INSERT INTO store_entries (
        receive_date, reference_number, qty_in, qty_out, cost_price,
@@ -410,11 +410,11 @@ async function setSellableQty(sequelize, transaction, product) {
         qtyOut: delta < 0 ? Math.abs(delta) : 0,
         cost: product.cost || 0,
         facilityId: FACILITY_ID,
-        source: place.source || location,
-        destination: place.destination || location,
+        source: location,
+        destination: location,
         sku: saved.sku || product.sku,
         location,
-        branchId: place.branchId || 0,
+        branchId: dawanau?.id || 0,
       },
       transaction,
     },
