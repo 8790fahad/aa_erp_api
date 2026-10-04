@@ -137,6 +137,58 @@ BEGIN
 END
 `.trim();
 
+function sameDescription(a, b) {
+  return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+}
+
+async function loadChart(sequelize, transaction) {
+  return sequelize.query(
+    `SELECT code, description
+     FROM account_category
+     WHERE facility_id = :facilityId`,
+    {
+      replacements: { facilityId: FACILITY_ID },
+      type: sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+}
+
+/**
+ * A destination that already belongs to a different account must not be
+ * overwritten. Drop that move, then drop any earlier move that was counting
+ * on the skipped account to vacate its code.
+ */
+function safePairs(rows, pairs) {
+  const byCode = new Map(rows.map((row) => [String(row.code), row]));
+  let matched = [];
+  for (const [oldCode, newCode, description] of pairs) {
+    const row = byCode.get(String(oldCode));
+    if (!row || !sameDescription(row.description, description)) continue;
+    matched.push([String(oldCode), String(newCode), description]);
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const sources = new Set(matched.map(([oldCode]) => oldCode));
+    const next = [];
+    for (const pair of matched) {
+      const occupant = byCode.get(pair[1]);
+      if (occupant && !sources.has(pair[1])) {
+        console.warn(
+          `[migrate] skip ${pair[0]} -> ${pair[1]}: ${pair[1]} is already "${occupant.description}"`,
+        );
+        changed = true;
+        continue;
+      }
+      next.push(pair);
+    }
+    matched = next;
+  }
+  return matched;
+}
+
 async function columnExists(sequelize, table, column) {
   const rows = await sequelize.query(
     `SELECT COLUMN_NAME AS columnName
@@ -173,9 +225,33 @@ async function replaceCode(
   );
 }
 
+async function replaceBusinessCodes(sequelize, from, to, transaction) {
+  const sets = [];
+  const ors = [];
+  for (const column of BUSINESS_COLUMNS) {
+    if (!(await columnExists(sequelize, "business", column))) continue;
+    sets.push(
+      `\`${column}\` = IF(\`${column}\` = :from, :to, \`${column}\`)`,
+    );
+    ors.push(`\`${column}\` = :from`);
+  }
+  if (!sets.length) return;
+  // One update, and only when a column actually holds this code, so the
+  // business audit trigger does not rewrite the logo on every empty pass.
+  await sequelize.query(
+    `UPDATE \`business\`
+     SET ${sets.join(", ")}
+     WHERE \`id\` = :facilityId
+       AND (${ors.join(" OR ")})`,
+    { replacements: { from, to, facilityId: FACILITY_ID }, transaction },
+  );
+}
+
 async function applyRemap(sequelize, pairs, transaction) {
+  const chart = await loadChart(sequelize, transaction);
+  const safe = safePairs(chart, pairs);
   const renamed = [];
-  for (const [oldCode, , description] of pairs) {
+  for (const [oldCode, , description] of safe) {
     const found = await sequelize.query(
       `SELECT code
        FROM account_category
@@ -236,20 +312,10 @@ async function applyRemap(sequelize, pairs, transaction) {
         transaction,
       );
     }
-    for (const column of BUSINESS_COLUMNS) {
-      await replaceCode(
-        sequelize,
-        "business",
-        column,
-        "id",
-        oldCode,
-        temp,
-        transaction,
-      );
-    }
+    await replaceBusinessCodes(sequelize, oldCode, temp, transaction);
   }
 
-  for (const [oldCode, newCode, description] of pairs) {
+  for (const [oldCode, newCode, description] of safe) {
     const temp = `~${oldCode}`;
     await sequelize.query(
       `UPDATE account_category
@@ -285,17 +351,7 @@ async function applyRemap(sequelize, pairs, transaction) {
         transaction,
       );
     }
-    for (const column of BUSINESS_COLUMNS) {
-      await replaceCode(
-        sequelize,
-        "business",
-        column,
-        "id",
-        temp,
-        newCode,
-        transaction,
-      );
-    }
+    await replaceBusinessCodes(sequelize, temp, newCode, transaction);
   }
 }
 
@@ -380,14 +436,49 @@ async function installFunction(sequelize) {
   await sequelize.query(CREATE_FN);
 }
 
+const AUDIT_TABLES = ["business", "customers", "requisition_details"];
+
+async function withoutRowAudit(queryInterface, sequelize, work) {
+  let audit;
+  try {
+    audit = require("./lib/rowChangeAuditTriggers");
+  } catch (err) {
+    audit = null;
+  }
+  if (audit?.dropTableTriggers) {
+    for (const table of AUDIT_TABLES) {
+      try {
+        await audit.dropTableTriggers(sequelize, table);
+      } catch (err) {
+        console.warn(`[migrate] could not pause ${table} audit: ${err.message}`);
+      }
+    }
+  }
+  try {
+    return await work();
+  } finally {
+    if (audit?.installTableTriggers) {
+      for (const table of AUDIT_TABLES) {
+        try {
+          await audit.installTableTriggers(queryInterface, sequelize, table);
+        } catch (err) {
+          console.warn(`[migrate] could not restore ${table} audit: ${err.message}`);
+        }
+      }
+    }
+  }
+}
+
 module.exports = {
   async up(queryInterface) {
     const sequelize = queryInterface.sequelize;
     await installFunction(sequelize);
-    await sequelize.transaction(async (transaction) => {
-      await applyRemap(sequelize, REMAP, transaction);
-      await alignMovedRows(sequelize, transaction);
-    });
+    await withoutRowAudit(queryInterface, sequelize, () =>
+      sequelize.transaction(async (transaction) => {
+        await applyRemap(sequelize, REMAP, transaction);
+        await alignMovedRows(sequelize, transaction);
+      }),
+    );
   },
 
   async down(queryInterface) {
