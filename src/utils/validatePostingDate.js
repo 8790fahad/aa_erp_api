@@ -64,7 +64,10 @@ function normalizePostingDate(value) {
 /**
  * Validate and return normalized YYYY-MM-DD. Throws PostingDateValidationError.
  */
-function validatePostingDate(value, { field = "transaction_date" } = {}) {
+function validatePostingDate(
+  value,
+  { field = "transaction_date", allowFuture = false, minDate, maxDate } = {},
+) {
   const normalized = normalizePostingDate(value);
   if (!normalized) {
     throw new PostingDateValidationError(
@@ -73,17 +76,23 @@ function validatePostingDate(value, { field = "transaction_date" } = {}) {
     );
   }
 
-  if (normalized < MIN_POSTING_DATE) {
+  const floor =
+    minDate && minDate > MIN_POSTING_DATE ? minDate : MIN_POSTING_DATE;
+  if (normalized < floor) {
     throw new PostingDateValidationError(
-      `Invalid ${field}: cannot be before 1 January 2025 (${normalized})`,
+      floor === MIN_POSTING_DATE
+        ? `Invalid ${field}: cannot be before 1 January 2025 (${normalized})`
+        : `Invalid ${field}: cannot be before the financial year (${floor})`,
       field,
     );
   }
 
-  const maxDate = getMaxPostingDate();
-  if (normalized > maxDate) {
+  const ceiling = maxDate || (!allowFuture ? getMaxPostingDate() : null);
+  if (ceiling && normalized > ceiling) {
     throw new PostingDateValidationError(
-      `Invalid ${field}: cannot be in the future (${normalized})`,
+      maxDate
+        ? `Invalid ${field}: cannot be after ${maxDate}`
+        : `Invalid ${field}: cannot be in the future (${normalized})`,
       field,
     );
   }

@@ -3,7 +3,10 @@ import { getAndUpdateNumber } from "../services/numberGen";
 const db = require("../models");
 const { Op } = require("sequelize");
 const { parseAmount } = require("../utils/parseAmount");
-const { validatePostingDate } = require("../utils/validatePostingDate");
+const {
+  validatePostingDate,
+  normalizePostingDate,
+} = require("../utils/validatePostingDate");
 const {
   normalizeNigerianPhone,
   isValidNigerianPhone,
@@ -1286,6 +1289,315 @@ exports.CreateCustomer = async (req, res) => {
       success: false,
       message: "Failed to create customer",
       error: error.message,
+    });
+  }
+};
+
+function openingBalanceDateBounds(startMonth) {
+  const month = parseInt(startMonth, 10);
+  const fyMonth = Number.isInteger(month) && month >= 1 && month <= 12 ? month : 1;
+  const today = moment();
+  let startYear = today.year();
+  if (today.month() + 1 < fyMonth) startYear -= 1;
+  return {
+    minDate: moment({ year: startYear, month: fyMonth - 1, day: 1 }).format(
+      "YYYY-MM-DD",
+    ),
+    maxDate: today.clone().add(1, "day").format("YYYY-MM-DD"),
+  };
+}
+
+/**
+ * Record or replace a customer's opening balance.
+ * Positive: Dr Accounts Receivable, Cr Opening Balance Equity.
+ * Negative: Dr Opening Balance Equity, Cr Customer Deposits.
+ */
+exports.setCustomerOpeningBalance = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      customerNo,
+      opening_balance,
+      obdate,
+      created_by,
+      opening_balance_equity: equityFromBody,
+    } = req.body || {};
+
+    if (!facilityId || !customerNo) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and customerNo are required",
+      });
+    }
+
+    const OB = parseFloat(opening_balance);
+    if (!Number.isFinite(OB) || Math.abs(OB) < 0.005) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter an opening balance amount",
+      });
+    }
+
+    const customer = await db.Customer.findOne({
+      where: { customerNo, facilityId },
+      transaction,
+    });
+    if (!customer) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Customer not found",
+      });
+    }
+
+    const business = await db.business.findOne({
+      where: { id: facilityId },
+      attributes: ["opening_balance_equity", "financial_year_start_month"],
+      transaction,
+    });
+    const dateBounds = openingBalanceDateBounds(
+      business?.financial_year_start_month,
+    );
+    let transactionDate;
+    try {
+      transactionDate = validatePostingDate(obdate, {
+        field: "obdate",
+        allowFuture: true,
+        minDate: dateBounds.minDate,
+        maxDate: dateBounds.maxDate,
+      });
+    } catch (err) {
+      await transaction.rollback();
+      const formatted = normalizePostingDate(obdate);
+      return res.status(400).json({
+        success: false,
+        message: formatted
+          ? `As of date must be from ${dateBounds.minDate} (start of the financial year) through ${dateBounds.maxDate} (tomorrow).`
+          : "Enter a valid as of date",
+      });
+    }
+
+    const equityCode = String(
+      equityFromBody || business?.opening_balance_equity || "",
+    ).trim();
+    const receivableCode = String(
+      customer.receivable_code || customer.account_head || "",
+    ).trim();
+    const depositCode = String(customer.receivable_accural_code || "").trim();
+    if (!equityCode || !receivableCode || !depositCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Set receivable, deposit, and opening balance equity accounts before recording an opening balance.",
+      });
+    }
+
+    const receivableAccount = await db.AccountCategory.findOne({
+      where: { code: receivableCode, facility_id: facilityId },
+      transaction,
+    });
+    const depositAccount = await db.AccountCategory.findOne({
+      where: { code: depositCode, facility_id: facilityId },
+      transaction,
+    });
+    const obeAccount = await db.AccountCategory.findOne({
+      where: { code: equityCode, facility_id: facilityId },
+      transaction,
+    });
+    if (!receivableAccount || !depositAccount || !obeAccount) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Receivable, Deposit, or Opening Balance Equity account not found",
+      });
+    }
+
+    const existing = await db.CustomerEntry.findOne({
+      where: { customerNo, facilityId, type: "opening_balance" },
+      order: [["entry_id", "DESC"]],
+      transaction,
+    });
+    if (existing?.link_id) {
+      const linkedRows = await db.GeneralLedger.findAll({
+        where: {
+          facility_id: facilityId,
+          reference_number: existing.link_id,
+        },
+        attributes: ["purpose_of_payment"],
+        transaction,
+      });
+      const hasOtherPostings = linkedRows.some((row) => {
+        const purpose = String(row.purpose_of_payment || "")
+          .trim()
+          .toLowerCase();
+        return purpose && !purpose.startsWith("opening balance");
+      });
+      if (hasOtherPostings) {
+        await transaction.rollback();
+        return res.status(409).json({
+          success: false,
+          message:
+            "This opening balance already has payments against it, so it cannot be replaced.",
+        });
+      }
+      await db.GeneralLedger.destroy({
+        where: {
+          facility_id: facilityId,
+          reference_number: existing.link_id,
+        },
+        transaction,
+      });
+      await db.Invoice.destroy({
+        where: { facility_id: facilityId, invoice_ref: existing.link_id },
+        transaction,
+      });
+      await existing.destroy({ transaction });
+    }
+
+    const userId = created_by || req.user?.id;
+    if (!userId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "created_by is required",
+      });
+    }
+
+    const displayName = customer.fullname || customer.company_name || customerNo;
+    const absOB = Math.abs(OB);
+    const invoiceRef = `OB-${await getAndUpdateNumber("OB", facilityId)}`;
+
+    if (OB > 0) {
+      await db.GeneralLedger.bulkCreate(
+        [
+          {
+            transaction_date: transactionDate,
+            account_code: receivableAccount.code,
+            account_subhead:
+              receivableAccount.parentCode || receivableAccount.parent_code || 0,
+            account_description: receivableAccount.description,
+            dr: absOB,
+            cr: 0,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: invoiceRef,
+            payee: displayName,
+            created_by: userId,
+            facility_id: facilityId,
+            type: "receivable",
+            transaction_ref: customerNo,
+          },
+          {
+            transaction_date: transactionDate,
+            account_code: obeAccount.code,
+            account_subhead: obeAccount.parentCode || obeAccount.parent_code || 0,
+            account_description: obeAccount.description,
+            dr: 0,
+            cr: absOB,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: invoiceRef,
+            created_by: userId,
+            facility_id: facilityId,
+            type: "equity",
+            transaction_ref: "",
+          },
+        ],
+        { transaction },
+      );
+      await db.Invoice.create(
+        {
+          ref_number: customerNo,
+          invoice_ref: invoiceRef,
+          description: "Opening Balance - Customer Owes",
+          transaction_date: transactionDate,
+          due_date: transactionDate,
+          amount: absOB,
+          balance: absOB,
+          payment_method: "opening_balance",
+          user_id: userId,
+          created_by: userId,
+          facility_id: facilityId,
+          type: "sales",
+          status: "unpaid",
+        },
+        { transaction },
+      );
+    } else {
+      await db.GeneralLedger.bulkCreate(
+        [
+          {
+            transaction_date: transactionDate,
+            account_code: obeAccount.code,
+            account_subhead: obeAccount.parentCode || obeAccount.parent_code || 0,
+            account_description: obeAccount.description,
+            dr: absOB,
+            cr: 0,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: invoiceRef,
+            created_by: userId,
+            facility_id: facilityId,
+            type: "equity",
+            transaction_ref: "",
+          },
+          {
+            transaction_date: transactionDate,
+            account_code: depositAccount.code,
+            account_subhead:
+              depositAccount.parentCode || depositAccount.parent_code || 0,
+            account_description: depositAccount.description,
+            dr: 0,
+            cr: absOB,
+            transaction_description: `opening balance for ${displayName}`,
+            purpose_of_payment: "Opening Balance",
+            reference_number: invoiceRef,
+            payee: displayName,
+            created_by: userId,
+            facility_id: facilityId,
+            type: "deposit",
+            transaction_ref: customerNo,
+          },
+        ],
+        { transaction },
+      );
+    }
+
+    await db.CustomerEntry.create(
+      {
+        customerNo,
+        description: "Opening Balance",
+        cost: absOB,
+        qty_in: OB > 0 ? 1 : 0,
+        qty_out: OB < 0 ? 1 : 0,
+        type: "opening_balance",
+        link_id: invoiceRef,
+        bank_account_id: 0,
+        facilityId,
+        mode_of_payment: "opening_balance",
+        created_by: userId,
+        transaction_date: transactionDate,
+      },
+      { transaction },
+    );
+
+    await transaction.commit();
+    return res.json({
+      success: true,
+      message: "Opening balance saved",
+      data: { customerNo, invoice_ref: invoiceRef, opening_balance: OB },
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("setCustomerOpeningBalance:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to save opening balance",
     });
   }
 };

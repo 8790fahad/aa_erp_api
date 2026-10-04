@@ -25,6 +25,10 @@ module.exports = (app) => {
   app.post("/get/bulk/payment/vouchers", getBulkPaymentVouchers);
   app.get("/get/purchase-order-pdf", getPurchaseOrderPdf);
   app.post("/create-customer", customer.CreateCustomer);
+  app.post(
+    "/api/v1/customer-opening-balance",
+    customer.setCustomerOpeningBalance,
+  );
   app.post("/create-customer-upload", customer.CreateCustomerUpload);
   app.post("/create-supplier-upload", customer.CreateSupplierUpload);
   app.post("/create-product-upload", customer.CreateProductUpload);

@@ -181,8 +181,19 @@ module.exports = (sequelize, DataTypes) => {
       return;
     }
     const { validatePostingDate } = require("../utils/validatePostingDate");
+    const purpose = String(instance.purpose_of_payment || "")
+      .trim()
+      .toLowerCase();
+    const isOpeningBalance = purpose.startsWith("opening balance");
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowIso = `${tomorrow.getFullYear()}-${String(
+      tomorrow.getMonth() + 1,
+    ).padStart(2, "0")}-${String(tomorrow.getDate()).padStart(2, "0")}`;
     instance.transaction_date = validatePostingDate(instance.transaction_date, {
       field: "transaction_date",
+      allowFuture: isOpeningBalance,
+      maxDate: isOpeningBalance ? tomorrowIso : undefined,
     });
   });
 
