@@ -2926,7 +2926,11 @@ exports.login = (req, res) => {
                       "Business profile load failed during login:",
                       profileErr,
                     );
-                    sendLoginSuccess(null, []);
+                    return res.status(503).json({
+                      success: false,
+                      message:
+                        "Unable to sign in. The business profile could not be loaded.",
+                    });
                   },
                   user[0].dataValues.email,
                 );
