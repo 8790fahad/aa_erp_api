@@ -41,7 +41,14 @@ const userDisplayName = (user) => {
 // Compute available qty at branch X for an SKU (sellable zone: for sales).
 // By-Product rows often have branchId 0 when posted from production — include
 // those at the source branch so approvers see the real transferable balance.
-async function getAvailableQty({ sku, facilityId, branchId, transaction }) {
+// When expiryDate is set, only that lot is counted (keeps transfer on one lot).
+async function getAvailableQty({
+  sku,
+  facilityId,
+  branchId,
+  expiryDate = null,
+  transaction,
+}) {
   const parsedBranchId = parseInt(branchId, 10);
   const branchFilter =
     Number.isInteger(parsedBranchId) && parsedBranchId > 0
@@ -59,6 +66,19 @@ async function getAvailableQty({ sku, facilityId, branchId, transaction }) {
          )`
       : "";
 
+  let expiryFilter = "";
+  const replacements = {
+    sku,
+    facilityId,
+    ...(Number.isInteger(parsedBranchId) && parsedBranchId > 0
+      ? { branchId: parsedBranchId }
+      : {}),
+  };
+  if (expiryDate) {
+    expiryFilter = "AND DATE(se.expiry_date) = DATE(:expiryDate)";
+    replacements.expiryDate = expiryDate;
+  }
+
   const zoneList = SELLABLE_ZONES.map((z) => `'${z}'`).join(", ");
   const rows = await db.sequelize.query(
     `SELECT IFNULL(SUM(se.qty_in) - SUM(se.qty_out), 0) AS balance
@@ -66,20 +86,79 @@ async function getAvailableQty({ sku, facilityId, branchId, transaction }) {
       WHERE se.product_id = :sku
         AND se.facilityId = :facilityId
         AND LOWER(TRIM(se.branch_name)) IN (${zoneList})
-        ${branchFilter}`,
+        ${branchFilter}
+        ${expiryFilter}`,
     {
-      replacements: {
-        sku,
-        facilityId,
-        ...(Number.isInteger(parsedBranchId) && parsedBranchId > 0
-          ? { branchId: parsedBranchId }
-          : {}),
-      },
+      replacements,
       type: db.sequelize.QueryTypes.SELECT,
       transaction,
     }
   );
   return parseFloat(rows?.[0]?.balance || 0);
+}
+
+/** Prefer dated lot expiry when the transfer line did not carry one. */
+async function resolveExpiryForTransfer({
+  sku,
+  facilityId,
+  branchId,
+  preferredExpiry,
+  qty,
+  transaction,
+}) {
+  if (
+    preferredExpiry &&
+    preferredExpiry !== "0000-00-00" &&
+    preferredExpiry !== "1111-11-11"
+  ) {
+    return moment(preferredExpiry).format("YYYY-MM-DD");
+  }
+
+  const parsedBranchId = parseInt(branchId, 10);
+  const zoneList = SELLABLE_ZONES.map((z) => `'${z}'`).join(", ");
+  const rows = await db.sequelize.query(
+    `SELECT
+        CASE
+          WHEN se.expiry_date IS NULL
+            OR se.expiry_date <= '2000-01-01'
+            OR se.expiry_date = '1111-11-11'
+          THEN NULL
+          ELSE DATE(se.expiry_date)
+        END AS expiry_day,
+        IFNULL(SUM(se.qty_in) - SUM(se.qty_out), 0) AS balance
+       FROM store_entries se
+      WHERE se.product_id = :sku
+        AND se.facilityId = :facilityId
+        AND LOWER(TRIM(se.branch_name)) IN (${zoneList})
+        AND se.branchId = :branchId
+      GROUP BY expiry_day
+     HAVING balance > 0.000001
+      ORDER BY
+        CASE WHEN expiry_day IS NULL THEN 1 ELSE 0 END,
+        expiry_day ASC`,
+    {
+      replacements: {
+        sku,
+        facilityId,
+        branchId: Number.isInteger(parsedBranchId) ? parsedBranchId : 0,
+      },
+      type: db.sequelize.QueryTypes.SELECT,
+      transaction,
+    }
+  );
+
+  const need = parseFloat(qty) || 0;
+  const dated = (rows || []).find(
+    (r) => r.expiry_day && parseFloat(r.balance) + 1e-6 >= need
+  );
+  if (dated?.expiry_day) {
+    return moment(dated.expiry_day).format("YYYY-MM-DD");
+  }
+  const anyDated = (rows || []).find((r) => r.expiry_day);
+  if (anyDated?.expiry_day) {
+    return moment(anyDated.expiry_day).format("YYYY-MM-DD");
+  }
+  return null;
 }
 
 function valuationMethodKey(invEvM) {
@@ -569,17 +648,26 @@ exports.approveGoodsTransfer = async (req, res) => {
     for (const line of items) {
       const need = effectiveQtyByLineId[String(line.id)];
       if (need <= 0) continue;
+      const lineExpiry =
+        line.expiry_date &&
+        line.expiry_date !== "0000-00-00" &&
+        line.expiry_date !== "1111-11-11"
+          ? moment(line.expiry_date).format("YYYY-MM-DD")
+          : null;
       const available = await getAvailableQty({
         sku: line.product_id,
         facilityId,
         branchId: transfer.source_branch_id,
+        expiryDate: lineExpiry,
         transaction: t,
       });
       if (available + 1e-6 < need) {
         await t.rollback();
         return res.status(400).json({
           success: false,
-          message: `Insufficient stock for ${line.item_name || line.product_id} at source branch (available ${available}, approved ${need})`,
+          message: `Insufficient stock for ${line.item_name || line.product_id}${
+            lineExpiry ? ` (expiry ${lineExpiry})` : ""
+          } at source branch (available ${available}, approved ${need})`,
         });
       }
     }
@@ -630,11 +718,23 @@ exports.approveGoodsTransfer = async (req, res) => {
           ? parseFloat(line.selling_price)
           : parseFloat(product?.selling_price) || cost;
 
-      // Persist approved qty and valuation-derived cost on the line.
+      const expiryDate = await resolveExpiryForTransfer({
+        sku,
+        facilityId,
+        branchId: transfer.source_branch_id,
+        preferredExpiry: line.expiry_date,
+        qty,
+        transaction: t,
+      });
+
+      // Persist approved qty, valuation-derived cost, and resolved expiry.
       line.quantity = qty;
       line.cost_price = cost;
       if (!line.selling_price || parseFloat(line.selling_price) <= 0) {
         line.selling_price = sell;
+      }
+      if (expiryDate && !line.expiry_date) {
+        line.expiry_date = expiryDate;
       }
       await line.save({ transaction: t });
 
@@ -647,6 +747,7 @@ exports.approveGoodsTransfer = async (req, res) => {
           qty_out: qty,
           cost_price: cost,
           selling_price: sell,
+          expiry_date: expiryDate,
           branch_name: ZONE,
           branchId: transfer.source_branch_id,
           source: "Branch Transfer",
@@ -669,6 +770,7 @@ exports.approveGoodsTransfer = async (req, res) => {
           qty_out: 0,
           cost_price: cost,
           selling_price: sell,
+          expiry_date: expiryDate,
           branch_name: ZONE,
           branchId: transfer.destination_branch_id,
           source: "Branch Transfer",

@@ -1035,25 +1035,44 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       branchCondition = ` AND LOWER(TRIM(se.branch_name)) IN (${zoneList})`;
     }
 
-    // Ledger qty by warehouse. Keep zero-balance rows so pending-only stock can show.
+    // Ledger qty by warehouse + expiry lot. Keep zero-balance rows so pending-only stock can show.
     const stockAgg = `
       SELECT
         se.product_id AS product_id,
         se.branchId AS branch_id,
+        CASE
+          WHEN se.expiry_date IS NULL
+            OR se.expiry_date <= '2000-01-01'
+            OR se.expiry_date = '1111-11-11'
+          THEN NULL
+          ELSE DATE(se.expiry_date)
+        END AS expiry_date,
         SUM(se.qty_in) - SUM(se.qty_out) AS qty,
-        COALESCE(MAX(se.branch_name), 'for sales') AS branch_name
+        COALESCE(MAX(se.branch_name), 'for sales') AS branch_name,
+        MAX(NULLIF(se.selling_price, 0)) AS lot_selling_price
       FROM store_entries se
       INNER JOIN products p
         ON ${sqlEq("se.product_id", "p.sku")}
         AND ${sqlEq("se.facilityId", "p.facility_id")}
       WHERE ${sqlEq("se.facilityId", ":facilityId")}
         ${branchCondition}
-      GROUP BY se.product_id, se.branchId
+      GROUP BY
+        se.product_id,
+        se.branchId,
+        CASE
+          WHEN se.expiry_date IS NULL
+            OR se.expiry_date <= '2000-01-01'
+            OR se.expiry_date = '1111-11-11'
+          THEN NULL
+          ELSE DATE(se.expiry_date)
+        END
     `;
 
     // Sold on invoices, minus already collected at the warehouse.
     // Uses store_entries (written when the invoice is created) so pending
     // appears immediately — not only after Invoice Separation packs exist.
+    // Fulfillment lines have no expiry, so pending is tracked per product/branch
+    // and shown on the no-expiry lot (or the only lot) in the UI.
     const pendingAgg = `
       SELECT
         sold.branch_id,
@@ -1118,26 +1137,37 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
     const buildQuery = (withPending) => `
       SELECT
         COALESCE(st.qty, 0) AS qty,
-        ${withPending ? "COALESCE(pc.pending_to_collect, 0)" : "0"} AS pending_to_collect,
+        ${
+          withPending
+            ? `CASE
+                 WHEN item_keys.expiry_date IS NULL
+                 THEN COALESCE(pc.pending_to_collect, 0)
+                 ELSE 0
+               END`
+            : "0"
+        } AS pending_to_collect,
         COALESCE(st.branch_name, 'for sales') AS branch_name,
         item_keys.branch_id,
         item_keys.product_id,
+        item_keys.expiry_date,
         p.name,
         p.sku AS item_code,
         p.unit_of_measure,
         p.cost_price AS cost,
-        p.selling_price,
+        COALESCE(NULLIF(st.lot_selling_price, 0), p.selling_price) AS selling_price,
         p.item_type,
         p.mark_up
       FROM (
         SELECT CONVERT(product_id USING utf8mb4) COLLATE utf8mb4_general_ci AS product_id,
-               branch_id
+               branch_id,
+               expiry_date
         FROM (${stockAgg}) stock_keys
         ${
           withPending
             ? `UNION
         SELECT CONVERT(product_id USING utf8mb4) COLLATE utf8mb4_general_ci AS product_id,
-               branch_id
+               branch_id,
+               CAST(NULL AS DATE) AS expiry_date
         FROM (${pendingAgg}) pending_keys`
             : ""
         }
@@ -1148,6 +1178,7 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
       LEFT JOIN (${stockAgg}) st
         ON ${sqlEq("st.product_id", "item_keys.product_id")}
        AND st.branch_id <=> item_keys.branch_id
+       AND st.expiry_date <=> item_keys.expiry_date
       ${
         withPending
           ? `LEFT JOIN (${pendingAgg}) pc
@@ -1161,7 +1192,10 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
           COALESCE(st.qty, 0) > 0
           ${withPending ? "OR COALESCE(pc.pending_to_collect, 0) > 0" : ""}
         )
-      ORDER BY p.name ASC
+      ORDER BY
+        p.name ASC,
+        CASE WHEN item_keys.expiry_date IS NULL THEN 1 ELSE 0 END,
+        item_keys.expiry_date ASC
     `;
 
     let inventoryItems;
@@ -1184,17 +1218,27 @@ exports.getInventoryForGoodsTransfer = async (req, res) => {
     const results = inventoryItems.map((item) => {
       const qty = parseFloat(item.qty) || 0;
       const pending = Math.max(0, parseFloat(item.pending_to_collect) || 0);
+      const expiryRaw = item.expiry_date;
+      const expiry_date =
+        expiryRaw &&
+        String(expiryRaw) !== "0000-00-00" &&
+        String(expiryRaw) !== "1111-11-11"
+          ? moment(expiryRaw).format("YYYY-MM-DD")
+          : null;
+      const productId = item.product_id;
       return {
         ...item,
-        product_id: item.product_id,
+        product_id: productId,
         name: item.name,
         item_name: item.name,
-        item_code: item.item_code || item.product_id,
+        item_code: item.item_code || productId,
         unit_of_measure: item.unit_of_measure || "Pcs",
+        expiry_date,
         qty,
         pending_to_collect: pending,
         balance: qty,
         total: qty + pending,
+        id: `${productId}-${expiry_date || "NULL"}-${item.branch_id || 0}`,
       };
     });
 
