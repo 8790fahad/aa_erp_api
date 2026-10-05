@@ -896,10 +896,29 @@ function buildSplitProgressForRow(plain) {
       (amountDue - (progress.collected_total || 0)).toFixed(2),
     );
     const allocated = Number(progress.credit_allocated) || 0;
-    const credit = allocated > 0.05 ? allocated : unpaid > 0.05 ? unpaid : 0;
+    const modes = collectModeIdsFromRow(plain);
+    const paidSideOpen =
+      (modes.includes("cash") && !progress.cash_done) ||
+      (modes.includes("transfer") && !progress.transfer_done) ||
+      (modes.includes("card") && !progress.card_done);
+
+    // Credit is the remainder after cash/transfer/card — do not treat the full
+    // unpaid invoice as credit exposure while those sides are still open.
+    let credit = 0;
+    if (allocated > 0.05) {
+      credit = allocated;
+    } else if (progress.credit != null && Number(progress.credit) > 0.05) {
+      credit = Number(progress.credit);
+    } else if (!paidSideOpen && unpaid > 0.05) {
+      credit = unpaid;
+    }
+
     return {
       ...progress,
-      credit,
+      credit: Number(credit.toFixed(2)),
+      credit_pending_collection: Boolean(
+        paidSideOpen && credit <= 0.05 && unpaid > 0.05,
+      ),
       original_amount: amountDue,
     };
   }
@@ -2833,10 +2852,13 @@ exports.getCashierDashboard = async (req, res) => {
     for (const row of pendingRows) {
       const pt = String(row.payment_type || "").toLowerCase();
       if (pt !== "credit_split") continue;
-      const extraAmount =
-        Number(row.split_progress?.credit) > 0.05
-          ? Number(row.split_progress.credit)
-          : Number(row.amount) || 0;
+      const creditPortion = Number(row.split_progress?.credit) || 0;
+      const awaitingPaidCollection = Boolean(
+        row.split_progress?.credit_pending_collection,
+      );
+      // Only check credit limit against the known credit portion (remainder),
+      // not the full invoice while transfer/cash is still to be collected.
+      const extraAmount = creditPortion > 0.05 ? creditPortion : 0;
       const check = await getCreditLimitCheck(facilityId, row.customer_no, {
         extraAmount,
         excludeInvoiceRef: row.sale_code,
@@ -2846,7 +2868,8 @@ exports.getCashierDashboard = async (req, res) => {
       row.credit_available = check.available;
       row.credit_projected = check.projected;
       row.credit_unlimited = check.unlimited;
-      row.credit_over_limit = check.overLimit;
+      row.credit_over_limit = extraAmount > 0.05 ? check.overLimit : false;
+      row.credit_awaiting_collection = awaitingPaidCollection;
     }
 
     // Resolve collector display names for split progress (when only user id stored)
