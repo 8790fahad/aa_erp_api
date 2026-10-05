@@ -230,7 +230,132 @@ async function loadHandedToSafe({
 }
 
 /**
+ * Cash moved out of the till to bank (or another account) via cash_transfers.
+ * Counts against cash-to-retire for the cashier.
+ */
+async function loadTillCashTransfersOut({
+  facilityId,
+  fromDate,
+  toDate,
+  cashierUserId = null,
+}) {
+  const empty = { cash: 0, lines: [] };
+  if (!facilityId || !fromDate || !toDate) return empty;
+  try {
+    let tillCashCodes = [];
+    try {
+      const biz = await db.sequelize.query(
+        `SELECT recon_cash_account_code
+           FROM business
+          WHERE id = :facilityId
+          LIMIT 1`,
+        {
+          replacements: { facilityId: String(facilityId) },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      const code = String(biz?.[0]?.recon_cash_account_code || "").trim();
+      if (code) tillCashCodes.push(code);
+    } catch (_) {
+      // column may be missing on older DBs
+    }
+
+    try {
+      const cashHeads = await db.sequelize.query(
+        `SELECT code
+           FROM account_category
+          WHERE facility_id = :facilityId
+            AND (
+              LOWER(IFNULL(description, '')) LIKE '%cash on hand%'
+              OR LOWER(IFNULL(description, '')) LIKE '%till%'
+              OR LOWER(IFNULL(category, '')) LIKE '%cash%'
+              OR code IN ('112199', '112200')
+            )`,
+        {
+          replacements: { facilityId: String(facilityId) },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      for (const row of cashHeads || []) {
+        const c = String(row.code || "").trim();
+        if (c && !tillCashCodes.includes(c)) tillCashCodes.push(c);
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    const where = [
+      "facilityId = :facilityId",
+      "DATE(`date`) BETWEEN :fromDate AND :toDate",
+      "amount > 0",
+      "(status IS NULL OR LOWER(status) IN ('completed', 'posted', 'paid', ''))",
+    ];
+    const replacements = {
+      facilityId: String(facilityId),
+      fromDate,
+      toDate,
+    };
+    if (cashierUserId) {
+      where.push("CAST(created_by AS CHAR) = CAST(:cashierUserId AS CHAR)");
+      replacements.cashierUserId = String(cashierUserId);
+    }
+
+    const fromFilterParts = [
+      "LOWER(IFNULL(remarks, '')) LIKE 'till:%'",
+      "LOWER(IFNULL(remarks, '')) LIKE 'till cash out%'",
+      "LOWER(IFNULL(remarks, '')) LIKE '%cash exchange%'",
+    ];
+    if (tillCashCodes.length) {
+      const placeholders = tillCashCodes.map((_, i) => `:tillCash${i}`);
+      tillCashCodes.forEach((c, i) => {
+        replacements[`tillCash${i}`] = c;
+      });
+      fromFilterParts.push(`from_account IN (${placeholders.join(", ")})`);
+    }
+    where.push(`(${fromFilterParts.join(" OR ")})`);
+
+    const rows = await db.sequelize.query(
+      `SELECT transfer_id, from_account, to_account, amount, remarks,
+              created_by AS user_id, \`date\` AS transaction_date, reference_number
+         FROM cash_transfers
+        WHERE ${where.join(" AND ")}
+        ORDER BY \`date\` DESC, created_at DESC`,
+      {
+        replacements,
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+
+    let total = 0;
+    const lines = [];
+    for (const row of rows || []) {
+      const amount = money(row.amount);
+      total += amount;
+      lines.push({
+        id: row.transfer_id,
+        user_id: row.user_id,
+        sale_code: row.reference_number || row.transfer_id,
+        description:
+          row.remarks ||
+          `Cash transfer ${row.from_account} → ${row.to_account}`,
+        payment_type: "cash transfer out",
+        till_mode: "cash",
+        amount,
+        transaction_date: row.transaction_date,
+        from_account: row.from_account,
+        to_account: row.to_account,
+      });
+    }
+    return { cash: money(total), lines };
+  } catch (err) {
+    console.warn("loadTillCashTransfersOut:", err.message);
+    return empty;
+  }
+}
+
+/**
  * Imprest + Pay Bill spend for a till, optionally limited to one cashier.
+ * Cash till also subtracts inter-bank / cash-to-bank transfers out.
  */
 async function loadTillSpend({
   facilityId,
@@ -250,13 +375,28 @@ async function loadTillSpend({
     toDate,
     cashierUserId,
   });
+  const cashTransfers = await loadTillCashTransfersOut({
+    facilityId,
+    fromDate,
+    toDate,
+    cashierUserId,
+  });
   return {
     imprest,
     payBills,
-    cash: money((imprest.cash || 0) + (payBills.cash || 0)),
+    cashTransfers,
+    cash: money(
+      (imprest.cash || 0) +
+        (payBills.cash || 0) +
+        (cashTransfers.cash || 0),
+    ),
     card: money((imprest.card || 0) + (payBills.card || 0)),
     transfer: money((imprest.transfer || 0) + (payBills.transfer || 0)),
-    lines: [...(imprest.lines || []), ...(payBills.lines || [])],
+    lines: [
+      ...(imprest.lines || []),
+      ...(payBills.lines || []),
+      ...(cashTransfers.lines || []),
+    ],
   };
 }
 
@@ -266,6 +406,7 @@ module.exports = {
   classifyTillExpense,
   loadTillExpenses,
   loadTillPayBills,
+  loadTillCashTransfersOut,
   loadTillSpend,
   loadHandedToSafe,
   retireAfterHandIn,

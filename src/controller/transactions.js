@@ -12,6 +12,9 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
 const { assertProductSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
+const {
+  resolveStockOutExpiry,
+} = require("../utils/storeLotExpiry");
 
 /** Mixed dump collations (utf8mb4_unicode_ci vs utf8mb4_general_ci) break JOIN '='. */
 const sqlEq = (a, b) =>
@@ -19,32 +22,9 @@ const sqlEq = (a, b) =>
 const sqlCol = (expr) =>
   `CONVERT(${expr} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 
-/** Blank, zero, and placeholder dates must not be stored as a lot expiry. */
-function normalizeStoreExpiry(value) {
-  if (value == null) return null;
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) return null;
-    return moment(value).format("YYYY-MM-DD");
-  }
-  const raw = String(value).trim();
-  if (
-    !raw ||
-    raw === "0000-00-00" ||
-    raw === "1111-11-11" ||
-    raw.startsWith("0000")
-  ) {
-    return null;
-  }
-  const parsed = moment(raw);
-  return parsed.isValid() ? parsed.format("YYYY-MM-DD") : null;
-}
-
 /**
- * Ready-for-sales stock is grouped by expiry. A sale saved with a blank
- * expiry does not reduce the dated lot the cashier sold from.
- * Prefer the expiry on the cart line. If that line has none, copy the
- * earliest dated receipt on the same product and branch — only when that
- * branch has no undated stock-in, which already shares the blank bucket.
+ * Ready-for-sales stock is grouped by expiry. Outs must hit a lot that still
+ * has positive balance (FEFO), otherwise Goods Balance and Create Invoice Avail diverge.
  */
 async function resolveSaleExpiry({
   sku,
@@ -53,33 +33,14 @@ async function resolveSaleExpiry({
   expiry,
   transaction,
 }) {
-  const fromLine = normalizeStoreExpiry(expiry);
-  if (fromLine) return fromLine;
-  if (!sku || !facilityId || !branchId) return null;
-
-  const rows = await db.sequelize.query(
-    `SELECT
-       SUM(CASE WHEN expiry_date IS NULL AND qty_in > 0 THEN 1 ELSE 0 END) AS null_lots,
-       DATE_FORMAT(MIN(CASE
-         WHEN expiry_date IS NOT NULL
-          AND expiry_date > '2000-01-01'
-          AND qty_in > 0
-         THEN expiry_date
-       END), '%Y-%m-%d') AS lot_expiry
-     FROM store_entries
-     WHERE facilityId = :facilityId
-       AND product_id = :sku
-       AND branchId = :branchId
-       AND type IN ('opening', 'opening_balance', 'purchase', 'transfer', 'production')`,
-    {
-      replacements: { facilityId, sku, branchId },
-      type: db.sequelize.QueryTypes.SELECT,
-      transaction,
-    },
-  );
-  const row = rows?.[0] || {};
-  if (Number(row.null_lots) > 0) return null;
-  return normalizeStoreExpiry(row.lot_expiry);
+  return resolveStockOutExpiry({
+    db,
+    sku,
+    facilityId,
+    branchId,
+    preferredExpiry: expiry,
+    transaction,
+  });
 }
 
 /**

@@ -2633,9 +2633,16 @@ exports.getTillReport = async (req, res) => {
     const payBillLines = (spend.payBills?.lines || []).filter(
       (l) => l.till_mode === mode,
     );
+    const cashTransferLines =
+      mode === "cash" ? spend.cashTransfers?.lines || [] : [];
 
     const nameIds = new Set();
-    for (const line of [...collectedLines, ...imprestLines, ...payBillLines]) {
+    for (const line of [
+      ...collectedLines,
+      ...imprestLines,
+      ...payBillLines,
+      ...cashTransferLines,
+    ]) {
       if (line.user_id) nameIds.add(String(line.user_id));
     }
     const nameById = {};
@@ -2671,6 +2678,9 @@ exports.getTillReport = async (req, res) => {
     const payBillTotal = tillMoney(
       payBillLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
     );
+    const cashTransferTotal = tillMoney(
+      cashTransferLines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
+    );
     const handed = await loadHandedToSafe({
       facilityId,
       fromDate: histFrom,
@@ -2697,10 +2707,14 @@ exports.getTillReport = async (req, res) => {
           total: payBillTotal,
           lines: withNames(payBillLines),
         },
+        cash_transfers_out: {
+          total: cashTransferTotal,
+          lines: withNames(cashTransferLines),
+        },
         handed_to_safe: handedTotal,
         retire: retireAfterHandIn(
           collectedTotal,
-          imprestTotal + payBillTotal,
+          imprestTotal + payBillTotal + cashTransferTotal,
           handedTotal,
         ),
       },
@@ -3508,6 +3522,7 @@ exports.getCashierDashboard = async (req, res) => {
     const pay_bills_cash = tillMoney(tillSpend.payBills?.cash);
     const pay_bills_card = tillMoney(tillSpend.payBills?.card);
     const pay_bills_transfer = tillMoney(tillSpend.payBills?.transfer);
+    const cash_transfers_out = tillMoney(tillSpend.cashTransfers?.cash);
     const expenses_cash = tillMoney(tillSpend.cash);
     const expenses_card = tillMoney(tillSpend.card);
     const expenses_transfer = tillMoney(tillSpend.transfer);
@@ -3856,6 +3871,7 @@ exports.getCashierDashboard = async (req, res) => {
           pay_bills_cash_today: pay_bills_cash,
           pay_bills_card_today: pay_bills_card,
           pay_bills_transfer_today: pay_bills_transfer,
+          cash_transfers_out_today: cash_transfers_out,
           handed_cash_today: handed_cash,
           handed_card_today: handed_card,
           handed_transfer_today: handed_transfer,

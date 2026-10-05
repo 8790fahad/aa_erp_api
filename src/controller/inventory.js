@@ -7,6 +7,7 @@ const { resolveBranchId, resolveBranchIds, validateBranchIdById } = require("../
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { parseQty } = require("../utils/parseAmount");
+const { resolveStockOutExpiry } = require("../utils/storeLotExpiry");
 async function numberGenerator(
   { query_type = "", facilityId = "" },
   callback = (f) => f,
@@ -2694,6 +2695,7 @@ exports.inventoryWriteOff = async (req, res) => {
       account_head_code,
       account_head_name = "",
       inserted_by = "",
+      expiry_date = null,
     } = req.body || {};
 
     if (!facilityId || !product_id || !quantity || !account_head_code) {
@@ -2842,6 +2844,15 @@ exports.inventoryWriteOff = async (req, res) => {
       created_by:           inserted_by || null,
     }, { transaction });
 
+    const writeOffExpiry = await resolveStockOutExpiry({
+      db,
+      sku: product_id,
+      facilityId,
+      branchId: hasBranchId ? parsedBranchId : null,
+      preferredExpiry: expiry_date,
+      transaction,
+    });
+
     // ── STEP 2: Store Entry — OUT ──────────────────────────────────────────
     await db.StoreEntry.create({
       product_id,
@@ -2862,7 +2873,7 @@ exports.inventoryWriteOff = async (req, res) => {
       reference_number: refBase,
       inserted_by:      inserted_by || null,
       location:         "Warehouse",
-      expiry_date:      null,
+      expiry_date:      writeOffExpiry,
       truckNo:          "",
       waybillNo:        "",
       supplier_code:    notes ? String(notes).slice(0, 140) : "",
