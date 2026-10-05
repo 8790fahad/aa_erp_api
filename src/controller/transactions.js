@@ -18,6 +18,112 @@ const sqlEq = (a, b) =>
   `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 const sqlCol = (expr) =>
   `CONVERT(${expr} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
+/** Blank, zero, and placeholder dates must not be stored as a lot expiry. */
+function normalizeStoreExpiry(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return moment(value).format("YYYY-MM-DD");
+  }
+  const raw = String(value).trim();
+  if (
+    !raw ||
+    raw === "0000-00-00" ||
+    raw === "1111-11-11" ||
+    raw.startsWith("0000")
+  ) {
+    return null;
+  }
+  const parsed = moment(raw);
+  return parsed.isValid() ? parsed.format("YYYY-MM-DD") : null;
+}
+
+/**
+ * Ready-for-sales stock is grouped by expiry. A sale saved with a blank
+ * expiry does not reduce the dated lot the cashier sold from.
+ * Prefer the expiry on the cart line. If that line has none, copy the
+ * earliest dated receipt on the same product and branch — only when that
+ * branch has no undated stock-in, which already shares the blank bucket.
+ */
+async function resolveSaleExpiry({
+  sku,
+  facilityId,
+  branchId,
+  expiry,
+  transaction,
+}) {
+  const fromLine = normalizeStoreExpiry(expiry);
+  if (fromLine) return fromLine;
+  if (!sku || !facilityId || !branchId) return null;
+
+  const rows = await db.sequelize.query(
+    `SELECT
+       SUM(CASE WHEN expiry_date IS NULL AND qty_in > 0 THEN 1 ELSE 0 END) AS null_lots,
+       DATE_FORMAT(MIN(CASE
+         WHEN expiry_date IS NOT NULL
+          AND expiry_date > '2000-01-01'
+          AND qty_in > 0
+         THEN expiry_date
+       END), '%Y-%m-%d') AS lot_expiry
+     FROM store_entries
+     WHERE facilityId = :facilityId
+       AND product_id = :sku
+       AND branchId = :branchId
+       AND type IN ('opening', 'opening_balance', 'purchase', 'transfer', 'production')`,
+    {
+      replacements: { facilityId, sku, branchId },
+      type: db.sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  const row = rows?.[0] || {};
+  if (Number(row.null_lots) > 0) return null;
+  return normalizeStoreExpiry(row.lot_expiry);
+}
+
+/**
+ * Product list quantity comes from inventory_valuation, which sales do not
+ * rewrite. Recompute it from store_entries after a goods sale so an existing
+ * valuation row matches the net quantity. Skip products with no row.
+ */
+async function syncInventoryValuationQty({ sku, facilityId, transaction }) {
+  if (!db.InventoryValuation || !sku || !facilityId) return;
+  const valuation = await db.InventoryValuation.findOne({
+    where: { product_id: sku, facility_id: facilityId },
+    transaction,
+    lock: transaction?.LOCK?.UPDATE,
+  });
+  if (!valuation) return;
+
+  const rows = await db.sequelize.query(
+    `SELECT SUM(COALESCE(qty_in, 0)) - SUM(COALESCE(qty_out, 0)) AS qty
+     FROM store_entries
+     WHERE facilityId = :facilityId
+       AND product_id = :sku`,
+    {
+      replacements: { facilityId, sku },
+      type: db.sequelize.QueryTypes.SELECT,
+      transaction,
+    },
+  );
+  const nextQty = Number(parseFloat(rows?.[0]?.qty || 0).toFixed(2));
+  const prevQty = parseFloat(valuation.quantity_on_hand) || 0;
+  const avg = parseFloat(valuation.avg_unit_cost) || 0;
+  const prevValue = parseFloat(valuation.total_value) || 0;
+  let nextValue = prevValue;
+  if (avg > 0) {
+    nextValue = Number((nextQty * avg).toFixed(2));
+  } else if (prevQty > 0) {
+    nextValue = Number(((prevValue * nextQty) / prevQty).toFixed(2));
+  }
+
+  await valuation.update(
+    { quantity_on_hand: nextQty, total_value: nextValue },
+    { transaction },
+  );
+}
+
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
@@ -4398,6 +4504,13 @@ exports.createSale = async (req, res) => {
         parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
         saleBranchId ||
         0;
+      const saleExpiry = await resolveSaleExpiry({
+        sku,
+        facilityId,
+        branchId: lineBranchId,
+        expiry: itm.expiry_date ?? itm.expiryDate,
+        transaction: t,
+      });
 
       await db.StoreEntry.create(
         {
@@ -4405,6 +4518,7 @@ exports.createSale = async (req, res) => {
           reference_number: saleRef,
           qty_in: 0,
           qty_out: qty,
+          expiry_date: saleExpiry,
           multiplier_id: multiplierValue
             ? multiplierValue.id
             : itm.multiplier_id,
@@ -4432,6 +4546,12 @@ exports.createSale = async (req, res) => {
         },
         { transaction: t }
       );
+
+      await syncInventoryValuationQty({
+        sku,
+        facilityId,
+        transaction: t,
+      });
     }
 
     // ===================================================================
