@@ -847,12 +847,13 @@ function getSplitCollectionProgress(history) {
   let depositApplied = 0;
   for (const h of list) {
     if (h?.credit_allocation?.amount != null) {
-      creditAllocated = Number(h.credit_allocation.amount) || 0;
+      creditAllocated += Number(h.credit_allocation.amount) || 0;
     }
     if (h?.deposit_application?.amount != null) {
       depositApplied += Number(h.deposit_application.amount) || 0;
     }
   }
+  creditAllocated = Number(creditAllocated.toFixed(2));
   return {
     cash: Number(cash.toFixed(2)),
     transfer: Number(transfer.toFixed(2)),
@@ -913,12 +914,17 @@ function buildSplitProgressForRow(plain) {
       credit = unpaid;
     }
 
+    const unsettled = Number(
+      (
+        unpaid -
+        (allocated > 0.05 ? allocated : 0)
+      ).toFixed(2),
+    );
     return {
       ...progress,
       credit: Number(credit.toFixed(2)),
-      credit_pending_collection: Boolean(
-        paidSideOpen && credit <= 0.05 && unpaid > 0.05,
-      ),
+      credit_pending_collection: false,
+      credit_remainder_open: Boolean(unsettled > 0.05),
       original_amount: amountDue,
     };
   }
@@ -2852,12 +2858,8 @@ exports.getCashierDashboard = async (req, res) => {
     for (const row of pendingRows) {
       const pt = String(row.payment_type || "").toLowerCase();
       if (pt !== "credit_split") continue;
-      const creditPortion = Number(row.split_progress?.credit) || 0;
-      const awaitingPaidCollection = Boolean(
-        row.split_progress?.credit_pending_collection,
-      );
-      // Only check credit limit against the known credit portion (remainder),
-      // not the full invoice while transfer/cash is still to be collected.
+      const creditPortion = Number(row.split_progress?.credit_allocated) || 0;
+      // Check limit only against credit already set on this invoice.
       const extraAmount = creditPortion > 0.05 ? creditPortion : 0;
       const check = await getCreditLimitCheck(facilityId, row.customer_no, {
         extraAmount,
@@ -2869,7 +2871,7 @@ exports.getCashierDashboard = async (req, res) => {
       row.credit_projected = check.projected;
       row.credit_unlimited = check.unlimited;
       row.credit_over_limit = extraAmount > 0.05 ? check.overLimit : false;
-      row.credit_awaiting_collection = awaitingPaidCollection;
+      row.credit_awaiting_collection = false;
     }
 
     // Resolve collector display names for split progress (when only user id stored)
@@ -4692,7 +4694,11 @@ exports.sendCreditRemainder = async (req, res) => {
     const amountDue = Number(row.amount) || 0;
     const progress = getSplitCollectionProgress(row.history);
     const unpaid = Number(
-      (amountDue - (progress.collected_total || 0)).toFixed(2),
+      (
+        amountDue -
+        (progress.collected_total || 0) -
+        (progress.credit_allocated || 0)
+      ).toFixed(2),
     );
     if (unpaid <= 0.05) {
       await transaction.rollback();
@@ -4704,9 +4710,7 @@ exports.sendCreditRemainder = async (req, res) => {
     }
 
     const requested = toMoney(req.body?.credit_amount ?? req.body?.amount);
-    const allocated = Number(progress.credit_allocated) || 0;
-    let creditAmount =
-      requested > 0.05 ? requested : allocated > 0.05 ? allocated : unpaid;
+    let creditAmount = requested > 0.05 ? requested : unpaid;
     creditAmount = Number(Math.min(Math.max(creditAmount, 0), unpaid).toFixed(2));
     if (creditAmount <= 0.05) {
       await transaction.rollback();
