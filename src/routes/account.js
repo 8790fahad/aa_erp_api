@@ -854,9 +854,29 @@ module.exports = (app) => {
     "/account/invoice-correction/invoices",
     invoiceCorrection.listInvoicesForCorrection,
   );
+  app.get(
+    "/account/invoice-correction/lines",
+    invoiceCorrection.getInvoiceLinesForCorrection,
+  );
   app.post(
     "/account/invoice-correction/update-date",
     invoiceCorrection.updateInvoiceDateWithLedger,
+  );
+  app.post(
+    "/account/invoice-correction/update-qty",
+    invoiceCorrection.updateInvoiceQtyWithLedger,
+  );
+  app.get(
+    "/account/invoice-correction/products",
+    invoiceCorrection.searchProductsForCorrection,
+  );
+  app.post(
+    "/account/invoice-correction/add-line",
+    invoiceCorrection.addInvoiceLineWithLedger,
+  );
+  app.post(
+    "/account/invoice-correction/delete-line",
+    invoiceCorrection.deleteInvoiceLineWithLedger,
   );
   app.post(
     "/account/invoice-correction/delete",
