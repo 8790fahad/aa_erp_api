@@ -6128,12 +6128,11 @@ function remainderTypeAfterDeposit(modes) {
   const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
   const bankLike = hasTransfer || hasCard;
-  if (hasCredit && (hasCash || bankLike)) return "credit_split";
+  if (hasCredit) return "credit_split";
   if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
   if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
-  if (hasCredit) return "credit";
   // Deposit-only: remainder is collected as cash at Verification Points.
   return "cash";
 }

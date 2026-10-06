@@ -3760,9 +3760,8 @@ exports.createSale = async (req, res) => {
 
         let coverageMessage = null;
         if (hasCredit && hasDeposit) {
-          if (!unlimitedCredit && over(creditLeft + deposit)) {
-            coverageMessage = `Invoice (${due.toFixed(2)}) exceeds credit available (${creditLeft.toFixed(2)}) plus deposit (${deposit.toFixed(2)}).`;
-          }
+          // Invoice may exceed deposit + credit; leftover is collected as cash.
+          coverageMessage = null;
         } else if (hasCredit && !unlimitedCredit && over(creditLeft)) {
           coverageMessage = `Invoice (${due.toFixed(2)}) exceeds credit available (${creditLeft.toFixed(2)}).`;
         } else if (hasDeposit && !hasCredit && over(deposit)) {
@@ -3774,6 +3773,24 @@ exports.createSale = async (req, res) => {
             success: false,
             message: coverageMessage,
           });
+        }
+        if (
+          hasCredit &&
+          hasDeposit &&
+          !hasCash &&
+          !hasTransfer &&
+          !unlimitedCredit &&
+          over(creditLeft + deposit)
+        ) {
+          if (!modes.includes("cash")) modes.push("cash");
+          if (
+            Array.isArray(payment_modes) &&
+            !payment_modes.some(
+              (m) => String(m || "").toLowerCase().trim() === "cash",
+            )
+          ) {
+            payment_modes.push("cash");
+          }
         }
       }
     }

@@ -235,12 +235,13 @@ function remainderTypeAfterDeposit(modes) {
   const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
   const bankLike = hasTransfer || hasCard;
-  if (hasCredit && (hasCash || bankLike)) return "credit_split";
+  // Credit leftover can still be split with cash at Verification Points
+  // when the invoice is larger than deposit + credit available.
+  if (hasCredit) return "credit_split";
   if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
   if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
-  if (hasCredit) return "credit";
   // Deposit-only (or no modes recorded): remainder is collected as cash.
   return "cash";
 }
@@ -2212,6 +2213,26 @@ exports.advanceSaleWorkflow = async (req, res) => {
       });
     }
 
+    // Apply Deposit must be posted before separation or credit approval.
+    // nextStageFor(awaiting_payment, deposit) is invoice_separation, so a
+    // Credit-tab "advance" (note "Credit approved") would skip the deposit,
+    // skip the credit-limit check, and leave the sale ledger unposted.
+    const depositNotApplied =
+      isDepositPaymentType(row.payment_type) &&
+      String(row.status || "") === "awaiting_payment" &&
+      !historyHasDepositApplied(row.history);
+    if (
+      depositNotApplied &&
+      (!action || action === "advance" || action === "set_status")
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Apply the customer deposit on Verification Points first. Credit approval is only for the leftover after that deposit is applied.",
+      });
+    }
+
     // Credit invoices cannot skip approval and jump to Separation / Warehouse
     if (
       isCredit &&
@@ -3111,6 +3132,24 @@ exports.getCashierDashboard = async (req, res) => {
             (Number(row.split_progress?.credit_allocated) || 0),
         ).toFixed(2),
       );
+    }
+    for (const row of depositRows) {
+      const modes = Array.isArray(row.payment_modes) ? row.payment_modes : [];
+      if (!row.credit_after_deposit && !modes.includes("credit")) continue;
+      if (row.credit_limit != null) continue;
+      const remainder = Number(row.credit_remainder) || 0;
+      const extraAmount =
+        remainder > 0.05 ? remainder : Number(row.amount) || 0;
+      const check = await getCreditLimitCheck(facilityId, row.customer_no, {
+        extraAmount,
+        excludeInvoiceRef: row.sale_code,
+      });
+      row.credit_limit = check.creditLimit;
+      row.credit_outstanding = check.outstanding;
+      row.credit_available = check.available;
+      row.credit_projected = check.projected;
+      row.credit_unlimited = check.unlimited;
+      row.credit_over_limit = check.overLimit;
     }
 
     // Discounted invoices awaiting approval before Verification Points
