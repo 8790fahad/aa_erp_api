@@ -2056,6 +2056,44 @@ exports.getSaleByCode = async (req, res) => {
       }
     }
 
+    // Credit + Apply Deposit: show the two amounts separately before either is posted.
+    let depositAvailable = 0;
+    let depositToApply = 0;
+    let creditToApply = 0;
+    if (
+      hasDepositMode &&
+      depositPaid <= 0.05 &&
+      baseEntry?.customerNo &&
+      facilityId
+    ) {
+      try {
+        const bals = await getCustomerLedgerBalances(
+          facilityId,
+          baseEntry.customerNo,
+        );
+        depositAvailable = Math.max(0, Number(bals?.deposit) || 0);
+        const unpaidNow = Number(
+          (
+            invoiceTotalAmount -
+            cashPaid -
+            transferPaid -
+            cardPaid -
+            depositPaid
+          ).toFixed(2),
+        );
+        depositToApply = Number(
+          Math.min(depositAvailable, Math.max(0, unpaidNow)).toFixed(2),
+        );
+        if (hasCreditMode && creditPaid <= 0.05) {
+          creditToApply = Number(
+            Math.max(0, unpaidNow - depositToApply).toFixed(2),
+          );
+        }
+      } catch (balErr) {
+        console.warn("getSaleByCode deposit split:", balErr.message);
+      }
+    }
+
     // Prefer the selected mix (and collected lines) over a later workflow status
     // that may have been rewritten to "credit" or "deposit".
     if (mixedModes) {
@@ -2170,6 +2208,9 @@ exports.getSaleByCode = async (req, res) => {
       card_paid: cardPaid,
       credit_paid: creditPaid,
       deposit_paid: depositPaid,
+      deposit_available: depositAvailable,
+      deposit_to_apply: depositToApply,
+      credit_to_apply: creditToApply,
       transfer_banks: transferBanks,
       card_accounts: cardAccounts,
       payment_breakdown: paymentBreakdown,
@@ -2212,6 +2253,9 @@ exports.getSaleByCode = async (req, res) => {
         card_paid: cardPaid,
         credit_paid: creditPaid,
         deposit_paid: depositPaid,
+        deposit_available: depositAvailable,
+        deposit_to_apply: depositToApply,
+        credit_to_apply: creditToApply,
         transfer_banks: transferBanks,
         card_accounts: cardAccounts,
         payment_breakdown: paymentBreakdown,
@@ -3723,6 +3767,11 @@ exports.createSale = async (req, res) => {
         rawMode === "bank" ||
         rawMode === "split" ||
         rawMode === "credit_split";
+      const hasCard =
+        modes.includes("card") ||
+        modes.includes("pos") ||
+        rawMode === "card" ||
+        rawMode === "pos";
       const hasCredit =
         modes.includes("credit") ||
         rawMode === "credit" ||
@@ -3743,7 +3792,7 @@ exports.createSale = async (req, res) => {
         });
       }
 
-      if ((hasCredit || hasDeposit) && !hasCash && !hasTransfer) {
+      if ((hasCredit || hasDeposit) && !hasCash && !hasTransfer && !hasCard) {
         const bals = await getCustomerLedgerBalances(facilityId, customer_id);
         const invoiceTotal = Number(total_amount);
         const due = Number.isFinite(invoiceTotal) && invoiceTotal > 0
@@ -3760,8 +3809,9 @@ exports.createSale = async (req, res) => {
 
         let coverageMessage = null;
         if (hasCredit && hasDeposit) {
-          // Invoice may exceed deposit + credit; leftover is collected as cash.
-          coverageMessage = null;
+          if (!unlimitedCredit && over(creditLeft + deposit)) {
+            coverageMessage = `Invoice (${due.toFixed(2)}) exceeds deposit (${deposit.toFixed(2)}) + credit available (${Number.isFinite(creditLeft) ? creditLeft.toFixed(2) : "unlimited"}). Tick Cash, Transfer, or POS for the leftover, or reduce the invoice.`;
+          }
         } else if (hasCredit && !unlimitedCredit && over(creditLeft)) {
           coverageMessage = `Invoice (${due.toFixed(2)}) exceeds credit available (${creditLeft.toFixed(2)}).`;
         } else if (hasDeposit && !hasCredit && over(deposit)) {
@@ -3773,24 +3823,6 @@ exports.createSale = async (req, res) => {
             success: false,
             message: coverageMessage,
           });
-        }
-        if (
-          hasCredit &&
-          hasDeposit &&
-          !hasCash &&
-          !hasTransfer &&
-          !unlimitedCredit &&
-          over(creditLeft + deposit)
-        ) {
-          if (!modes.includes("cash")) modes.push("cash");
-          if (
-            Array.isArray(payment_modes) &&
-            !payment_modes.some(
-              (m) => String(m || "").toLowerCase().trim() === "cash",
-            )
-          ) {
-            payment_modes.push("cash");
-          }
         }
       }
     }

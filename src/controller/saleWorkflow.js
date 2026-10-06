@@ -3369,62 +3369,8 @@ exports.getCashierDashboard = async (req, res) => {
     pullIntoDiscount(creditRows);
     pullIntoDiscount(depositRows);
 
-    // Credit + Apply Deposit stays on Apply Deposit until applied, and also
-    // lists on Credit so the credit remainder is visible immediately.
-    // Do not treat Cash/Transfer leftovers as Credit unless Credit was selected.
-    const listOnCreditTab = (row) => {
-      if (Boolean(row.credit_after_deposit)) return true;
-      const modes = Array.isArray(row.payment_modes)
-        ? row.payment_modes
-        : paymentModesFromHistory(row.history);
-      if (modes.includes("credit")) return true;
-      if (modes.includes("cash") || modes.includes("transfer") || modes.includes("card")) return false;
-      return Number(row.credit_remainder) > 0.05;
-    };
-    if (
-      ct !== "cash" &&
-      ct !== "transfer" &&
-      ct !== "card" &&
-      ct !== "split" &&
-      ct !== "discount" &&
-      ct !== "mode" &&
-      ct !== "deposit" &&
-      ct !== "apply_credit"
-    ) {
-      for (const row of depositRows) {
-        if (!listOnCreditTab(row)) continue;
-        if (
-          creditRows.some(
-            (c) => String(c.sale_code) === String(row.sale_code),
-          )
-        ) {
-          continue;
-        }
-        const remainder = Number(row.credit_remainder) || 0;
-        const extraAmount =
-          remainder > 0.05 ? remainder : Number(row.amount) || 0;
-        const check = await getCreditLimitCheck(facilityId, row.customer_no, {
-          extraAmount,
-          excludeInvoiceRef: row.sale_code,
-        });
-        creditRows.push({
-          ...row,
-          deposit_pending: true,
-          credit_after_deposit: true,
-          status_label:
-            remainder > 0.05
-              ? "Credit after deposit"
-              : "Covered by deposit",
-          status_color: remainder > 0.05 ? "rose" : "teal",
-          credit_limit: check.creditLimit,
-          credit_outstanding: check.outstanding,
-          credit_available: check.available,
-          credit_projected: check.projected,
-          credit_unlimited: check.unlimited,
-          credit_over_limit: check.overLimit,
-        });
-      }
-    }
+    // Apply Deposit invoices stay on Apply Deposit until the deposit is confirmed.
+    // Cash leftover then appears on Cash; credit leftover on Credit.
 
     const summary = {
       pending_cash: 0,
