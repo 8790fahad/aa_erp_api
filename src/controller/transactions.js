@@ -3792,6 +3792,43 @@ exports.createSale = async (req, res) => {
         });
       }
 
+      if (hasCredit && !isWalkInCustomer(customer)) {
+        const parsedLimit = parseCreditLimitValue(customer.credit_limit);
+        if (parsedLimit != null) {
+          const creditBals = await getCustomerLedgerBalances(
+            facilityId,
+            customer_id,
+          );
+          const creditLeft = Math.max(
+            0,
+            parsedLimit - (Number(creditBals.receivables) || 0),
+          );
+          if (!(creditLeft > 0.05)) {
+            await t.rollback();
+            return res.status(400).json({
+              success: false,
+              message:
+                "This customer has no credit left. Credit stays off until the limit has room.",
+            });
+          }
+        }
+      }
+
+      if (hasDeposit) {
+        const depositBals = await getCustomerLedgerBalances(
+          facilityId,
+          customer_id,
+        );
+        if (!((Number(depositBals.deposit) || 0) > 0.05)) {
+          await t.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              "This customer has no deposit. Apply Deposit stays off until a deposit is available.",
+          });
+        }
+      }
+
       if ((hasCredit || hasDeposit) && !hasCash && !hasTransfer && !hasCard) {
         const bals = await getCustomerLedgerBalances(facilityId, customer_id);
         const invoiceTotal = Number(total_amount);
