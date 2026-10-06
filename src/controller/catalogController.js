@@ -148,7 +148,6 @@ const buildCatalogStockMap = async (products, facilityId) => {
           AND b.facilityId = sd.facilityId
         WHERE sd.facilityId = :facilityId
           AND (sd.sku IN (:skus) OR sd.product_id IN (:skus))
-          AND (sd.expiry_date IS NULL OR sd.expiry_date >= CURDATE())
         GROUP BY
           COALESCE(sd.sku, sd.product_id),
           sd.branchId,

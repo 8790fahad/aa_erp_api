@@ -9002,7 +9002,6 @@ exports.getReadyForSalesItems = async (req, res) => {
       ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND sd.\`branchId\` > 0
-        AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
         ${salesStoppedCondition}
       ORDER BY
         COALESCE(b.\`branch_name\`, ''),
@@ -9104,7 +9103,6 @@ exports.getReadyForSalesByBranch = async (req, res) => {
       ${balanceClause ? balanceClause + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
         AND sd.\`branchId\` IS NOT NULL
         AND sd.\`branchId\` > 0
-        AND (sd.\`expiry_date\` IS NULL OR sd.\`expiry_date\` >= CURDATE())
         ${salesStoppedCondition}
     `;
 
