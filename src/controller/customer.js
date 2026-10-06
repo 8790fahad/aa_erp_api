@@ -6128,11 +6128,12 @@ function remainderTypeAfterDeposit(modes) {
   const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
   const bankLike = hasTransfer || hasCard;
-  if (hasCredit) return "credit_split";
+  if (hasCredit && (hasCash || bankLike)) return "credit_split";
   if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
   if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
+  if (hasCredit) return "credit";
   // Deposit-only: remainder is collected as cash at Verification Points.
   return "cash";
 }
@@ -6285,7 +6286,10 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
           });
           if (wf) {
             const wfStatus = String(wf.status || "").toLowerCase();
+            const { depositSkippedBeforeLedger } = require("./saleWorkflow");
+            const depositStillOpen = depositSkippedBeforeLedger(wf);
             if (
+              !depositStillOpen &&
               [
                 "payment_confirmed",
                 "credit_approved",
@@ -6300,6 +6304,9 @@ exports.applyCustomerAdvanceToInvoices = async (req, res) => {
               ].includes(wfStatus)
             ) {
               throw new Error("This invoice is already processed.");
+            }
+            if (depositStillOpen) {
+              wf.status = "awaiting_payment";
             }
             leftover = leftoverAfterCollections(wf);
           }

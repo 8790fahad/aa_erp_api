@@ -235,15 +235,33 @@ function remainderTypeAfterDeposit(modes) {
   const hasCard = modes.includes("card");
   const hasCredit = modes.includes("credit");
   const bankLike = hasTransfer || hasCard;
-  // Credit leftover can still be split with cash at Verification Points
-  // when the invoice is larger than deposit + credit available.
-  if (hasCredit) return "credit_split";
+  if (hasCredit && (hasCash || bankLike)) return "credit_split";
   if ((hasCash && bankLike) || (hasTransfer && hasCard)) return "split";
   if (hasCard && !hasCash && !hasTransfer) return "card";
   if (hasTransfer) return "transfer";
   if (hasCash) return "cash";
+  if (hasCredit) return "credit";
   // Deposit-only (or no modes recorded): remainder is collected as cash.
   return "cash";
+}
+
+/** Credit was approved before the deposit was applied, so the sale ledger is still queued. */
+function depositSkippedBeforeLedger(row) {
+  if (!row || !isDepositPaymentType(row.payment_type)) return false;
+  const status = String(row.status || "").toLowerCase();
+  if (
+    ![
+      "invoice_separation",
+      "credit_approved",
+      "final_invoice",
+      "payment_confirmed",
+    ].includes(status)
+  ) {
+    return false;
+  }
+  const history = normalizeHistory(row.history);
+  if (historyHasDepositApplied(history)) return false;
+  return pendingSaleLedgerIndex(history) >= 0;
 }
 
 function historyHasCreditAfterDeposit(history) {
@@ -1718,6 +1736,7 @@ async function createSaleWorkflowRecord(
 exports.SALE_WORKFLOW_STAGES = SALE_WORKFLOW_STAGES;
 exports.createSaleWorkflowRecord = createSaleWorkflowRecord;
 exports.flushPendingSaleLedger = flushPendingSaleLedger;
+exports.depositSkippedBeforeLedger = depositSkippedBeforeLedger;
 exports.normalizePaymentType = normalizePaymentType;
 exports.paymentModesFromHistory = paymentModesFromHistory;
 exports.getSplitCollectionProgress = getSplitCollectionProgress;
@@ -3058,6 +3077,34 @@ exports.getCashierDashboard = async (req, res) => {
       } catch (_) {
         /* ignore name lookup failures */
       }
+    }
+
+    // Credit approval that skipped Apply Deposit left the sale ledger queued.
+    // Put those invoices back on Apply Deposit so the deposit can still be posted.
+    const skippedDeposit = await db.SaleWorkflow.findAll({
+      where: withActiveToday({
+        facility_id: facilityId,
+        payment_type: ["deposit", "apply_deposit", "apply_credit"],
+        status: [
+          "invoice_separation",
+          "credit_approved",
+          "final_invoice",
+          "payment_confirmed",
+        ],
+      }),
+      limit: 50,
+    });
+    for (const row of skippedDeposit) {
+      if (!depositSkippedBeforeLedger(row)) continue;
+      row.status = "awaiting_payment";
+      row.history = pushHistory(
+        row.history,
+        "awaiting_payment",
+        row.updated_by || row.created_by,
+        "Returned to Apply Deposit — credit was approved before the deposit was applied",
+      );
+      if (typeof row.changed === "function") row.changed("history", true);
+      await row.save();
     }
 
     const depositWhere = {
