@@ -1412,8 +1412,17 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       userId,
       viewAll,
       createdBy,
+      date,
+      paymentDate: paymentDateQuery,
     } = req.query;
     if (!facilityId) return res.status(400).json({ success: false, message: "facilityId is required" });
+
+    const paymentDateRaw = String(date || paymentDateQuery || "")
+      .trim()
+      .slice(0, 10);
+    const paymentDate = /^\d{4}-\d{2}-\d{2}$/.test(paymentDateRaw)
+      ? paymentDateRaw
+      : "";
 
     const rowLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     const filterBySupplier = supplierNo && String(supplierNo).trim();
@@ -1469,6 +1478,11 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
              ? "AND TRIM(CONVERT(se.created_by USING utf8mb4)) COLLATE utf8mb4_unicode_ci IN (:creatorIds)"
              : ""
          }
+         ${
+           paymentDate
+             ? "AND DATE(COALESCE(se.transaction_date, se.created_at)) = :paymentDate"
+             : ""
+         }
          AND (se.type = 'payment' OR se.type IS NULL OR se.type = '')
        ORDER BY se.created_at DESC
        LIMIT :rowLimit`,
@@ -1477,6 +1491,7 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
           facilityId,
           ...(filterBySupplier ? { supplierNo: filterBySupplier } : {}),
           ...(filterByCreator ? { creatorIds } : {}),
+          ...(paymentDate ? { paymentDate } : {}),
           rowLimit,
         },
         type: db.sequelize.QueryTypes.SELECT,
