@@ -60,6 +60,11 @@ module.exports = (sequelize, DataTypes) => {
       expiry_date: DataTypes.DATE,
       // Pricing
       cost_price: DataTypes.DECIMAL(20, 2),
+      vat_amount: {
+        type: DataTypes.DECIMAL(20, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
       selling_price: DataTypes.DECIMAL(20, 2),
       mark_up: DataTypes.DECIMAL(10, 2),
       markup_mode: DataTypes.STRING(20),

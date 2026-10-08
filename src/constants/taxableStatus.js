@@ -51,9 +51,34 @@ function normalizeTaxableStatus(value, fallback = "Taxable") {
   return fallback;
 }
 
-/** True when VAT should be calculated / applied on this product. */
+/** True when output VAT is charged on the selling price. */
 function isProductTaxable(value) {
   return normalizeTaxableStatus(value, "") === "Taxable";
+}
+
+/**
+ * True when the recorded cost includes 7.5% input VAT.
+ * Only Taxable products. Zero Rated, Non-Taxable, and Exempted are 0.
+ */
+function costIncludesInputVat(value) {
+  return normalizeTaxableStatus(value, "") === "Taxable";
+}
+
+/** Nigeria input VAT. Inclusive: VAT = cost × 7.5 / 107.5. */
+const INCLUSIVE_INPUT_VAT_PERCENT = 7.5;
+
+/**
+ * Line VAT inside an inclusive unit cost.
+ * Only Taxable products. Zero Rated, Non-Taxable, and Exempted are 0.
+ */
+function inclusiveInputVatAmount(unitCost, qty, taxable) {
+  if (!costIncludesInputVat(taxable)) return 0;
+  const unit = Number(unitCost) || 0;
+  const q = Number(qty) || 0;
+  if (unit <= 0 || q <= 0) return 0;
+  const rate = INCLUSIVE_INPUT_VAT_PERCENT / 100;
+  const unitVat = unit - unit / (1 + rate);
+  return Number((q * unitVat).toFixed(2));
 }
 
 function isValidTaxableStatus(value) {
@@ -66,5 +91,8 @@ module.exports = {
   LEGACY_NOT_TAXABLE,
   normalizeTaxableStatus,
   isProductTaxable,
+  costIncludesInputVat,
   isValidTaxableStatus,
+  INCLUSIVE_INPUT_VAT_PERCENT,
+  inclusiveInputVatAmount,
 };

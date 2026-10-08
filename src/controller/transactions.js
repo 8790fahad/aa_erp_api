@@ -6,7 +6,7 @@ import {
 const db = require("../models");
 const moment = require("moment");
 const UUIDV4 = require("uuid").v4;
-const { Op } = require("sequelize");
+const { Op, QueryTypes } = require("sequelize");
 const { sellingApi } = require("./api/transactionsApi");
 const { getAndUpdateNumber } = require("../services/numberGen");
 const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
@@ -85,7 +85,7 @@ async function syncInventoryValuationQty({ sku, facilityId, transaction }) {
   );
 }
 
-const { isProductTaxable } = require("../constants/taxableStatus");
+const { isProductTaxable, costIncludesInputVat } = require("../constants/taxableStatus");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
 const { isWalkInCustomer, parseCreditLimitValue } = require("../utils/customerKind");
 const { inferTaxInclusiveType } = require("../utils/saleVat");
@@ -4403,6 +4403,37 @@ exports.createSale = async (req, res) => {
       return Number((totalDiscount * proportion).toFixed(2));
     }
 
+    let cachedInputVatAccount;
+
+    async function getInputVatAccount() {
+      if (cachedInputVatAccount !== undefined) return cachedInputVatAccount;
+      const [row] = await db.sequelize.query(
+        `SELECT ac.code
+         FROM taxes t
+         INNER JOIN account_category ac
+           ON ac.facility_id = t.facilityId
+          AND ac.code = t.account_sub_head
+         WHERE t.facilityId = :facilityId
+           AND t.tax_category = 'Purchase'
+           AND t.inclusive_type = 'inclusive'
+           AND t.description LIKE 'Input VAT%'
+         ORDER BY t.id ASC
+         LIMIT 1`,
+        {
+          replacements: { facilityId },
+          type: QueryTypes.SELECT,
+          transaction: t,
+        },
+      );
+      cachedInputVatAccount = row?.code
+        ? await db.AccountCategory.findOne({
+            where: { code: row.code, facility_id: facilityId },
+            transaction: t,
+          })
+        : null;
+      return cachedInputVatAccount;
+    }
+
     // ===================================================================
     // HELPER: PROCESS GOODS ITEM
     // ===================================================================
@@ -4432,7 +4463,10 @@ exports.createSale = async (req, res) => {
         itm.multiplier_id
       );
 
-      let unitCost = valuationResult?.calculatedCostPrice || 0;
+      let unitCost = Number(valuationResult?.calculatedCostPrice) || 0;
+      let vatPerUnit = costIncludesInputVat(product?.taxable)
+        ? Number(valuationResult?.vatPerUnit) || 0
+        : 0;
 
       // If no cost price calculated and allow_sales_without_stock is enabled, use fallback
       if (unitCost <= 0) {
@@ -4456,6 +4490,11 @@ exports.createSale = async (req, res) => {
               `Warning: No inventory available for ${sku}. Using product cost_price: ${unitCost.toFixed(2)}`
             );
           }
+          if (unitCost > 0 && costIncludesInputVat(product?.taxable)) {
+            const gross = unitCost;
+            vatPerUnit = Number((gross - gross / 1.075).toFixed(2));
+            unitCost = Number((gross / 1.075).toFixed(2));
+          }
         } else {
         throw new Error(
           `Unable to calculate cost price for ${sku}. No inventory available.`
@@ -4464,6 +4503,8 @@ exports.createSale = async (req, res) => {
       }
 
       const cogsAmount = Number((unitCost * qty).toFixed(2));
+      const inputVatAmount = Number((vatPerUnit * qty).toFixed(2));
+      const inventoryAmount = Number((cogsAmount + inputVatAmount).toFixed(2));
       totalCOGS += cogsAmount;
 
       const inventoryAccount = await getAccountSafe(
@@ -4507,7 +4548,7 @@ exports.createSale = async (req, res) => {
           createLedgerEntry(
             inventoryAccount,
             0,
-            cogsAmount,
+            inventoryAmount,
             "inventory",
             `Pro-bono inventory reduction [${pcode}] – ${product.name}`,
             pcode
@@ -4531,11 +4572,30 @@ exports.createSale = async (req, res) => {
           createLedgerEntry(
             inventoryAccount,
             0,
-            cogsAmount,
+            inventoryAmount,
             "inventory",
             `Inventory reduction [${pcode}] – ${product.name}`,
             pcode
           )
+        );
+      }
+
+      if (inputVatAmount > 0) {
+        const inputVatAccount = await getInputVatAccount();
+        if (!inputVatAccount) {
+          throw new Error(
+            "Input VAT account is not set up. Add an inclusive Input VAT tax before selling.",
+          );
+        }
+        ledgerEntries.push(
+          createLedgerEntry(
+            inputVatAccount,
+            inputVatAmount,
+            0,
+            "tax",
+            `Input VAT [${pcode}] – ${product.name}`,
+            pcode,
+          ),
         );
       }
 
@@ -4575,7 +4635,8 @@ exports.createSale = async (req, res) => {
           multiplier_id: multiplierValue
             ? multiplierValue.id
             : itm.multiplier_id,
-          cost_price: unitCost,
+          cost_price: Number((inventoryAmount / qty).toFixed(2)),
+          vat_amount: inputVatAmount,
           mark_up: markUpValue,
           selling_price: sellingPrice,
           // Store zone is always "for sales"; branchId tracks the physical branch.

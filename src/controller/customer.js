@@ -15,6 +15,7 @@ const {
 const moment = require("moment");
 const { resolveDefaultBranchId, resolveRequiredBranchId } = require("../services/branchResolver");
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
+const { inclusiveInputVatAmount } = require("../constants/taxableStatus");
 let today = moment().format("YYYY-MM-DD");
 const {
   Customer,
@@ -5217,6 +5218,11 @@ const createProductUploadBase = async (req, res, itemType) => {
                 qty_in: qty,
                 qty_out: 0,
                 cost_price: parseFloat(cost_price) || 0,
+                vat_amount: inclusiveInputVatAmount(
+                  cost_price,
+                  qty,
+                  product.taxable,
+                ),
                 selling_price: parseFloat(selling_price) || 0,
                 status: "approved",
                 type: STORE_ENTRY_TYPE.OPENING_BALANCE,
@@ -5465,6 +5471,11 @@ exports.CreateProductUploadRawMaterial = async (req, res) => {
             qty_in,
             qty_out: 0,
             cost_price: cost_price || 0,
+            vat_amount: inclusiveInputVatAmount(
+              cost_price,
+              qty_in,
+              item.taxable,
+            ),
             selling_price: selling_price || 0,
             supplier_code: "",
             branch_name: "Raw Material",
@@ -5716,6 +5727,11 @@ exports.CreateProductUploadWip = async (req, res) => {
           qty_in: quantity,
           qty_out: 0,
           cost_price,
+          vat_amount: inclusiveInputVatAmount(
+            cost_price,
+            quantity,
+            item.taxable,
+          ),
           selling_price: 0,
           supplier_code: "",
           branch_name: "Work In Progress",

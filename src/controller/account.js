@@ -15264,6 +15264,7 @@ exports.directPurchaseConsumables = async (req, res) => {
         productName: product.name,
         sku,
         isTaxable,
+        vatAmount: 0,
       });
 
       // === 1. Store Entry (Stock In) ===
@@ -15488,10 +15489,11 @@ exports.directPurchaseConsumables = async (req, res) => {
         }
       }
 
-      // Persist per-item VAT on the purchase line
+      // Persist per-item VAT on the purchase line and the stock line
+      processedItem.vatAmount = parseFloat(Number(itemTotalTax || 0).toFixed(2));
       await db.SupplierEntry.update(
         {
-          vat_amount: parseFloat(Number(itemTotalTax || 0).toFixed(2)),
+          vat_amount: processedItem.vatAmount,
         },
         {
           where: {
@@ -15705,6 +15707,22 @@ exports.directPurchaseConsumables = async (req, res) => {
     );
 
     await Promise.all(storeEntryPromises);
+
+    for (const processedItem of processedItems) {
+      if (!(processedItem.vatAmount > 0)) continue;
+      await db.StoreEntry.update(
+        { vat_amount: processedItem.vatAmount },
+        {
+          where: {
+            reference_number: pvCode,
+            facilityId,
+            product_id: String(processedItem.sku),
+            type: STORE_ENTRY_TYPE.PURCHASE,
+          },
+          transaction,
+        },
+      );
+    }
 
     // === Save all ledger entries ===
     for (const entry of ledgerEntries) {

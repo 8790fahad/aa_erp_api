@@ -11,6 +11,7 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 const {
   normalizeTaxableStatus,
   isValidTaxableStatus,
+  inclusiveInputVatAmount,
 } = require("../constants/taxableStatus");
 const {
   validatePostingDate,
@@ -989,6 +990,11 @@ exports.createProductWithStoreEntry = async (req, res) => {
             qty_in: qty_in,
             qty_out: 0,
             cost_price: cost_price || 0,
+            vat_amount: inclusiveInputVatAmount(
+              cost_price,
+              qty_in,
+              resolvedTaxable,
+            ),
             selling_price: selling_price || 0,
             supplier_code: supplier_code || "",
             branch_name: storeZoneForItemType(item_type),

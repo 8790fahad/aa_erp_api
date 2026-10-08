@@ -1966,6 +1966,17 @@ exports.deleteSupplierEntry = async (req, res) => {
   }
 };
 
+/** Unit cost with the VAT inside an inclusive cost taken out. */
+const costAfterTaxFromRow = (row, qty) => {
+  const costPrice = parseFloat(row?.cost_price) || 0;
+  const q = parseFloat(qty) || 0;
+  const lineVat = parseFloat(row?.vat_amount) || 0;
+  if (costPrice <= 0) return 0;
+  if (q <= 0 || lineVat <= 0) return costPrice;
+  const net = costPrice - lineVat / q;
+  return net > 0 ? net : costPrice;
+};
+
 /** Weighted average cost_price from store entry rows (inbound or outbound qty > 0). */
 const averagePositiveCostFromStoreRows = (rows, direction = "in") => {
   let totalQty = 0;
@@ -1975,7 +1986,7 @@ const averagePositiveCostFromStoreRows = (rows, direction = "in") => {
       direction === "out"
         ? parseFloat(row.qty_out) || 0
         : parseFloat(row.qty_in) || 0;
-    const costPrice = parseFloat(row.cost_price) || 0;
+    const costPrice = costAfterTaxFromRow(row, qty);
     if (qty > 0 && costPrice > 0) {
       totalQty += qty;
       totalCost += qty * costPrice;
@@ -1987,10 +1998,151 @@ const averagePositiveCostFromStoreRows = (rows, direction = "in") => {
 /** Most recent non-zero cost_price on the product's store ledger. */
 const lastPositiveCostFromStoreRows = (rows) => {
   for (let i = (rows || []).length - 1; i >= 0; i -= 1) {
-    const costPrice = parseFloat(rows[i].cost_price) || 0;
+    const qty =
+      parseFloat(rows[i].qty_in) || parseFloat(rows[i].qty_out) || 0;
+    const costPrice = costAfterTaxFromRow(rows[i], qty);
     if (costPrice > 0) return costPrice;
   }
   return 0;
+};
+
+/** VAT per unit sitting inside an inclusive cost_price. */
+const vatPerUnitOnRow = (row, qty) => {
+  const costPrice = parseFloat(row?.cost_price) || 0;
+  const net = costAfterTaxFromRow(row, qty);
+  const vat = costPrice - net;
+  return vat > 0 ? vat : 0;
+};
+
+const averagePositiveVatFromStoreRows = (rows, direction = "in") => {
+  let totalQty = 0;
+  let totalVat = 0;
+  for (const row of rows || []) {
+    const qty =
+      direction === "out"
+        ? parseFloat(row.qty_out) || 0
+        : parseFloat(row.qty_in) || 0;
+    const costPrice = parseFloat(row.cost_price) || 0;
+    if (qty > 0 && costPrice > 0) {
+      totalQty += qty;
+      totalVat += qty * vatPerUnitOnRow(row, qty);
+    }
+  }
+  return totalQty > 0 ? totalVat / totalQty : 0;
+};
+
+const lastPositiveVatFromStoreRows = (rows) => {
+  for (let i = (rows || []).length - 1; i >= 0; i -= 1) {
+    const qty =
+      parseFloat(rows[i].qty_in) || parseFloat(rows[i].qty_out) || 0;
+    const costPrice = parseFloat(rows[i].cost_price) || 0;
+    if (qty > 0 && costPrice > 0) return vatPerUnitOnRow(rows[i], qty);
+  }
+  return 0;
+};
+
+/** Current net unit cost and the VAT per unit still in stock. */
+const rollForwardUnitCost = (rows, valuation_method) => {
+  let stockBalance = 0;
+  let totalCost = 0;
+  let totalVat = 0;
+  const fifoLayers = [];
+
+  for (const row of rows || []) {
+    const qtyIn = parseFloat(row.qty_in) || 0;
+    const qtyOut = parseFloat(row.qty_out) || 0;
+
+    if (qtyIn > 0) {
+      const netCost = costAfterTaxFromRow(row, qtyIn);
+      const costToUse =
+        netCost > 0
+          ? netCost
+          : stockBalance > 0
+            ? totalCost / stockBalance
+            : 0;
+      const rowVat = vatPerUnitOnRow(row, qtyIn);
+      const vatToUse =
+        rowVat > 0
+          ? rowVat
+          : netCost <= 0 && stockBalance > 0
+            ? totalVat / stockBalance
+            : 0;
+
+      if (valuation_method === "FIFO" || valuation_method === "LIFO") {
+        fifoLayers.push({ qty: qtyIn, cost: costToUse, vat: vatToUse });
+      } else {
+        totalCost += qtyIn * costToUse;
+        totalVat += qtyIn * vatToUse;
+      }
+      stockBalance += qtyIn;
+    }
+
+    if (qtyOut > 0) {
+      if (valuation_method === "FIFO") {
+        let remaining = qtyOut;
+        while (remaining > 0 && fifoLayers.length > 0) {
+          const layer = fifoLayers[0];
+          const take = Math.min(layer.qty, remaining);
+          layer.qty -= take;
+          remaining -= take;
+          if (layer.qty <= 0) fifoLayers.shift();
+        }
+      } else if (valuation_method === "LIFO") {
+        let remaining = qtyOut;
+        while (remaining > 0 && fifoLayers.length > 0) {
+          const layer = fifoLayers[fifoLayers.length - 1];
+          const take = Math.min(layer.qty, remaining);
+          layer.qty -= take;
+          remaining -= take;
+          if (layer.qty <= 0) fifoLayers.pop();
+        }
+      } else {
+        const avg = stockBalance > 0 ? totalCost / stockBalance : 0;
+        const avgVat = stockBalance > 0 ? totalVat / stockBalance : 0;
+        totalCost -= qtyOut * avg;
+        totalVat -= qtyOut * avgVat;
+      }
+      stockBalance -= qtyOut;
+      stockBalance = Math.max(0, stockBalance);
+      totalCost = Math.max(0, totalCost);
+      totalVat = Math.max(0, totalVat);
+    }
+  }
+
+  let unitCost = 0;
+  let vatPerUnit = 0;
+
+  if (stockBalance > 0) {
+    if (valuation_method === "WAC") {
+      unitCost = totalCost / stockBalance;
+      vatPerUnit = totalVat / stockBalance;
+    } else if (valuation_method === "FIFO") {
+      unitCost = fifoLayers.length > 0 ? fifoLayers[0].cost : 0;
+      vatPerUnit = fifoLayers.length > 0 ? fifoLayers[0].vat : 0;
+    } else if (valuation_method === "LIFO") {
+      const layer = fifoLayers[fifoLayers.length - 1];
+      unitCost = layer ? layer.cost : 0;
+      vatPerUnit = layer ? layer.vat : 0;
+    }
+  }
+
+  if (unitCost <= 0) {
+    unitCost = averagePositiveCostFromStoreRows(rows, "in");
+    vatPerUnit = averagePositiveVatFromStoreRows(rows, "in");
+  }
+  if (unitCost <= 0) {
+    unitCost = averagePositiveCostFromStoreRows(rows, "out");
+    vatPerUnit = averagePositiveVatFromStoreRows(rows, "out");
+  }
+  if (unitCost <= 0) {
+    unitCost = lastPositiveCostFromStoreRows(rows);
+    vatPerUnit = lastPositiveVatFromStoreRows(rows);
+  }
+
+  return {
+    calculatedCostPrice: Number((unitCost || 0).toFixed(2)),
+    vatPerUnit: Number((vatPerUnit || 0).toFixed(2)),
+  };
 };
 
 const queryPositiveStoreCostAverage = async (
@@ -2004,7 +2156,8 @@ const queryPositiveStoreCostAverage = async (
     : "";
   const [row] = await db.sequelize.query(
     `SELECT
-       SUM(${qtyField} * cost_price) / NULLIF(SUM(CASE WHEN ${qtyField} > 0 AND cost_price > 0 THEN ${qtyField} ELSE 0 END), 0)
+       SUM(${qtyField} * (cost_price - IF(${qtyField} > 0, COALESCE(vat_amount, 0) / ${qtyField}, 0)))
+         / NULLIF(SUM(CASE WHEN ${qtyField} > 0 AND cost_price > 0 THEN ${qtyField} ELSE 0 END), 0)
          AS avg_cost
      FROM store_entries
      WHERE product_id = :product_id
@@ -3057,7 +3210,7 @@ exports.getCurrentUnitCost = async (
     // ===================================
     const rows = await db.sequelize.query(
       `
-      SELECT qty_in, qty_out, cost_price
+      SELECT qty_in, qty_out, cost_price, COALESCE(vat_amount, 0) AS vat_amount
       FROM store_entries
       WHERE product_id = :product_id
         AND facilityId = :facility_id
@@ -3069,98 +3222,9 @@ exports.getCurrentUnitCost = async (
       },
     );
 
-    if (rows.length === 0) return { calculatedCostPrice: 0 };
+    if (rows.length === 0) return { calculatedCostPrice: 0, vatPerUnit: 0 };
 
-    // ===================================
-    // 2. Rebuild current state (perpetual)
-    // ===================================
-    let stockBalance = 0;
-    let totalCost = 0;
-    const fifoLayers = []; // only for FIFO/LIFO
-
-    for (const row of rows) {
-      const qtyIn = parseFloat(row.qty_in) || 0;
-      const qtyOut = parseFloat(row.qty_out) || 0;
-      let costPrice = row.cost_price == null ? 0 : parseFloat(row.cost_price);
-
-      // ——— INCOMING ———
-      if (qtyIn > 0) {
-        const costToUse =
-          costPrice > 0
-            ? costPrice
-            : stockBalance > 0
-              ? totalCost / stockBalance
-              : 0;
-
-        if (valuation_method === "FIFO" || valuation_method === "LIFO") {
-          fifoLayers.push({ qty: qtyIn, cost: costToUse });
-        } else {
-          // WAC
-          totalCost += qtyIn * costToUse;
-        }
-        stockBalance += qtyIn;
-      }
-
-      // ——— OUTGOING ———
-      if (qtyOut > 0) {
-        if (valuation_method === "FIFO") {
-          let remaining = qtyOut;
-          while (remaining > 0 && fifoLayers.length > 0) {
-            const layer = fifoLayers[0];
-            const take = Math.min(layer.qty, remaining);
-            layer.qty -= take;
-            remaining -= take;
-            if (layer.qty <= 0) fifoLayers.shift();
-          }
-        } else if (valuation_method === "LIFO") {
-          let remaining = qtyOut;
-          while (remaining > 0 && fifoLayers.length > 0) {
-            const layer = fifoLayers[fifoLayers.length - 1];
-            const take = Math.min(layer.qty, remaining);
-            layer.qty -= take;
-            remaining -= take;
-            if (layer.qty <= 0) fifoLayers.pop();
-          }
-        } else {
-          // WAC
-          const avg = stockBalance > 0 ? totalCost / stockBalance : 0;
-          totalCost -= qtyOut * avg;
-        }
-        stockBalance -= qtyOut;
-        stockBalance = Math.max(0, stockBalance);
-        totalCost = Math.max(0, totalCost);
-      }
-    }
-
-    // ===================================
-    // 3. Return current unit cost (never 0 when ledger has positive costs)
-    // ===================================
-    let unitCost = 0;
-
-    if (stockBalance > 0) {
-      if (valuation_method === "WAC") {
-        unitCost = totalCost / stockBalance;
-      } else if (valuation_method === "FIFO") {
-        unitCost = fifoLayers.length > 0 ? fifoLayers[0].cost : 0;
-      } else if (valuation_method === "LIFO") {
-        unitCost =
-          fifoLayers.length > 0 ? fifoLayers[fifoLayers.length - 1].cost : 0;
-      }
-    }
-
-    if (unitCost <= 0) {
-      unitCost = averagePositiveCostFromStoreRows(rows, "in");
-    }
-    if (unitCost <= 0) {
-      unitCost = averagePositiveCostFromStoreRows(rows, "out");
-    }
-    if (unitCost <= 0) {
-      unitCost = lastPositiveCostFromStoreRows(rows);
-    }
-
-    return {
-      calculatedCostPrice: Number(unitCost.toFixed(2)),
-    };
+    return rollForwardUnitCost(rows, valuation_method);
   } catch (error) {
     console.error("getCurrentUnitCost error:", error);
     return { calculatedCostPrice: 0 };
@@ -3197,7 +3261,7 @@ exports.getCurrentUnitCostWithMultiplier = async (
 
     const rows = await db.sequelize.query(
       `
-      SELECT qty_in, qty_out, cost_price
+      SELECT qty_in, qty_out, cost_price, COALESCE(vat_amount, 0) AS vat_amount
       FROM store_entries
       WHERE product_id = :product_id
         AND facilityId = :facility_id
@@ -3210,98 +3274,9 @@ exports.getCurrentUnitCostWithMultiplier = async (
       },
     );
 
-    if (rows.length === 0) return { calculatedCostPrice: 0 };
+    if (rows.length === 0) return { calculatedCostPrice: 0, vatPerUnit: 0 };
 
-    // ===================================
-    // 2. Rebuild current state (perpetual)
-    // ===================================
-    let stockBalance = 0;
-    let totalCost = 0;
-    const fifoLayers = []; // only for FIFO/LIFO
-
-    for (const row of rows) {
-      const qtyIn = parseFloat(row.qty_in) || 0;
-      const qtyOut = parseFloat(row.qty_out) || 0;
-      let costPrice = row.cost_price == null ? 0 : parseFloat(row.cost_price);
-
-      // ——— INCOMING ———
-      if (qtyIn > 0) {
-        const costToUse =
-          costPrice > 0
-            ? costPrice
-            : stockBalance > 0
-              ? totalCost / stockBalance
-              : 0;
-
-        if (valuation_method === "FIFO" || valuation_method === "LIFO") {
-          fifoLayers.push({ qty: qtyIn, cost: costToUse });
-        } else {
-          // WAC
-          totalCost += qtyIn * costToUse;
-        }
-        stockBalance += qtyIn;
-      }
-
-      // ——— OUTGOING ———
-      if (qtyOut > 0) {
-        if (valuation_method === "FIFO") {
-          let remaining = qtyOut;
-          while (remaining > 0 && fifoLayers.length > 0) {
-            const layer = fifoLayers[0];
-            const take = Math.min(layer.qty, remaining);
-            layer.qty -= take;
-            remaining -= take;
-            if (layer.qty <= 0) fifoLayers.shift();
-          }
-        } else if (valuation_method === "LIFO") {
-          let remaining = qtyOut;
-          while (remaining > 0 && fifoLayers.length > 0) {
-            const layer = fifoLayers[fifoLayers.length - 1];
-            const take = Math.min(layer.qty, remaining);
-            layer.qty -= take;
-            remaining -= take;
-            if (layer.qty <= 0) fifoLayers.pop();
-          }
-        } else {
-          // WAC
-          const avg = stockBalance > 0 ? totalCost / stockBalance : 0;
-          totalCost -= qtyOut * avg;
-        }
-        stockBalance -= qtyOut;
-        stockBalance = Math.max(0, stockBalance);
-        totalCost = Math.max(0, totalCost);
-      }
-    }
-
-    // ===================================
-    // 3. Return current unit cost (never 0 when ledger has positive costs)
-    // ===================================
-    let unitCost = 0;
-
-    if (stockBalance > 0) {
-      if (valuation_method === "WAC") {
-        unitCost = totalCost / stockBalance;
-      } else if (valuation_method === "FIFO") {
-        unitCost = fifoLayers.length > 0 ? fifoLayers[0].cost : 0;
-      } else if (valuation_method === "LIFO") {
-        unitCost =
-          fifoLayers.length > 0 ? fifoLayers[fifoLayers.length - 1].cost : 0;
-      }
-    }
-
-    if (unitCost <= 0) {
-      unitCost = averagePositiveCostFromStoreRows(rows, "in");
-    }
-    if (unitCost <= 0) {
-      unitCost = averagePositiveCostFromStoreRows(rows, "out");
-    }
-    if (unitCost <= 0) {
-      unitCost = lastPositiveCostFromStoreRows(rows);
-    }
-
-    return {
-      calculatedCostPrice: Number(unitCost.toFixed(2)),
-    };
+    return rollForwardUnitCost(rows, valuation_method);
   } catch (error) {
     console.error("getCurrentUnitCost error:", error);
     return { calculatedCostPrice: 0 };

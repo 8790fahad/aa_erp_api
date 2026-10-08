@@ -6,6 +6,23 @@ const {
   STORE_ENTRY_TYPE,
 } = require("../constants/storeEntryTypes");
 
+/**
+ * Stock valuation unit cost = cost after tax + VAT.
+ * cost_price on a receipt already includes VAT for Taxable products.
+ * vat_amount is that VAT for the whole line, so adding it back keeps the gross cost.
+ */
+const receiptGrossUnitCostSql = `(
+  se.cost_price
+  - IF(se.qty_in > 0, COALESCE(se.vat_amount, 0) / se.qty_in, 0)
+  + IF(se.qty_in > 0, COALESCE(se.vat_amount, 0) / se.qty_in, 0)
+)`;
+
+/** Sales / P&L unit cost = cost after the VAT inside the line is removed. */
+const saleNetUnitCostSql = `(
+  COALESCE(NULLIF(se.cost_price, 0), p.cost_price, 0)
+  - IF(se.qty_out > 0, COALESCE(se.vat_amount, 0) / se.qty_out, 0)
+)`;
+
 /** Normalize mixed utf8mb4 collations before comparing SKU columns. */
 const skuEq = (a, b) =>
   `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
@@ -262,7 +279,7 @@ exports.getInventoryValuationReport = async (req, res) => {
           COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS stock_qty,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END) > 0
-            THEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * se.cost_price ELSE 0 END)
+            THEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END)
                  / SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost
@@ -337,7 +354,7 @@ exports.getInventoryValuationReport = async (req, res) => {
           COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS quantity,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END) > 0
-            THEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * se.cost_price ELSE 0 END)
+            THEN SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END)
                  / SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost,
@@ -500,7 +517,7 @@ exports.getInventoryValuationCostLayers = async (req, res) => {
         COALESCE(p.cost_price, 0) AS list_cost,
         COALESCE(SUM(se.qty_in), 0) - COALESCE(SUM(se.qty_out), 0) AS stock_qty,
         SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE 0 END) AS receipt_qty,
-        SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * se.cost_price ELSE 0 END) AS receipt_value
+        SUM(CASE WHEN se.qty_in > 0 THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END) AS receipt_value
       FROM products p
       LEFT JOIN store_entries se
         ON ${skuEq("se.product_id", "p.sku")}
@@ -520,7 +537,7 @@ exports.getInventoryValuationCostLayers = async (req, res) => {
         se.reference_number,
         se.qty_in,
         se.cost_price,
-        se.qty_in * se.cost_price AS line_value,
+        se.qty_in * ${receiptGrossUnitCostSql} AS line_value,
         se.branch_name,
         se.source,
         se.supplier_code
@@ -539,7 +556,7 @@ exports.getInventoryValuationCostLayers = async (req, res) => {
         se.cost_price,
         COUNT(*) AS line_count,
         SUM(se.qty_in) AS qty,
-        SUM(se.qty_in * se.cost_price) AS value
+        SUM(se.qty_in * ${receiptGrossUnitCostSql}) AS value
       FROM store_entries se
       WHERE ${skuEq("se.product_id", ":sku")}
         AND se.facilityId = :facilityId
@@ -1781,7 +1798,7 @@ async function queryRawMaterialsInventory({
           ), 0) AS quantity,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in ELSE 0 END) > 0
-            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in * se.cost_price ELSE 0 END)
+            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END)
                  / SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost
@@ -2014,7 +2031,7 @@ async function queryFinishedGoodsInventory({
           ), 0) AS quantity,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in ELSE 0 END) > 0
-            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in * se.cost_price ELSE 0 END)
+            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END)
                  / SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :asOfDate THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost,
@@ -2119,7 +2136,7 @@ async function queryFinishedGoodsInventory({
           ), 0) AS quantity,
           CASE
             WHEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :toDate THEN se.qty_in ELSE 0 END) > 0
-            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :toDate THEN se.qty_in * se.cost_price ELSE 0 END)
+            THEN SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :toDate THEN se.qty_in * ${receiptGrossUnitCostSql} ELSE 0 END)
                  / SUM(CASE WHEN se.qty_in > 0 AND ${entryDateSql} <= :toDate THEN se.qty_in ELSE 0 END)
             ELSE COALESCE(p.cost_price, 0)
           END AS avco_cost,
@@ -2714,12 +2731,12 @@ exports.getSalesPerProductReport = async (req, res) => {
         CASE
           WHEN SUM(se.qty_out) > 0
           THEN SUM(
-            se.qty_out * COALESCE(NULLIF(se.cost_price, 0), p.cost_price, 0)
+            se.qty_out * ${saleNetUnitCostSql}
           ) / SUM(se.qty_out)
           ELSE COALESCE(MAX(p.cost_price), 0)
         END AS unit_cost,
         SUM(
-          se.qty_out * COALESCE(NULLIF(se.cost_price, 0), p.cost_price, 0)
+          se.qty_out * ${saleNetUnitCostSql}
         ) AS cost_of_goods_sold
       FROM store_entries se
       INNER JOIN products p
@@ -2902,7 +2919,7 @@ exports.getSalesBySupplierReport = async (req, res) => {
         SUM(se.qty_out) AS quantity_sold,
         SUM(se.qty_out * COALESCE(se.selling_price, 0)) AS gross_sales,
         SUM(
-          se.qty_out * COALESCE(NULLIF(se.cost_price, 0), p.cost_price, 0)
+          se.qty_out * ${saleNetUnitCostSql}
         ) AS cost_of_goods_sold
       FROM store_entries se
       INNER JOIN products p
