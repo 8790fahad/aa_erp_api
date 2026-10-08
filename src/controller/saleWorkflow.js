@@ -1882,6 +1882,15 @@ exports.listSaleWorkflows = async (req, res) => {
         where.payment_type = types[0];
       }
     }
+    const historyDate = String(req.query.historyDate || "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(historyDate)) {
+      where.updated_at = {
+        [Op.between]: [
+          new Date(`${historyDate}T00:00:00.000`),
+          new Date(`${historyDate}T23:59:59.999`),
+        ],
+      };
+    }
 
     const limit = Math.min(
       500,
@@ -3954,6 +3963,10 @@ exports.getSeparationDashboard = async (req, res) => {
       "goods_released",
       "completed",
     ];
+    const dateParam = String(req.query.historyDate || req.query.date || "").trim();
+    const historyDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
+      ? dateParam
+      : moment().format("YYYY-MM-DD");
 
     const mapWorkflow = (r) => {
       const plain = r.toJSON ? r.toJSON() : r;
@@ -4003,9 +4016,15 @@ exports.getSeparationDashboard = async (req, res) => {
       where: {
         facility_id: facilityId,
         status: { [Op.in]: historyStatuses },
+        updated_at: {
+          [Op.between]: [
+            new Date(`${historyDate}T00:00:00.000`),
+            new Date(`${historyDate}T23:59:59.999`),
+          ],
+        },
       },
       order: [["updated_at", "DESC"]],
-      limit: 150,
+      limit: 500,
     });
 
     const historySaleCodes = historyRows.map((r) => r.sale_code).filter(Boolean);
@@ -4058,6 +4077,7 @@ exports.getSeparationDashboard = async (req, res) => {
         summary: {
           pending_count: pendingMerged.length,
           history_count: history.length,
+          history_date: historyDate,
           packs_total: history.reduce((s, r) => s + (r.pack_count || 0), 0),
         },
       },

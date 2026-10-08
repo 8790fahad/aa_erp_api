@@ -269,7 +269,7 @@ exports.getAllEmployees = async (req, res) => {
 
     const investmentBalances = await db.sequelize.query(
       `SELECT transaction_ref AS ref,
-              COALESCE(SUM(cr), 0) - COALESCE(SUM(dr), 0) AS balance
+              COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
        FROM general_ledger
        WHERE facility_id = :facilityId
          AND purpose_of_payment = 'Business associate investment'
@@ -586,7 +586,7 @@ exports.getAllEmployees = async (req, res) => {
 
     const investmentBalances = await db.sequelize.query(
       `SELECT transaction_ref AS ref,
-              COALESCE(SUM(cr), 0) - COALESCE(SUM(dr), 0) AS balance
+              COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
        FROM general_ledger
        WHERE facility_id = :facilityId
          AND purpose_of_payment = 'Business associate investment'
@@ -1752,7 +1752,7 @@ exports.bulkCreateEmployees = async (req, res) => {
 /**
  * POST /api/hr/employees/:id/investment-opening-balance
  * Business associate investment that already existed.
- * Dr Opening Balance Equity · Cr the investment account.
+ * Dr the investment account · Cr Opening Balance Equity.
  */
 exports.setInvestmentOpeningBalance = async (req, res) => {
   const transaction = await db.sequelize.transaction();
@@ -1760,18 +1760,12 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
     const {
       facilityId,
       amount,
-      currentBalance,
       asOfDate,
       investmentHead,
       userId,
     } = req.body || {};
     const value = parseFloat(amount);
     const head = String(investmentHead || "").trim();
-    const hasCurrent =
-      currentBalance !== undefined &&
-      currentBalance !== null &&
-      String(currentBalance).trim() !== "";
-    const balance = hasCurrent ? parseFloat(currentBalance) : value;
 
     if (!facilityId) {
       await transaction.rollback();
@@ -1785,13 +1779,6 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Enter the investment opening balance",
-      });
-    }
-    if (!Number.isFinite(balance) || balance < 0) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message: "Enter a valid current balance",
       });
     }
     if (!head) {
@@ -1902,15 +1889,15 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
     const parentOf = (account) =>
       account.parentCode ?? account.parent_code ?? account.code ?? "0";
 
-    if (balance > 0) {
+    if (value > 0) {
       await db.GeneralLedger.bulkCreate(
         [
           {
             transaction_date: transactionDate,
-            account_code: equityAccount.code,
-            account_subhead: String(parentOf(equityAccount)),
-            account_description: equityAccount.description,
-            dr: balance,
+            account_code: investmentAccount.code,
+            account_subhead: String(parentOf(investmentAccount)),
+            account_description: investmentAccount.description,
+            dr: value,
             cr: 0,
             transaction_description: desc,
             purpose_of_payment: "Business associate investment",
@@ -1920,15 +1907,15 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
             facility_id: facilityId,
             type: "opening_balance",
             status: "posted",
-            transaction_ref: `${employee.employeeId}-OBE`,
+            transaction_ref: `${employee.employeeId}-INV`,
           },
           {
             transaction_date: transactionDate,
-            account_code: investmentAccount.code,
-            account_subhead: String(parentOf(investmentAccount)),
-            account_description: investmentAccount.description,
+            account_code: equityAccount.code,
+            account_subhead: String(parentOf(equityAccount)),
+            account_description: equityAccount.description,
             dr: 0,
-            cr: balance,
+            cr: value,
             transaction_description: desc,
             purpose_of_payment: "Business associate investment",
             reference_number: reference,
@@ -1937,7 +1924,7 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
             facility_id: facilityId,
             type: "opening_balance",
             status: "posted",
-            transaction_ref: `${employee.employeeId}-INV`,
+            transaction_ref: `${employee.employeeId}-OBE`,
           },
         ],
         { transaction },
@@ -1966,7 +1953,7 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
         investmentOpeningDate: transactionDate,
         investmentAccountHead: head,
         investmentReference: reference,
-        investmentCurrentBalance: balance,
+        investmentCurrentBalance: value,
       },
     });
   } catch (error) {
