@@ -15721,7 +15721,11 @@ exports.directPurchaseConsumables = async (req, res) => {
           dr: cleanEntry.dr,
           cr: cleanEntry.cr,
           account_description: cleanEntry.account_description,
-          transaction_description: cleanEntry.transaction_description,
+          transaction_description: withSupplierLabel(
+            cleanEntry.transaction_description,
+            supplier_no,
+            supplier_name,
+          ),
           reference_number: pvCode,
           purpose_of_payment: narration,
           payee: supplier_name,
@@ -17015,7 +17019,11 @@ exports.directPurchaseExpenses = async (req, res) => {
           dr: entry.dr,
           cr: entry.cr,
           account_description: entry.account_description,
-          transaction_description: entry.transaction_description,
+          transaction_description: withSupplierLabel(
+            entry.transaction_description,
+            supplier_no,
+            supplier_name,
+          ),
           reference_number: pvCode,
           purpose_of_payment: narration,
           payee: supplier_name,
@@ -18173,9 +18181,13 @@ exports.paySupplierBills = async (req, res) => {
 
       // Debit: Accounts Payable (Reduce Liability)
       // Use narration in transaction_description if provided, otherwise use default
+      const supplierLabel = supplierPartyLabel(
+        supplier_no,
+        supplier.supplier_name,
+      );
       const transactionDesc = narration
-        ? `${narration} - Invoice ${invoice_ref}`
-        : `Payment for Invoice ${invoice_ref}`;
+        ? `${narration} [${supplierLabel}] - Invoice ${invoice_ref}`
+        : `Payment for Invoice ${invoice_ref} [${supplierLabel}]`;
 
       ledgerEntries.push({
         account_code: payableAcc.code,
@@ -18188,6 +18200,7 @@ exports.paySupplierBills = async (req, res) => {
         type: "payable",
         bank_account_id: mode_of_payment !== "cash" ? bankAccount?.id : null,
         transaction_ref: supplier_no,
+        payee: supplier.supplier_name || supplier_no,
       });
 
       // Create Supplier Payment Entry
@@ -18220,8 +18233,8 @@ exports.paySupplierBills = async (req, res) => {
       // Credit: Payment Source (Cash or Bank)
       // Use narration in transaction_description if provided, otherwise use default
       const paymentDesc = narration
-        ? `${narration} - Invoice ${invoice_ref}`
-        : `Supplier Bill Payment - Invoice ${invoice_ref}`;
+        ? `${narration} [${supplierLabel}] - Invoice ${invoice_ref}`
+        : `Supplier Bill Payment [${supplierLabel}] - Invoice ${invoice_ref}`;
 
       ledgerEntries.push({
         account_code: paymentAccount.code,
@@ -18233,7 +18246,8 @@ exports.paySupplierBills = async (req, res) => {
         transaction_description: paymentDesc,
         type: "bank",
         bank_account_id: bankAccount?.id || accountHead.head,
-        transaction_ref: pvCodeString,
+        transaction_ref: supplier_no,
+        payee: supplier.supplier_name || supplier_no,
       });
     }
 
@@ -18258,7 +18272,7 @@ exports.paySupplierBills = async (req, res) => {
           transaction_description: entry.transaction_description,
           reference_number: entry.reference_number,
           purpose_of_payment: narration,
-          payee: "Multiple Suppliers",
+          payee: entry.payee || null,
           created_by: userId,
           facility_id: facilityId,
           status: "paid",
@@ -22102,6 +22116,99 @@ exports.deleteSavedReport = async (req, res) => {
   }
 };
 
+function customerLedgerName(row) {
+  const person = [row?.first_name, row?.last_name]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  return String(
+    row?.fullname || row?.company_name || person || row?.store_name || "",
+  ).trim();
+}
+
+function nameFromPayee(payee, code) {
+  const text = String(payee || "").trim();
+  const match = text.match(
+    new RegExp(`^${code}\\s*[—–-]\\s*(.+)$`, "i"),
+  );
+  const name = String(match?.[1] || "").trim();
+  if (!name || name.toUpperCase() === String(code).toUpperCase()) return "";
+  return name;
+}
+
+function describeWithCustomer(txn, nameByCode) {
+  const description = String(txn?.transaction_description || "");
+  if (!description) return description;
+  return description.replace(/\[(CUS-\d+)\]/gi, (full, code) => {
+    const name =
+      nameByCode.get(String(code).toUpperCase()) ||
+      nameFromPayee(txn.payee, code);
+    if (!name) return full;
+    return `[${code} — ${name}]`;
+  });
+}
+
+function partyCode(text, prefix) {
+  const match = String(text || "").match(new RegExp(`${prefix}-\\d+`, "i"));
+  return match ? match[0].toUpperCase() : "";
+}
+
+function supplierPartyLabel(code, name) {
+  const supplierCode = String(code || "").trim();
+  const supplierName = String(name || "").trim();
+  if (
+    supplierCode &&
+    supplierName &&
+    supplierName.toUpperCase() !== supplierCode.toUpperCase()
+  ) {
+    return `${supplierCode} — ${supplierName}`;
+  }
+  return supplierName || supplierCode;
+}
+
+function withSupplierLabel(description, code, name) {
+  const text = String(description || "").trim();
+  const supplierName = String(name || "").trim();
+  const label = supplierPartyLabel(code, supplierName);
+  if (!label) return text;
+  if (supplierName && text.toLowerCase().includes(supplierName.toLowerCase())) {
+    return text;
+  }
+  if (text.toLowerCase().includes(label.toLowerCase())) return text;
+  return text ? `${text} [${label}]` : `[${label}]`;
+}
+
+function looksLikeSupplierBill(txn) {
+  const desc = String(txn?.transaction_description || "");
+  const payee = String(txn?.payee || "");
+  if (/^multiple suppliers$/i.test(payee)) return true;
+  if (partyCode(txn?.transaction_ref, "SUP") || partyCode(desc, "SUP")) return true;
+  return /supplier bill|direct purchase|direct expense|purchase of |payment for invoice|goods received/i.test(
+    desc,
+  );
+}
+
+function describeWithSupplier(txn, supplierByCode, supplierByRef) {
+  let description = String(txn?.transaction_description || "");
+  let code =
+    partyCode(txn?.transaction_ref, "SUP") || partyCode(description, "SUP");
+  let name = code ? supplierByCode.get(code) || "" : "";
+  const refKey = String(txn?.reference_number || "").trim().toUpperCase();
+  if (!name && refKey && supplierByRef.has(refKey)) {
+    const hit = supplierByRef.get(refKey);
+    code = code || hit.code || "";
+    name = hit.name || supplierByCode.get(code) || "";
+  }
+  const payee = String(txn?.payee || "").trim();
+  if (!name && payee && !/^multiple suppliers$/i.test(payee)) {
+    name = (code && nameFromPayee(payee, code)) || payee;
+    if (/^SUP-\d+$/i.test(name)) name = "";
+  }
+  if (!name) return description;
+  if (/\[CUS-\d+/i.test(description) && !code) return description;
+  return withSupplierLabel(description, code, name);
+}
+
 exports.getAccountLedgerReport = async (req, res) => {
   try {
     const { facilityId, fromDate, toDate, accountCodes } = req.body;
@@ -22263,6 +22370,118 @@ exports.getAccountLedgerReport = async (req, res) => {
       }),
     ]);
 
+    const customerCodes = new Set();
+    transactions.forEach((txn) => {
+      const text = String(txn.transaction_description || "");
+      const matches = text.match(/\[(CUS-\d+)\]/gi) || [];
+      matches.forEach((token) => {
+        const code = token.replace(/[\[\]]/g, "");
+        if (code) customerCodes.add(code);
+      });
+    });
+
+    const supplierCodes = new Set();
+    const billRefs = new Set();
+    transactions.forEach((txn) => {
+      const code =
+        partyCode(txn.transaction_ref, "SUP") ||
+        partyCode(txn.transaction_description, "SUP");
+      if (code) supplierCodes.add(code);
+      if (!looksLikeSupplierBill(txn)) return;
+      const ref = String(txn.reference_number || "").trim();
+      if (ref) billRefs.add(ref);
+    });
+
+    const supplierByRef = new Map();
+    if (billRefs.size > 0) {
+      const refList = [...billRefs];
+      const [supplierEntries, purchaseInvoices] = await Promise.all([
+        db.SupplierEntry.findAll({
+          where: {
+            facilityId,
+            [Op.or]: [
+              { receiptNo: { [Op.in]: refList } },
+              { link_id: { [Op.in]: refList } },
+            ],
+          },
+          attributes: ["receiptNo", "link_id", "supplier_number"],
+          raw: true,
+        }),
+        db.Invoice.findAll({
+          where: {
+            facility_id: facilityId,
+            invoice_ref: { [Op.in]: refList },
+            type: "purchase",
+          },
+          attributes: ["invoice_ref", "ref_number"],
+          raw: true,
+        }),
+      ]);
+      const rememberRef = (key, code) => {
+        const refKey = String(key || "").trim().toUpperCase();
+        const supplierCode = String(code || "").trim().toUpperCase();
+        if (!refKey || !supplierCode) return;
+        supplierByRef.set(refKey, { code: supplierCode, name: "" });
+        supplierCodes.add(supplierCode);
+      };
+      supplierEntries.forEach((row) => {
+        rememberRef(row.receiptNo, row.supplier_number);
+        rememberRef(row.link_id, row.supplier_number);
+      });
+      purchaseInvoices.forEach((row) => {
+        rememberRef(row.invoice_ref, row.ref_number);
+      });
+    }
+
+    const supplierByCode = new Map();
+    if (supplierCodes.size > 0) {
+      const suppliers = await db.SuppliersInfo.findAll({
+        where: {
+          facilityId,
+          supplier_number: { [Op.in]: [...supplierCodes] },
+        },
+        attributes: ["supplier_number", "supplier_name", "company_name"],
+        raw: true,
+      });
+      suppliers.forEach((supplier) => {
+        const code = String(supplier.supplier_number || "").trim().toUpperCase();
+        const name = String(
+          supplier.supplier_name || supplier.company_name || "",
+        ).trim();
+        if (code && name) supplierByCode.set(code, name);
+      });
+      supplierByRef.forEach((hit, key) => {
+        supplierByRef.set(key, {
+          code: hit.code,
+          name: supplierByCode.get(hit.code) || "",
+        });
+      });
+    }
+
+    const nameByCode = new Map();
+    if (customerCodes.size > 0) {
+      const customers = await Customer.findAll({
+        where: {
+          facilityId,
+          customerNo: { [Op.in]: [...customerCodes] },
+        },
+        attributes: [
+          "customerNo",
+          "fullname",
+          "company_name",
+          "first_name",
+          "last_name",
+          "store_name",
+        ],
+        raw: true,
+      });
+      customers.forEach((customer) => {
+        const name = customerLedgerName(customer);
+        const code = String(customer.customerNo || "").toUpperCase();
+        if (code && name) nameByCode.set(code, name);
+      });
+    }
+
     const openingMap = {};
     openingBalances.forEach((ob) => {
       const code = String(ob.account_code);
@@ -22295,7 +22514,18 @@ exports.getAccountLedgerReport = async (req, res) => {
       let runningBalance = openingBalance;
       const rows = accTxns.map((t) => {
         runningBalance += signedMovement(nature, t.dr, t.cr);
-        return { ...t, running_balance: runningBalance };
+        return {
+          ...t,
+          transaction_description: describeWithSupplier(
+            {
+              ...t,
+              transaction_description: describeWithCustomer(t, nameByCode),
+            },
+            supplierByCode,
+            supplierByRef,
+          ),
+          running_balance: runningBalance,
+        };
       });
 
       const totalDr = accTxns.reduce((s, t) => s + parseFloat(t.dr || 0), 0);

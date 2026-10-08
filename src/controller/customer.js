@@ -204,7 +204,7 @@ exports.getReceivedPaymentHistory = async (req, res) => {
     }
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
-    const limitNum = Math.min(Math.max(parseInt(pageSize, 10) || 10, 1), 100);
+    const limitNum = Math.min(Math.max(parseInt(pageSize, 10) || 10, 1), 500);
     const offset = (pageNum - 1) * limitNum;
 
     const replacements = { facilityId, limit: limitNum, offset };
@@ -224,13 +224,15 @@ exports.getReceivedPaymentHistory = async (req, res) => {
       }
     }
 
-    if (fromDate && String(fromDate).trim()) {
+    const fromDay = String(fromDate || "").trim().slice(0, 10);
+    const toDay = String(toDate || "").trim().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(fromDay)) {
       whereParts.push("DATE(ce.created_at) >= :fromDate");
-      replacements.fromDate = String(fromDate).trim();
+      replacements.fromDate = fromDay;
     }
-    if (toDate && String(toDate).trim()) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(toDay)) {
       whereParts.push("DATE(ce.created_at) <= :toDate");
-      replacements.toDate = String(toDate).trim();
+      replacements.toDate = toDay;
     }
 
     const searchTerm = String(search).trim();

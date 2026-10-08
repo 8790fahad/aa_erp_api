@@ -4360,6 +4360,12 @@ exports.cashierConfirmPayment = async (req, res) => {
     const saleDate = new Date().toISOString().slice(0, 10);
     const saleRef = row.sale_code;
     const customerCodeLabel = row.customer_no || "";
+    const customerNameLabel = String(
+      row.customer_name || customer.fullname || customer.company_name || "",
+    ).trim();
+    const customerPartyLabel = customerNameLabel
+      ? `${customerCodeLabel} — ${customerNameLabel}`
+      : customerCodeLabel;
     const branchId = row.branch_id || null;
     const ledgerEntries = [];
 
@@ -4419,6 +4425,27 @@ exports.cashierConfirmPayment = async (req, res) => {
             message: "Bank account not found or inactive",
           });
         }
+        const channel =
+          String(bank.channel || "bank").trim().toLowerCase() === "pos"
+            ? "pos"
+            : "bank";
+        const wantsPos = modeRaw === "card" || resolvedSide === "card";
+        if (wantsPos && channel !== "pos") {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              "POS payments must use an account whose type is POS. Set that in Admin → Settings → Bank setup.",
+          });
+        }
+        if (!wantsPos && channel === "pos") {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message:
+              "Transfer payments must use an account whose type is Bank, not POS.",
+          });
+        }
         accountCode = bank.head;
         bankAccountId = String(bankId);
       }
@@ -4448,7 +4475,7 @@ exports.cashierConfirmPayment = async (req, res) => {
         dr: payAmt,
         cr: 0,
         account_description: payAccount.description,
-        transaction_description: `Sale payment (${modeLabel}) [${customerCodeLabel}] — ${saleRef}`,
+        transaction_description: `Sale payment (${modeLabel}) [${customerPartyLabel}] — ${saleRef}`,
         bank_account_id: bankAccountId,
         reference_number: saleRef,
         purpose_of_payment: "Cash Sale",
@@ -4470,7 +4497,7 @@ exports.cashierConfirmPayment = async (req, res) => {
         dr: 0,
         cr: payAmt,
         account_description: receivableAccount.description,
-        transaction_description: `Sale settlement (${modeLabel}) [${customerCodeLabel}] — ${saleRef}`,
+        transaction_description: `Sale settlement (${modeLabel}) [${customerPartyLabel}] — ${saleRef}`,
         bank_account_id: "",
         reference_number: saleRef,
         purpose_of_payment: "Cash Sale",

@@ -3,6 +3,10 @@ const { Op } = require("sequelize");
 const moment = require("moment");
 const { getAndUpdateNumber } = require("../services/numberGen");
 
+function normalizeAccountChannel(value) {
+  return String(value || "").trim().toLowerCase() === "pos" ? "pos" : "bank";
+}
+
 const statementTxnNet = (txn) => {
   const credit = parseFloat(txn.credit || 0);
   const debit = parseFloat(txn.debit || 0);
@@ -654,6 +658,7 @@ exports.createBankAccount = async (req, res) => {
       account_name,
       user_id,
       account_bank_type,
+      channel,
       head, // GL Account Head (e.g., "10101")
       subhead, // GL Account Subhead (optional)
       facilityId,
@@ -752,6 +757,7 @@ exports.createBankAccount = async (req, res) => {
         bank_code: String(bank_code),
         bank_name: String(bank_name),
         account_bank_type: String(account_bank_type),
+        channel: normalizeAccountChannel(channel),
         user_id: String(user_id),
         head: head ? String(head) : null,
         subhead: subhead ? String(subhead) : null,
@@ -947,6 +953,7 @@ exports.bulkCreateBankAccounts = async (req, res) => {
             bank_code,
             bank_name,
             account_bank_type,
+            channel: normalizeAccountChannel(item.channel),
             user_id: String(user_id),
             head: head || null,
             currency,
@@ -1091,7 +1098,8 @@ exports.getBankAccounts = async (req, res) => {
         bld.*,
         lr.last_reconciled,
         COALESCE(ob.opening_balance, obc.opening_balance, 0) AS opening_balance,
-        COALESCE(ob.opening_balance_date, obc.opening_balance_date) AS opening_balance_date
+        COALESCE(ob.opening_balance_date, obc.opening_balance_date) AS opening_balance_date,
+        COALESCE(NULLIF(ba.channel, ''), 'bank') AS channel
       FROM bank_list_data bld
       LEFT JOIN bank_accounts ba ON ba.id = bld.id
       LEFT JOIN (
@@ -1158,6 +1166,7 @@ exports.updateBankAccount = async (req, res) => {
       bank_code,
       user_id,
       account_bank_type,
+      channel,
       head,
       subhead,
       facilityId,
@@ -1251,6 +1260,10 @@ exports.updateBankAccount = async (req, res) => {
         account_bank_type: account_bank_type
           ? String(account_bank_type)
           : bankAccount.account_bank_type,
+        channel:
+          channel !== undefined && channel !== null && String(channel).trim() !== ""
+            ? normalizeAccountChannel(channel)
+            : normalizeAccountChannel(bankAccount.channel),
         head: head ? String(head) : bankAccount.head,
         subhead: subhead ? String(subhead) : bankAccount.subhead,
         category: category !== undefined ? category : bankAccount.category,

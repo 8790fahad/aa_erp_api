@@ -7,6 +7,11 @@ module.exports = (sequelize, DataTypes) => {
       account_name: { type: DataTypes.STRING, allowNull: false },
       bank_code: { type: DataTypes.STRING, allowNull: false },
       account_bank_type: { type: DataTypes.STRING, allowNull: false },
+      channel: {
+        type: DataTypes.STRING(10),
+        allowNull: false,
+        defaultValue: "bank",
+      },
       head: { type: DataTypes.STRING, allowNull: true },
       currency: { type: DataTypes.STRING, defaultValue: "NGN" },
       facilityId: { type: DataTypes.STRING, allowNull: false },

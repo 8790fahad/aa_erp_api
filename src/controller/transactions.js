@@ -4072,6 +4072,12 @@ exports.createSale = async (req, res) => {
     }
 
     const customerCodeLabel = customer.customerNo;
+    const customerNameLabel = String(
+      customer.fullname || customer.company_name || "",
+    ).trim();
+    const customerPartyLabel = customerNameLabel
+      ? `${customerCodeLabel} — ${customerNameLabel}`
+      : customerCodeLabel;
 
     /** Enforce chart codes from the product tied to this item code (no request fallbacks). */
     function assertRevenueAccountForItem(product, label) {
@@ -5373,7 +5379,7 @@ exports.createSale = async (req, res) => {
             prepaymentApplied,
             0,
             "deposit",
-            `Advance applied [${customerCodeLabel}] — ${saleRef}${productNamesText}`,
+            `Advance applied [${customerPartyLabel}] — ${saleRef}${productNamesText}`,
             customerCodeLabel
           )
         );
@@ -5381,7 +5387,7 @@ exports.createSale = async (req, res) => {
         await db.CustomerEntry.create(
           {
             customerNo: customer_id,
-            description: `Advance applied [${customerCodeLabel}] — ${saleRef}${productNamesText}`,
+            description: `Advance applied [${customerPartyLabel}] — ${saleRef}${productNamesText}`,
             cost: prepaymentApplied,
             qty_in: 0,
             qty_out: 1,
@@ -5421,10 +5427,10 @@ exports.createSale = async (req, res) => {
       const vatText = totalCalculatedVAT > 0 ? " (incl. VAT)" : "";
       const saleLabel = isCashSale ? "Cash sale" : "Credit sale";
       const saleDescription = itemNames
-        ? `${saleLabel} [${customerCodeLabel}] — ${itemNames}${
+        ? `${saleLabel} [${customerPartyLabel}] — ${itemNames}${
             itemDetails.filter((i) => !i.isProBono).length > 3 ? "..." : ""
           }${vatText}`
-        : `${saleLabel} [${customerCodeLabel}] — ${saleRef}${vatText}`;
+        : `${saleLabel} [${customerPartyLabel}] — ${saleRef}${vatText}`;
 
       ledgerEntries.push(
         createLedgerEntry(
@@ -5604,7 +5610,7 @@ exports.createSale = async (req, res) => {
             payAmt,
             0,
             "bank",
-            `Sale payment (${modeLabel}) [${customerCodeLabel}] — ${saleRef}`,
+            `Sale payment (${modeLabel}) [${customerPartyLabel}] — ${saleRef}`,
             customerCodeLabel,
             {
               bank_account_id: split.bankAccountId || "",
@@ -5620,7 +5626,7 @@ exports.createSale = async (req, res) => {
             0,
             payAmt,
             "receivable",
-            `Sale settlement (${modeLabel}) [${customerCodeLabel}] — ${saleRef}`,
+            `Sale settlement (${modeLabel}) [${customerPartyLabel}] — ${saleRef}`,
             customerCodeLabel,
             {
               purpose_of_payment: "Cash Sale",
@@ -5660,7 +5666,7 @@ exports.createSale = async (req, res) => {
           amountToAR,
           0,
           "bank",
-          `Cash sale payment [${customerCodeLabel}] — ${saleRef}`,
+          `Cash sale payment [${customerPartyLabel}] — ${saleRef}`,
           customerCodeLabel,
           {
             bank_account_id: resolvedBankAccountId || "",
@@ -5676,7 +5682,7 @@ exports.createSale = async (req, res) => {
           0,
           amountToAR,
           "receivable",
-          `Cash sale settlement [${customerCodeLabel}] — ${saleRef}`,
+          `Cash sale settlement [${customerPartyLabel}] — ${saleRef}`,
           customerCodeLabel,
           {
             purpose_of_payment: "Cash Sale",
