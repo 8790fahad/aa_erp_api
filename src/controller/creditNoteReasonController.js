@@ -87,6 +87,16 @@ const DEBIT_NOTE_REASONS = [
       "Describe returned goods and how inventory or stock should be updated.",
   },
   {
+    category: "MONEY_ONLY",
+    value: "Money from supplier — cash or transfer only, no goods",
+    label: "Money from supplier",
+    explanation:
+      "The supplier gave money only. Stock is not changed.",
+    inventoryRelated: false,
+    restockInventory: false,
+    lineKind: null,
+  },
+  {
     category: "OVERCHARGE",
     value: "Supplier overcharged — adjustment for excess billing",
     label: "Supplier overcharged",

@@ -22,6 +22,10 @@ module.exports = (app) => {
 
   // Employee Management Routes
   app.post("/api/hr/employees", employeesController.createEmployee);
+  app.post(
+    "/api/hr/employees/:id/investment-opening-balance",
+    employeesController.setInvestmentOpeningBalance,
+  );
   app.post("/api/hr/employees/bulk", employeesController.bulkCreateEmployees);
   app.get("/api/hr/employees", employeesController.getAllEmployees);
   app.get("/api/hr/employees/:id", employeesController.getEmployeeById);

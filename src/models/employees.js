@@ -132,6 +132,23 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING,
         allowNull: true,
       },
+      investmentOpeningBalance: {
+        type: DataTypes.DECIMAL(20, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+      investmentOpeningDate: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+      },
+      investmentAccountHead: {
+        type: DataTypes.STRING(100),
+        allowNull: true,
+      },
+      investmentReference: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
       createdBy: {
         type: DataTypes.CHAR(36).BINARY,
         allowNull: false,

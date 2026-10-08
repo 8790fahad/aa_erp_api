@@ -1239,7 +1239,7 @@ const getSupplierBills = async (req, res) => {
 
     if (searchTerm) {
       whereClause +=
-        " AND (i.invoice_ref LIKE :search OR i.ref_number LIKE :search OR COALESCE(s.supplier_name, '') LIKE :search OR COALESCE(i.description, '') LIKE :search)";
+        " AND (i.invoice_ref LIKE :search OR i.ref_number LIKE :search OR COALESCE(se_sup.supplier_number, '') LIKE :search OR COALESCE(s.supplier_name, s_entry.supplier_name, '') LIKE :search OR COALESCE(i.description, '') LIKE :search)";
       replacements.search = `%${searchTerm}%`;
     }
 
@@ -1277,6 +1277,38 @@ const getSupplierBills = async (req, res) => {
       ) s
         ON s.supplier_number = i.ref_number
         AND s.facilityId = i.facility_id
+      LEFT JOIN (
+        SELECT
+          ref_no,
+          facilityId,
+          MAX(NULLIF(supplier_number, '')) AS supplier_number
+        FROM (
+          SELECT receiptNo AS ref_no, facilityId, supplier_number
+          FROM supplier_entries
+          WHERE facilityId = :facilityId
+            AND receiptNo IS NOT NULL
+            AND receiptNo != ''
+          UNION ALL
+          SELECT cheque_no AS ref_no, facilityId, supplier_number
+          FROM supplier_entries
+          WHERE facilityId = :facilityId
+            AND cheque_no IS NOT NULL
+            AND cheque_no != ''
+        ) se_ids
+        GROUP BY ref_no, facilityId
+      ) se_sup
+        ON se_sup.ref_no = i.invoice_ref
+        AND se_sup.facilityId = i.facility_id
+      LEFT JOIN (
+        SELECT
+          supplier_number,
+          facilityId,
+          MAX(NULLIF(supplier_name, '')) AS supplier_name
+        FROM suppliersinfo
+        GROUP BY supplier_number, facilityId
+      ) s_entry
+        ON s_entry.supplier_number = se_sup.supplier_number
+        AND s_entry.facilityId = i.facility_id
       LEFT JOIN (
         SELECT
           reference_number AS transaction_ref,
@@ -1391,12 +1423,16 @@ const getSupplierBills = async (req, res) => {
       SELECT
         i.invoice_id,
         i.invoice_ref,
-        i.ref_number,
+        COALESCE(
+          NULLIF(s.supplier_number, ''),
+          NULLIF(se_sup.supplier_number, ''),
+          i.ref_number
+        ) AS ref_number,
         i.transaction_date,
         i.due_date,
         i.amount as  amount,
         i.description,
-        COALESCE(s.supplier_name, 'Unknown Supplier') AS supplier_name,
+        COALESCE(s.supplier_name, s_entry.supplier_name, 'Unknown Supplier') AS supplier_name,
         COALESCE(payments.total_paid, 0) AS total_paid,
         (i.amount - COALESCE(payments.total_paid, 0)) AS amount_due,
         COALESCE(adv.available_advance, 0) AS available_advance,

@@ -22,6 +22,11 @@ const PAYMENT_ADJUSTMENT_LABELS = {
   account_adjustment: "Account adjustment",
 };
 
+/** Parking a money-only supplier credit on the advance does not use it up. */
+function applicationUsesCredit(row) {
+  return String(row?.invoice_ref || "").trim().toUpperCase() !== "ADVANCE";
+}
+
 function formatPaymentAdjustmentNote(method) {
   if (method == null || method === "") return "";
   const label =
@@ -543,8 +548,52 @@ exports.createCreditNote = async (req, res) => {
     // Fallback single returns/adjustment account when lines lack chart codes
     const returnsAccountName =
       type === "customer" ? "Sales Returns" : "Purchase Returns";
+    const moneyOnlyCredit =
+      type === "supplier" &&
+      (String(reasonCategory || "").toUpperCase() === "MONEY_ONLY" ||
+        /money from supplier/i.test(String(reason || "")));
     let returnsAccount = null;
-    if (!usableLines.length) {
+    let moneyHeadAccount = null;
+    let supplierAdvanceAccount = null;
+    if (moneyOnlyCredit) {
+      const headCode = String(req.body.moneyHeadCode || "").trim();
+      const accrualCode = String(req.body.payableAccrualCode || "").trim();
+      if (!headCode) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Select a head for money from the supplier",
+        });
+      }
+      if (!accrualCode) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "Supplier advance account is not set for this business",
+        });
+      }
+      moneyHeadAccount = await db.AccountCategory.findOne({
+        where: { facility_id: facilityId, code: headCode },
+      });
+      supplierAdvanceAccount = await db.AccountCategory.findOne({
+        where: { facility_id: facilityId, code: accrualCode },
+      });
+      if (!moneyHeadAccount) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Head ${headCode} was not found in Chart of Accounts`,
+        });
+      }
+      if (!supplierAdvanceAccount) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Supplier advance account ${accrualCode} was not found in Chart of Accounts`,
+        });
+      }
+    } else if (!usableLines.length) {
       returnsAccount = await db.AccountCategory.findOne({
         where: {
           facility_id: facilityId,
@@ -732,6 +781,29 @@ exports.createCreditNote = async (req, res) => {
           "VAT",
         );
       }
+    } else if (moneyOnlyCredit) {
+      // Debit the supplier advance (type accrued, tied to the supplier) so the
+      // advance balance increases. Credit the head the user selected.
+      pushGl(
+        supplierAdvanceAccount,
+        totalAmount,
+        0,
+        `Supplier advance — ${entityName} — ${creditNoteNumber}`,
+        "ADV",
+        {
+          type: "accrued",
+          mode_of_payment: "supplier_advance",
+          transaction_ref: entityId,
+        },
+      );
+      pushGl(
+        moneyHeadAccount,
+        0,
+        totalAmount,
+        `Money from supplier ${creditNoteNumber} - ${entityName}`,
+        "HEAD",
+        { type: "bank", mode_of_payment: "supplier_advance" },
+      );
     } else {
       // Dr Accounts Payable / Cr line accounts (or Purchase Returns / Inventory)
       pushGl(
@@ -819,7 +891,8 @@ exports.createCreditNote = async (req, res) => {
     await db.Invoice.create(
       {
         invoice_ref: creditNoteNumber,
-        ref_number: reference || null, // Link to original invoice if provided
+        ref_number:
+          type === "supplier" ? entityId : reference || null,
         due_date: transactionDate,
         transaction_date: transactionDate,
         tax_amount: calculatedVat,
@@ -854,6 +927,25 @@ exports.createCreditNote = async (req, res) => {
         },
         { transaction }
       );
+    } else if (moneyOnlyCredit) {
+      await db.SupplierEntry.create(
+        {
+          supplier_number: entityId,
+          description: `Money from supplier ${creditNoteNumber} — advance${reference ? ` (Ref: ${reference})` : ""}`,
+          qty_in: 0,
+          qty_out: 0,
+          cost: totalAmount,
+          facilityId: facilityId,
+          mode_of_payment: "supplier_advance",
+          receiptNo: creditNoteNumber,
+          cheque_no: creditNoteNumber,
+          link_id: reference || null,
+          type: "payment",
+          bank_account_id: "",
+          created_by: userId,
+        },
+        { transaction },
+      );
     } else {
       // Supplier credit note - reduce what we owe (debit entry)
       await db.SupplierEntry.create(
@@ -881,7 +973,21 @@ exports.createCreditNote = async (req, res) => {
     let creditsRemainingOnCreate = totalAmount;
     let docStatusOnCreate = "open";
 
-    if (postCustomerToDeposit) {
+    if (moneyOnlyCredit) {
+      await db.CreditNoteApplication.create(
+        {
+          facility_id: facilityId,
+          credit_note_number: creditNoteNumber,
+          invoice_ref: "ADVANCE",
+          amount: totalAmount,
+          created_by: userId,
+        },
+        { transaction },
+      );
+      creditsAppliedOnCreate = totalAmount;
+      creditsRemainingOnCreate = 0;
+      docStatusOnCreate = "closed";
+    } else if (postCustomerToDeposit) {
       await db.CreditNoteApplication.create(
         {
           facility_id: facilityId,
@@ -1303,6 +1409,7 @@ exports.getCreditNotes = async (req, res) => {
 
     const appliedMap = {};
     for (const a of apps) {
+      if (!applicationUsesCredit(a)) continue;
       const k = a.credit_note_number;
       appliedMap[k] = (appliedMap[k] || 0) + (parseFloat(a.amount) || 0);
     }
@@ -1620,7 +1727,8 @@ exports.getCreditNoteDetails = async (req, res) => {
     });
 
     const creditsApplied = applications.reduce(
-      (s, a) => s + (parseFloat(a.amount) || 0),
+      (s, a) =>
+        applicationUsesCredit(a) ? s + (parseFloat(a.amount) || 0) : s,
       0,
     );
     const totalAmount = Math.abs(parseFloat(invoice.amount) || 0);
@@ -1845,7 +1953,8 @@ exports.applyCreditNote = async (req, res) => {
       transaction,
     });
     const alreadyApplied = existingApps.reduce(
-      (s, a) => s + (parseFloat(a.amount) || 0),
+      (s, a) =>
+        applicationUsesCredit(a) ? s + (parseFloat(a.amount) || 0) : s,
       0,
     );
     const totalAmount = Math.abs(parseFloat(invoice.amount) || 0);

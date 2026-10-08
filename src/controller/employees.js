@@ -1,6 +1,8 @@
 const db = require("../models");
 const { Op } = require("sequelize");
 const { v4: uuidv4 } = require("uuid");
+const { getAndUpdateNumber } = require("../services/numberGen");
+const { validatePostingDate } = require("../utils/validatePostingDate");
 const {
   syncEmployeePayeProfileFromStructure,
 } = require("./payeSettings");
@@ -248,6 +250,10 @@ exports.getAllEmployees = async (req, res) => {
         "salaryStatus",
         "salaryStatusReason",
         "salaryStatusDate",
+        "investmentOpeningBalance",
+        "investmentOpeningDate",
+        "investmentAccountHead",
+        "investmentReference",
         "createdAt"
       ],
       include: [
@@ -261,9 +267,41 @@ exports.getAllEmployees = async (req, res) => {
       order: [["firstName", "ASC"]],
     });
 
+    const investmentBalances = await db.sequelize.query(
+      `SELECT transaction_ref AS ref,
+              COALESCE(SUM(cr), 0) - COALESCE(SUM(dr), 0) AS balance
+       FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND purpose_of_payment = 'Business associate investment'
+         AND transaction_ref LIKE '%-INV'
+       GROUP BY transaction_ref`,
+      {
+        replacements: { facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const balanceByRef = Object.fromEntries(
+      (investmentBalances || []).map((row) => [
+        row.ref,
+        Number(row.balance) || 0,
+      ]),
+    );
+    const employeeRows = employees.map((employee) => {
+      const plain = employee.toJSON ? employee.toJSON() : employee;
+      const ref = `${plain.employeeId}-INV`;
+      const ledgerBalance = balanceByRef[ref];
+      return {
+        ...plain,
+        investmentCurrentBalance:
+          ledgerBalance === undefined
+            ? Number(plain.investmentOpeningBalance) || 0
+            : ledgerBalance,
+      };
+    });
+
     res.json({
       success: true,
-      data: { employees },
+      data: { employees: employeeRows },
     });
   } catch (error) {
     console.error("Error fetching employees:", error);
@@ -546,10 +584,42 @@ exports.getAllEmployees = async (req, res) => {
       order: [["createdAt", "DESC"]],
     });
 
+    const investmentBalances = await db.sequelize.query(
+      `SELECT transaction_ref AS ref,
+              COALESCE(SUM(cr), 0) - COALESCE(SUM(dr), 0) AS balance
+       FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND purpose_of_payment = 'Business associate investment'
+         AND transaction_ref LIKE '%-INV'
+       GROUP BY transaction_ref`,
+      {
+        replacements: { facilityId },
+        type: db.Sequelize.QueryTypes.SELECT,
+      },
+    );
+    const balanceByRef = Object.fromEntries(
+      (investmentBalances || []).map((row) => [
+        row.ref,
+        Number(row.balance) || 0,
+      ]),
+    );
+    const employeesWithInvestment = rows.map((employee) => {
+      const plain = employee.toJSON ? employee.toJSON() : employee;
+      const ref = `${plain.employeeId}-INV`;
+      const ledgerBalance = balanceByRef[ref];
+      return {
+        ...plain,
+        investmentCurrentBalance:
+          ledgerBalance === undefined
+            ? Number(plain.investmentOpeningBalance) || 0
+            : ledgerBalance,
+      };
+    });
+
     res.json({
       success: true,
       data: {
-        employees: rows,
+        employees: employeesWithInvestment,
         pagination: {
           total: count,
           page: parseInt(page),
@@ -1675,6 +1745,236 @@ exports.bulkCreateEmployees = async (req, res) => {
       success: false,
       message: "Error bulk creating employees",
       error: error.message,
+    });
+  }
+};
+
+/**
+ * POST /api/hr/employees/:id/investment-opening-balance
+ * Business associate investment that already existed.
+ * Dr Opening Balance Equity · Cr the investment account.
+ */
+exports.setInvestmentOpeningBalance = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      amount,
+      currentBalance,
+      asOfDate,
+      investmentHead,
+      userId,
+    } = req.body || {};
+    const value = parseFloat(amount);
+    const head = String(investmentHead || "").trim();
+    const hasCurrent =
+      currentBalance !== undefined &&
+      currentBalance !== null &&
+      String(currentBalance).trim() !== "";
+    const balance = hasCurrent ? parseFloat(currentBalance) : value;
+
+    if (!facilityId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!Number.isFinite(value) || value <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter the investment opening balance",
+      });
+    }
+    if (!Number.isFinite(balance) || balance < 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid current balance",
+      });
+    }
+    if (!head) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Select the business associate investment account",
+      });
+    }
+
+    const employee = await db.employees.findOne({
+      where: { id: req.params.id, facilityId },
+      transaction,
+    });
+    if (!employee) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Business associate not found",
+      });
+    }
+    if (employee.contractType !== "Business Associate") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Opening investment is only for a business associate",
+      });
+    }
+
+    const business = await db.business.findOne({
+      where: { id: facilityId },
+      attributes: ["opening_balance_equity"],
+      transaction,
+    });
+    const equityCode = String(business?.opening_balance_equity || "").trim();
+    if (!equityCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "Set Opening Balance Equity under Default accounts before posting this balance",
+      });
+    }
+
+    const [investmentAccount, equityAccount] = await Promise.all([
+      db.AccountCategory.findOne({
+        where: { code: head, facility_id: facilityId },
+        transaction,
+      }),
+      db.AccountCategory.findOne({
+        where: { code: equityCode, facility_id: facilityId },
+        transaction,
+      }),
+    ]);
+    if (!investmentAccount) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Investment account not found: ${head}`,
+      });
+    }
+    if (!equityAccount) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Opening Balance Equity account not found: ${equityCode}`,
+      });
+    }
+
+    let transactionDate;
+    try {
+      transactionDate = validatePostingDate(asOfDate || new Date(), {
+        field: "asOfDate",
+        allowFuture: true,
+      });
+    } catch (err) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: err.message || "Enter a valid as of date",
+      });
+    }
+
+    const actor = userId || req.user?.id;
+    if (!actor) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "userId is required",
+      });
+    }
+
+    const previousRef = String(employee.investmentReference || "").trim();
+    if (previousRef) {
+      await db.GeneralLedger.destroy({
+        where: {
+          facility_id: facilityId,
+          reference_number: previousRef,
+          purpose_of_payment: "Business associate investment",
+        },
+        transaction,
+      });
+    }
+
+    const reference = previousRef || `OB-${await getAndUpdateNumber("OB", facilityId)}`;
+    const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim();
+    const desc = `Opening balance — business associate investment — ${name}`;
+    const parentOf = (account) =>
+      account.parentCode ?? account.parent_code ?? account.code ?? "0";
+
+    if (balance > 0) {
+      await db.GeneralLedger.bulkCreate(
+        [
+          {
+            transaction_date: transactionDate,
+            account_code: equityAccount.code,
+            account_subhead: String(parentOf(equityAccount)),
+            account_description: equityAccount.description,
+            dr: balance,
+            cr: 0,
+            transaction_description: desc,
+            purpose_of_payment: "Business associate investment",
+            reference_number: reference,
+            payee: name.slice(0, 50),
+            created_by: String(actor),
+            facility_id: facilityId,
+            type: "opening_balance",
+            status: "posted",
+            transaction_ref: `${employee.employeeId}-OBE`,
+          },
+          {
+            transaction_date: transactionDate,
+            account_code: investmentAccount.code,
+            account_subhead: String(parentOf(investmentAccount)),
+            account_description: investmentAccount.description,
+            dr: 0,
+            cr: balance,
+            transaction_description: desc,
+            purpose_of_payment: "Business associate investment",
+            reference_number: reference,
+            payee: name.slice(0, 50),
+            created_by: String(actor),
+            facility_id: facilityId,
+            type: "opening_balance",
+            status: "posted",
+            transaction_ref: `${employee.employeeId}-INV`,
+          },
+        ],
+        { transaction },
+      );
+    }
+
+    await employee.update(
+      {
+        investmentOpeningBalance: value,
+        investmentOpeningDate: transactionDate,
+        investmentAccountHead: head,
+        investmentReference: reference,
+        updatedBy: String(actor),
+      },
+      { transaction },
+    );
+
+    await transaction.commit();
+    return res.status(201).json({
+      success: true,
+      message: "Investment opening balance posted",
+      data: {
+        id: employee.id,
+        employeeId: employee.employeeId,
+        investmentOpeningBalance: value,
+        investmentOpeningDate: transactionDate,
+        investmentAccountHead: head,
+        investmentReference: reference,
+        investmentCurrentBalance: balance,
+      },
+    });
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    console.error("setInvestmentOpeningBalance", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to post investment opening balance",
     });
   }
 };
