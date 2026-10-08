@@ -128,14 +128,55 @@ function isCogsSql(alias = "ac") {
   )`;
 }
 
+/**
+ * Taxation expense accounts. Mirrors the Income Statement classifier
+ * (accountingReports.classifySection): an explicit pl_line of tax/taxes wins,
+ * otherwise a CoA type of "Taxes" puts the account in the taxation section.
+ */
+function isTaxSql(alias = "ac") {
+  const plLine = normalizeTypeSql(`${alias}.pl_line`);
+  return `(
+    UPPER(${alias}.account_nature) = 'EXPENSE'
+    AND (
+      ${plLine} IN ('tax', 'taxes')
+      OR (
+        ${plLine} NOT IN (
+          'turnover', 'other_income', 'cost_of_sales', 'admin_costs',
+          'finance', 'interest', 'impairment'
+        )
+        AND ${normalizeTypeSql(`${alias}.type`)} = 'taxes'
+      )
+    )
+  )`;
+}
+
+/** COGS accounts, excluding anything classified as taxation. */
+function isCogsExTaxSql(alias = "ac") {
+  return `(${isCogsSql(alias)} AND NOT ${isTaxSql(alias)})`;
+}
+
+/**
+ * Revenue − COGS = Gross Profit
+ * Gross Profit − Operating Expenses = Profit Before Tax
+ * Profit Before Tax − Taxation = Net Profit (Profit After Tax)
+ * Tax is carved out of "total expenses" so it is not double counted in opex.
+ */
+function computePlFigures({ revenue, expenses, cogs, taxation }) {
+  const operatingExpenses = Math.max(expenses - cogs - taxation, 0);
+  const grossProfit = revenue - cogs;
+  const profitBeforeTax = grossProfit - operatingExpenses;
+  const netProfit = profitBeforeTax - taxation;
+  return { operatingExpenses, grossProfit, profitBeforeTax, taxation, netProfit };
+}
+
 async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
-  // Revenue − COGS = Gross Profit; Gross Profit − Operating = Net Profit
   const rows = await sequelize.query(
     `
       SELECT
         COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS total_revenue,
         COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS total_expenses,
-        COALESCE(SUM(${cogsLineSql(isCogsSql("ac"))}), 0) AS cogs
+        COALESCE(SUM(${cogsLineSql(isCogsExTaxSql("ac"))}), 0) AS cogs,
+        COALESCE(SUM(CASE WHEN ${isTaxSql("ac")} THEN gl.dr - gl.cr ELSE 0 END), 0) AS taxation
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId
@@ -151,18 +192,20 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
   const totalRevenue = parseFloat(rows[0]?.total_revenue || 0);
   const totalExpenses = parseFloat(rows[0]?.total_expenses || 0);
   const cogs = parseFloat(rows[0]?.cogs || 0);
-  const operatingExpenses = Math.max(totalExpenses - cogs, 0);
-  const grossProfit = totalRevenue - cogs;
-  const netProfit = grossProfit - operatingExpenses;
+  const taxation = parseFloat(rows[0]?.taxation || 0);
+  const pl = computePlFigures({
+    revenue: totalRevenue,
+    expenses: totalExpenses,
+    cogs,
+    taxation,
+  });
 
   return {
     totalRevenue,
     totalIncome: totalRevenue,
     totalExpenses,
     cogs,
-    grossProfit,
-    operatingExpenses,
-    netProfit,
+    ...pl,
   };
 }
 
@@ -203,40 +246,40 @@ async function fetchCashInBank(sequelize, facilityId, asOfDate) {
   return parseFloat(rows[0]?.cash_balance || 0);
 }
 
-function buildMonthSeries(fromDate, toDate) {
-  const start = moment(fromDate, "YYYY-MM-DD").startOf("month");
-  const end = moment(toDate, "YYYY-MM-DD").startOf("month");
-  const months = [];
+function buildDaySeries(fromDate, toDate) {
+  const start = moment(fromDate, "YYYY-MM-DD").startOf("day");
+  const end = moment(toDate, "YYYY-MM-DD").startOf("day");
+  const days = [];
   const cursor = start.clone();
-  while (cursor.isSameOrBefore(end, "month")) {
-    months.push({
-      monthKey: cursor.format("YYYY-MM"),
-      month: cursor.format("MMM"),
+  while (cursor.isSameOrBefore(end, "day")) {
+    days.push({
+      date: cursor.format("YYYY-MM-DD"),
+      label: cursor.format("D MMM"),
       revenue: 0,
       income: 0,
       expenses: 0,
     });
-    cursor.add(1, "month");
+    cursor.add(1, "day");
   }
-  return months;
+  return days;
 }
 
 async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
   const rows = await sequelize.query(
     `
       SELECT
-        DATE_FORMAT(gl.transaction_date, '%Y-%m') AS month_key,
-        DATE_FORMAT(gl.transaction_date, '%b') AS month_label,
+        DATE_FORMAT(gl.transaction_date, '%Y-%m-%d') AS day_key,
         COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS revenue,
         COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS expenses,
-        COALESCE(SUM(${cogsLineSql(isCogsSql("ac"))}), 0) AS cogs
+        COALESCE(SUM(${cogsLineSql(isCogsExTaxSql("ac"))}), 0) AS cogs,
+        COALESCE(SUM(CASE WHEN ${isTaxSql("ac")} THEN gl.dr - gl.cr ELSE 0 END), 0) AS taxation
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
       WHERE gl.facility_id = :facilityId
         AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
         AND IFNULL(gl.type, '') != 'opening_balance'
-      GROUP BY month_key, month_label
-      ORDER BY month_key ASC
+      GROUP BY day_key
+      ORDER BY day_key ASC
     `,
     {
       replacements: { facilityId, fromDate, toDate },
@@ -244,39 +287,43 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
     },
   );
 
-  const byMonth = new Map(
+  const byDay = new Map(
     rows.map((row) => {
       const revenue = parseFloat(row.revenue || 0);
       const expenses = parseFloat(row.expenses || 0);
       const cogs = parseFloat(row.cogs || 0);
-      const operatingExpenses = Math.max(expenses - cogs, 0);
-      const grossProfit = revenue - cogs;
-      const netProfit = grossProfit - operatingExpenses;
+      const taxation = parseFloat(row.taxation || 0);
+      const { operatingExpenses, grossProfit, profitBeforeTax, netProfit } =
+        computePlFigures({ revenue, expenses, cogs, taxation });
       return [
-        row.month_key,
+        row.day_key,
         {
-          monthKey: row.month_key,
-          month: row.month_label,
+          date: row.day_key,
+          label: moment(row.day_key, "YYYY-MM-DD").format("D MMM"),
           revenue,
           income: revenue,
           expenses,
           cogs,
           grossProfit,
           operatingExpenses,
+          profitBeforeTax,
+          taxation,
           netProfit,
         },
       ];
     }),
   );
 
-  return buildMonthSeries(fromDate, toDate).map((slot) => {
-    const found = byMonth.get(slot.monthKey);
+  return buildDaySeries(fromDate, toDate).map((slot) => {
+    const found = byDay.get(slot.date);
     if (found) return found;
     return {
       ...slot,
       cogs: 0,
       grossProfit: 0,
       operatingExpenses: 0,
+      profitBeforeTax: 0,
+      taxation: 0,
       netProfit: 0,
     };
   });
@@ -1206,6 +1253,8 @@ const EMPTY_PERIOD_TOTALS = {
   cogs: 0,
   grossProfit: 0,
   operatingExpenses: 0,
+  profitBeforeTax: 0,
+  taxation: 0,
   netProfit: 0,
 };
 
@@ -1332,6 +1381,10 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     currentTotals.netProfit,
     priorTotals.netProfit,
   );
+  const taxationChange = pctChange(
+    currentTotals.taxation,
+    priorTotals.taxation,
+  );
   const cashChange = pctChange(cashInBank, priorCashInBank);
   const cogsChange = pctChange(currentTotals.cogs, priorTotals.cogs);
   const gpChange = pctChange(currentTotals.grossProfit, priorTotals.grossProfit);
@@ -1349,7 +1402,11 @@ async function buildFinancialDashboardOverview(sequelize, options) {
       cogs: currentTotals.cogs,
       grossProfit: currentTotals.grossProfit,
       operatingExpenses: currentTotals.operatingExpenses,
+      profitBeforeTax: currentTotals.profitBeforeTax,
+      taxation: currentTotals.taxation,
       netProfit: currentTotals.netProfit,
+      taxationChange: taxationChange.value,
+      taxationChangeLabel: taxationChange.label,
       cashInBank,
       incomeChange: incomeChange.value,
       revenueChange: incomeChange.value,
