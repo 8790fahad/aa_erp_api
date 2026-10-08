@@ -512,11 +512,15 @@ exports.issueCreditNote = async (req, res) => {
     }
 
     const productLabel = rule.product_name || "All products";
-    const lineDescription = `Volume rebate — ${rule.name} (${rule.period_label}) · ${productLabel}`;
+    const beforeTarget = req.body?.beforeTarget === true;
+    const earlyNote = beforeTarget
+      ? " Granted before the quantity target was reached."
+      : "";
+    const lineDescription = `Volume rebate — ${rule.name} (${rule.period_label}) · ${productLabel}${earlyNote}`;
     const today = new Date().toISOString().slice(0, 10);
     const reason = isPurchase
-      ? `Post-purchase volume rebate: ${rule.name} (${rule.period_label})`
-      : `Post-sale volume rebate: ${rule.name} (${rule.period_label})`;
+      ? `Post-purchase volume rebate: ${rule.name} (${rule.period_label})${earlyNote}`
+      : `Post-sale volume rebate: ${rule.name} (${rule.period_label})${earlyNote}`;
 
     const cnBody = isPurchase
       ? {
@@ -959,9 +963,13 @@ exports.issuePayment = async (req, res) => {
       10,
     );
     const productLabel = rule.product_name || "All products";
+    const beforeTarget = req.body?.beforeTarget === true;
+    const earlyNote = beforeTarget
+      ? " Granted before the quantity target was reached."
+      : "";
     const purpose = `Rebate payout ${paymentRef}`.slice(0, 150);
     const desc =
-      `${isPurchase ? "Volume rebate received" : "Volume rebate paid"} — ${rule.name} (${rule.period_label}) · ${productLabel} · ${customerName}`.slice(
+      `${isPurchase ? "Volume rebate received" : "Volume rebate paid"} — ${rule.name} (${rule.period_label}) · ${productLabel} · ${customerName}${earlyNote}`.slice(
         0,
         500,
       );

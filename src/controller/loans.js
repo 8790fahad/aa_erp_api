@@ -49,6 +49,30 @@ function parseLoanStartDate(startMonth, startDate) {
   return null;
 }
 
+function loanAmountDue(loan) {
+  return parseFloat(loan.amount || 0) + parseFloat(loan.profit || 0);
+}
+
+function parseProfitAmount(profit) {
+  if (profit == null || String(profit).trim() === "") return 0;
+  const value = parseFloat(profit);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return value;
+}
+
+async function resolveProfitHead(facilityId, explicitHead, setupProfitHead) {
+  if (explicitHead) return explicitHead;
+  if (setupProfitHead) return setupProfitHead;
+  const namedDefault = await db.loan_setups.findOne({
+    where: {
+      facilityId,
+      status: true,
+      name: "Default loan receivable",
+    },
+  });
+  return namedDefault?.profitHead || null;
+}
+
 /**
  * Helper to record a GL transaction (Double Entry)
  */
@@ -108,7 +132,7 @@ async function recordGLTransaction({
 
 exports.createLoanSetup = async (req, res) => {
   try {
-    const { name, description, amount, receivableHead, facilityId, userId } = req.body;
+    const { name, description, amount, receivableHead, profitHead, facilityId, userId } = req.body;
     
     if (!name || !receivableHead) {
       return res.status(400).json({ success: false, message: "Name and Receivable Account are required" });
@@ -120,6 +144,7 @@ exports.createLoanSetup = async (req, res) => {
       description,
       amount,
       receivableHead,
+      profitHead: profitHead || null,
       facilityId: facilityId || req.user?.facilityId,
       createdBy: userId || req.user?.id
     });
@@ -148,7 +173,7 @@ exports.getAllLoanSetups = async (req, res) => {
 exports.updateLoanSetup = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, amount, receivableHead, facilityId, userId } = req.body;
+    const { name, description, amount, receivableHead, profitHead, facilityId, userId } = req.body;
     
     const setup = await db.loan_setups.findOne({
       where: { id, facilityId: facilityId || req.user?.facilityId }
@@ -160,6 +185,7 @@ exports.updateLoanSetup = async (req, res) => {
     setup.description = description || setup.description;
     setup.amount = amount !== undefined ? amount : setup.amount;
     setup.receivableHead = receivableHead || setup.receivableHead;
+    if (profitHead !== undefined) setup.profitHead = profitHead || null;
     setup.updatedBy = userId || req.user?.id;
 
     await setup.save();
@@ -216,6 +242,8 @@ exports.createLoan = async (req, res) => {
       postDisbursement = true,
       startMonth,
       startDate,
+      profit,
+      profitHead,
     } = req.body;
 
     if (!employeeId || !amount || !durationMonths) {
@@ -249,6 +277,22 @@ exports.createLoan = async (req, res) => {
         where: { id: loanSetupId, facilityId: resolvedFacilityId },
       });
       setupReceivable = setup?.receivableHead || null;
+    }
+    if (!setupReceivable) {
+      const namedDefault = await db.loan_setups.findOne({
+        where: {
+          facilityId: resolvedFacilityId,
+          status: true,
+          name: "Default loan receivable",
+        },
+      });
+      const fallbackSetup =
+        namedDefault ||
+        (await db.loan_setups.findOne({
+          where: { facilityId: resolvedFacilityId, status: true },
+          order: [["createdAt", "ASC"]],
+        }));
+      setupReceivable = fallbackSetup?.receivableHead || null;
     }
 
     if (!setupReceivable) {
@@ -292,11 +336,32 @@ exports.createLoan = async (req, res) => {
     const empName = employee
       ? `${employee.firstName || ""} ${employee.lastName || ""}`.trim()
       : "Staff";
+    const isAssociate = employee?.contractType === "Business Associate";
+    const resolvedRepayment = isAssociate
+      ? "Self"
+      : repaymentMethod || "Salary Deduction";
 
     const loanId = uuidv4();
     const loanAmount = parseFloat(amount);
+    const loanProfit = parseProfitAmount(profit);
+    if (loanProfit == null) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid profit amount",
+      });
+    }
     const months = parseInt(durationMonths, 10);
     const shouldPost = postDisbursement !== false && postDisbursement !== "false";
+    const profitAccount =
+      loanProfit > 0
+        ? await resolveProfitHead(resolvedFacilityId, profitHead, null)
+        : null;
+    if (loanProfit > 0 && !profitAccount) {
+      return res.status(400).json({
+        success: false,
+        message: "Set the loan profit account in Settings before adding a profit",
+      });
+    }
 
     // Always allocate a number-generator reference for the loan voucher
     const loanReference = await allocateLoanReference(resolvedFacilityId);
@@ -314,6 +379,18 @@ exports.createLoan = async (req, res) => {
         createdBy: resolvedUserId,
         transactionRef: loanId,
       });
+      if (loanProfit > 0) {
+        await recordGLTransaction({
+          facilityId: resolvedFacilityId,
+          accountDR: setupReceivable,
+          accountCR: profitAccount,
+          amount: loanProfit,
+          description: `Loan Profit (${mode.toUpperCase()}) - ${empName}`,
+          reference: loanReference,
+          createdBy: resolvedUserId,
+          transactionRef: loanId,
+        });
+      }
     }
 
     const newLoan = await db.loans.create({
@@ -322,11 +399,16 @@ exports.createLoan = async (req, res) => {
       loanSetupId,
       facilityId: resolvedFacilityId,
       amount: loanAmount,
-      purpose: purpose || `Staff loan - ${empName}`,
-      repaymentMethod: repaymentMethod || "Salary Deduction",
+      profit: loanProfit,
+      purpose:
+        purpose ||
+        (isAssociate
+          ? `Business associate loan - ${empName}`
+          : `Staff loan - ${empName}`),
+      repaymentMethod: resolvedRepayment,
       durationMonths: months,
       monthlyDeductionAmount:
-        monthlyDeductionAmount || loanAmount / months,
+        monthlyDeductionAmount || (loanAmount + loanProfit) / months,
       createdBy: resolvedUserId,
       status: shouldPost ? "Approved" : "Pending",
       startDate: resolvedStartDate,
@@ -365,7 +447,7 @@ exports.getAllLoans = async (req, res) => {
         {
           model: db.employees,
           as: "employee",
-          attributes: ["id", "firstName", "lastName", "employeeId", "departmentId"],
+          attributes: ["id", "firstName", "lastName", "employeeId", "departmentId", "contractType"],
           include: [
             {
               model: db.Department,
@@ -444,6 +526,7 @@ exports.updateLoan = async (req, res) => {
       loanSetupId,
       startMonth,
       startDate,
+      profit,
     } = req.body;
 
     const loan = await db.loans.findOne({
@@ -476,6 +559,21 @@ exports.updateLoan = async (req, res) => {
       });
     }
 
+    if (loan.status === "Pending" && profit !== undefined) {
+      const parsedProfit = parseProfitAmount(profit);
+      if (parsedProfit == null) {
+        return res.status(400).json({
+          success: false,
+          message: "Enter a valid profit amount",
+        });
+      }
+      loan.profit = parsedProfit;
+    }
+
+    if (loan.status === "Pending" && amount !== undefined) {
+      loan.amount = amount;
+    }
+
     if (repaymentMethod !== undefined) {
       if (!["Self", "Salary Deduction"].includes(repaymentMethod)) {
         return res.status(400).json({
@@ -498,7 +596,7 @@ exports.updateLoan = async (req, res) => {
 
       // Recalculate monthly deduction from remaining balance
       const outstanding =
-        parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+        loanAmountDue(loan) - parseFloat(loan.amountPaid || 0);
       loan.monthlyDeductionAmount =
         outstanding > 0 ? outstanding / months : 0;
     }
@@ -520,7 +618,6 @@ exports.updateLoan = async (req, res) => {
     }
 
     if (loan.status === "Pending") {
-      loan.amount = amount !== undefined ? amount : loan.amount;
       loan.purpose = purpose || loan.purpose;
       if (receivableHead !== undefined) loan.receivableHead = receivableHead;
       if (loanSetupId !== undefined) loan.loanSetupId = loanSetupId;
@@ -528,7 +625,7 @@ exports.updateLoan = async (req, res) => {
       // If duration wasn't sent but amount changed on pending, refresh monthly
       if (durationMonths === undefined && amount !== undefined) {
         const months = parseInt(loan.durationMonths, 10) || 1;
-        loan.monthlyDeductionAmount = parseFloat(loan.amount) / months;
+        loan.monthlyDeductionAmount = loanAmountDue(loan) / months;
       }
 
       if (paymentMode !== undefined) {
@@ -616,6 +713,21 @@ exports.updateLoanStatus = async (req, res) => {
           message: "Disbursement requires both a Payment Source and a Loan Receivable Account"
         });
       }
+      const approvalProfit = parseFloat(loan.profit || 0);
+      const approvalProfitHead =
+        approvalProfit > 0
+          ? await resolveProfitHead(
+              loan.facilityId,
+              null,
+              loan.setup?.profitHead,
+            )
+          : null;
+      if (approvalProfit > 0 && !approvalProfitHead) {
+        return res.status(400).json({
+          success: false,
+          message: "Set the loan profit account in Settings before disbursing a profit",
+        });
+      }
 
       // Record GL Disbursement using number-generator reference
       const empName = `${loan.employee?.firstName || ""} ${loan.employee?.lastName || ""}`.trim();
@@ -633,6 +745,18 @@ exports.updateLoanStatus = async (req, res) => {
         createdBy: userId || req.user?.id,
         transactionRef: loan.id
       });
+      if (approvalProfit > 0) {
+        await recordGLTransaction({
+          facilityId: loan.facilityId,
+          accountDR: currentReceivableHead,
+          accountCR: approvalProfitHead,
+          amount: approvalProfit,
+          description: `Loan Profit (${mode?.toUpperCase()}) - ${empName}`,
+          reference: loanReference,
+          createdBy: userId || req.user?.id,
+          transactionRef: loan.id,
+        });
+      }
 
       // Keep final disbursement source on the loan
       loan.paymentMode = mode;
@@ -701,7 +825,7 @@ exports.getEmployeeLoans = async (req, res) => {
 exports.recordRepayment = async (req, res) => {
   try {
     const { id } = req.params; // loanId
-    const { amount, paymentMethod, reference, userId, facilityId, paymentMode, bankHead, cashHead, chequeNumber } = req.body;
+    const { amount, profit, paymentMethod, reference, userId, facilityId, paymentMode, bankHead, cashHead, chequeNumber, profitHead } = req.body;
     
     const loan = await db.loans.findOne({
       where: { id, facilityId: facilityId || req.user?.facilityId },
@@ -727,8 +851,21 @@ exports.recordRepayment = async (req, res) => {
       });
     }
 
-    const outstanding =
-      parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+    const profitAmount = parseFloat(profit);
+    const resolvedProfit =
+      Number.isFinite(profitAmount) && profitAmount > 0 ? profitAmount : 0;
+    if (
+      profit != null &&
+      String(profit).trim() !== "" &&
+      (!Number.isFinite(profitAmount) || profitAmount < 0)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid profit amount",
+      });
+    }
+
+    const outstanding = loanAmountDue(loan) - parseFloat(loan.amountPaid || 0);
     if (repaymentAmount > outstanding + 0.0001) {
       return res.status(400).json({
         success: false,
@@ -737,6 +874,20 @@ exports.recordRepayment = async (req, res) => {
     }
 
     const currentReceivableHead = loan.receivableHead || loan.setup?.receivableHead;
+    let profitAccount = null;
+    if (resolvedProfit > 0) {
+      profitAccount = await resolveProfitHead(
+        loan.facilityId,
+        profitHead,
+        loan.setup?.profitHead,
+      );
+    }
+    if (resolvedProfit > 0 && !profitAccount) {
+      return res.status(400).json({
+        success: false,
+        message: "Set the loan profit account in Settings before collecting a profit",
+      });
+    }
 
     // Use the loan voucher reference (LM-#) for repayments + GL
     let loanReference = loan.referenceNumber || null;
@@ -752,6 +903,7 @@ exports.recordRepayment = async (req, res) => {
       loanId: loan.id,
       facilityId: loan.facilityId,
       amount: repaymentAmount,
+      profit: resolvedProfit,
       paymentMethod: paymentMethod || "Manual",
       reference: loanReference,
       createdBy: userId || req.user?.id || userId,
@@ -770,24 +922,37 @@ exports.recordRepayment = async (req, res) => {
     }
 
     const empName = `${loan.employee?.firstName || ""} ${loan.employee?.lastName || ""}`.trim();
+    const collectionLabel = `${paymentMethod || "Manual"} - ${
+      paymentMode?.toUpperCase() || "BANK"
+    }${chequeNumber ? " - Chq: " + chequeNumber : ""} - ${empName}`;
     await recordGLTransaction({
       facilityId: loan.facilityId,
       accountDR: collectionHead,
       accountCR: currentReceivableHead,
       amount: repaymentAmount,
-      description: `Loan Repayment (${paymentMethod || "Manual"} - ${
-        paymentMode?.toUpperCase() || "BANK"
-      })${chequeNumber ? " - Chq: " + chequeNumber : ""} - ${empName}`,
+      description: `Loan Repayment (${collectionLabel})`,
       reference: loanReference,
       createdBy: userId || req.user?.id,
       transactionRef: repaymentId,
     });
+    if (resolvedProfit > 0) {
+      await recordGLTransaction({
+        facilityId: loan.facilityId,
+        accountDR: collectionHead,
+        accountCR: profitAccount,
+        amount: resolvedProfit,
+        description: `Loan Profit (${collectionLabel})`,
+        reference: loanReference,
+        createdBy: userId || req.user?.id,
+        transactionRef: repaymentId,
+      });
+    }
 
     // Update loan total paid amount
     const newAmountPaid = parseFloat(loan.amountPaid || 0) + repaymentAmount;
     loan.amountPaid = newAmountPaid;
 
-    if (newAmountPaid >= parseFloat(loan.amount)) {
+    if (newAmountPaid >= loanAmountDue(loan) - 0.0001) {
       loan.status = "Paid Off";
     } else if (loan.status === "Approved") {
       loan.status = "Repaying";

@@ -75,7 +75,8 @@ exports.runPayroll = async (req, res) => {
     const employeeWhere = { 
       facilityId, 
       status: "Active",
-      salaryStatus: { [Op.ne]: "Stopped" } // Exclude employees with stopped salaries
+      salaryStatus: { [Op.ne]: "Stopped" }, // Exclude employees with stopped salaries
+      contractType: { [Op.ne]: "Business Associate" },
     };
     // If no employeeIds provided, backend defaults to ALL active staff (excluding stopped salaries)
     if (req.body.employeeIds && Array.isArray(req.body.employeeIds) && req.body.employeeIds.length > 0) {
@@ -326,7 +327,10 @@ exports.runPayroll = async (req, res) => {
 
       for (const loan of activeLoans) {
         if (!loanAppliesInPeriod(loan, month, year)) continue;
-        const remainingBalance = parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+        const remainingBalance =
+          parseFloat(loan.amount) +
+          parseFloat(loan.profit || 0) -
+          parseFloat(loan.amountPaid || 0);
         if (remainingBalance > 0) {
           const deduction = Math.min(parseFloat(loan.monthlyDeductionAmount || 0), remainingBalance);
           if (deduction > 0) {
@@ -889,7 +893,9 @@ exports.updatePayrollStatus = async (req, res) => {
           });
           if (already) continue;
           const remainingBalance =
-            parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+            parseFloat(loan.amount) +
+            parseFloat(loan.profit || 0) -
+            parseFloat(loan.amountPaid || 0);
           if (remainingBalance <= 0) continue;
           const applyAmt = Math.min(
             remainingToApply,
@@ -909,7 +915,10 @@ exports.updatePayrollStatus = async (req, res) => {
           const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
           loan.amountPaid = newAmountPaid;
           loan.status =
-            newAmountPaid >= parseFloat(loan.amount) ? "Paid Off" : "Repaying";
+            newAmountPaid >=
+            parseFloat(loan.amount) + parseFloat(loan.profit || 0)
+              ? "Paid Off"
+              : "Repaying";
           await loan.save();
           remainingToApply -= applyAmt;
         }
@@ -1007,7 +1016,9 @@ exports.batchUpdateStatus = async (req, res) => {
           });
           if (already) continue;
           const remainingBalance =
-            parseFloat(loan.amount) - parseFloat(loan.amountPaid || 0);
+            parseFloat(loan.amount) +
+            parseFloat(loan.profit || 0) -
+            parseFloat(loan.amountPaid || 0);
           if (remainingBalance <= 0) continue;
           const applyAmt = Math.min(
             remainingToApply,
@@ -1027,7 +1038,10 @@ exports.batchUpdateStatus = async (req, res) => {
           const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
           loan.amountPaid = newAmountPaid;
           loan.status =
-            newAmountPaid >= parseFloat(loan.amount) ? "Paid Off" : "Repaying";
+            newAmountPaid >=
+            parseFloat(loan.amount) + parseFloat(loan.profit || 0)
+              ? "Paid Off"
+              : "Repaying";
           await loan.save();
           remainingToApply -= applyAmt;
         }

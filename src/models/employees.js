@@ -91,7 +91,8 @@ module.exports = (sequelize, DataTypes) => {
           "Full-time",
           "Contract",
           "Intern",
-          "Part-time"
+          "Part-time",
+          "Business Associate"
         ),
         allowNull: false,
       },

@@ -25,6 +25,10 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING(100),
         allowNull: false,
       },
+      profitHead: {
+        type: DataTypes.STRING(100),
+        allowNull: true,
+      },
       facilityId: {
         type: DataTypes.CHAR(36).BINARY,
         allowNull: false,

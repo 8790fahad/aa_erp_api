@@ -5,30 +5,44 @@ const {
   syncEmployeePayeProfileFromStructure,
 } = require("./payeSettings");
 
-// Generate employee ID
-const generateEmployeeId = async (facilityId) => {
-  // Find the highest numeric id for EMP-XXXX in this facility
-  const lastEmployee = await db.employees.findOne({
-    where: {
-      facilityId,
-      employeeId: { [Op.like]: "EMP-%" },
-    },
-    order: [["employeeId", "DESC"]],
+// Next unused code for a prefix. Numeric only, so EMP-E2E… does not reset the sequence to 0001.
+const generatePersonCode = async (prefix) => {
+  const rows = await db.employees.findAll({
+    attributes: ["employeeId"],
+    where: { employeeId: { [Op.like]: `${prefix}-%` } },
   });
-
-  let nextNumber = 1;
-  if (lastEmployee && lastEmployee.employeeId) {
-    const parts = lastEmployee.employeeId.split("-");
-    if (parts.length === 2) {
-      const lastNumber = parseInt(parts[1], 10);
-      if (!isNaN(lastNumber)) {
-        nextNumber = lastNumber + 1;
-      }
-    }
+  let max = 0;
+  const pattern = new RegExp(`^${prefix}-(\\d+)$`, "i");
+  for (const row of rows) {
+    const match = String(row.employeeId || "").match(pattern);
+    if (!match) continue;
+    const value = parseInt(match[1], 10);
+    if (!Number.isNaN(value) && value > max) max = value;
   }
-
-  return `EMP-${String(nextNumber).padStart(4, "0")}`;
+  return `${prefix}-${String(max + 1).padStart(4, "0")}`;
 };
+
+const generateEmployeeId = (facilityId) => generatePersonCode("EMP", facilityId);
+
+const BUSINESS_ASSOCIATE = "Business Associate";
+
+async function ensureBusinessAssociateDepartment(facilityId) {
+  const existing = await db.Department.findOne({
+    where: {
+      facilityId: String(facilityId),
+      departmentName: "Business Associates",
+    },
+  });
+  if (existing) return existing.id;
+  const created = await db.Department.create({
+    departmentName: "Business Associates",
+    facilityId: String(facilityId),
+    description: "People who receive loans and repay them directly",
+    status: "active",
+    type: "others",
+  });
+  return created.id;
+}
 
 function normalizeLookupKey(value) {
   return String(value || "").trim().toLowerCase();
@@ -309,7 +323,10 @@ exports.createEmployee = async (req, res) => {
       });
     }
 
-    // Use custom employee ID when provided, otherwise auto-generate
+    const isAssociate = contractType === BUSINESS_ASSOCIATE;
+
+    // Use custom employee ID when provided, otherwise auto-generate.
+    // Associates use BA-0001 so they do not collide with EMP-0001.
     const customEmployeeId = String(requestedEmployeeId || "").trim();
     let employeeId;
     if (customEmployeeId) {
@@ -324,12 +341,37 @@ exports.createEmployee = async (req, res) => {
       }
       employeeId = customEmployeeId;
     } else {
-      employeeId = await generateEmployeeId(facilityId);
+      employeeId = await generatePersonCode(isAssociate ? "BA" : "EMP");
+    }
+    if (isAssociate && (!String(firstName || "").trim() || !String(lastName || "").trim())) {
+      return res.status(400).json({
+        success: false,
+        message: "First name and last name are required",
+      });
+    }
+    if (isAssociate && !String(contactInfo || "").trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Phone number is required",
+      });
+    }
+
+    const resolvedUserId = userId || createdBy;
+    if (!resolvedUserId) {
+      return res.status(400).json({
+        success: false,
+        message: "Created by is required",
+      });
+    }
+
+    let resolvedDepartmentId = departmentId;
+    if (isAssociate && !resolvedDepartmentId) {
+      resolvedDepartmentId = await ensureBusinessAssociateDepartment(facilityId);
     }
 
     // Prefer simple per-employee package (basic + allowances/deductions)
     let resolvedStructureId = salaryStructureId || null;
-    if (basicSalary) {
+    if (!isAssociate && basicSalary) {
       resolvedStructureId = await upsertEmployeeSalaryPackage({
         facilityId,
         employee: { firstName, lastName },
@@ -343,12 +385,12 @@ exports.createEmployee = async (req, res) => {
     const employee = await db.employees.create({
       id: uuidv4(),
       employeeId,
-      userId,
+      userId: resolvedUserId,
       facilityId,
       firstName,
       lastName,
-      gender,
-      dateOfBirth,
+      gender: gender || (isAssociate ? "Other" : gender),
+      dateOfBirth: dateOfBirth || (isAssociate ? "1990-01-01" : dateOfBirth),
       contactInfo,
       address,
       nationalId,
@@ -358,11 +400,12 @@ exports.createEmployee = async (req, res) => {
       accountName,
       accountType,
       photoUrl,
-      departmentId,
-      designation,
-      hireDate,
+      departmentId: resolvedDepartmentId,
+      designation: designation || (isAssociate ? BUSINESS_ASSOCIATE : designation),
+      hireDate: hireDate || (isAssociate ? new Date() : hireDate),
       contractType,
       salaryStructureId: resolvedStructureId,
+      salaryStatus: isAssociate ? "Stopped" : "Active",
       emergencyContact,
       emergencyPhone,
       nextOfKin,
@@ -371,6 +414,8 @@ exports.createEmployee = async (req, res) => {
       status: "Active",
     });
 
+    // Associates are loan-only. They do not accrue leave.
+    if (!isAssociate) {
     // Initialize leave balances for the year
     const currentYear = new Date().getFullYear();
     const leaveTypes = [
@@ -402,6 +447,7 @@ exports.createEmployee = async (req, res) => {
         createdBy,
       });
     }
+    }
 
     // Link salary package → PAYE profile so tax setup picks up basic pay + relief flags
     if (resolvedStructureId) {
@@ -416,7 +462,9 @@ exports.createEmployee = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Employee created successfully",
+      message: isAssociate
+        ? "Business associate created successfully"
+        : "Employee created successfully",
       data: employee,
     });
   } catch (error) {
@@ -657,6 +705,12 @@ exports.updateEmployee = async (req, res) => {
     } = rest;
 
     const updatePayload = { ...safeRest, updatedBy };
+    if (updatePayload.contractType === BUSINESS_ASSOCIATE) {
+      updatePayload.salaryStatus = "Stopped";
+      if (!updatePayload.designation && !employee.designation) {
+        updatePayload.designation = BUSINESS_ASSOCIATE;
+      }
+    }
 
     const customEmployeeId = String(requestedEmployeeId || "").trim();
     if (customEmployeeId && customEmployeeId !== employee.employeeId) {
@@ -1192,6 +1246,7 @@ exports.bulkCreateEmployees = async (req, res) => {
     "Contract",
     "Intern",
     "Part-time",
+    "Business Associate",
   ];
 
   try {
@@ -1291,7 +1346,7 @@ exports.bulkCreateEmployees = async (req, res) => {
       if (!validContracts.includes(contractType)) {
         errors.push({
           row: rowNum,
-          message: `Invalid Contract Type '${contractType}' — use Permanent, Full-time, Contract, Intern, or Part-time`,
+          message: `Invalid Contract Type '${contractType}' — use Permanent, Full-time, Contract, Intern, Part-time, or Business Associate`,
         });
         continue;
       }

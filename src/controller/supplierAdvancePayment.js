@@ -227,7 +227,10 @@ async function getAvailableSupplierAdvance(facilityId, supplierNo, transaction) 
     `SELECT COALESCE(SUM(dr) - SUM(cr), 0) AS available_advance
      FROM general_ledger
      WHERE facility_id = :facilityId
-       AND transaction_ref = :supplierNo
+       AND (
+         transaction_ref = :supplierNo
+         OR transaction_ref LIKE CONCAT(:supplierNo, '-%')
+       )
        AND LOWER(type) IN ('accrued', 'advance')`,
     {
       replacements: { facilityId, supplierNo },
@@ -236,6 +239,59 @@ async function getAvailableSupplierAdvance(facilityId, supplierNo, transaction) 
     },
   );
   return Math.max(0, parseFloat(balRows[0]?.available_advance || 0));
+}
+
+/**
+ * Open vendor credit notes (CN-S) not yet applied to a bill, refund, or GIT.
+ * Remaining = credit total − applications.
+ */
+async function getOpenVendorCredits(facilityId, supplierNo, transaction) {
+  const rows = await db.sequelize.query(
+    `SELECT
+       i.invoice_ref AS credit_note_number,
+       ABS(i.amount) AS total_amount,
+       COALESCE(app.applied, 0) AS applied,
+       GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0) AS remaining
+     FROM invoices i
+     INNER JOIN (
+       SELECT cheque_no, MAX(supplier_number) AS supplier_number
+       FROM supplier_entries
+       WHERE facilityId = :facilityId
+         AND supplier_number = :supplierNo
+         AND cheque_no LIKE 'CN-S%'
+       GROUP BY cheque_no
+     ) se
+       ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
+        = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+     LEFT JOIN (
+       SELECT credit_note_number, SUM(amount) AS applied
+       FROM credit_note_applications
+       WHERE facility_id = :facilityId
+       GROUP BY credit_note_number
+     ) app
+       ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+        = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+     WHERE i.facility_id = :facilityId
+       AND i.type = 'purchase'
+       AND i.invoice_ref LIKE 'CN-S%'
+       AND i.amount < 0
+     HAVING remaining > 0.009
+     ORDER BY i.transaction_date ASC, i.invoice_ref ASC`,
+    {
+      replacements: { facilityId, supplierNo },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+  return rows.map((row) => ({
+    creditNoteNumber: row.credit_note_number,
+    remaining: parseFloat(row.remaining) || 0,
+  }));
+}
+
+async function getOpenVendorCreditTotal(facilityId, supplierNo, transaction) {
+  const rows = await getOpenVendorCredits(facilityId, supplierNo, transaction);
+  return rows.reduce((sum, row) => sum + row.remaining, 0);
 }
 
 /**
@@ -410,7 +466,7 @@ function vendorTypeSqlForApplyDeposit(types) {
 /**
  * GET /api/v1/suppliers-for-apply-deposit
  * Inventory vendors by default; optional withBalance=1 limits to those with
- * deposit or goods-in-transit.
+ * an open vendor credit note, a deposit, or goods-in-transit.
  */
 exports.listSuppliersForApplyDeposit = async (req, res) => {
   try {
@@ -453,7 +509,11 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
          ) git ON git.transaction_ref = s.supplier_number`;
 
     const balanceSql = withBalance
-      ? " AND (COALESCE(adv.bal, 0) > 0.009 OR COALESCE(git.bal, 0) > 0.009)"
+      ? ` AND (
+           COALESCE(adv.bal, 0) > 0.009
+           OR COALESCE(git.bal, 0) > 0.009
+           OR COALESCE(cn.bal, 0) > 0.009
+         )`
       : "";
 
     const rows = await db.sequelize.query(
@@ -464,6 +524,7 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
          s.email,
          s.phone,
          GREATEST(COALESCE(adv.bal, 0), 0) AS available_deposit,
+         GREATEST(COALESCE(cn.bal, 0), 0) AS available_credit_note,
          GREATEST(COALESCE(git.bal, 0), 0) AS available_git
        FROM (
          SELECT
@@ -477,12 +538,52 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
          GROUP BY supplier_number
        ) s
        LEFT JOIN (
-         SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
-           FROM general_ledger
-          WHERE facility_id = :facilityId
-            AND LOWER(type) IN ('accrued', 'advance')
-          GROUP BY transaction_ref
-       ) adv ON adv.transaction_ref = s.supplier_number
+         SELECT supplier_number, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
+           FROM (
+             SELECT
+               s2.supplier_number,
+               gl.dr,
+               gl.cr
+             FROM suppliersinfo s2
+             INNER JOIN general_ledger gl
+               ON gl.facility_id = s2.facilityId
+              AND LOWER(gl.type) IN ('accrued', 'advance')
+              AND (
+                gl.transaction_ref = s2.supplier_number
+                OR gl.transaction_ref LIKE CONCAT(s2.supplier_number, '-%')
+              )
+             WHERE s2.facilityId = :facilityId
+           ) dep
+          GROUP BY supplier_number
+       ) adv ON adv.supplier_number = s.supplier_number
+       LEFT JOIN (
+         SELECT
+           se.supplier_number,
+           SUM(GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0)) AS bal
+         FROM invoices i
+         INNER JOIN (
+           SELECT cheque_no, MAX(supplier_number) AS supplier_number
+           FROM supplier_entries
+           WHERE facilityId = :facilityId
+             AND cheque_no LIKE 'CN-S%'
+           GROUP BY cheque_no
+         ) se
+           ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
+            = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         LEFT JOIN (
+           SELECT credit_note_number, SUM(amount) AS applied
+           FROM credit_note_applications
+           WHERE facility_id = :facilityId
+           GROUP BY credit_note_number
+         ) app
+           ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+            = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         WHERE i.facility_id = :facilityId
+           AND i.type = 'purchase'
+           AND i.invoice_ref LIKE 'CN-S%'
+           AND i.amount < 0
+         GROUP BY se.supplier_number
+       ) cn ON cn.supplier_number = s.supplier_number
        ${gitJoin}
        WHERE 1 = 1
          ${typeSql}
@@ -1500,12 +1601,17 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
 
     let availableAdvance = 0;
     let availableGit = 0;
+    let availableCreditNote = 0;
     if (filterBySupplier) {
       availableAdvance = await getAvailableSupplierAdvance(
         facilityId,
         filterBySupplier,
       );
       availableGit = await getAvailableSupplierGoodsInTransit(
+        facilityId,
+        filterBySupplier,
+      );
+      availableCreditNote = await getOpenVendorCreditTotal(
         facilityId,
         filterBySupplier,
       );
@@ -1591,6 +1697,7 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       count:             rows.length,
       available_advance: availableAdvance,
       available_deposit: availableAdvance,
+      available_credit_note: availableCreditNote,
       available_goods_in_transit: availableGit,
       available_git: availableGit,
     });
@@ -1920,9 +2027,167 @@ exports.applySupplierAdvanceToBills = async (req, res) => {
 };
 
 /**
+ * Reclassify an open vendor credit note into the goods-in-transit pool.
+ * Dr Goods in Transit, Cr Accounts Payable, and mark the credit note applied to GIT.
+ */
+async function moveVendorCreditToGoodsInTransit({
+  res,
+  facilityId,
+  actor,
+  supplier,
+  supplierNumber,
+  moveAmt,
+  transactionDate,
+  narration,
+}) {
+  const payableCode = supplier.payable_code;
+  if (!payableCode) {
+    return res.status(400).json({
+      success: false,
+      error: "Supplier missing payable_code",
+    });
+  }
+  const payableAccount = await db.AccountCategory.findOne({
+    where: { code: payableCode, facility_id: facilityId },
+  });
+  if (!payableAccount) {
+    return res.status(404).json({
+      success: false,
+      error: `Payable account not found: ${payableCode}`,
+    });
+  }
+  const gitAccount = await resolveGoodsInTransitAccount(facilityId);
+  if (!gitAccount) {
+    return res.status(404).json({
+      success: false,
+      error:
+        "Goods in Transit account not found in Chart of Accounts. Please add it under Current Assets (e.g. 112103).",
+    });
+  }
+
+  const openNotes = await getOpenVendorCredits(facilityId, supplierNumber);
+  const availableCredit = openNotes.reduce((sum, row) => sum + row.remaining, 0);
+  if (moveAmt > availableCredit + 0.01) {
+    return res.status(400).json({
+      success: false,
+      error: `Amount (${moveAmt}) exceeds open vendor credit (${availableCredit})`,
+      available_credit_note: availableCredit,
+    });
+  }
+
+  const referenceNumber = `GIT-${await getAndUpdateNumber("GIT", facilityId)}`;
+  const supplierName = supplier.supplier_name || supplierNumber;
+  const desc =
+    String(narration || "").trim() ||
+    `Move vendor credit to goods in transit — ${supplierName}`;
+
+  await db.sequelize.transaction(async (t) => {
+    let left = moveAmt;
+    for (const note of openNotes) {
+      if (left <= 0.009) break;
+      const take = Math.min(left, note.remaining);
+      if (take <= 0) continue;
+      await db.CreditNoteApplication.create(
+        {
+          facility_id: facilityId,
+          credit_note_number: note.creditNoteNumber,
+          invoice_ref: "GIT",
+          amount: take,
+          created_by: actor,
+        },
+        { transaction: t },
+      );
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: payableAccount.code,
+          account_subhead: payableAccount.parent_code || 0,
+          dr: 0,
+          cr: take,
+          account_description: payableAccount.description,
+          transaction_description: `${desc} — ${note.creditNoteNumber}`,
+          reference_number: referenceNumber,
+          purpose_of_payment: "Move vendor credit to goods in transit",
+          payee: supplierName,
+          created_by: actor,
+          facility_id: facilityId,
+          status: "posted",
+          type: "payable",
+          transaction_ref: `${note.creditNoteNumber}-AP`,
+        },
+        { transaction: t },
+      );
+      left -= take;
+    }
+
+    await GeneralLedger.create(
+      {
+        transaction_date: transactionDate,
+        account_code: gitAccount.code,
+        account_subhead: gitAccount.parent_code || 0,
+        dr: moveAmt,
+        cr: 0,
+        account_description: gitAccount.description,
+        transaction_description: desc,
+        reference_number: referenceNumber,
+        purpose_of_payment: "Move vendor credit to goods in transit",
+        payee: supplierName,
+        created_by: actor,
+        facility_id: facilityId,
+        status: "posted",
+        type: "goods_in_transit",
+        transaction_ref: supplierNumber,
+      },
+      { transaction: t },
+    );
+
+    await SupplierEntry.create(
+      {
+        supplier_number: supplierNumber,
+        description: `Vendor credit -> Goods in transit (${formatAmount(moveAmt)})`,
+        qty_in: 0,
+        qty_out: 0,
+        cost: moveAmt,
+        facilityId,
+        mode_of_payment: "GIT",
+        receiptNo: referenceNumber,
+        type: "payment",
+        link_id: referenceNumber,
+        created_by: actor,
+        created_at: new Date(),
+      },
+      { transaction: t },
+    );
+  });
+
+  const [creditAfter, gitAfter] = await Promise.all([
+    getOpenVendorCreditTotal(facilityId, supplierNumber),
+    getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+      null,
+      gitAccount.code,
+    ),
+  ]);
+
+  return res.status(201).json({
+    success: true,
+    message: `Moved ${moveAmt.toLocaleString()} from vendor credit to goods in transit`,
+    data: {
+      reference_number: referenceNumber,
+      supplier_no: supplierNumber,
+      amount: moveAmt,
+      source: "credit_note",
+      available_credit_note: creditAfter,
+      available_goods_in_transit: gitAfter,
+    },
+  });
+}
+
+/**
  * POST /api/v1/move-supplier-deposit-to-git
- * Reclassify supplier deposit/advance into goods-in-transit pool.
- * body: { facilityId, userId, supplier_no, amount, transaction_date?, narration? }
+ * Reclassify supplier deposit/advance or an open vendor credit into goods-in-transit.
+ * body: { facilityId, userId, supplier_no, amount, transaction_date?, narration?, source?: deposit|credit_note }
  */
 exports.moveSupplierDepositToGoodsInTransit = async (req, res) => {
   const {
@@ -1968,6 +2233,20 @@ exports.moveSupplierDepositToGoodsInTransit = async (req, res) => {
     });
     if (!supplier) {
       return res.status(404).json({ success: false, error: "Supplier not found" });
+    }
+
+    const moveSource = String(req.body.source || "deposit").toLowerCase();
+    if (moveSource === "credit_note" || moveSource === "credit") {
+      return moveVendorCreditToGoodsInTransit({
+        res,
+        facilityId,
+        actor,
+        supplier,
+        supplierNumber,
+        moveAmt,
+        transactionDate,
+        narration,
+      });
     }
 
     const accrualCode =

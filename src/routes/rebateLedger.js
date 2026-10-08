@@ -15,4 +15,17 @@ module.exports = (app) => {
     "/api/v1/rebate-ledger/issue-payment",
     rebate.issuePayment,
   );
+
+  const grants = require("../controller/rebateGrants");
+  app.get("/api/v1/rebate-ledger/grants", grants.listGrants);
+  app.post("/api/v1/rebate-ledger/grants", grants.createGrant);
+  app.post(
+    "/api/v1/rebate-ledger/grants/:id/issue-credit-note",
+    grants.issueGrantCreditNote,
+  );
+  app.post(
+    "/api/v1/rebate-ledger/grants/:id/issue-payment",
+    grants.issueGrantPayment,
+  );
+  app.delete("/api/v1/rebate-ledger/grants/:id", grants.deleteGrant);
 };
