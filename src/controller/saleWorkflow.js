@@ -5464,14 +5464,31 @@ exports.listWarehouseRequests = async (req, res) => {
           limit: 200,
         })
       : [];
+    const dateParam = String(req.query.historyDate || req.query.date || "").trim();
+    const historyDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
+      ? dateParam
+      : moment().format("YYYY-MM-DD");
+    const historyStart = new Date(`${historyDate}T00:00:00.000`);
+    const historyEnd = new Date(`${historyDate}T23:59:59.999`);
+
     const collectedPacks = await db.SaleFulfillment.findAll({
-      where: { ...fulBase, status: "collected" },
+      where: {
+        ...fulBase,
+        status: "collected",
+        [Op.or]: [
+          { collected_at: { [Op.between]: [historyStart, historyEnd] } },
+          {
+            collected_at: null,
+            updated_at: { [Op.between]: [historyStart, historyEnd] },
+          },
+        ],
+      },
       include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
       order: [
         ["collected_at", "DESC"],
         ["updated_at", "DESC"],
       ],
-      limit: 150,
+      limit: 500,
     });
 
     const packs = [...pendingPacks, ...collectedPacks];
@@ -5501,7 +5518,12 @@ exports.listWarehouseRequests = async (req, res) => {
       workflow: wfByCode.get(p.sale_code) || null,
     }));
 
-    return res.json({ success: true, results, count: results.length });
+    return res.json({
+      success: true,
+      results,
+      count: results.length,
+      history_date: historyDate,
+    });
   } catch (err) {
     console.error("listWarehouseRequests:", err);
     return res.status(500).json({

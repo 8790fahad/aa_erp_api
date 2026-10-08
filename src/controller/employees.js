@@ -1872,12 +1872,22 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
     }
 
     const previousRef = String(employee.investmentReference || "").trim();
-    if (previousRef) {
+    const employeeCode = String(employee.employeeId || "").trim();
+    const replaceWhere = [
+      ...(previousRef ? [{ reference_number: previousRef }] : []),
+      ...(employeeCode
+        ? [
+            { transaction_ref: `${employeeCode}-INV` },
+            { transaction_ref: `${employeeCode}-OBE` },
+          ]
+        : []),
+    ];
+    if (replaceWhere.length) {
       await db.GeneralLedger.destroy({
         where: {
           facility_id: facilityId,
-          reference_number: previousRef,
           purpose_of_payment: "Business associate investment",
+          [Op.or]: replaceWhere,
         },
         transaction,
       });
@@ -1945,7 +1955,9 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
     await transaction.commit();
     return res.status(201).json({
       success: true,
-      message: "Investment opening balance posted",
+      message: previousRef
+        ? "Investment opening balance updated"
+        : "Investment opening balance posted",
       data: {
         id: employee.id,
         employeeId: employee.employeeId,
