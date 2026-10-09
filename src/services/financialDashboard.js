@@ -191,7 +191,7 @@ function isCogsSql(alias = "ac") {
 /**
  * SELECT columns shared by the period totals and the daily trend.
  *   turnover      sales accounts, plus sales journals posted to other accounts
- *   other_income  non-operating income
+ *   other_income  non-operating income (added to revenue on the dashboard)
  *   cogs          cost of sales accounts, plus cost of sales posted elsewhere
  *   opex          every other expense (admin, impairment, finance, tax)
  */
@@ -215,20 +215,21 @@ function plColumnsSql() {
 }
 
 /**
- * Same order as the Income Statement:
- *   Turnover − Cost of sales = Gross Profit
- *   Gross Profit + Other Income − Operating Expenses = Net Profit
+ * Dashboard summary. Every income account counts as Revenue (turnover plus other
+ * income), so the cards read:
+ *   Revenue − COGS = Gross Profit
+ *   Gross Profit − Operating Expenses = Net Profit
+ * Net Profit is the same figure as profit after tax on the Income Statement.
  */
 function computePlFigures(row) {
-  const revenue = parseFloat(row.turnover || 0);
-  const otherIncome = parseFloat(row.other_income || 0);
+  const revenue =
+    parseFloat(row.turnover || 0) + parseFloat(row.other_income || 0);
   const cogs = parseFloat(row.cogs || 0);
   const operatingExpenses = parseFloat(row.opex || 0);
   const grossProfit = revenue - cogs;
-  const netProfit = grossProfit + otherIncome - operatingExpenses;
+  const netProfit = grossProfit - operatingExpenses;
   return {
     revenue,
-    otherIncome,
     cogs,
     grossProfit,
     operatingExpenses,
@@ -261,7 +262,6 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
     totalIncome: pl.revenue,
     totalExpenses: pl.expenses,
     cogs: pl.cogs,
-    otherIncome: pl.otherIncome,
     grossProfit: pl.grossProfit,
     operatingExpenses: pl.operatingExpenses,
     netProfit: pl.netProfit,
@@ -316,7 +316,6 @@ function buildDaySeries(fromDate, toDate) {
       label: cursor.format("D MMM"),
       revenue: 0,
       income: 0,
-      otherIncome: 0,
       expenses: 0,
       cogs: 0,
       grossProfit: 0,
@@ -359,7 +358,6 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
           label: moment(row.day_key, "YYYY-MM-DD").format("D MMM"),
           revenue: pl.revenue,
           income: pl.revenue,
-          otherIncome: pl.otherIncome,
           expenses: pl.expenses,
           cogs: pl.cogs,
           grossProfit: pl.grossProfit,
@@ -1298,7 +1296,6 @@ const EMPTY_PERIOD_TOTALS = {
   totalExpenses: 0,
   cogs: 0,
   grossProfit: 0,
-  otherIncome: 0,
   operatingExpenses: 0,
   netProfit: 0,
 };
@@ -1426,10 +1423,6 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     currentTotals.netProfit,
     priorTotals.netProfit,
   );
-  const otherIncomeChange = pctChange(
-    currentTotals.otherIncome,
-    priorTotals.otherIncome,
-  );
   const cashChange = pctChange(cashInBank, priorCashInBank);
   const cogsChange = pctChange(currentTotals.cogs, priorTotals.cogs);
   const gpChange = pctChange(currentTotals.grossProfit, priorTotals.grossProfit);
@@ -1447,9 +1440,6 @@ async function buildFinancialDashboardOverview(sequelize, options) {
       cogs: currentTotals.cogs,
       grossProfit: currentTotals.grossProfit,
       operatingExpenses: currentTotals.operatingExpenses,
-      otherIncome: currentTotals.otherIncome,
-      otherIncomeChange: otherIncomeChange.value,
-      otherIncomeChangeLabel: otherIncomeChange.label,
       netProfit: currentTotals.netProfit,
       cashInBank,
       incomeChange: incomeChange.value,
