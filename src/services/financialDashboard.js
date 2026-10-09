@@ -4,7 +4,9 @@ const { sqlEq, sqlCol } = require("../utils/sqlCollate");
 const {
   revenueLineSql,
   expenseLineSql,
-  cogsLineSql,
+  stockMovementSql,
+  cogsJournalSql,
+  misplacedPlSql,
 } = require("../utils/plAmountSql");
 
 const EXPENSE_COLORS = [
@@ -88,28 +90,87 @@ const COA_LEFT_JOIN = `
     AND ${sqlEq("ac.facility_id", "gl.facility_id")}
 `;
 
-function isRevenueSql() {
+/**
+ * Profit and loss classification.
+ *
+ * This mirrors the Income Statement (accountingReports.classifySection) so the
+ * dashboard and the report always agree. Only active leaf accounts count, an
+ * explicit pl_line wins, and otherwise the chart type decides the section.
+ *
+ * The Income Statement classifies a leaf account by its note group (the parent
+ * header), so `cls` carries the group's pl_line / type / nature, or the leaf's
+ * own when it has no group.
+ */
+const PL_CLASS_JOIN = `
+  LEFT JOIN (
+    SELECT
+      leaf.code AS code,
+      leaf.facility_id AS facility_id,
+      CASE WHEN grp.code IS NOT NULL THEN grp.pl_line ELSE leaf.pl_line END AS pl_line,
+      CASE WHEN grp.code IS NOT NULL THEN grp.type ELSE leaf.type END AS type,
+      CASE WHEN grp.code IS NOT NULL THEN grp.account_nature ELSE leaf.account_nature END AS account_nature
+    FROM account_category leaf
+    LEFT JOIN account_category grp
+      ON ${sqlEq("grp.code", "leaf.parent_code")}
+      AND ${sqlEq("grp.facility_id", "leaf.facility_id")}
+      AND grp.display = 0
+      AND grp.parent_code != '0'
+      AND grp.is_active = 1
+      AND grp.account_nature IN ('REVENUE', 'EXPENSE')
+    WHERE leaf.facility_id = :facilityId
+  ) cls
+    ON ${sqlEq("cls.code", "gl.account_code")}
+    AND ${sqlEq("cls.facility_id", "gl.facility_id")}
+`;
+const KNOWN_PL_LINES = `(
+  'turnover', 'other_income', 'cost_of_sales', 'admin_costs',
+  'finance', 'interest', 'tax', 'taxes', 'impairment'
+)`;
+
+const plLineKey = (alias) => normalizeTypeSql(`${alias}.pl_line`);
+const typeKey = (alias) => normalizeTypeSql(`${alias}.type`);
+
+/** Leaf accounts that appear as lines on the Income Statement. */
+function isReportedAccountSql(alias = "ac") {
   return `(
-    UPPER(ac.account_nature) = 'REVENUE'
+    ${alias}.display = 1
+    AND ${alias}.is_active = 1
+    AND ${alias}.account_nature IN ('REVENUE', 'EXPENSE')
+  )`;
+}
+
+/** Journal lines the Income Statement leaves out (stock movements, cost of sales posted to sales). */
+function keepLineSql(alias = "ac", gl = "gl") {
+  return `NOT (
+    ${stockMovementSql(gl)}
     OR (
-      ac.code IS NULL
-      AND (
-        LEFT(TRIM(gl.account_code), 1) = '4'
-        OR LOWER(gl.type) = 'revenue'
+      ${cogsJournalSql(gl)}
+      AND UPPER(IFNULL(${alias}.account_nature, '')) = 'REVENUE'
+    )
+  )`;
+}
+
+function isTurnoverAccountSql(alias = "ac") {
+  return `(
+    UPPER(${alias}.account_nature) = 'REVENUE'
+    AND (
+      ${plLineKey(alias)} = 'turnover'
+      OR (
+        ${plLineKey(alias)} NOT IN ${KNOWN_PL_LINES}
+        AND ${typeKey(alias)} LIKE '%operating%'
+        AND ${typeKey(alias)} NOT LIKE '%non_operating%'
       )
     )
   )`;
 }
 
-function isExpenseSql() {
+function isOtherIncomeAccountSql(alias = "ac") {
   return `(
-    UPPER(ac.account_nature) = 'EXPENSE'
-    OR (
-      ac.code IS NULL
-      AND (
-        LEFT(TRIM(gl.account_code), 1) = '5'
-        OR LOWER(gl.type) = 'expenses'
-      )
+    UPPER(${alias}.account_nature) = 'REVENUE'
+    AND NOT ${isTurnoverAccountSql(alias)}
+    AND (
+      ${plLineKey(alias)} = 'other_income'
+      OR ${plLineKey(alias)} NOT IN ${KNOWN_PL_LINES}
     )
   )`;
 }
@@ -118,67 +179,71 @@ function isCogsSql(alias = "ac") {
   return `(
     UPPER(${alias}.account_nature) = 'EXPENSE'
     AND (
-      LOWER(IFNULL(${alias}.pl_line, '')) LIKE '%cost_of_sales%'
-      OR LOWER(IFNULL(${alias}.pl_line, '')) LIKE '%cogs%'
-      OR LOWER(IFNULL(${alias}.type, '')) LIKE '%cost%sale%'
-      OR LOWER(IFNULL(${alias}.subcategory, '')) LIKE '%cost%sale%'
-      OR LOWER(IFNULL(${alias}.description, '')) LIKE '%cost of sale%'
-      OR LEFT(TRIM(${alias}.code), 1) = '7'
-    )
-  )`;
-}
-
-/**
- * Taxation expense accounts. Mirrors the Income Statement classifier
- * (accountingReports.classifySection): an explicit pl_line of tax/taxes wins,
- * otherwise a CoA type of "Taxes" puts the account in the taxation section.
- */
-function isTaxSql(alias = "ac") {
-  const plLine = normalizeTypeSql(`${alias}.pl_line`);
-  return `(
-    UPPER(${alias}.account_nature) = 'EXPENSE'
-    AND (
-      ${plLine} IN ('tax', 'taxes')
+      ${plLineKey(alias)} = 'cost_of_sales'
       OR (
-        ${plLine} NOT IN (
-          'turnover', 'other_income', 'cost_of_sales', 'admin_costs',
-          'finance', 'interest', 'impairment'
-        )
-        AND ${normalizeTypeSql(`${alias}.type`)} = 'taxes'
+        ${plLineKey(alias)} NOT IN ${KNOWN_PL_LINES}
+        AND ${typeKey(alias)} = 'cost_of_sales'
       )
     )
   )`;
 }
 
-/** COGS accounts, excluding anything classified as taxation. */
-function isCogsExTaxSql(alias = "ac") {
-  return `(${isCogsSql(alias)} AND NOT ${isTaxSql(alias)})`;
+/**
+ * SELECT columns shared by the period totals and the daily trend.
+ *   turnover      sales accounts, plus sales journals posted to other accounts
+ *   other_income  non-operating income
+ *   cogs          cost of sales accounts, plus cost of sales posted elsewhere
+ *   opex          every other expense (admin, impairment, finance, tax)
+ */
+function plColumnsSql() {
+  const reported = isReportedAccountSql("ac");
+  const keep = keepLineSql("ac", "gl");
+  const misplaced = misplacedPlSql("gl", "ac");
+  return `
+    COALESCE(SUM(CASE WHEN ${reported} AND ${isTurnoverAccountSql("cls")} AND ${keep}
+      THEN gl.cr - gl.dr ELSE 0 END), 0) + ${misplaced.sales} AS turnover,
+    COALESCE(SUM(CASE WHEN ${reported} AND ${isOtherIncomeAccountSql("cls")} AND ${keep}
+      THEN gl.cr - gl.dr ELSE 0 END), 0) AS other_income,
+    COALESCE(SUM(CASE WHEN ${reported} AND ${isCogsSql("cls")} AND ${keep}
+      THEN gl.dr - gl.cr ELSE 0 END), 0) + ${misplaced.cogs} AS cogs,
+    COALESCE(SUM(CASE WHEN ${reported}
+      AND UPPER(cls.account_nature) = 'EXPENSE'
+      AND NOT ${isCogsSql("cls")}
+      AND ${keep}
+      THEN gl.dr - gl.cr ELSE 0 END), 0) AS opex
+  `;
 }
 
 /**
- * Revenue − COGS = Gross Profit
- * Gross Profit − Operating Expenses = Profit Before Tax
- * Profit Before Tax − Taxation = Net Profit (Profit After Tax)
- * Tax is carved out of "total expenses" so it is not double counted in opex.
+ * Same order as the Income Statement:
+ *   Turnover − Cost of sales = Gross Profit
+ *   Gross Profit + Other Income − Operating Expenses = Net Profit
  */
-function computePlFigures({ revenue, expenses, cogs, taxation }) {
-  const operatingExpenses = Math.max(expenses - cogs - taxation, 0);
+function computePlFigures(row) {
+  const revenue = parseFloat(row.turnover || 0);
+  const otherIncome = parseFloat(row.other_income || 0);
+  const cogs = parseFloat(row.cogs || 0);
+  const operatingExpenses = parseFloat(row.opex || 0);
   const grossProfit = revenue - cogs;
-  const profitBeforeTax = grossProfit - operatingExpenses;
-  const netProfit = profitBeforeTax - taxation;
-  return { operatingExpenses, grossProfit, profitBeforeTax, taxation, netProfit };
+  const netProfit = grossProfit + otherIncome - operatingExpenses;
+  return {
+    revenue,
+    otherIncome,
+    cogs,
+    grossProfit,
+    operatingExpenses,
+    netProfit,
+    expenses: cogs + operatingExpenses,
+  };
 }
 
 async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
   const rows = await sequelize.query(
     `
-      SELECT
-        COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS total_revenue,
-        COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS total_expenses,
-        COALESCE(SUM(${cogsLineSql(isCogsExTaxSql("ac"))}), 0) AS cogs,
-        COALESCE(SUM(CASE WHEN ${isTaxSql("ac")} THEN gl.dr - gl.cr ELSE 0 END), 0) AS taxation
+      SELECT ${plColumnsSql()}
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
+      ${PL_CLASS_JOIN}
       WHERE gl.facility_id = :facilityId
         AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
         AND IFNULL(gl.type, '') != 'opening_balance'
@@ -189,23 +254,17 @@ async function fetchPeriodTotals(sequelize, facilityId, fromDate, toDate) {
     },
   );
 
-  const totalRevenue = parseFloat(rows[0]?.total_revenue || 0);
-  const totalExpenses = parseFloat(rows[0]?.total_expenses || 0);
-  const cogs = parseFloat(rows[0]?.cogs || 0);
-  const taxation = parseFloat(rows[0]?.taxation || 0);
-  const pl = computePlFigures({
-    revenue: totalRevenue,
-    expenses: totalExpenses,
-    cogs,
-    taxation,
-  });
+  const pl = computePlFigures(rows[0] || {});
 
   return {
-    totalRevenue,
-    totalIncome: totalRevenue,
-    totalExpenses,
-    cogs,
-    ...pl,
+    totalRevenue: pl.revenue,
+    totalIncome: pl.revenue,
+    totalExpenses: pl.expenses,
+    cogs: pl.cogs,
+    otherIncome: pl.otherIncome,
+    grossProfit: pl.grossProfit,
+    operatingExpenses: pl.operatingExpenses,
+    netProfit: pl.netProfit,
   };
 }
 
@@ -257,7 +316,12 @@ function buildDaySeries(fromDate, toDate) {
       label: cursor.format("D MMM"),
       revenue: 0,
       income: 0,
+      otherIncome: 0,
       expenses: 0,
+      cogs: 0,
+      grossProfit: 0,
+      operatingExpenses: 0,
+      netProfit: 0,
     });
     cursor.add(1, "day");
   }
@@ -269,12 +333,10 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
     `
       SELECT
         DATE_FORMAT(gl.transaction_date, '%Y-%m-%d') AS day_key,
-        COALESCE(SUM(${revenueLineSql(isRevenueSql())}), 0) AS revenue,
-        COALESCE(SUM(${expenseLineSql(isExpenseSql())}), 0) AS expenses,
-        COALESCE(SUM(${cogsLineSql(isCogsExTaxSql("ac"))}), 0) AS cogs,
-        COALESCE(SUM(CASE WHEN ${isTaxSql("ac")} THEN gl.dr - gl.cr ELSE 0 END), 0) AS taxation
+        ${plColumnsSql()}
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
+      ${PL_CLASS_JOIN}
       WHERE gl.facility_id = :facilityId
         AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
         AND IFNULL(gl.type, '') != 'opening_balance'
@@ -289,44 +351,28 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
 
   const byDay = new Map(
     rows.map((row) => {
-      const revenue = parseFloat(row.revenue || 0);
-      const expenses = parseFloat(row.expenses || 0);
-      const cogs = parseFloat(row.cogs || 0);
-      const taxation = parseFloat(row.taxation || 0);
-      const { operatingExpenses, grossProfit, profitBeforeTax, netProfit } =
-        computePlFigures({ revenue, expenses, cogs, taxation });
+      const pl = computePlFigures(row);
       return [
         row.day_key,
         {
           date: row.day_key,
           label: moment(row.day_key, "YYYY-MM-DD").format("D MMM"),
-          revenue,
-          income: revenue,
-          expenses,
-          cogs,
-          grossProfit,
-          operatingExpenses,
-          profitBeforeTax,
-          taxation,
-          netProfit,
+          revenue: pl.revenue,
+          income: pl.revenue,
+          otherIncome: pl.otherIncome,
+          expenses: pl.expenses,
+          cogs: pl.cogs,
+          grossProfit: pl.grossProfit,
+          operatingExpenses: pl.operatingExpenses,
+          netProfit: pl.netProfit,
         },
       ];
     }),
   );
 
-  return buildDaySeries(fromDate, toDate).map((slot) => {
-    const found = byDay.get(slot.date);
-    if (found) return found;
-    return {
-      ...slot,
-      cogs: 0,
-      grossProfit: 0,
-      operatingExpenses: 0,
-      profitBeforeTax: 0,
-      taxation: 0,
-      netProfit: 0,
-    };
-  });
+  return buildDaySeries(fromDate, toDate).map(
+    (slot) => byDay.get(slot.date) || slot,
+  );
 }
 
 /**
@@ -1252,9 +1298,8 @@ const EMPTY_PERIOD_TOTALS = {
   totalExpenses: 0,
   cogs: 0,
   grossProfit: 0,
+  otherIncome: 0,
   operatingExpenses: 0,
-  profitBeforeTax: 0,
-  taxation: 0,
   netProfit: 0,
 };
 
@@ -1381,9 +1426,9 @@ async function buildFinancialDashboardOverview(sequelize, options) {
     currentTotals.netProfit,
     priorTotals.netProfit,
   );
-  const taxationChange = pctChange(
-    currentTotals.taxation,
-    priorTotals.taxation,
+  const otherIncomeChange = pctChange(
+    currentTotals.otherIncome,
+    priorTotals.otherIncome,
   );
   const cashChange = pctChange(cashInBank, priorCashInBank);
   const cogsChange = pctChange(currentTotals.cogs, priorTotals.cogs);
@@ -1402,11 +1447,10 @@ async function buildFinancialDashboardOverview(sequelize, options) {
       cogs: currentTotals.cogs,
       grossProfit: currentTotals.grossProfit,
       operatingExpenses: currentTotals.operatingExpenses,
-      profitBeforeTax: currentTotals.profitBeforeTax,
-      taxation: currentTotals.taxation,
+      otherIncome: currentTotals.otherIncome,
+      otherIncomeChange: otherIncomeChange.value,
+      otherIncomeChangeLabel: otherIncomeChange.label,
       netProfit: currentTotals.netProfit,
-      taxationChange: taxationChange.value,
-      taxationChangeLabel: taxationChange.label,
       cashInBank,
       incomeChange: incomeChange.value,
       revenueChange: incomeChange.value,

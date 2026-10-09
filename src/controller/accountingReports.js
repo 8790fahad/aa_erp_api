@@ -1758,6 +1758,7 @@ exports.getIncomeStatement = async (req, res) => {
          ac.code                              AS account_code,
          ac.parent_code                       AS note_group_code,
          ac.description                       AS account_name,
+         ac.type                              AS account_type,
          ac.subcategory,
          ac.account_nature,
          ac.pl_line,
@@ -1774,7 +1775,7 @@ exports.getIncomeStatement = async (req, res) => {
          AND ac.display        = 1
          AND ac.is_active      = 1
        GROUP BY
-         ac.code, ac.parent_code, ac.description,
+         ac.code, ac.parent_code, ac.description, ac.type,
          ac.subcategory, ac.account_nature, ac.pl_line
        ORDER BY ac.code ASC`,
       { replacements: { facilityId, startDate, endDate }, type: QueryTypes.SELECT }

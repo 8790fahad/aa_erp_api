@@ -79,6 +79,8 @@ function misplacedPlSql(gl = "gl", ac = "ac") {
 }
 
 module.exports = {
+  stockMovementSql,
+  cogsJournalSql,
   revenueLineSql,
   expenseLineSql,
   cogsLineSql,
