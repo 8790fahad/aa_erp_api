@@ -6,10 +6,88 @@
  * the matching inventory reduction, and the opening-balance pair.
  * Selling price is left as it is. Zero Rated, so no VAT is taken out.
  * Safe to run again: a line already at 47,000 is skipped.
+ * Before changing anything it copies the affected rows into backup tables
+ * named bak_bakers_pride_47000_<table> (products, store_entries,
+ * general_ledger, inventory_valuation). These are kept, not dropped by down().
  */
+const BACKUP_PREFIX = "bak_bakers_pride_47000_";
+
+/**
+ * Copies every row this migration can change into backup tables.
+ * Runs before the transaction because CREATE TABLE commits in MySQL.
+ * Each table copies the original's structure and primary key, and rows are
+ * added with INSERT IGNORE, so running again never overwrites the first copy.
+ */
+const BACKUPS = [
+  {
+    table: "products",
+    select: `
+      SELECT p.* FROM products p
+      WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+    `,
+  },
+  {
+    table: "store_entries",
+    select: `
+      SELECT se.* FROM store_entries se
+      INNER JOIN products p
+        ON p.sku COLLATE utf8mb4_general_ci = se.product_id COLLATE utf8mb4_general_ci
+       AND p.facility_id COLLATE utf8mb4_general_ci = se.facilityId COLLATE utf8mb4_general_ci
+      WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+        AND se.cost_price IN (45000, 47000)
+    `,
+  },
+  {
+    table: "general_ledger",
+    select: `
+      SELECT gl.* FROM general_ledger gl
+      WHERE (
+          (gl.transaction_description LIKE 'COGS [P005] %'
+            OR gl.transaction_description LIKE 'Inventory reduction [P005] %')
+          AND EXISTS (
+            SELECT 1 FROM store_entries se
+            INNER JOIN products p
+              ON p.sku COLLATE utf8mb4_general_ci = se.product_id COLLATE utf8mb4_general_ci
+             AND p.facility_id COLLATE utf8mb4_general_ci = se.facilityId COLLATE utf8mb4_general_ci
+            WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+              AND se.qty_out > 0
+              AND se.reference_number COLLATE utf8mb4_general_ci = gl.reference_number COLLATE utf8mb4_general_ci
+              AND se.facilityId COLLATE utf8mb4_general_ci = gl.facility_id COLLATE utf8mb4_general_ci
+          )
+        )
+        OR (
+          gl.transaction_ref = 'P005'
+          AND gl.type IN ('inventory', 'opening_balance')
+          AND gl.transaction_description LIKE 'Opening Balance%Bakers Pride%'
+        )
+    `,
+  },
+  {
+    table: "inventory_valuation",
+    select: `
+      SELECT iv.* FROM inventory_valuation iv
+      INNER JOIN products p
+        ON p.sku COLLATE utf8mb4_general_ci = iv.product_id COLLATE utf8mb4_general_ci
+       AND p.facility_id COLLATE utf8mb4_general_ci = iv.facility_id COLLATE utf8mb4_general_ci
+      WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+    `,
+  },
+];
+
+async function backupAffectedTables(sequelize) {
+  for (const { table, select } of BACKUPS) {
+    const backup = `${BACKUP_PREFIX}${table}`;
+    await sequelize.query(
+      `CREATE TABLE IF NOT EXISTS \`${backup}\` LIKE \`${table}\``,
+    );
+    await sequelize.query(`INSERT IGNORE INTO \`${backup}\` ${select}`);
+  }
+}
+
 module.exports = {
   async up(queryInterface) {
     const sequelize = queryInterface.sequelize;
+    await backupAffectedTables(sequelize);
     const transaction = await sequelize.transaction();
     try {
       await sequelize.query(

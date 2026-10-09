@@ -5,6 +5,62 @@
 -- inventory reduction, and the opening-balance pair.
 -- Safe to run again: a line already at 47,000 is skipped.
 
+-- Backup. Copies every row this script can change into bak_bakers_pride_47000_*
+-- tables. Run this part first and keep the tables until you have checked the
+-- books. INSERT IGNORE keeps the first copy if the script is run again.
+-- To restore a table: UPDATE it from its backup on the primary key.
+
+CREATE TABLE IF NOT EXISTS bak_bakers_pride_47000_products LIKE products;
+INSERT IGNORE INTO bak_bakers_pride_47000_products
+SELECT p.* FROM products p
+WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%';
+
+CREATE TABLE IF NOT EXISTS bak_bakers_pride_47000_store_entries LIKE store_entries;
+INSERT IGNORE INTO bak_bakers_pride_47000_store_entries
+SELECT se.* FROM store_entries se
+INNER JOIN products p
+  ON p.sku COLLATE utf8mb4_general_ci = se.product_id COLLATE utf8mb4_general_ci
+ AND p.facility_id COLLATE utf8mb4_general_ci = se.facilityId COLLATE utf8mb4_general_ci
+WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+  AND se.cost_price IN (45000, 47000);
+
+CREATE TABLE IF NOT EXISTS bak_bakers_pride_47000_general_ledger LIKE general_ledger;
+INSERT IGNORE INTO bak_bakers_pride_47000_general_ledger
+SELECT gl.* FROM general_ledger gl
+WHERE (
+    (gl.transaction_description LIKE 'COGS [P005] %'
+      OR gl.transaction_description LIKE 'Inventory reduction [P005] %')
+    AND EXISTS (
+      SELECT 1 FROM store_entries se
+      INNER JOIN products p
+        ON p.sku COLLATE utf8mb4_general_ci = se.product_id COLLATE utf8mb4_general_ci
+       AND p.facility_id COLLATE utf8mb4_general_ci = se.facilityId COLLATE utf8mb4_general_ci
+      WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%'
+        AND se.qty_out > 0
+        AND se.reference_number COLLATE utf8mb4_general_ci = gl.reference_number COLLATE utf8mb4_general_ci
+        AND se.facilityId COLLATE utf8mb4_general_ci = gl.facility_id COLLATE utf8mb4_general_ci
+    )
+  )
+  OR (
+    gl.transaction_ref = 'P005'
+    AND gl.type IN ('inventory', 'opening_balance')
+    AND gl.transaction_description LIKE 'Opening Balance%Bakers Pride%'
+  );
+
+CREATE TABLE IF NOT EXISTS bak_bakers_pride_47000_inventory_valuation LIKE inventory_valuation;
+INSERT IGNORE INTO bak_bakers_pride_47000_inventory_valuation
+SELECT iv.* FROM inventory_valuation iv
+INNER JOIN products p
+  ON p.sku COLLATE utf8mb4_general_ci = iv.product_id COLLATE utf8mb4_general_ci
+ AND p.facility_id COLLATE utf8mb4_general_ci = iv.facility_id COLLATE utf8mb4_general_ci
+WHERE p.sku = 'P005' AND p.name LIKE 'Bakers Pride%';
+
+-- Row counts in each backup, to compare with the preview below.
+SELECT 'products' AS tbl, COUNT(*) AS rows_backed_up FROM bak_bakers_pride_47000_products
+UNION ALL SELECT 'store_entries', COUNT(*) FROM bak_bakers_pride_47000_store_entries
+UNION ALL SELECT 'general_ledger', COUNT(*) FROM bak_bakers_pride_47000_general_ledger
+UNION ALL SELECT 'inventory_valuation', COUNT(*) FROM bak_bakers_pride_47000_inventory_valuation;
+
 START TRANSACTION;
 
 -- Preview
