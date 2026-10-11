@@ -5,6 +5,7 @@ const moment = require("moment");
 const db = require("../models");
 const { notifyWorkflowPosting } = require("./workflowMail");
 const { getNowPartsInTimezone } = require("./invoiceClosingService");
+const { sqlEq } = require("../utils/sqlCollate");
 
 const TZ = "Africa/Lagos";
 const DEADLINE_DAY = 22;
@@ -30,6 +31,49 @@ function formatAmount(amount) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+function emptyPosition(fromDateStr, toDateStr, extra = {}) {
+  return {
+    head: "",
+    description: "",
+    fromDate: fromDateStr,
+    toDate: toDateStr,
+    input_vat: 0,
+    output_vat: 0,
+    net: 0,
+    amount_to_pay: 0,
+    recoverable: 0,
+    line_count: 0,
+    nearest: null,
+    ...extra,
+  };
+}
+
+function packPosition({
+  vatHead,
+  description,
+  fromDateStr,
+  toDateStr,
+  inputVat,
+  outputVat,
+  lineCount,
+  nearest = null,
+}) {
+  const net = Number((outputVat - inputVat).toFixed(2));
+  return {
+    head: vatHead,
+    description: description || "VAT Recoverable",
+    fromDate: fromDateStr,
+    toDate: toDateStr,
+    input_vat: Number(inputVat.toFixed(2)),
+    output_vat: Number(outputVat.toFixed(2)),
+    net,
+    amount_to_pay: net > 0.005 ? net : 0,
+    recoverable: net < -0.005 ? Math.abs(net) : 0,
+    line_count: lineCount,
+    nearest,
+  };
 }
 
 function previousMonthBounds(localDate) {
@@ -64,18 +108,7 @@ async function computeVatHeadPosition({
     : moment().format("YYYY-MM-DD");
 
   if (!facilityId) {
-    return {
-      head: "",
-      description: "",
-      fromDate: fromDateStr,
-      toDate: toDateStr,
-      input_vat: 0,
-      output_vat: 0,
-      net: 0,
-      amount_to_pay: 0,
-      recoverable: 0,
-      line_count: 0,
-    };
+    return emptyPosition(fromDateStr, toDateStr);
   }
 
   let vatHead = String(head || "").trim();
@@ -89,25 +122,35 @@ async function computeVatHeadPosition({
   }
 
   if (!vatHead) {
-    return {
-      head: "",
-      description: "",
-      fromDate: fromDateStr,
-      toDate: toDateStr,
-      input_vat: 0,
-      output_vat: 0,
-      net: 0,
-      amount_to_pay: 0,
-      recoverable: 0,
-      line_count: 0,
-    };
+    return emptyPosition(fromDateStr, toDateStr);
   }
 
-  const account = await db.AccountCategory.findOne({
-    where: { code: vatHead, facilityId: String(facilityId) },
-    attributes: ["code", "description"],
-    raw: true,
-  });
+  const accounts = await db.sequelize.query(
+    `SELECT code, description
+     FROM account_category
+     WHERE ${sqlEq("code", ":head")}
+       AND ${sqlEq("facility_id", ":facilityId")}
+     LIMIT 1`,
+    {
+      replacements: {
+        head: vatHead,
+        facilityId: String(facilityId),
+      },
+      type: QueryTypes.SELECT,
+    },
+  );
+  const account = accounts[0];
+
+  const headWhere = `
+    ${sqlEq("gl.facility_id", ":facilityId")}
+    AND ${sqlEq("TRIM(gl.account_code)", "TRIM(:head)")}
+  `;
+  const replacements = {
+    facilityId: String(facilityId),
+    head: vatHead,
+    fromDate: fromDateStr,
+    toDate: toDateStr,
+  };
 
   const totals = await db.sequelize.query(
     `SELECT
@@ -115,40 +158,66 @@ async function computeVatHeadPosition({
        COALESCE(SUM(gl.cr), 0) AS output_vat,
        COUNT(*) AS line_count
      FROM general_ledger gl
-     WHERE (
-         gl.facility_id = :facilityId
-         OR CONVERT(gl.facility_id USING utf8mb4) = CONVERT(:facilityId USING utf8mb4)
-       )
-       AND TRIM(gl.account_code) = TRIM(:head)
+     WHERE ${headWhere}
        AND DATE(gl.transaction_date) >= :fromDate
        AND DATE(gl.transaction_date) <= :toDate`,
     {
-      replacements: {
-        facilityId: String(facilityId),
-        head: vatHead,
-        fromDate: fromDateStr,
-        toDate: toDateStr,
-      },
+      replacements,
       type: QueryTypes.SELECT,
     },
   );
 
   const inputVat = parseFloat(totals[0]?.input_vat || 0) || 0;
   const outputVat = parseFloat(totals[0]?.output_vat || 0) || 0;
-  const net = Number((outputVat - inputVat).toFixed(2));
+  const lineCount = parseInt(totals[0]?.line_count || 0, 10);
 
-  return {
-    head: vatHead,
+  let nearest = null;
+  if (lineCount === 0) {
+    const latest = await db.sequelize.query(
+      `SELECT
+         YEAR(gl.transaction_date) AS y,
+         MONTH(gl.transaction_date) AS m,
+         COALESCE(SUM(gl.dr), 0) AS input_vat,
+         COALESCE(SUM(gl.cr), 0) AS output_vat,
+         COUNT(*) AS line_count
+       FROM general_ledger gl
+       WHERE ${headWhere}
+       GROUP BY YEAR(gl.transaction_date), MONTH(gl.transaction_date)
+       ORDER BY y DESC, m DESC
+       LIMIT 1`,
+      {
+        replacements,
+        type: QueryTypes.SELECT,
+      },
+    );
+    const row = latest[0];
+    const year = Number(row?.y);
+    const month = Number(row?.m);
+    if (Number.isInteger(year) && Number.isInteger(month) && month >= 1) {
+      const bounds = moment({ year, month: month - 1, day: 1 });
+      nearest = {
+        year,
+        month,
+        label: bounds.format("MMMM YYYY"),
+        fromDate: bounds.clone().startOf("month").format("YYYY-MM-DD"),
+        toDate: bounds.clone().endOf("month").format("YYYY-MM-DD"),
+        input_vat: Number((parseFloat(row.input_vat || 0) || 0).toFixed(2)),
+        output_vat: Number((parseFloat(row.output_vat || 0) || 0).toFixed(2)),
+        line_count: parseInt(row.line_count || 0, 10),
+      };
+    }
+  }
+
+  return packPosition({
+    vatHead,
     description: account?.description || "VAT Recoverable",
-    fromDate: fromDateStr,
-    toDate: toDateStr,
-    input_vat: Number(inputVat.toFixed(2)),
-    output_vat: Number(outputVat.toFixed(2)),
-    net,
-    amount_to_pay: net > 0.005 ? net : 0,
-    recoverable: net < -0.005 ? Math.abs(net) : 0,
-    line_count: parseInt(totals[0]?.line_count || 0, 10),
-  };
+    fromDateStr,
+    toDateStr,
+    inputVat,
+    outputVat,
+    lineCount,
+    nearest,
+  });
 }
 
 async function notifyFacilityVatPayment(business, localDate) {
