@@ -1105,7 +1105,8 @@ exports.getTrialBalance = async (req, res) => {
     const grandTotalDebit  = parseFloat(grandRow?.total_debit  || 0);
     const grandTotalCredit = parseFloat(grandRow?.total_credit || 0);
 
-    // Leaf-only net balances for display totals (sum of DR / CR columns)
+    // Leaf nets, plus a parent's own GL when it also has children.
+    // Posting to a group head (e.g. 800200) was dropped from totals before.
     let displayDebit = 0;
     let displayCredit = 0;
     activeAccounts.forEach((r) => {
@@ -1113,8 +1114,10 @@ exports.getTrialBalance = async (req, res) => {
       const activeKids = (childrenByParent.get(code) || []).filter(
         (k) => activeCodesSet.has(k)
       );
-      if (activeKids.length === 0) {
-        const cols = toTrialBalanceColumns(r.total_debit, r.total_credit);
+      const ownDr = parseFloat(r.total_debit || 0);
+      const ownCr = parseFloat(r.total_credit || 0);
+      if (activeKids.length === 0 || ownDr !== 0 || ownCr !== 0) {
+        const cols = toTrialBalanceColumns(ownDr, ownCr);
         displayDebit += cols.total_debit;
         displayCredit += cols.total_credit;
       }
