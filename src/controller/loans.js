@@ -4,6 +4,18 @@ const { getAndUpdateNumber } = require("../services/numberGen");
 
 /** Loan disbursement voucher series in number_generator / general ledger */
 const LOAN_NUMBER_PREFIX = "LM";
+const LOAN_PAYMENT_MODES = ["bank", "cheque", "cash", "others"];
+
+function resolveLoanPaymentMode(paymentMode, fallback = "bank") {
+  return LOAN_PAYMENT_MODES.includes(String(paymentMode || "").toLowerCase())
+    ? String(paymentMode).toLowerCase()
+    : fallback;
+}
+
+function resolveSourceHead(mode, bankHead, cashHead) {
+  if (mode === "cash") return cashHead || null;
+  return bankHead || null;
+}
 
 function formatLoanReference(seq) {
   const n = parseInt(seq, 10) || 1;
@@ -303,13 +315,14 @@ exports.createLoan = async (req, res) => {
       });
     }
 
-    const mode = ["bank", "cheque", "cash"].includes(paymentMode)
-      ? paymentMode
-      : "bank";
+    const mode = resolveLoanPaymentMode(paymentMode);
     const resolvedBankHead = mode === "cash" ? null : bankHead || null;
     const resolvedCashHead = mode === "cash" ? cashHead || null : null;
-    const disbursementHead =
-      mode === "cash" ? resolvedCashHead : resolvedBankHead;
+    const disbursementHead = resolveSourceHead(
+      mode,
+      resolvedBankHead,
+      resolvedCashHead,
+    );
     const resolvedCheque =
       mode === "cheque" ? String(chequeNumber || "").trim() : null;
 
@@ -319,7 +332,9 @@ exports.createLoan = async (req, res) => {
         message:
           mode === "cash"
             ? "Select the cash account to pay the loan from"
-            : "Select the bank account to pay the loan from",
+            : mode === "others"
+              ? "Select the account head to pay the loan from"
+              : "Select the bank account to pay the loan from",
       });
     }
 
@@ -629,9 +644,7 @@ exports.updateLoan = async (req, res) => {
       }
 
       if (paymentMode !== undefined) {
-        const mode = ["bank", "cheque", "cash"].includes(paymentMode)
-          ? paymentMode
-          : loan.paymentMode || "bank";
+        const mode = resolveLoanPaymentMode(paymentMode, loan.paymentMode || "bank");
         loan.paymentMode = mode;
         if (mode === "cash") {
           if (!cashHead) {
@@ -646,7 +659,10 @@ exports.updateLoan = async (req, res) => {
           if (!bankHead) {
             return res.status(400).json({
               success: false,
-              message: "Select the bank account to pay the loan from",
+              message:
+                mode === "others"
+                  ? "Select the account head to pay the loan from"
+                  : "Select the bank account to pay the loan from",
             });
           }
           loan.bankHead = bankHead;
@@ -701,11 +717,15 @@ exports.updateLoanStatus = async (req, res) => {
 
     // Accounting Treatment for Approval (Disbursement)
     if (status === "Approved" && loan.status === "Pending") {
-      const mode = paymentMode || loan.paymentMode || "bank";
-      const disbursementHead =
-        mode === "cash"
-          ? cashHead || loan.cashHead
-          : bankHead || loan.bankHead;
+      const mode = resolveLoanPaymentMode(
+        paymentMode || loan.paymentMode,
+        "bank",
+      );
+      const disbursementHead = resolveSourceHead(
+        mode,
+        bankHead || loan.bankHead,
+        cashHead || loan.cashHead,
+      );
       
       if (!disbursementHead || !currentReceivableHead) {
         return res.status(400).json({
@@ -910,7 +930,12 @@ exports.recordRepayment = async (req, res) => {
     });
 
     // Accounting Treatment for Repayment
-    const collectionHead = paymentMode === "cash" ? cashHead : bankHead;
+    const collectionMode = resolveLoanPaymentMode(paymentMode);
+    const collectionHead = resolveSourceHead(
+      collectionMode,
+      bankHead,
+      cashHead,
+    );
     if (!collectionHead || !currentReceivableHead) {
       // Roll back repayment if we can't post GL
       await repayment.destroy();
@@ -923,7 +948,7 @@ exports.recordRepayment = async (req, res) => {
 
     const empName = `${loan.employee?.firstName || ""} ${loan.employee?.lastName || ""}`.trim();
     const collectionLabel = `${paymentMethod || "Manual"} - ${
-      paymentMode?.toUpperCase() || "BANK"
+      collectionMode?.toUpperCase() || "BANK"
     }${chequeNumber ? " - Chq: " + chequeNumber : ""} - ${empName}`;
     await recordGLTransaction({
       facilityId: loan.facilityId,

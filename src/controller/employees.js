@@ -155,6 +155,8 @@ const toComponentMap = (value) => {
  * Create/update a personal salary package for an employee (hidden from UI).
  * Keeps payroll working without a separate Salary Structure screen.
  */
+const DEFAULT_SALARY_ACCOUNT_HEAD = "800101";
+
 const upsertEmployeeSalaryPackage = async ({
   facilityId,
   employee,
@@ -172,7 +174,8 @@ const upsertEmployeeSalaryPackage = async ({
 
   const allowancesMap = toComponentMap(allowances);
   const deductionsMap = toComponentMap(deductions);
-  const salaryAccountCode = String(accountCode || "").trim();
+  const salaryAccountCode =
+    String(accountCode || "").trim() || DEFAULT_SALARY_ACCOUNT_HEAD;
   const displayName =
     `${employee?.firstName || ""} ${employee?.lastName || ""}`.trim() ||
     "Employee";
@@ -192,7 +195,7 @@ const upsertEmployeeSalaryPackage = async ({
         basicSalary: basic,
         allowances: allowancesMap,
         deductions: deductionsMap,
-        accountCode: salaryAccountCode || structure.accountCode || "",
+        accountCode: salaryAccountCode,
         updatedBy: userId,
         status: "Active",
       },
