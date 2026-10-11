@@ -728,6 +728,14 @@ exports.markPayrollAsPaid = async (req, res) => {
           as: "employee",
           attributes: ["id", "employeeId", "firstName", "lastName"],
           required: false,
+          include: [
+            {
+              model: db.salary_structures,
+              as: "salaryStructure",
+              attributes: ["id", "accountCode", "allowances", "deductions"],
+              required: false,
+            },
+          ],
         },
       ],
     });

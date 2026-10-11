@@ -160,9 +160,26 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
       const empName = [p.employee?.firstName, p.employee?.lastName].filter(Boolean).join(" ") || empId;
       const empRef  = `${batchRef}-${empId}`.slice(0, 15);
       const tRef    = `${batchRef}-${empId}`.slice(0, 100);
+      const salaryStructure =
+        p.salaryStructure || p.employee?.salaryStructure || {};
+      const structureAllowances =
+        typeof salaryStructure.allowances === "string"
+          ? JSON.parse(salaryStructure.allowances || "{}")
+          : salaryStructure.allowances || {};
+      const structureDeductions =
+        typeof salaryStructure.deductions === "string"
+          ? JSON.parse(salaryStructure.deductions || "{}")
+          : salaryStructure.deductions || {};
+      const componentHead = (map, name) => {
+        const val = map?.[name];
+        if (val && typeof val === "object") {
+          return String(val.accountCode || val.accountHead || "").trim();
+        }
+        return "";
+      };
 
       // 1. DR Basic Salary Expense
-      const rawSalaryCode = p.salaryStructure?.accountCode;
+      const rawSalaryCode = salaryStructure.accountCode;
       const salaryCode =
         rawSalaryCode && String(rawSalaryCode).trim()
           ? String(rawSalaryCode).trim()
@@ -200,7 +217,10 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
         if (parseFloat(amount) <= 0) continue;
         const comp = (p.masterComponents || []).find(c => c.name === name && c.type === "allowance");
         lines.push(buildGLLine({
-          accountCode: comp?.accountCode || DEFAULT_CODES.ALLOWANCE_EXPENSE,
+          accountCode:
+            componentHead(structureAllowances, name) ||
+            comp?.accountCode ||
+            DEFAULT_CODES.ALLOWANCE_EXPENSE,
           accountSubhead: "payroll",
           description: `${name} Allowance — ${empName} (${month}/${year})`,
           debit: parseFloat(amount),
@@ -305,7 +325,10 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
         if (STATUTORY_KEYS.has(name.toLowerCase().trim())) continue;
         const comp = (p.masterComponents || []).find(c => c.name === name && c.type === "deduction");
         lines.push(buildGLLine({
-          accountCode: comp?.accountCode || DEFAULT_CODES.OTHER_DEDUCTION,
+          accountCode:
+            componentHead(structureDeductions, name) ||
+            comp?.accountCode ||
+            DEFAULT_CODES.OTHER_DEDUCTION,
           accountSubhead: "payable",
           description: `${name} Deduction — ${empName} (${month}/${year})`,
           debit: 0,

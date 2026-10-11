@@ -141,7 +141,9 @@ const toComponentMap = (value) => {
     value.forEach((row) => {
       const name = String(row?.name || "").trim();
       if (!name) return;
-      map[name] = parseFloat(row.amount) || 0;
+      const amount = parseFloat(row.amount) || 0;
+      const accountCode = String(row.accountCode || row.accountHead || "").trim();
+      map[name] = accountCode ? { amount, accountCode } : amount;
     });
     return map;
   }
@@ -159,6 +161,7 @@ const upsertEmployeeSalaryPackage = async ({
   basicSalary,
   allowances,
   deductions,
+  accountCode,
   userId,
   transaction,
 }) => {
@@ -169,6 +172,7 @@ const upsertEmployeeSalaryPackage = async ({
 
   const allowancesMap = toComponentMap(allowances);
   const deductionsMap = toComponentMap(deductions);
+  const salaryAccountCode = String(accountCode || "").trim();
   const displayName =
     `${employee?.firstName || ""} ${employee?.lastName || ""}`.trim() ||
     "Employee";
@@ -188,6 +192,7 @@ const upsertEmployeeSalaryPackage = async ({
         basicSalary: basic,
         allowances: allowancesMap,
         deductions: deductionsMap,
+        accountCode: salaryAccountCode || structure.accountCode || "",
         updatedBy: userId,
         status: "Active",
       },
@@ -207,7 +212,7 @@ const upsertEmployeeSalaryPackage = async ({
       deductions: deductionsMap,
       paymentType: "Monthly",
       status: "Active",
-      accountCode: "",
+      accountCode: salaryAccountCode,
       createdBy: userId,
     },
     { transaction },
@@ -340,6 +345,7 @@ exports.createEmployee = async (req, res) => {
       basicSalary,
       allowances,
       deductions,
+      accountCode,
       emergencyContact,
       emergencyPhone,
       nextOfKin,
@@ -416,6 +422,7 @@ exports.createEmployee = async (req, res) => {
         basicSalary,
         allowances,
         deductions,
+        accountCode,
         userId: createdBy,
       });
     }
@@ -584,7 +591,7 @@ exports.getAllEmployees = async (req, res) => {
         {
           model: db.salary_structures,
           as: "salaryStructure",
-          attributes: ["id", "structureName", "basicSalary", "allowances", "deductions", "payeRate", "pensionRate"],
+          attributes: ["id", "structureName", "basicSalary", "allowances", "deductions", "accountCode", "payeRate", "pensionRate"],
           required: false,
         },
         {
@@ -716,6 +723,7 @@ exports.getEmployeeById = async (req, res) => {
             "basicSalary",
             "allowances",
             "deductions",
+            "accountCode",
             "payeRate",
             "pensionRate",
           ],
@@ -786,6 +794,7 @@ exports.updateEmployee = async (req, res) => {
       basicSalary,
       allowances,
       deductions,
+      accountCode,
       ...rest
     } = req.body;
     
@@ -813,6 +822,8 @@ exports.updateEmployee = async (req, res) => {
       basicSalary: _bs,
       allowances: _al,
       deductions: _de,
+      accountCode: _ac,
+      salaryAccountCode: _sac,
       ...safeRest
     } = rest;
 
@@ -856,6 +867,7 @@ exports.updateEmployee = async (req, res) => {
         basicSalary,
         allowances,
         deductions,
+        accountCode,
         userId: updatedBy,
       });
       if (structureId) {
