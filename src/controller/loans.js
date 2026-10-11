@@ -292,7 +292,7 @@ exports.createLoan = async (req, res) => {
           where: { facilityId: resolvedFacilityId, status: true },
           order: [["createdAt", "ASC"]],
         }));
-      setupReceivable = fallbackSetup?.receivableHead || null;
+      setupReceivable = fallbackSetup?.receivableHead || "112104";
     }
 
     if (!setupReceivable) {

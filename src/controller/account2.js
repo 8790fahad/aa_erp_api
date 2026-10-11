@@ -56,12 +56,72 @@ exports.getCustomerDetails = async (req, res) => {
     credit_limit = 0,
     facilityId = "",
     customer_type = "",
+    search = "",
+    limit = "",
   } = req.query;
 
   try {
     let results = [];
 
     switch (query_type) {
+      case "search": {
+        const facilityForQuery = customer || facilityId;
+        if (!facilityForQuery) {
+          return res.status(400).json({
+            success: false,
+            error: "Missing facility identifier",
+            message: "Provide customer (facility id) in the query string",
+          });
+        }
+        const rowLimit = Math.min(Math.max(parseInt(limit, 10) || 25, 1), 50);
+        const rawQ = String(search || fullname || "").trim();
+        const safeQ = rawQ.replace(/[%_\\]/g, "");
+        const replacements = { facilityId: facilityForQuery, rowLimit };
+        const where = ["c.facilityId = :facilityId"];
+        if (safeQ) {
+          replacements.q = `%${safeQ}%`;
+          replacements.qPrefix = `${safeQ}%`;
+          where.push(`(
+            c.fullname LIKE :q
+            OR c.customerNo LIKE :q
+            OR c.company_name LIKE :q
+            OR c.phone LIKE :q
+            OR c.mobile LIKE :q
+          )`);
+        }
+        const orderBy = safeQ
+          ? `CASE
+               WHEN c.fullname LIKE :qPrefix THEN 0
+               WHEN c.customerNo LIKE :qPrefix THEN 1
+               ELSE 2
+             END,
+             c.fullname ASC`
+          : "c.fullname ASC";
+        results = await db.sequelize.query(
+          `SELECT
+             c.customerNo,
+             c.fullname,
+             c.company_name,
+             c.address,
+             c.phone,
+             c.mobile,
+             c.email,
+             c.credit_limit,
+             c.receivable_code,
+             c.customer_type,
+             c.status
+           FROM customers c
+           WHERE ${where.join(" AND ")}
+           ORDER BY ${orderBy}
+           LIMIT :rowLimit`,
+          {
+            replacements,
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        );
+        break;
+      }
+
       case "customers": {
         const facilityForQuery = customer || facilityId;
         if (!facilityForQuery) {

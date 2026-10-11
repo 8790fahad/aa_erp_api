@@ -380,7 +380,7 @@ async function resolveDefaultLoanReceivable(facilityId) {
     where: { facilityId, status: true },
     order: [["createdAt", "ASC"]],
   });
-  return fallbackSetup?.receivableHead || null;
+  return fallbackSetup?.receivableHead || "112104";
 }
 
 async function loadPeriodLoanCredits({ employeeIds, facilityId, month, year }) {

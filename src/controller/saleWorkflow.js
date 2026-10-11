@@ -5203,6 +5203,55 @@ exports.completeSeparation = async (req, res) => {
   }
 };
 
+const SUPERUSER_KEYS = ["Administrator", "Super Administrator", "Admin"];
+const REPRINT_GOODS_ISSUE_PRIVILEGE = "Reprint Goods Issue Note";
+
+function parseFuncList(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function userCanReprintGoodsIssue(facilityId, userId) {
+  const uid = String(userId || "").trim();
+  if (!facilityId || !uid) return false;
+  try {
+    const bizRows = await db.sequelize.query(
+      `SELECT business_admin FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    if (String(bizRows[0]?.business_admin || "") === uid) return true;
+
+    const memRows = await db.sequelize.query(
+      `SELECT functionalities, role
+       FROM membership
+       WHERE business_id = :facilityId
+         AND CAST(user_id AS CHAR) = CAST(:userId AS CHAR)
+       LIMIT 1`,
+      {
+        replacements: { facilityId, userId: uid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const funcs = parseFuncList(memRows[0]?.functionalities);
+    const role = String(memRows[0]?.role || "");
+    if (SUPERUSER_KEYS.some((key) => funcs.includes(key) || role === key)) {
+      return true;
+    }
+    return funcs.includes(REPRINT_GOODS_ISSUE_PRIVILEGE);
+  } catch (err) {
+    console.warn("userCanReprintGoodsIssue:", err.message);
+    return false;
+  }
+}
+
 exports.markFulfillmentPrinted = async (req, res) => {
   try {
     const { facilityId, packCode, id, updated_by } = req.body || {};
@@ -5222,6 +5271,23 @@ exports.markFulfillmentPrinted = async (req, res) => {
         success: false,
         message: "Fulfillment pack not found",
       });
+    }
+
+    const alreadyPrinted =
+      Boolean(row.printed_at) ||
+      ["printed", "collecting", "collected"].includes(
+        String(row.status || "").toLowerCase(),
+      );
+    if (alreadyPrinted) {
+      const actor = updated_by || req.user?.id;
+      const allowed = await userCanReprintGoodsIssue(facilityId, actor);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "This Goods Issue Note is already printed. Reprint requires permission.",
+        });
+      }
     }
 
     if (row.status === "pending") {

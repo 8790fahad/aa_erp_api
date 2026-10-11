@@ -2047,11 +2047,18 @@ exports.receiveInvestmentPayment = async (req, res) => {
     const {
       facilityId,
       amount,
+      profit,
+      profitHead,
       transaction_date,
       accountCode,
       userId,
     } = req.body || {};
     const value = Math.round((parseFloat(amount) || 0) * 100) / 100;
+    const profitRaw = profit == null || String(profit).trim() === ""
+      ? 0
+      : parseFloat(profit);
+    const profitValue = Math.round((Number.isFinite(profitRaw) ? profitRaw : NaN) * 100) / 100;
+    const profitCode = String(profitHead || "").trim();
     const cashCode = String(accountCode || "").trim();
 
     if (!facilityId) {
@@ -2066,6 +2073,20 @@ exports.receiveInvestmentPayment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Enter the amount received",
+      });
+    }
+    if (!Number.isFinite(profitValue) || profitValue < 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid profit amount",
+      });
+    }
+    if (profitValue > 0 && !profitCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Select the profit account",
       });
     }
     if (!cashCode) {
@@ -2125,7 +2146,7 @@ exports.receiveInvestmentPayment = async (req, res) => {
       });
     }
 
-    const [cashAccount, investmentAccount] = await Promise.all([
+    const [cashAccount, investmentAccount, profitAccount] = await Promise.all([
       db.AccountCategory.findOne({
         where: { code: cashCode, facility_id: facilityId },
         transaction,
@@ -2134,6 +2155,12 @@ exports.receiveInvestmentPayment = async (req, res) => {
         where: { code: investmentHead, facility_id: facilityId },
         transaction,
       }),
+      profitValue > 0
+        ? db.AccountCategory.findOne({
+            where: { code: profitCode, facility_id: facilityId },
+            transaction,
+          })
+        : Promise.resolve(null),
     ]);
     if (!cashAccount) {
       await transaction.rollback();
@@ -2147,6 +2174,13 @@ exports.receiveInvestmentPayment = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: `Investment account not found: ${investmentHead}`,
+      });
+    }
+    if (profitValue > 0 && !profitAccount) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Profit account not found: ${profitCode}`,
       });
     }
 
@@ -2175,48 +2209,68 @@ exports.receiveInvestmentPayment = async (req, res) => {
     const reference = `IR-${await getAndUpdateNumber("IR", facilityId)}`;
     const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim();
     const desc = `Investment received — ${name}`;
+    const profitDesc = `Investment profit — ${name}`;
+    const cashIn = Math.round((value + profitValue) * 100) / 100;
     const parentOf = (account) =>
       account.parentCode ?? account.parent_code ?? account.code ?? "0";
 
-    await db.GeneralLedger.bulkCreate(
-      [
-        {
-          transaction_date: transactionDate,
-          account_code: cashAccount.code,
-          account_subhead: String(parentOf(cashAccount)),
-          account_description: cashAccount.description,
-          dr: value,
-          cr: 0,
-          transaction_description: desc,
-          purpose_of_payment: "Business associate investment receipt",
-          reference_number: reference,
-          payee: name.slice(0, 50),
-          created_by: String(actor),
-          facility_id: facilityId,
-          type: "bank",
-          status: "posted",
-          transaction_ref: reference,
-        },
-        {
-          transaction_date: transactionDate,
-          account_code: investmentAccount.code,
-          account_subhead: String(parentOf(investmentAccount)),
-          account_description: investmentAccount.description,
-          dr: 0,
-          cr: value,
-          transaction_description: desc,
-          purpose_of_payment: "Business associate investment",
-          reference_number: reference,
-          payee: name.slice(0, 50),
-          created_by: String(actor),
-          facility_id: facilityId,
-          type: "payment",
-          status: "posted",
-          transaction_ref: invRef,
-        },
-      ],
-      { transaction },
-    );
+    const lines = [
+      {
+        transaction_date: transactionDate,
+        account_code: cashAccount.code,
+        account_subhead: String(parentOf(cashAccount)),
+        account_description: cashAccount.description,
+        dr: cashIn,
+        cr: 0,
+        transaction_description: desc,
+        purpose_of_payment: "Business associate investment receipt",
+        reference_number: reference,
+        payee: name.slice(0, 50),
+        created_by: String(actor),
+        facility_id: facilityId,
+        type: "bank",
+        status: "posted",
+        transaction_ref: reference,
+      },
+      {
+        transaction_date: transactionDate,
+        account_code: investmentAccount.code,
+        account_subhead: String(parentOf(investmentAccount)),
+        account_description: investmentAccount.description,
+        dr: 0,
+        cr: value,
+        transaction_description: desc,
+        purpose_of_payment: "Business associate investment",
+        reference_number: reference,
+        payee: name.slice(0, 50),
+        created_by: String(actor),
+        facility_id: facilityId,
+        type: "payment",
+        status: "posted",
+        transaction_ref: invRef,
+      },
+    ];
+    if (profitValue > 0 && profitAccount) {
+      lines.push({
+        transaction_date: transactionDate,
+        account_code: profitAccount.code,
+        account_subhead: String(parentOf(profitAccount)),
+        account_description: profitAccount.description,
+        dr: 0,
+        cr: profitValue,
+        transaction_description: profitDesc,
+        purpose_of_payment: "Business associate investment profit",
+        reference_number: reference,
+        payee: name.slice(0, 50),
+        created_by: String(actor),
+        facility_id: facilityId,
+        type: "revenue",
+        status: "posted",
+        transaction_ref: reference,
+      });
+    }
+
+    await db.GeneralLedger.bulkCreate(lines, { transaction });
 
     await transaction.commit();
     return res.status(201).json({
@@ -2225,6 +2279,7 @@ exports.receiveInvestmentPayment = async (req, res) => {
       data: {
         reference_number: reference,
         amount: value,
+        profit: profitValue,
         investmentCurrentBalance: Math.round((outstanding - value) * 100) / 100,
       },
     });

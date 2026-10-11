@@ -594,21 +594,27 @@ const startServer = () => {
   return server;
 };
 
+function migrateInBackground(label) {
+  const {
+    runPendingMigrations,
+  } = require("./bootstrap/runPendingMigrations");
+  runPendingMigrations()
+    .then((result) => {
+      if (result?.ran?.length) {
+        console.log(
+          `[${label} ${process.pid}] Auto-migrate applied ${result.ran.length} file(s)`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error(`[${label} ${process.pid}] Auto-migrate failed:`, err.message);
+    });
+}
+
 async function boot() {
-  // Create/upgrade schema + audit triggers before accepting traffic
-  try {
-    const {
-      runPendingMigrations,
-    } = require("./bootstrap/runPendingMigrations");
-    await runPendingMigrations();
-  } catch (err) {
-    console.error(
-      `[pid ${process.pid}] Auto-migrate failed:`,
-      err.message,
-    );
-    // Continue boot — app may still serve if DB already exists
-  }
+  // Accept traffic first. Long data backfills must not block login /health.
   startServer();
+  migrateInBackground("pid");
 }
 
 const shouldUseCluster =
@@ -619,37 +625,24 @@ if ((cluster.isPrimary || cluster.isMaster) && shouldUseCluster) {
   const cpuCount =
     parseInt(process.env.CLUSTER_WORKERS, 10) || os.cpus().length;
 
-  (async () => {
-    try {
-      const {
-        runPendingMigrations,
-      } = require("./bootstrap/runPendingMigrations");
-      await runPendingMigrations();
-    } catch (err) {
-      console.error(
-        `[Master ${process.pid}] Auto-migrate failed:`,
-        err.message,
-      );
-    }
+  console.log(
+    `[Master ${process.pid}] Starting ${cpuCount} worker${
+      cpuCount > 1 ? "s" : ""
+    }`,
+  );
+  for (let i = 0; i < cpuCount; i += 1) {
+    cluster.fork();
+  }
 
-    console.log(
-      `[Master ${process.pid}] Starting ${cpuCount} worker${
-        cpuCount > 1 ? "s" : ""
-      }`,
+  cluster.on("exit", (worker, code, signal) => {
+    console.warn(
+      `[Master ${process.pid}] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`,
     );
-    for (let i = 0; i < cpuCount; i += 1) {
-      cluster.fork();
-    }
+    cluster.fork();
+  });
 
-    cluster.on("exit", (worker, code, signal) => {
-      console.warn(
-        `[Master ${process.pid}] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`,
-      );
-      cluster.fork();
-    });
-  })();
+  migrateInBackground("Master");
 } else if (shouldUseCluster) {
-  // Worker process — migrations already ran in master
   startServer();
 } else {
   boot();
