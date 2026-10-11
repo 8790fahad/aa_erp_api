@@ -518,7 +518,16 @@ exports.createEmployee = async (req, res) => {
 // Get all employees
 exports.getAllEmployees = async (req, res) => {
   try {
-    const { page = 1, limit = 10, search, departmentId, status, facilityId } = req.query;
+    const {
+      page = 1,
+      limit = 10,
+      search,
+      departmentId,
+      status,
+      facilityId,
+      lite,
+      includeInvestment,
+    } = req.query;
     
     if (!facilityId) {
       return res.status(400).json({
@@ -527,8 +536,14 @@ exports.getAllEmployees = async (req, res) => {
         error: "facilityId query parameter is missing"
       });
     }
-    
-    const offset = (page - 1) * limit;
+
+    const isLite = lite === "1" || lite === "true";
+    const wantInvestment =
+      includeInvestment === "1" ||
+      includeInvestment === "true" ||
+      (!isLite && includeInvestment !== "0" && includeInvestment !== "false");
+    const pageSize = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 2000);
+    const offset = (page - 1) * pageSize;
 
     let whereClause = { facilityId };
 
@@ -549,23 +564,28 @@ exports.getAllEmployees = async (req, res) => {
       whereClause.status = status;
     }
 
-    const { count, rows } = await db.employees.findAndCountAll({
-      where: whereClause,
-      include: [
+    const include = [
+      {
+        model: db.Department,
+        as: "department",
+        attributes: ["id", "departmentName", "departmentCode"],
+        required: false,
+      },
+    ];
+
+    if (!isLite) {
+      include.push(
         {
           model: db.users,
           as: "user",
           attributes: ["id", "email", "phone", "image"],
-        },
-        {
-          model: db.Department,
-          as: "department",
-          attributes: ["id", "departmentName", "departmentCode"],
+          required: false,
         },
         {
           model: db.salary_structures,
           as: "salaryStructure",
           attributes: ["id", "structureName", "basicSalary", "allowances", "deductions", "payeRate", "pensionRate"],
+          required: false,
         },
         {
           model: db.employee_paye_profiles,
@@ -577,44 +597,66 @@ exports.getAllEmployees = async (req, res) => {
             "appliesPension",
           ],
           required: false,
-        },
-      ],
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      order: [["createdAt", "DESC"]],
+        }
+      );
+    }
+
+    const { count, rows } = await db.employees.findAndCountAll({
+      where: whereClause,
+      attributes: isLite
+        ? [
+            "id",
+            "employeeId",
+            "firstName",
+            "lastName",
+            "designation",
+            "departmentId",
+            "status",
+            "contractType",
+          ]
+        : undefined,
+      include,
+      limit: pageSize,
+      offset: parseInt(offset, 10),
+      order: isLite ? [["firstName", "ASC"]] : [["createdAt", "DESC"]],
     });
 
-    const investmentBalances = await db.sequelize.query(
-      `SELECT transaction_ref AS ref,
-              COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-       FROM general_ledger
-       WHERE facility_id = :facilityId
-         AND purpose_of_payment = 'Business associate investment'
-         AND transaction_ref LIKE '%-INV'
-       GROUP BY transaction_ref`,
-      {
-        replacements: { facilityId },
-        type: db.Sequelize.QueryTypes.SELECT,
-      },
+    let employeesWithInvestment = rows.map((employee) =>
+      employee.toJSON ? employee.toJSON() : employee
     );
-    const balanceByRef = Object.fromEntries(
-      (investmentBalances || []).map((row) => [
-        row.ref,
-        Number(row.balance) || 0,
-      ]),
-    );
-    const employeesWithInvestment = rows.map((employee) => {
-      const plain = employee.toJSON ? employee.toJSON() : employee;
-      const ref = `${plain.employeeId}-INV`;
-      const ledgerBalance = balanceByRef[ref];
-      return {
-        ...plain,
-        investmentCurrentBalance:
-          ledgerBalance === undefined
-            ? Number(plain.investmentOpeningBalance) || 0
-            : ledgerBalance,
-      };
-    });
+
+    if (wantInvestment) {
+      const investmentBalances = await db.sequelize.query(
+        `SELECT transaction_ref AS ref,
+                COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND purpose_of_payment = 'Business associate investment'
+           AND transaction_ref LIKE '%-INV'
+         GROUP BY transaction_ref`,
+        {
+          replacements: { facilityId },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      const balanceByRef = Object.fromEntries(
+        (investmentBalances || []).map((row) => [
+          row.ref,
+          Number(row.balance) || 0,
+        ]),
+      );
+      employeesWithInvestment = employeesWithInvestment.map((plain) => {
+        const ref = `${plain.employeeId}-INV`;
+        const ledgerBalance = balanceByRef[ref];
+        return {
+          ...plain,
+          investmentCurrentBalance:
+            ledgerBalance === undefined
+              ? Number(plain.investmentOpeningBalance) || 0
+              : ledgerBalance,
+        };
+      });
+    }
 
     res.json({
       success: true,
@@ -622,9 +664,9 @@ exports.getAllEmployees = async (req, res) => {
         employees: employeesWithInvestment,
         pagination: {
           total: count,
-          page: parseInt(page),
-          limit: parseInt(limit),
-          pages: Math.ceil(count / limit),
+          page: parseInt(page, 10) || 1,
+          limit: pageSize,
+          pages: Math.ceil(count / pageSize),
         },
       },
     });
@@ -1873,20 +1915,41 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
 
     const previousRef = String(employee.investmentReference || "").trim();
     const employeeCode = String(employee.employeeId || "").trim();
+    const invRef = employeeCode ? `${employeeCode}-INV` : "";
+    let received = 0;
+    if (invRef) {
+      const [receivedRow] = await db.sequelize.query(
+        `SELECT COALESCE(SUM(cr), 0) AS received
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND purpose_of_payment = 'Business associate investment'
+           AND transaction_ref = :invRef
+           AND reference_number LIKE 'IR-%'`,
+        {
+          replacements: { facilityId, invRef },
+          type: db.Sequelize.QueryTypes.SELECT,
+          transaction,
+        },
+      );
+      received = Math.round((Number(receivedRow?.received) || 0) * 100) / 100;
+      if (value + 0.009 < received) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Principal cannot be less than ${received} already received`,
+        });
+      }
+    }
     const replaceWhere = [
       ...(previousRef ? [{ reference_number: previousRef }] : []),
-      ...(employeeCode
-        ? [
-            { transaction_ref: `${employeeCode}-INV` },
-            { transaction_ref: `${employeeCode}-OBE` },
-          ]
-        : []),
+      ...(employeeCode ? [{ transaction_ref: `${employeeCode}-OBE` }] : []),
     ];
     if (replaceWhere.length) {
       await db.GeneralLedger.destroy({
         where: {
           facility_id: facilityId,
           purpose_of_payment: "Business associate investment",
+          reference_number: { [Op.notLike]: "IR-%" },
           [Op.or]: replaceWhere,
         },
         transaction,
@@ -1965,7 +2028,7 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
         investmentOpeningDate: transactionDate,
         investmentAccountHead: head,
         investmentReference: reference,
-        investmentCurrentBalance: value,
+        investmentCurrentBalance: Math.round((value - received) * 100) / 100,
       },
     });
   } catch (error) {
@@ -1974,6 +2037,203 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error.message || "Failed to post investment opening balance",
+    });
+  }
+};
+
+exports.receiveInvestmentPayment = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const {
+      facilityId,
+      amount,
+      transaction_date,
+      accountCode,
+      userId,
+    } = req.body || {};
+    const value = Math.round((parseFloat(amount) || 0) * 100) / 100;
+    const cashCode = String(accountCode || "").trim();
+
+    if (!facilityId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!Number.isFinite(value) || value <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Enter the amount received",
+      });
+    }
+    if (!cashCode) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Select the cash or bank account",
+      });
+    }
+
+    const employee = await db.employees.findOne({
+      where: { id: req.params.id, facilityId },
+      transaction,
+    });
+    if (!employee) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Business associate not found",
+      });
+    }
+    if (employee.contractType !== "Business Associate") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Receipts are only for a business associate investment",
+      });
+    }
+    const investmentHead = String(employee.investmentAccountHead || "").trim();
+    if (!investmentHead) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Post an opening balance before receiving a payment",
+      });
+    }
+
+    const invRef = `${employee.employeeId}-INV`;
+    const [balRow] = await db.sequelize.query(
+      `SELECT COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
+       FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND purpose_of_payment = 'Business associate investment'
+         AND transaction_ref = :invRef`,
+      {
+        replacements: { facilityId, invRef },
+        type: db.Sequelize.QueryTypes.SELECT,
+        transaction,
+      },
+    );
+    const outstanding = Math.round((Number(balRow?.balance) || 0) * 100) / 100;
+    if (value > outstanding + 0.009) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Amount cannot exceed the current balance of ${outstanding}`,
+      });
+    }
+
+    const [cashAccount, investmentAccount] = await Promise.all([
+      db.AccountCategory.findOne({
+        where: { code: cashCode, facility_id: facilityId },
+        transaction,
+      }),
+      db.AccountCategory.findOne({
+        where: { code: investmentHead, facility_id: facilityId },
+        transaction,
+      }),
+    ]);
+    if (!cashAccount) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Cash or bank account not found: ${cashCode}`,
+      });
+    }
+    if (!investmentAccount) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Investment account not found: ${investmentHead}`,
+      });
+    }
+
+    let transactionDate;
+    try {
+      transactionDate = validatePostingDate(transaction_date || new Date(), {
+        field: "transaction_date",
+      });
+    } catch (err) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: err.message || "Enter a valid date",
+      });
+    }
+
+    const actor = userId || req.user?.id;
+    if (!actor) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "userId is required",
+      });
+    }
+
+    const reference = `IR-${await getAndUpdateNumber("IR", facilityId)}`;
+    const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim();
+    const desc = `Investment received — ${name}`;
+    const parentOf = (account) =>
+      account.parentCode ?? account.parent_code ?? account.code ?? "0";
+
+    await db.GeneralLedger.bulkCreate(
+      [
+        {
+          transaction_date: transactionDate,
+          account_code: cashAccount.code,
+          account_subhead: String(parentOf(cashAccount)),
+          account_description: cashAccount.description,
+          dr: value,
+          cr: 0,
+          transaction_description: desc,
+          purpose_of_payment: "Business associate investment receipt",
+          reference_number: reference,
+          payee: name.slice(0, 50),
+          created_by: String(actor),
+          facility_id: facilityId,
+          type: "bank",
+          status: "posted",
+          transaction_ref: reference,
+        },
+        {
+          transaction_date: transactionDate,
+          account_code: investmentAccount.code,
+          account_subhead: String(parentOf(investmentAccount)),
+          account_description: investmentAccount.description,
+          dr: 0,
+          cr: value,
+          transaction_description: desc,
+          purpose_of_payment: "Business associate investment",
+          reference_number: reference,
+          payee: name.slice(0, 50),
+          created_by: String(actor),
+          facility_id: facilityId,
+          type: "payment",
+          status: "posted",
+          transaction_ref: invRef,
+        },
+      ],
+      { transaction },
+    );
+
+    await transaction.commit();
+    return res.status(201).json({
+      success: true,
+      message: "Investment payment received",
+      data: {
+        reference_number: reference,
+        amount: value,
+        investmentCurrentBalance: Math.round((outstanding - value) * 100) / 100,
+      },
+    });
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    console.error("receiveInvestmentPayment", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to receive the investment payment",
     });
   }
 };

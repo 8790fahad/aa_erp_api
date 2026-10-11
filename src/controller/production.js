@@ -606,7 +606,11 @@ export const approveMaterialRequisition = async (req, res) => {
       });
 
       const valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-      const methodKey = valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod;
+      const methodKey = valuationMethod === "Weighted Average Cost"
+        ? "WAC"
+        : valuationMethod === "Batch by Batch"
+          ? "BATCH"
+          : valuationMethod;
 
       // 6. Calculate COGS using proper valuation
       const { calculatedCostPrice } = await getCurrentUnitCost(

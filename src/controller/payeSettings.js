@@ -570,13 +570,6 @@ exports.getPayeEmployeePreview = async (req, res) => {
       let profile = profileMap[emp.id];
       const structureDefaults = profileDefaultsFromSalaryStructure(emp.salaryStructure);
 
-      if (isBlankPayeProfile(profile) && structureDefaults) {
-        // Persist link from salary structure → PAYE profile so payroll and preview stay in sync
-        profile = await syncEmployeePayeProfileFromStructure(emp, {
-          salaryStructure: emp.salaryStructure,
-        });
-      }
-
       if (!profile) {
         profile = structureDefaults || emptyPayeProfile();
       } else if (isBlankPayeProfile(profile) && structureDefaults) {

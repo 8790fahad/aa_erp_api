@@ -221,8 +221,19 @@ async function userCanSeeAllPayBills(facilityId, userId) {
   }
 }
 
-/** Deposit on the supplier advance (accrued) account. */
+/**
+ * Deposit on the supplier advance (accrued) account.
+ * Credit notes posted onto this account are included in the net, then the
+ * part that is still an open credit note is taken back out. A credit note
+ * already moved to GIT has its clearing credit on another reference, so
+ * dropping only the CN-S lines would subtract that credit from a later deposit.
+ */
 async function getAccruedSupplierAdvance(facilityId, supplierNo, transaction) {
+  const queryOpts = {
+    replacements: { facilityId, supplierNo },
+    type: db.sequelize.QueryTypes.SELECT,
+    ...(transaction ? { transaction } : {}),
+  };
   const balRows = await db.sequelize.query(
     `SELECT COALESCE(SUM(dr) - SUM(cr), 0) AS available_advance
      FROM general_ledger
@@ -231,37 +242,86 @@ async function getAccruedSupplierAdvance(facilityId, supplierNo, transaction) {
          transaction_ref = :supplierNo
          OR transaction_ref LIKE CONCAT(:supplierNo, '-%')
        )
-       AND LOWER(type) IN ('accrued', 'advance')
-       AND (reference_number IS NULL OR reference_number NOT LIKE 'CN-S%')`,
-    {
-      replacements: { facilityId, supplierNo },
-      type: db.sequelize.QueryTypes.SELECT,
-      ...(transaction ? { transaction } : {}),
-    },
+       AND LOWER(type) IN ('accrued', 'advance')`,
+    queryOpts,
   );
-  return Math.max(0, parseFloat(balRows[0]?.available_advance || 0));
+  const openRows = await db.sequelize.query(
+    `SELECT COALESCE(SUM(LEAST(note_net, remaining)), 0) AS open_on_advance
+     FROM (
+       SELECT
+         GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0) AS remaining,
+         (
+           SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+           FROM general_ledger gl
+           WHERE gl.facility_id = :facilityId
+             AND CONVERT(gl.reference_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+               = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+             AND LOWER(gl.type) IN ('accrued', 'advance')
+             AND (
+               gl.transaction_ref = :supplierNo
+               OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
+             )
+         ) AS note_net
+       FROM invoices i
+       INNER JOIN (
+         SELECT ref_no AS cheque_no
+         FROM (
+           SELECT cheque_no AS ref_no
+           FROM supplier_entries
+           WHERE facilityId = :facilityId
+             AND supplier_number = :supplierNo
+             AND cheque_no LIKE 'CN-S%'
+           UNION ALL
+           SELECT receiptNo AS ref_no
+           FROM supplier_entries
+           WHERE facilityId = :facilityId
+             AND supplier_number = :supplierNo
+             AND receiptNo LIKE 'CN-S%'
+         ) refs
+         GROUP BY ref_no
+       ) se
+         ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
+          = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+       LEFT JOIN (
+         SELECT credit_note_number, SUM(amount) AS applied
+         FROM credit_note_applications
+         WHERE facility_id = :facilityId
+           AND UPPER(invoice_ref) <> 'ADVANCE'
+         GROUP BY credit_note_number
+       ) app
+         ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+          = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+       WHERE i.facility_id = :facilityId
+         AND i.type = 'purchase'
+         AND i.invoice_ref LIKE 'CN-S%'
+         AND i.amount < 0
+     ) notes
+     WHERE remaining > 0.009
+       AND note_net > 0.009`,
+    queryOpts,
+  );
+  const net = parseFloat(balRows[0]?.available_advance || 0);
+  const openOnAdvance = parseFloat(openRows[0]?.open_on_advance || 0);
+  return Math.max(0, net - openOnAdvance);
 }
 
 /**
  * Cash paid beyond open bills, same pool as the Supplier Advances report.
- * Positive payable/payment nets that were not matched off the supplier.
+ * One net for the supplier. A later GIT credit uses a new reference, so
+ * grouping each reference on its own would keep the original payment.
  */
 async function getPrepaidSupplierAdvance(facilityId, supplierNo, transaction) {
   const balRows = await db.sequelize.query(
-    `SELECT COALESCE(SUM(ref_net), 0) AS available_prepaid
-     FROM (
-       SELECT GREATEST(0, COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0)) AS ref_net
-       FROM general_ledger
-       WHERE facility_id = :facilityId
-         AND (
-           transaction_ref = :supplierNo
-           OR transaction_ref LIKE CONCAT(:supplierNo, '-%')
-         )
-         AND LOWER(COALESCE(type, '')) IN ('payable', 'payables', 'payment')
-         AND transaction_ref IS NOT NULL
-         AND transaction_ref <> ''
-       GROUP BY transaction_ref, reference_number
-     ) prepaid`,
+    `SELECT GREATEST(0, COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0)) AS available_prepaid
+     FROM general_ledger
+     WHERE facility_id = :facilityId
+       AND (
+         transaction_ref = :supplierNo
+         OR transaction_ref LIKE CONCAT(:supplierNo, '-%')
+       )
+       AND LOWER(COALESCE(type, '')) IN ('payable', 'payables', 'payment')
+       AND transaction_ref IS NOT NULL
+       AND transaction_ref <> ''`,
     {
       replacements: { facilityId, supplierNo },
       type: db.sequelize.QueryTypes.SELECT,
@@ -570,7 +630,7 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
          MAX(s.vendor_type) AS vendor_type,
          MAX(s.email) AS email,
          MAX(s.phone) AS phone,
-         GREATEST(COALESCE(MAX(adv.bal), 0), 0) + GREATEST(COALESCE(SUM(prepaid.bal), 0), 0) AS available_deposit,
+         GREATEST(COALESCE(MAX(adv.bal), 0) - COALESCE(MAX(cn_adv.bal), 0), 0) + GREATEST(COALESCE(SUM(prepaid.bal), 0), 0) AS available_deposit,
          GREATEST(COALESCE(MAX(cn.bal), 0), 0) AS available_credit_note,
          GREATEST(COALESCE(MAX(git.bal), 0), 0) AS available_git
        FROM (
@@ -595,7 +655,6 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
              INNER JOIN general_ledger gl
                ON gl.facility_id = s2.facilityId
               AND LOWER(gl.type) IN ('accrued', 'advance')
-              AND (gl.reference_number IS NULL OR gl.reference_number NOT LIKE 'CN-S%')
               AND (
                 gl.transaction_ref = s2.supplier_number
                 OR gl.transaction_ref LIKE CONCAT(s2.supplier_number, '-%')
@@ -604,6 +663,60 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
            ) dep
           GROUP BY supplier_number
        ) adv ON adv.supplier_number = s.supplier_number
+       LEFT JOIN (
+         SELECT supplier_number, SUM(LEAST(note_net, remaining)) AS bal
+           FROM (
+             SELECT
+               se.supplier_number,
+               GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0) AS remaining,
+               (
+                 SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+                 FROM general_ledger gl
+                 WHERE gl.facility_id = :facilityId
+                   AND CONVERT(gl.reference_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                     = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                   AND LOWER(gl.type) IN ('accrued', 'advance')
+                   AND (
+                     gl.transaction_ref = se.supplier_number
+                     OR gl.transaction_ref LIKE CONCAT(se.supplier_number, '-%')
+                   )
+               ) AS note_net
+             FROM invoices i
+             INNER JOIN (
+               SELECT ref_no AS cheque_no, MAX(supplier_number) AS supplier_number
+               FROM (
+                 SELECT cheque_no AS ref_no, supplier_number
+                 FROM supplier_entries
+                 WHERE facilityId = :facilityId
+                   AND cheque_no LIKE 'CN-S%'
+                 UNION ALL
+                 SELECT receiptNo AS ref_no, supplier_number
+                 FROM supplier_entries
+                 WHERE facilityId = :facilityId
+                   AND receiptNo LIKE 'CN-S%'
+               ) refs
+               GROUP BY ref_no
+             ) se
+               ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+             LEFT JOIN (
+               SELECT credit_note_number, SUM(amount) AS applied
+               FROM credit_note_applications
+               WHERE facility_id = :facilityId
+                 AND UPPER(invoice_ref) <> 'ADVANCE'
+               GROUP BY credit_note_number
+             ) app
+               ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
+                = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+             WHERE i.facility_id = :facilityId
+               AND i.type = 'purchase'
+               AND i.invoice_ref LIKE 'CN-S%'
+               AND i.amount < 0
+           ) notes
+          WHERE remaining > 0.009
+            AND note_net > 0.009
+          GROUP BY supplier_number
+       ) cn_adv ON cn_adv.supplier_number = s.supplier_number
        LEFT JOIN (
          SELECT party_ref, SUM(ref_net) AS bal
            FROM (
@@ -615,7 +728,7 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
                AND LOWER(COALESCE(type, '')) IN ('payable', 'payables', 'payment')
                AND transaction_ref IS NOT NULL
                AND transaction_ref <> ''
-             GROUP BY transaction_ref, reference_number
+             GROUP BY transaction_ref
            ) pref
           GROUP BY party_ref
        ) prepaid

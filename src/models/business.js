@@ -420,7 +420,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
       inv_ev_m: {
-        type: DataTypes.ENUM("Weighted Average Cost", "LIFO", "FIFO"),
+        type: DataTypes.ENUM(
+          "Weighted Average Cost",
+          "LIFO",
+          "FIFO",
+          "Batch by Batch",
+        ),
         allowNull: false,
         defaultValue: "Weighted Average Cost",
       },

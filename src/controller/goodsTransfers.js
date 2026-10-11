@@ -162,16 +162,26 @@ async function resolveExpiryForTransfer({
 }
 
 function valuationMethodKey(invEvM) {
-  const method = invEvM || "Weighted Average Cost";
-  return method === "Weighted Average Cost" ? "WAC" : method;
+  return inventoryCtrl.mapValuationMethodKey
+    ? inventoryCtrl.mapValuationMethodKey(invEvM)
+    : invEvM === "Weighted Average Cost"
+      ? "WAC"
+      : invEvM;
 }
 
-/** Unit cost from perpetual inventory valuation (WAC / FIFO / LIFO). */
-async function resolveUnitCostForTransfer({ sku, facilityId, methodKey }) {
+/** Unit cost from perpetual inventory valuation (WAC / FIFO / LIFO / batch). */
+async function resolveUnitCostForTransfer({
+  sku,
+  facilityId,
+  methodKey,
+  expiry = null,
+  batchId = null,
+}) {
   const { calculatedCostPrice } = await inventoryCtrl.getCurrentUnitCost(
     sku,
     facilityId,
     methodKey,
+    methodKey === "BATCH" ? { expiry, batchId } : {},
   );
   return parseFloat(calculatedCostPrice) || 0;
 }
@@ -700,10 +710,21 @@ exports.approveGoodsTransfer = async (req, res) => {
         transaction: t,
       });
 
+      const expiryDate = await resolveExpiryForTransfer({
+        sku,
+        facilityId,
+        branchId: transfer.source_branch_id,
+        preferredExpiry: line.expiry_date,
+        qty,
+        transaction: t,
+      });
+
       const cost = await resolveUnitCostForTransfer({
         sku,
         facilityId,
         methodKey,
+        expiry: expiryDate || line.expiry_date,
+        batchId: line.batch_id || line.batch_no,
       });
       if (cost <= 0) {
         await t.rollback();
@@ -717,15 +738,6 @@ exports.approveGoodsTransfer = async (req, res) => {
         line.selling_price != null && parseFloat(line.selling_price) > 0
           ? parseFloat(line.selling_price)
           : parseFloat(product?.selling_price) || cost;
-
-      const expiryDate = await resolveExpiryForTransfer({
-        sku,
-        facilityId,
-        branchId: transfer.source_branch_id,
-        preferredExpiry: line.expiry_date,
-        qty,
-        transaction: t,
-      });
 
       // Persist approved qty, valuation-derived cost, and resolved expiry.
       line.quantity = qty;

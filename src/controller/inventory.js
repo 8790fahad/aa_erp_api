@@ -7,7 +7,10 @@ const { resolveBranchId, resolveBranchIds, validateBranchIdById } = require("../
 const { STORE_ENTRY_TYPE } = require("../constants/storeEntryTypes");
 const { isProductTaxable } = require("../constants/taxableStatus");
 const { parseQty } = require("../utils/parseAmount");
-const { resolveStockOutExpiry } = require("../utils/storeLotExpiry");
+const {
+  resolveStockOutExpiry,
+  normalizeStoreExpiry,
+} = require("../utils/storeLotExpiry");
 async function numberGenerator(
   { query_type = "", facilityId = "" },
   callback = (f) => f,
@@ -257,7 +260,8 @@ exports.getProductList = (req, res) => {
   } = req.body;
 
   // Cash account lookup is used by advance-payment drawers.
-  // Payment Mode = Cash → only Cash on/in Hand (not equivalents / charges / banks).
+  // Payment Mode = Cash → asset accounts on the chart whose name contains "cash"
+  // (Cash on Hand, Cash Holding Safe). Expense charges and bank accounts stay out.
   if (String(query_type).toLowerCase() === "cash") {
     return db.sequelize
       .query(
@@ -270,10 +274,11 @@ exports.getProductList = (req, res) => {
         FROM account_category
         WHERE
           facility_id = :facilityId
+          AND COALESCE(is_active, 1) = 1
+          AND LOWER(COALESCE(category, '')) = 'assets'
           AND (
             code = '112199'
-            OR LOWER(COALESCE(description, '')) LIKE '%cash on hand%'
-            OR LOWER(COALESCE(description, '')) LIKE '%cash in hand%'
+            OR LOWER(COALESCE(description, '')) LIKE '%cash%'
           )
         ORDER BY
           CASE
@@ -2041,6 +2046,210 @@ const lastPositiveVatFromStoreRows = (rows) => {
   return 0;
 };
 
+function mapValuationMethodKey(invEvM) {
+  const raw = String(invEvM || "Weighted Average Cost").trim();
+  const upper = raw.toUpperCase().replace(/[_-]+/g, " ");
+  if (
+    raw === "Weighted Average Cost" ||
+    upper === "WAC" ||
+    upper === "AVCO" ||
+    upper === "AVERAGE"
+  ) {
+    return "WAC";
+  }
+  if (upper === "FIFO") return "FIFO";
+  if (upper === "LIFO") return "LIFO";
+  if (
+    raw === "Batch by Batch" ||
+    upper === "BATCH" ||
+    upper === "BATCH BY BATCH" ||
+    upper === "SPECIFIC"
+  ) {
+    return "BATCH";
+  }
+  return "WAC";
+}
+
+function lotKeyFromRow(row) {
+  const ref = String(row?.reference_number || "").trim();
+  if (ref) return ref;
+  const expiry = normalizeStoreExpiry(row?.expiry_date);
+  if (expiry) return expiry;
+  const batch =
+    row?.batch_id != null && String(row.batch_id).trim() !== ""
+      ? String(row.batch_id).trim()
+      : "";
+  return batch || "no-ref";
+}
+
+function rowMatchesRequestedLot(row, { expiry, batchId, referenceNumber } = {}) {
+  const wantRef =
+    referenceNumber != null && String(referenceNumber).trim() !== ""
+      ? String(referenceNumber).trim()
+      : null;
+  const wantExpiry = normalizeStoreExpiry(expiry);
+  const wantBatch =
+    batchId != null && String(batchId).trim() !== ""
+      ? String(batchId).trim()
+      : null;
+  if (!wantRef && !wantExpiry && !wantBatch) return true;
+  const rowRef = String(row?.reference_number || "").trim();
+  const rowExpiry = normalizeStoreExpiry(row?.expiry_date);
+  const rowBatch =
+    row?.batch_id != null && String(row.batch_id).trim() !== ""
+      ? String(row.batch_id).trim()
+      : null;
+  if (wantRef) return rowRef === wantRef;
+  if (wantExpiry && wantBatch) {
+    return rowExpiry === wantExpiry && rowBatch === wantBatch;
+  }
+  if (wantExpiry) return rowExpiry === wantExpiry;
+  return rowBatch === wantBatch;
+}
+
+function summarizeLotsFromStoreRows(rows) {
+  const layers = [];
+  for (const row of rows || []) {
+    const qtyIn = parseFloat(row.qty_in) || 0;
+    const qtyOut = parseFloat(row.qty_out) || 0;
+    if (qtyIn > 0) {
+      const net = costAfterTaxFromRow(row, qtyIn);
+      const vat = vatPerUnitOnRow(row, qtyIn);
+      layers.push({
+        key: lotKeyFromRow(row),
+        inboundQty: qtyIn,
+        inboundCost: net > 0 ? qtyIn * net : 0,
+        inboundVat: qtyIn * vat,
+        remaining: qtyIn,
+      });
+    }
+    if (qtyOut > 0) {
+      let left = qtyOut;
+      for (const layer of layers) {
+        if (left <= 0) break;
+        if (layer.remaining <= 0) continue;
+        const take = Math.min(layer.remaining, left);
+        layer.remaining -= take;
+        left -= take;
+      }
+    }
+  }
+  const lots = new Map();
+  for (const layer of layers) {
+    const key = layer.key || "no-ref";
+    if (!lots.has(key)) {
+      lots.set(key, {
+        inboundQty: 0,
+        inboundCost: 0,
+        inboundVat: 0,
+        remaining: 0,
+      });
+    }
+    const lot = lots.get(key);
+    lot.inboundQty += layer.inboundQty;
+    lot.inboundCost += layer.inboundCost;
+    lot.inboundVat += layer.inboundVat;
+    lot.remaining += layer.remaining;
+  }
+  return lots;
+}
+
+function unitCostFromLots(lots) {
+  let remQty = 0;
+  let remCost = 0;
+  let remVat = 0;
+  let lastPurchase = 0;
+  let lastVat = 0;
+  for (const lot of lots.values()) {
+    const purchase = lot.inboundQty > 0 ? lot.inboundCost / lot.inboundQty : 0;
+    const purchaseVat = lot.inboundQty > 0 ? lot.inboundVat / lot.inboundQty : 0;
+    if (purchase > 0) {
+      lastPurchase = purchase;
+      lastVat = purchaseVat;
+    }
+    if (lot.remaining > 0 && purchase > 0) {
+      remQty += lot.remaining;
+      remCost += lot.remaining * purchase;
+      remVat += lot.remaining * purchaseVat;
+    }
+  }
+  if (remQty > 0) {
+    return {
+      calculatedCostPrice: Number((remCost / remQty).toFixed(2)),
+      vatPerUnit: Number((remVat / remQty).toFixed(2)),
+    };
+  }
+  return {
+    calculatedCostPrice: Number((lastPurchase || 0).toFixed(2)),
+    vatPerUnit: Number((lastVat || 0).toFixed(2)),
+  };
+}
+
+async function getBatchByBatchUnitCost(
+  product_id,
+  facility_id,
+  {
+    expiry = null,
+    batchId = null,
+    referenceNumber = null,
+    multiplierId = undefined,
+    transaction = null,
+  } = {},
+) {
+  if (!product_id || !facility_id) {
+    return { calculatedCostPrice: 0, vatPerUnit: 0 };
+  }
+
+  const multiplierCondition =
+    multiplierId === null
+      ? "AND multiplier_id IS NULL"
+      : multiplierId === undefined
+        ? ""
+        : "AND multiplier_id = :multiplier_id";
+
+  const replacements = {
+    product_id,
+    facility_id,
+  };
+  if (multiplierId !== null && multiplierId !== undefined) {
+    replacements.multiplier_id = multiplierId;
+  }
+
+  const rows = await db.sequelize.query(
+    `
+    SELECT qty_in, qty_out, cost_price, COALESCE(vat_amount, 0) AS vat_amount,
+           expiry_date, batch_id, reference_number
+    FROM store_entries
+    WHERE product_id = :product_id
+      AND facilityId = :facility_id
+      ${multiplierCondition}
+    ORDER BY receive_date ASC, id ASC
+    `,
+    {
+      replacements,
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+
+  if (!rows.length) return { calculatedCostPrice: 0, vatPerUnit: 0 };
+
+  const requested = { expiry, batchId, referenceNumber };
+  const hasLotFilter = Boolean(
+    normalizeStoreExpiry(expiry) ||
+      (batchId != null && String(batchId).trim() !== "") ||
+      (referenceNumber != null && String(referenceNumber).trim() !== ""),
+  );
+  const lotRows = hasLotFilter
+    ? rows.filter((row) => rowMatchesRequestedLot(row, requested))
+    : rows;
+  const lots = summarizeLotsFromStoreRows(lotRows.length ? lotRows : rows);
+  const fromLots = unitCostFromLots(lots);
+  if (fromLots.calculatedCostPrice > 0) return fromLots;
+
+  return rollForwardUnitCost(lotRows.length ? lotRows : rows, "BATCH");
+}
+
 /** Current net unit cost and the VAT per unit still in stock. */
 const rollForwardUnitCost = (rows, valuation_method) => {
   let stockBalance = 0;
@@ -2068,7 +2277,11 @@ const rollForwardUnitCost = (rows, valuation_method) => {
             ? totalVat / stockBalance
             : 0;
 
-      if (valuation_method === "FIFO" || valuation_method === "LIFO") {
+      if (
+        valuation_method === "FIFO" ||
+        valuation_method === "LIFO" ||
+        valuation_method === "BATCH"
+      ) {
         fifoLayers.push({ qty: qtyIn, cost: costToUse, vat: vatToUse });
       } else {
         totalCost += qtyIn * costToUse;
@@ -2078,7 +2291,7 @@ const rollForwardUnitCost = (rows, valuation_method) => {
     }
 
     if (qtyOut > 0) {
-      if (valuation_method === "FIFO") {
+      if (valuation_method === "FIFO" || valuation_method === "BATCH") {
         let remaining = qtyOut;
         while (remaining > 0 && fifoLayers.length > 0) {
           const layer = fifoLayers[0];
@@ -2123,6 +2336,17 @@ const rollForwardUnitCost = (rows, valuation_method) => {
       const layer = fifoLayers[fifoLayers.length - 1];
       unitCost = layer ? layer.cost : 0;
       vatPerUnit = layer ? layer.vat : 0;
+    } else if (valuation_method === "BATCH") {
+      let remQty = 0;
+      let remCost = 0;
+      let remVat = 0;
+      for (const layer of fifoLayers) {
+        remQty += layer.qty;
+        remCost += layer.qty * layer.cost;
+        remVat += layer.qty * (layer.vat || 0);
+      }
+      unitCost = remQty > 0 ? remCost / remQty : 0;
+      vatPerUnit = remQty > 0 ? remVat / remQty : 0;
     }
   }
 
@@ -2285,8 +2509,7 @@ exports.getWipInventory = async (req, res) => {
     const useDefaultCost =
       business?.default_valuation_source !== "system_valuation";
     const valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-    const methodKey =
-      valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod; // "FIFO", "LIFO", "WAC"
+    const methodKey = mapValuationMethodKey(valuationMethod);
 
     // 2. Live WIP balances from store_entries (not the wip_inventory view —
     // that view can lag or under-report, which blocks production with false
@@ -2559,7 +2782,7 @@ exports.executeWipAction = async (req, res) => {
       unitCost = parseFloat(product?.cost_price || 0) || 0;
     } else {
       const valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-      const methodKey = valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod;
+      const methodKey = mapValuationMethodKey(valuationMethod);
       const { calculatedCostPrice } = await exports.getCurrentUnitCost(product_id, facilityId, methodKey);
       unitCost = calculatedCostPrice || 0;
     }
@@ -2921,7 +3144,7 @@ exports.inventoryWriteOff = async (req, res) => {
       unitCost = parseFloat(product?.cost_price || 0) || 0;
     } else {
       const valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-      const methodKey = valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod;
+      const methodKey = mapValuationMethodKey(valuationMethod);
       const { calculatedCostPrice } = await exports.getCurrentUnitCost(product_id, facilityId, methodKey);
       unitCost = calculatedCostPrice || 0;
     }
@@ -3195,14 +3418,23 @@ exports.getProducedGoods = async (req, res) => {
   }
 };
 
+exports.mapValuationMethodKey = mapValuationMethodKey;
+
 exports.getCurrentUnitCost = async (
   product_id,
   facility_id,
   valuation_method = "WAC",
+  options = {},
 ) => {
   try {
     if (!product_id || !facility_id) {
       return { calculatedCostPrice: 0 };
+    }
+
+    const methodKey = mapValuationMethodKey(valuation_method);
+    const opts = options && typeof options === "object" ? options : {};
+    if (methodKey === "BATCH") {
+      return getBatchByBatchUnitCost(product_id, facility_id, opts);
     }
 
     // ===================================
@@ -3219,12 +3451,13 @@ exports.getCurrentUnitCost = async (
       {
         replacements: { product_id, facility_id },
         type: db.sequelize.QueryTypes.SELECT,
+        ...(opts.transaction ? { transaction: opts.transaction } : {}),
       },
     );
 
     if (rows.length === 0) return { calculatedCostPrice: 0, vatPerUnit: 0 };
 
-    return rollForwardUnitCost(rows, valuation_method);
+    return rollForwardUnitCost(rows, methodKey);
   } catch (error) {
     console.error("getCurrentUnitCost error:", error);
     return { calculatedCostPrice: 0 };
@@ -3236,10 +3469,20 @@ exports.getCurrentUnitCostWithMultiplier = async (
   facility_id,
   valuation_method = "WAC",
   multiplier_id = null,
+  options = {},
 ) => {
   try {
     if (!product_id || !facility_id) {
       return { calculatedCostPrice: 0 };
+    }
+
+    const methodKey = mapValuationMethodKey(valuation_method);
+    const opts = options && typeof options === "object" ? options : {};
+    if (methodKey === "BATCH") {
+      return getBatchByBatchUnitCost(product_id, facility_id, {
+        ...opts,
+        multiplierId: multiplier_id,
+      });
     }
 
     // ===================================
@@ -3271,12 +3514,13 @@ exports.getCurrentUnitCostWithMultiplier = async (
       {
         replacements,
         type: db.sequelize.QueryTypes.SELECT,
+        ...(opts.transaction ? { transaction: opts.transaction } : {}),
       },
     );
 
     if (rows.length === 0) return { calculatedCostPrice: 0, vatPerUnit: 0 };
 
-    return rollForwardUnitCost(rows, valuation_method);
+    return rollForwardUnitCost(rows, methodKey);
   } catch (error) {
     console.error("getCurrentUnitCost error:", error);
     return { calculatedCostPrice: 0 };
@@ -4298,7 +4542,7 @@ exports.getProductUnitCost = async (req, res) => {
     const useDefaultCost =
       business?.default_valuation_source !== "system_valuation";
     const valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-    const methodKey = valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod;
+    const methodKey = mapValuationMethodKey(valuationMethod);
 
     const { start: periodStart, end: periodEnd } = getValuationPeriodBounds(
       business?.valuation_date,

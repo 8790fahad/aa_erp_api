@@ -34,11 +34,20 @@ function storeZoneForItemType(itemType) {
 
 function mapValuationMethodKey(invEvM) {
   const raw = String(invEvM || "Weighted Average Cost").trim();
-  if (raw === "Weighted Average Cost" || raw.toUpperCase() === "WAC") {
+  const upper = raw.toUpperCase().replace(/[_-]+/g, " ");
+  if (raw === "Weighted Average Cost" || upper === "WAC" || upper === "AVCO") {
     return "WAC";
   }
-  if (raw.toUpperCase() === "FIFO") return "FIFO";
-  if (raw.toUpperCase() === "LIFO") return "LIFO";
+  if (upper === "FIFO") return "FIFO";
+  if (upper === "LIFO") return "LIFO";
+  if (
+    raw === "Batch by Batch" ||
+    upper === "BATCH" ||
+    upper === "BATCH BY BATCH" ||
+    upper === "SPECIFIC"
+  ) {
+    return "BATCH";
+  }
   return "WAC";
 }
 
@@ -47,6 +56,7 @@ function valuationMethodLabel(key, invEvM) {
   if (k === "WAC") return "Weighted Average Cost (WAC)";
   if (k === "FIFO") return "First In, First Out (FIFO)";
   if (k === "LIFO") return "Last In, First Out (LIFO)";
+  if (k === "BATCH") return "Batch by Batch (each purchase)";
   return String(invEvM || key || "Weighted Average Cost");
 }
 
@@ -86,7 +96,8 @@ async function batchUnitCostsFromStoreEntries(
 
   const rows = await db.sequelize.query(
     `
-      SELECT product_id, qty_in, qty_out, cost_price
+      SELECT product_id, qty_in, qty_out, cost_price, expiry_date, batch_id,
+             reference_number
       FROM store_entries
       WHERE facilityId = :facilityId
         AND product_id IN (:skus)
@@ -110,6 +121,50 @@ async function batchUnitCostsFromStoreEntries(
     const skuRows = bySku.get(sku) || [];
     if (skuRows.length === 0) {
       costs.set(sku, 0);
+      continue;
+    }
+
+    if (valuationMethod === "BATCH") {
+      const layers = [];
+      let lastPositiveCost = 0;
+      for (const row of skuRows) {
+        const qtyIn = parseFloat(row.qty_in) || 0;
+        const qtyOut = parseFloat(row.qty_out) || 0;
+        const costPrice = row.cost_price == null ? 0 : parseFloat(row.cost_price);
+        const ref =
+          String(row.reference_number || "").trim() ||
+          (row.expiry_date && String(row.expiry_date).slice(0, 10) > "2000-01-01"
+            ? String(row.expiry_date).slice(0, 10)
+            : "no-ref");
+        if (qtyIn > 0) {
+          if (costPrice > 0) lastPositiveCost = costPrice;
+          layers.push({
+            ref,
+            qty: qtyIn,
+            cost: costPrice,
+          });
+        }
+        if (qtyOut > 0) {
+          let left = qtyOut;
+          for (const layer of layers) {
+            if (left <= 0) break;
+            if (layer.qty <= 0) continue;
+            const take = Math.min(layer.qty, left);
+            layer.qty -= take;
+            left -= take;
+          }
+        }
+      }
+      let remQty = 0;
+      let remCost = 0;
+      for (const layer of layers) {
+        if (layer.qty > 0 && layer.cost > 0) {
+          remQty += layer.qty;
+          remCost += layer.qty * layer.cost;
+        }
+      }
+      const unitCost = remQty > 0 ? remCost / remQty : lastPositiveCost;
+      costs.set(sku, Number((unitCost || 0).toFixed(2)));
       continue;
     }
 
@@ -137,7 +192,11 @@ async function batchUnitCostsFromStoreEntries(
           positiveInSum += qtyIn * costToUse;
           positiveInQty += qtyIn;
         }
-        if (valuationMethod === "FIFO" || valuationMethod === "LIFO") {
+        if (
+          valuationMethod === "FIFO" ||
+          valuationMethod === "LIFO" ||
+          valuationMethod === "BATCH"
+        ) {
           fifoLayers.push({ qty: qtyIn, cost: costToUse });
         } else {
           totalCost += qtyIn * costToUse;
@@ -146,7 +205,7 @@ async function batchUnitCostsFromStoreEntries(
       }
 
       if (qtyOut > 0) {
-        if (valuationMethod === "FIFO") {
+        if (valuationMethod === "FIFO" || valuationMethod === "BATCH") {
           let remaining = qtyOut;
           while (remaining > 0 && fifoLayers.length > 0) {
             const layer = fifoLayers[0];
@@ -183,6 +242,14 @@ async function batchUnitCostsFromStoreEntries(
       } else if (valuationMethod === "LIFO") {
         unitCost =
           fifoLayers.length > 0 ? fifoLayers[fifoLayers.length - 1].cost : 0;
+      } else if (valuationMethod === "BATCH") {
+        let remQty = 0;
+        let remCost = 0;
+        for (const layer of fifoLayers) {
+          remQty += layer.qty;
+          remCost += layer.qty * layer.cost;
+        }
+        unitCost = remQty > 0 ? remCost / remQty : 0;
       }
     }
     if (unitCost <= 0 && positiveInQty > 0) {

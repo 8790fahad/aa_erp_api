@@ -1,4 +1,9 @@
 const db = require("../models");
+const {
+  resolveDefaultLoanReceivable,
+  loadPeriodLoanCredits,
+  allocateLoanCreditLines,
+} = require("../services/staffLoanDeductions");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PAYROLL ACCOUNTING — General Ledger Integration
@@ -16,7 +21,7 @@ const db = require("../models");
 //   CR  Net Pay Payable     (netPay)              — bank / wages payable
 //   CR  PAYE Tax Payable    (paye)                — PAYE liability
 //   CR  Pension Payable     (pension)             — pension liability
-//   CR  Loan Deduction      (loanRepayment)       — loan payable
+//   CR  Loan Receivable     (loanRepayment)       — staff loan receivable
 //   CR  Other Deduction     (per deduction comp.) — deduction.accountCode
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -68,17 +73,24 @@ function buildGLLine({
  * Returns count of persisted lines.
  */
 async function persistLines(lines) {
-  let count = 0;
-  for (const line of lines) {
-    if (line.dr === 0 && line.cr === 0) continue;
-    try {
-      await db.GeneralLedger.create(line);
-      count++;
-    } catch (err) {
-      console.error(`[PayrollGL] Failed to persist line (${line.account_code}):`, err.message);
+  const toInsert = (lines || []).filter((line) => line.dr !== 0 || line.cr !== 0);
+  if (!toInsert.length) return 0;
+  try {
+    await db.GeneralLedger.bulkCreate(toInsert);
+    return toInsert.length;
+  } catch (err) {
+    console.error("[PayrollGL] bulkCreate failed, falling back to per-line:", err.message);
+    let count = 0;
+    for (const line of toInsert) {
+      try {
+        await db.GeneralLedger.create(line);
+        count++;
+      } catch (lineErr) {
+        console.error(`[PayrollGL] Failed to persist line (${line.account_code}):`, lineErr.message);
+      }
     }
+    return count;
   }
-  return count;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -133,6 +145,15 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
     } catch (err) {
       /* keep default */
     }
+
+    const fallbackLoanReceivable =
+      (await resolveDefaultLoanReceivable(facilityId)) || DEFAULT_CODES.LOAN_DEDUCTION;
+    const periodLoanCredits = await loadPeriodLoanCredits({
+      employeeIds: payrolls.map((p) => p.employeeId),
+      facilityId,
+      month,
+      year,
+    });
 
     for (const p of payrolls) {
       const empId   = p.employeeId;
@@ -248,14 +269,19 @@ exports.createPayrollJournalEntries = async (payrollData, facilityId, createdBy 
         }));
       }
 
-      // 8. CR Loan Deduction Payable
-      if (parseFloat(p.loanRepayment || 0) > 0) {
+      // 8. CR Staff Loan Receivable (clears the disbursement asset)
+      const loanCreditLines = allocateLoanCreditLines(
+        periodLoanCredits[empId] || [],
+        p.loanRepayment,
+        fallbackLoanReceivable,
+      );
+      for (const loanLine of loanCreditLines) {
         lines.push(buildGLLine({
-          accountCode: DEFAULT_CODES.LOAN_DEDUCTION,
-          accountSubhead: "payable",
-          description: `Loan Repayment — ${empName} (${month}/${year})`,
+          accountCode: loanLine.accountCode,
+          accountSubhead: "loan",
+          description: `Staff Loan Deduction — ${empName} (${month}/${year})`,
           debit: 0,
-          credit: parseFloat(p.loanRepayment),
+          credit: loanLine.amount,
           facilityId, reference: empRef, transactionRef: tRef, createdBy, employeeId: empId,
           transactionDate: txDate,
         }));
@@ -413,26 +439,26 @@ exports.reversePayrollJournalEntries = async (month, year, facilityId, createdBy
       },
     });
 
-    const reversals = [];
-    for (const e of entries) {
-      const rev = await db.GeneralLedger.create({
-        transaction_date:        new Date(),
-        account_code:            e.account_code,
-        account_subhead:         e.account_subhead,
-        dr:                      parseFloat(e.cr || 0),
-        cr:                      parseFloat(e.dr || 0),
-        account_description:     `REVERSAL — ${e.account_description}`,
-        transaction_description: `REVERSAL — ${e.transaction_description}`,
-        reference_number:        e.reference_number,
-        purpose_of_payment:      "Payroll Reversal",
-        payee:                   e.payee,
-        facility_id:             e.facility_id,
-        transaction_ref:         `REV-${e.transaction_ref}`.slice(0, 100),
-        type:                    "journal_entry",
-        created_by:              String(createdBy),
-        status:                  "saved",
-      });
-      reversals.push(rev);
+    const reversals = entries.map((e) => ({
+      transaction_date:        new Date(),
+      account_code:            e.account_code,
+      account_subhead:         e.account_subhead,
+      dr:                      parseFloat(e.cr || 0),
+      cr:                      parseFloat(e.dr || 0),
+      account_description:     `REVERSAL — ${e.account_description}`,
+      transaction_description: `REVERSAL — ${e.transaction_description}`,
+      reference_number:        e.reference_number,
+      purpose_of_payment:      "Payroll Reversal",
+      payee:                   e.payee,
+      facility_id:             e.facility_id,
+      transaction_ref:         `REV-${e.transaction_ref}`.slice(0, 100),
+      type:                    "journal_entry",
+      created_by:              String(createdBy),
+      status:                  "saved",
+    }));
+
+    if (reversals.length) {
+      await db.GeneralLedger.bulkCreate(reversals);
     }
 
     return { success: true, message: `${reversals.length} reversal entries created`, entries: reversals };

@@ -9,6 +9,13 @@ const {
   notifyPayrollReadyForPayment,
   notifyPayrollPaid,
 } = require("../services/payrollMail");
+const {
+  previewEmployeeLoanDeductionsBatch,
+  applyPayrollLoanDeductions,
+  applyPayrollLoanDeductionsBatch,
+  reversePayrollLoanDeductions,
+  reversePayrollLoanDeductionsBatch,
+} = require("../services/staffLoanDeductions");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -28,14 +35,27 @@ function countWorkingDaysInMonth(year, month) {
   return count;
 }
 
-/** True when payroll period is on/after the loan's applies-from month. */
-function loanAppliesInPeriod(loan, month, year) {
-  if (!loan?.startDate) return true;
-  const start = new Date(loan.startDate);
-  if (Number.isNaN(start.getTime())) return true;
-  const startYm = start.getFullYear() * 12 + start.getMonth();
-  const periodYm = parseInt(year, 10) * 12 + (parseInt(month, 10) - 1);
-  return periodYm >= startYm;
+function idKey(id) {
+  if (id == null) return "";
+  return String(id);
+}
+
+function groupRowsByEmployeeId(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const key = idKey(row.employeeId);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  }
+  return map;
+}
+
+function matchMasterComponents(allAllowances, salaryStructureId, designation) {
+  const structureKey = idKey(salaryStructureId);
+  return (allAllowances || []).filter((comp) => {
+    if (structureKey && idKey(comp.salaryStructureId) === structureKey) return true;
+    return Boolean(comp.isRoleBased) && comp.roleName === designation;
+  });
 }
 
 // ─── runPayroll ───────────────────────────────────────────────────────────────
@@ -102,21 +122,78 @@ exports.runPayroll = async (req, res) => {
     );
 
     const payrollResults = [];
+    const periodStart = new Date(year, month - 1, 1);
+    const periodEnd = new Date(year, month, 1);
+    const employeeIds = employees.map((e) => e.id);
+    const periodMonth = parseInt(month, 10);
+    const periodYear = parseInt(year, 10);
+
+    let attendanceByEmployee = new Map();
+    let masterAllowances = [];
+    let bonusesByEmployee = new Map();
+    let existingByEmployee = new Map();
+    let loanPreviewByEmployee = new Map();
+
+    if (employeeIds.length) {
+      const [attendanceRows, allowanceRows, bonusRows, existingRows, loanPreview] =
+        await Promise.all([
+          db.attendance.findAll({
+            where: {
+              facilityId,
+              employeeId: { [Op.in]: employeeIds },
+              date: {
+                [Op.and]: [
+                  { [Op.gte]: periodStart },
+                  { [Op.lt]: periodEnd },
+                ],
+              },
+            },
+          }),
+          db.allowances.findAll({
+            where: { facilityId, status: "Active" },
+          }),
+          db.bonuses.findAll({
+            where: {
+              facilityId,
+              employeeId: { [Op.in]: employeeIds },
+              status: "approved",
+              bonusDate: {
+                [Op.and]: [
+                  { [Op.gte]: periodStart },
+                  { [Op.lt]: periodEnd },
+                ],
+              },
+            },
+          }),
+          db.payroll.findAll({
+            where: {
+              facilityId,
+              month: periodMonth,
+              year: periodYear,
+              employeeId: { [Op.in]: employeeIds },
+            },
+          }),
+          previewEmployeeLoanDeductionsBatch({
+            employeeIds,
+            facilityId,
+            month,
+            year,
+          }),
+        ]);
+
+      attendanceByEmployee = groupRowsByEmployeeId(attendanceRows);
+      masterAllowances = allowanceRows;
+      bonusesByEmployee = groupRowsByEmployeeId(bonusRows);
+      existingRows.forEach((row) => existingByEmployee.set(idKey(row.employeeId), row));
+      loanPreviewByEmployee = loanPreview;
+    }
+
+    const toCreate = [];
+    const toUpdate = [];
 
     for (const employee of employees) {
-      // ── Attendance for this month ──────────────────────────────────────
-      const attendance = await db.attendance.findAll({
-        where: {
-          employeeId: employee.id,
-          facilityId,
-          date: {
-            [Op.and]: [
-              { [Op.gte]: new Date(year, month - 1, 1) },
-              { [Op.lt]:  new Date(year, month,     1) },
-            ],
-          },
-        },
-      });
+      const empKey = idKey(employee.id);
+      const attendance = attendanceByEmployee.get(empKey) || [];
 
       const presentDays   = attendance.filter(a => a.status === "Present").length;
       const overtimeHours = parseFloat(
@@ -187,16 +264,11 @@ exports.runPayroll = async (req, res) => {
       }
 
       // 2. Master allowances table — role-based + structure-based + accountCodes
-      const masterComponents = await db.allowances.findAll({
-        where: {
-          facilityId,
-          status: "Active",
-          [Op.or]: [
-            { salaryStructureId: salaryStructure.id },
-            { roleName: employee.designation, isRoleBased: true },
-          ],
-        },
-      });
+      const masterComponents = matchMasterComponents(
+        masterAllowances,
+        salaryStructure.id,
+        employee.designation
+      );
 
       // Build a lookup map for GL (name → accountCode) that the GL writer will use
       const componentAccountMap = {};
@@ -218,19 +290,7 @@ exports.runPayroll = async (req, res) => {
       });
 
       // 3. Approved bonuses this month
-      const activeBonuses = await db.bonuses.findAll({
-        where: {
-          employeeId: employee.id,
-          facilityId,
-          status: "approved",
-          bonusDate: {
-            [Op.and]: [
-              { [Op.gte]: new Date(year, month - 1, 1) },
-              { [Op.lt]:  new Date(year, month,     1) },
-            ],
-          },
-        },
-      });
+      const activeBonuses = bonusesByEmployee.get(empKey) || [];
 
       let totalBonuses = 0;
       let totalTaxableBonuses = 0;
@@ -253,14 +313,7 @@ exports.runPayroll = async (req, res) => {
       const overtime = calculateOvertime(overtimeHours, basicSalary, salaryStructure.overtimeRate);
       const grossPay = basicSalary + totalAllowances + totalBonuses + overtime;
 
-      const existingRecord = await db.payroll.findOne({
-        where: {
-          employeeId: employee.id,
-          facilityId,
-          month: parseInt(month, 10),
-          year: parseInt(year, 10),
-        },
-      });
+      const existingRecord = existingByEmployee.get(empKey);
 
       let computedPaye = 0;
       let paye = 0;
@@ -315,35 +368,14 @@ exports.runPayroll = async (req, res) => {
       }
 
       // ── Loan Repayments (preview only on Draft — do not mutate loans) ──
-      let loanRepaymentTotal = 0;
-      const activeLoans = await db.loans.findAll({
-        where: {
-          employeeId: employee.id,
-          facilityId,
-          status: { [Op.in]: ["Approved", "Repaying"] },
-          repaymentMethod: "Salary Deduction",
-        },
-      });
-
-      for (const loan of activeLoans) {
-        if (!loanAppliesInPeriod(loan, month, year)) continue;
-        const remainingBalance =
-          parseFloat(loan.amount) +
-          parseFloat(loan.profit || 0) -
-          parseFloat(loan.amountPaid || 0);
-        if (remainingBalance > 0) {
-          const deduction = Math.min(parseFloat(loan.monthlyDeductionAmount || 0), remainingBalance);
-          if (deduction > 0) {
-            loanRepaymentTotal += deduction;
-          }
-        }
-      }
+      const loanRepaymentTotal =
+        loanPreviewByEmployee.get(empKey) ||
+        loanPreviewByEmployee.get(employee.id) ||
+        0;
 
       const totalDeductionsFinal = totalDeductionsMaster + paye + pension + loanRepaymentTotal;
       const netPay             = Math.max(0, grossPay - totalDeductionsFinal);
 
-      // ── Create or Update Payroll Record ───────────────────────────────
-      let payroll;
       const payrollDataObj = {
         basicSalary: parseFloat(basicSalary.toFixed(2)),
         allowances: parseFloat(totalAllowances.toFixed(2)),
@@ -369,29 +401,9 @@ exports.runPayroll = async (req, res) => {
         updatedBy: createdBy,
       };
 
-      if (existingRecord) {
-        if (existingRecord.status === 'Paid') {
-            console.warn(`[Payroll] Employee ${employee.employeeId} already paid — skipped update`);
-            continue;
-        }
-        payroll = await existingRecord.update(payrollDataObj);
-      } else {
-        payroll = await db.payroll.create({
-          id: uuidv4(),
-          employeeId: employee.id,
-          facilityId,
-          month: parseInt(month),
-          year: parseInt(year),
-          ...payrollDataObj,
-          createdBy,
-        });
-      }
-
-      // Convert to plain object to ensure custom properties like 'employee' are preserved in JSON response
-      const payrollJson = payroll.get({ plain: true });
-      payrollJson.employee = { 
-        firstName: employee.firstName, 
-        lastName: employee.lastName, 
+      const employeePayload = {
+        firstName: employee.firstName,
+        lastName: employee.lastName,
         employeeId: employee.employeeId,
         designation: employee.designation,
         photoUrl: employee.photoUrl,
@@ -399,7 +411,55 @@ exports.runPayroll = async (req, res) => {
         bankAccount: employee.bankAccount,
       };
 
-      payrollResults.push(payrollJson);
+      if (existingRecord) {
+        if (existingRecord.status === "Paid") {
+          console.warn(`[Payroll] Employee ${employee.employeeId} already paid — skipped update`);
+          continue;
+        }
+        toUpdate.push({ record: existingRecord, data: payrollDataObj, employee: employeePayload });
+      } else {
+        toCreate.push({
+          id: uuidv4(),
+          employeeId: employee.id,
+          facilityId,
+          month: periodMonth,
+          year: periodYear,
+          ...payrollDataObj,
+          createdBy,
+          employee: employeePayload,
+        });
+      }
+    }
+
+    const transaction = await db.sequelize.transaction();
+    try {
+      if (toCreate.length) {
+        await db.payroll.bulkCreate(
+          toCreate.map(({ employee, ...row }) => row),
+          { transaction }
+        );
+      }
+      if (toUpdate.length) {
+        await Promise.all(
+          toUpdate.map(({ record, data }) => record.update(data, { transaction }))
+        );
+      }
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
+
+    for (const row of toCreate) {
+      const { employee, ...payrollRow } = row;
+      payrollResults.push({ ...payrollRow, employee });
+    }
+    for (const { record, data, employee } of toUpdate) {
+      payrollResults.push({
+        ...record.get({ plain: true }),
+        ...data,
+        employee,
+      });
     }
 
     // ── Summary ───────────────────────────────────────────────────────────
@@ -469,6 +529,7 @@ exports.getPayrollByMonth = async (req, res) => {
             "firstName",
             "lastName",
             "designation",
+            "photoUrl",
             "bankName",
             "bankAccount",
             "bankCode",
@@ -661,6 +722,14 @@ exports.markPayrollAsPaid = async (req, res) => {
         year: parseInt(year),
         status: "Processed",
       },
+      include: [
+        {
+          model: db.employees,
+          as: "employee",
+          attributes: ["id", "employeeId", "firstName", "lastName"],
+          required: false,
+        },
+      ],
     });
 
     if (payrolls.length === 0) {
@@ -873,56 +942,27 @@ exports.updatePayrollStatus = async (req, res) => {
 
     // Apply loan deductions when confirming Draft → Processed (single record)
     if (nextStatus === "Processed" && payroll.status === "Draft") {
-      const deduction = parseFloat(payroll.loanRepayment || 0);
-      if (deduction > 0) {
-        const periodRef = `Payroll ${payroll.month}/${payroll.year}`;
-        const activeLoans = await db.loans.findAll({
-          where: {
-            employeeId: payroll.employeeId,
-            facilityId,
-            status: { [Op.in]: ["Approved", "Repaying"] },
-            repaymentMethod: "Salary Deduction",
-          },
-        });
-        let remainingToApply = deduction;
-        for (const loan of activeLoans) {
-          if (remainingToApply <= 0) break;
-          if (!loanAppliesInPeriod(loan, payroll.month, payroll.year)) continue;
-          const already = await db.loan_repayments.findOne({
-            where: { loanId: loan.id, facilityId, reference: periodRef },
-          });
-          if (already) continue;
-          const remainingBalance =
-            parseFloat(loan.amount) +
-            parseFloat(loan.profit || 0) -
-            parseFloat(loan.amountPaid || 0);
-          if (remainingBalance <= 0) continue;
-          const applyAmt = Math.min(
-            remainingToApply,
-            parseFloat(loan.monthlyDeductionAmount || remainingToApply),
-            remainingBalance,
-          );
-          if (applyAmt <= 0) continue;
-          await db.loan_repayments.create({
-            id: uuidv4(),
-            loanId: loan.id,
-            facilityId,
-            amount: applyAmt,
-            paymentMethod: "Payroll Deduction",
-            reference: periodRef,
-            createdBy: userId,
-          });
-          const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
-          loan.amountPaid = newAmountPaid;
-          loan.status =
-            newAmountPaid >=
-            parseFloat(loan.amount) + parseFloat(loan.profit || 0)
-              ? "Paid Off"
-              : "Repaying";
-          await loan.save();
-          remainingToApply -= applyAmt;
-        }
-      }
+      await applyPayrollLoanDeductions({
+        employeeId: payroll.employeeId,
+        facilityId,
+        month: payroll.month,
+        year: payroll.year,
+        deductionTotal: payroll.loanRepayment,
+        userId,
+      });
+    }
+
+    // Undo salary deductions if a processed batch is sent back or cancelled
+    if (
+      payroll.status === "Processed" &&
+      ["Draft", "Cancelled"].includes(nextStatus)
+    ) {
+      await reversePayrollLoanDeductions({
+        employeeId: payroll.employeeId,
+        facilityId,
+        month: payroll.month,
+        year: payroll.year,
+      });
     }
 
     await payroll.update({
@@ -991,61 +1031,25 @@ exports.batchUpdateStatus = async (req, res) => {
           status: "Draft",
         },
       });
-      for (const row of drafts) {
-        const deduction = parseFloat(row.loanRepayment || 0);
-        if (deduction <= 0) continue;
-        const periodRef = `Payroll ${row.month}/${row.year}`;
-        const activeLoans = await db.loans.findAll({
-          where: {
-            employeeId: row.employeeId,
-            facilityId,
-            status: { [Op.in]: ["Approved", "Repaying"] },
-            repaymentMethod: "Salary Deduction",
-          },
-        });
-        let remainingToApply = deduction;
-        for (const loan of activeLoans) {
-          if (remainingToApply <= 0) break;
-          if (!loanAppliesInPeriod(loan, row.month, row.year)) continue;
-          const already = await db.loan_repayments.findOne({
-            where: {
-              loanId: loan.id,
-              facilityId,
-              reference: periodRef,
-            },
-          });
-          if (already) continue;
-          const remainingBalance =
-            parseFloat(loan.amount) +
-            parseFloat(loan.profit || 0) -
-            parseFloat(loan.amountPaid || 0);
-          if (remainingBalance <= 0) continue;
-          const applyAmt = Math.min(
-            remainingToApply,
-            parseFloat(loan.monthlyDeductionAmount || remainingToApply),
-            remainingBalance,
-          );
-          if (applyAmt <= 0) continue;
-          await db.loan_repayments.create({
-            id: uuidv4(),
-            loanId: loan.id,
-            facilityId,
-            amount: applyAmt,
-            paymentMethod: "Payroll Deduction",
-            reference: periodRef,
-            createdBy: userId,
-          });
-          const newAmountPaid = parseFloat(loan.amountPaid || 0) + applyAmt;
-          loan.amountPaid = newAmountPaid;
-          loan.status =
-            newAmountPaid >=
-            parseFloat(loan.amount) + parseFloat(loan.profit || 0)
-              ? "Paid Off"
-              : "Repaying";
-          await loan.save();
-          remainingToApply -= applyAmt;
-        }
-      }
+      await applyPayrollLoanDeductionsBatch({
+        payrollRows: drafts,
+        facilityId,
+        userId,
+      });
+    }
+
+    if (["Draft", "Cancelled"].includes(nextStatus)) {
+      const processed = await db.payroll.findAll({
+        where: {
+          id: { [Op.in]: ids },
+          facilityId,
+          status: "Processed",
+        },
+      });
+      await reversePayrollLoanDeductionsBatch({
+        payrollRows: processed,
+        facilityId,
+      });
     }
 
     // Paid must go through markPayrollAsPaid (GL posting)

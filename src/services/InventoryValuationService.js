@@ -187,6 +187,20 @@ class InventoryValuationService {
         case "FIFO":
           valuationData = await this.calculateFIFO(productId, facilityId);
           break;
+        case "BATCH":
+        case "Batch by Batch":
+          if (batchInfo?.batchId) {
+            valuationData = await this.calculateSpecific(
+              productId,
+              facilityId,
+              batchInfo.batchId,
+            );
+            valuationData.valuation_method = "BATCH";
+          } else {
+            valuationData = await this.calculateWAC(productId, facilityId);
+            valuationData.valuation_method = "BATCH";
+          }
+          break;
         case "SPECIFIC":
           if (!batchInfo || !batchInfo.batchId) {
             throw new Error("Batch ID required for SPECIFIC valuation method");

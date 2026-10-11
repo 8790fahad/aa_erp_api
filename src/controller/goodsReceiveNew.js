@@ -113,6 +113,8 @@ async function updateInventoryValuation(
           updatedQuantity > 0 ? updatedTotalValue / updatedQuantity : 0;
         break;
 
+      case "BATCH":
+      case "Batch by Batch":
       case "SPECIFIC":
         // For specific identification, we would need lot tracking
         // This is a simplified approach

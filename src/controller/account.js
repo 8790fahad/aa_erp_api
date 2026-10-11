@@ -10165,12 +10165,17 @@ exports.updateInventoryValMethod = async (req, res) => {
     const { valuation_date } = req.body;
 
     // Validate method
-    const validMethods = ["Weighted Average Cost", "LIFO", "FIFO"];
+    const validMethods = [
+      "Weighted Average Cost",
+      "LIFO",
+      "FIFO",
+      "Batch by Batch",
+    ];
     if (!validMethods.includes(method)) {
       return res.status(400).json({
         success: false,
         message:
-          "Invalid inventory valuation method. Must be one of: Weighted Average Cost, LIFO, FIFO",
+          "Invalid inventory valuation method. Must be one of: Weighted Average Cost, LIFO, FIFO, Batch by Batch",
       });
     }
 
@@ -20415,7 +20420,7 @@ async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
         AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
         AND gl.transaction_ref IS NOT NULL
         AND gl.transaction_ref != ''
-      GROUP BY gl.transaction_ref, gl.reference_number
+      GROUP BY gl.transaction_ref
     ) prepaid
       ON prepaid.party_ref = s.supplier_number
       OR prepaid.party_ref LIKE CONCAT(s.supplier_number, '-%')
@@ -20842,24 +20847,18 @@ exports.getSupplierBalanceStatement = async (req, res) => {
               )
           ), 0)
           + COALESCE((
-            SELECT SUM(ref_net)
-            FROM (
-              SELECT GREATEST(
-                0,
-                COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
-              ) AS ref_net
-              FROM general_ledger gl
-              WHERE gl.facility_id = :facilityId
-                AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
-                AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
-                AND (
-                  gl.transaction_ref = :supplierNo
-                  OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
-                )
-                AND gl.reference_number IS NOT NULL
-                AND TRIM(gl.reference_number) <> ''
-              GROUP BY gl.reference_number
-            ) prepaid
+            SELECT GREATEST(
+              0,
+              COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+            )
+            FROM general_ledger gl
+            WHERE gl.facility_id = :facilityId
+              AND (:asAtDate IS NULL OR gl.transaction_date <= :asAtDate)
+              AND LOWER(COALESCE(gl.type, '')) IN ('payable', 'payables', 'payment')
+              AND (
+                gl.transaction_ref = :supplierNo
+                OR gl.transaction_ref LIKE CONCAT(:supplierNo, '-%')
+              )
           ), 0)
         ) AS advance
       `,

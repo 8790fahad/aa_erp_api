@@ -189,7 +189,7 @@ function isCogsSql(alias = "ac") {
 }
 
 /**
- * SELECT columns shared by the period totals and the daily trend.
+ * SELECT columns shared by the period totals and the monthly trend.
  *   turnover      sales accounts, plus sales journals posted to other accounts
  *   other_income  non-operating income (added to revenue on the dashboard)
  *   cogs          cost of sales accounts, plus cost of sales posted elsewhere
@@ -305,33 +305,55 @@ async function fetchCashInBank(sequelize, facilityId, asOfDate) {
   return parseFloat(rows[0]?.cash_balance || 0);
 }
 
-function buildDaySeries(fromDate, toDate) {
-  const start = moment(fromDate, "YYYY-MM-DD").startOf("day");
-  const end = moment(toDate, "YYYY-MM-DD").startOf("day");
-  const days = [];
+function monthTrendBounds(fromDate, toDate) {
+  const from = moment(fromDate, "YYYY-MM-DD");
+  const to = moment(toDate, "YYYY-MM-DD");
+  const start = from.isSame(to, "year")
+    ? from.clone().startOf("year")
+    : from.clone().startOf("month");
+  const end = to.clone().startOf("month");
+  return { start, end };
+}
+
+function emptyTrendPoint(date, label) {
+  return {
+    date,
+    label,
+    revenue: 0,
+    income: 0,
+    expenses: 0,
+    cogs: 0,
+    grossProfit: 0,
+    operatingExpenses: 0,
+    netProfit: 0,
+  };
+}
+
+function buildMonthSeries(fromDate, toDate) {
+  const { start, end } = monthTrendBounds(fromDate, toDate);
+  const spansYears = !start.isSame(end, "year");
+  const months = [];
   const cursor = start.clone();
-  while (cursor.isSameOrBefore(end, "day")) {
-    days.push({
-      date: cursor.format("YYYY-MM-DD"),
-      label: cursor.format("D MMM"),
-      revenue: 0,
-      income: 0,
-      expenses: 0,
-      cogs: 0,
-      grossProfit: 0,
-      operatingExpenses: 0,
-      netProfit: 0,
-    });
-    cursor.add(1, "day");
+  while (cursor.isSameOrBefore(end, "month")) {
+    months.push(
+      emptyTrendPoint(
+        cursor.format("YYYY-MM"),
+        cursor.format(spansYears ? "MMM YY" : "MMM"),
+      ),
+    );
+    cursor.add(1, "month");
   }
-  return days;
+  return months;
 }
 
 async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
+  const { start, end } = monthTrendBounds(fromDate, toDate);
+  const trendFrom = start.format("YYYY-MM-DD");
+  const trendTo = end.clone().endOf("month").format("YYYY-MM-DD");
   const rows = await sequelize.query(
     `
       SELECT
-        DATE_FORMAT(gl.transaction_date, '%Y-%m-%d') AS day_key,
+        DATE_FORMAT(gl.transaction_date, '%Y-%m') AS month_key,
         ${plColumnsSql()}
       FROM general_ledger gl
       ${COA_LEFT_JOIN}
@@ -339,23 +361,25 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
       WHERE gl.facility_id = :facilityId
         AND DATE(gl.transaction_date) BETWEEN DATE(:fromDate) AND DATE(:toDate)
         AND IFNULL(gl.type, '') != 'opening_balance'
-      GROUP BY day_key
-      ORDER BY day_key ASC
+      GROUP BY month_key
+      ORDER BY month_key ASC
     `,
     {
-      replacements: { facilityId, fromDate, toDate },
+      replacements: { facilityId, fromDate: trendFrom, toDate: trendTo },
       type: QueryTypes.SELECT,
     },
   );
 
-  const byDay = new Map(
+  const spansYears = !start.isSame(end, "year");
+  const byMonth = new Map(
     rows.map((row) => {
       const pl = computePlFigures(row);
+      const month = moment(row.month_key, "YYYY-MM");
       return [
-        row.day_key,
+        row.month_key,
         {
-          date: row.day_key,
-          label: moment(row.day_key, "YYYY-MM-DD").format("D MMM"),
+          date: row.month_key,
+          label: month.format(spansYears ? "MMM YY" : "MMM"),
           revenue: pl.revenue,
           income: pl.revenue,
           expenses: pl.expenses,
@@ -368,8 +392,8 @@ async function fetchProfitLossTrend(sequelize, facilityId, fromDate, toDate) {
     }),
   );
 
-  return buildDaySeries(fromDate, toDate).map(
-    (slot) => byDay.get(slot.date) || slot,
+  return buildMonthSeries(fromDate, toDate).map(
+    (slot) => byMonth.get(slot.date) || slot,
   );
 }
 

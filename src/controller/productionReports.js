@@ -27,6 +27,198 @@ const saleNetUnitCostSql = `(
 const skuEq = (a, b) =>
   `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 
+function isBatchValuationMethod(method) {
+  const raw = String(method || "").trim().toUpperCase().replace(/[_-]+/g, " ");
+  return raw === "BATCH" || raw === "BATCH BY BATCH" || raw === "SPECIFIC";
+}
+
+function batchRefLabel(value) {
+  const ref = String(value || "").trim();
+  return ref || "—";
+}
+
+function consumeLayerQty(layers, qtyOut, matchFn = null) {
+  let remaining = qtyOut;
+  if (matchFn) {
+    for (const layer of layers) {
+      if (remaining <= 0) break;
+      if (layer.qty <= 0 || !matchFn(layer)) continue;
+      const take = Math.min(layer.qty, remaining);
+      layer.qty -= take;
+      remaining -= take;
+    }
+  }
+  for (const layer of layers) {
+    if (remaining <= 0) break;
+    if (layer.qty <= 0) continue;
+    const take = Math.min(layer.qty, remaining);
+    layer.qty -= take;
+    remaining -= take;
+  }
+}
+
+/** Remaining stock per store + product + inbound reference_number. */
+async function buildReferenceBatchItems({
+  warehouseJoinSql,
+  productWhereSql,
+  categoryWhereSql,
+  replacements,
+}) {
+  const rows = await db.sequelize.query(
+    `
+    SELECT
+      p.id,
+      p.name AS product_name,
+      p.sku,
+      p.unit_of_measure AS unit,
+      p.category,
+      p.item_type AS status,
+      COALESCE(p.selling_price, 0) AS selling_price,
+      COALESCE(p.cost_price, 0) AS product_cost,
+      se.branchId AS branch_id,
+          COALESCE(NULLIF(TRIM(br.branch_name), ''), '') AS warehouse_name,
+      COALESCE(se.qty_in, 0) AS qty_in,
+      COALESCE(se.qty_out, 0) AS qty_out,
+      ${receiptGrossUnitCostSql} AS unit_cost,
+      se.reference_number,
+      se.expiry_date,
+      se.receive_date,
+      se.createdAt
+    FROM store_entries se
+    INNER JOIN products p
+      ON ${skuEq("se.product_id", "p.sku")}
+      AND ${skuEq("p.facility_id", "se.facilityId")}
+    LEFT JOIN branches br
+      ON br.id = se.branchId
+      AND ${skuEq("br.facilityId", "se.facilityId")}
+    WHERE se.facilityId = :facilityId
+      AND p.item_type IN ('Finished Good', 'By-Product', 'Resalable', 'Semi Finished')
+      AND (
+        (se.receive_date IS NOT NULL AND se.receive_date <= :asOfDate)
+        OR (se.receive_date IS NULL AND DATE(se.createdAt) <= :asOfDate)
+      )
+      ${warehouseJoinSql}
+      ${productWhereSql}
+      ${categoryWhereSql}
+    ORDER BY
+      se.branchId ASC,
+      p.sku ASC,
+      CASE
+        WHEN se.receive_date IS NOT NULL AND se.receive_date > '2000-01-01'
+        THEN se.receive_date
+        ELSE DATE(se.createdAt)
+      END ASC,
+      se.id ASC
+    `,
+    {
+      replacements,
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+
+  const buckets = new Map();
+  for (const row of rows) {
+    const sku = String(row.sku || "").trim();
+    const branchId = Number(row.branch_id) || 0;
+    const key = `${branchId}|${sku}`;
+    if (!buckets.has(key)) {
+      buckets.set(key, { meta: row, layers: [] });
+    }
+    const bucket = buckets.get(key);
+    const qtyIn = parseFloat(row.qty_in) || 0;
+    const qtyOut = parseFloat(row.qty_out) || 0;
+    const cost =
+      parseFloat(row.unit_cost || 0) || parseFloat(row.product_cost || 0) || 0;
+    const expiry =
+      row.expiry_date && String(row.expiry_date).slice(0, 10) > "2000-01-01"
+        ? String(row.expiry_date).slice(0, 10)
+        : null;
+
+    if (qtyIn > 0) {
+      bucket.layers.push({
+        ref: batchRefLabel(row.reference_number),
+        qty: qtyIn,
+        cost,
+        date: row.receive_date || row.createdAt,
+        expiry,
+      });
+    }
+    if (qtyOut > 0) {
+      consumeLayerQty(
+        bucket.layers,
+        qtyOut,
+        expiry ? (layer) => layer.expiry === expiry : null,
+      );
+    }
+  }
+
+  const items = [];
+  for (const bucket of buckets.values()) {
+    const m = bucket.meta;
+    const sell = parseFloat(m.selling_price) || 0;
+    const byAmount = new Map();
+    for (const layer of bucket.layers) {
+      if (layer.qty <= 0.0001) continue;
+      const cost =
+        layer.cost > 0 ? layer.cost : parseFloat(m.product_cost || 0) || 0;
+      const amountKey = Number(cost).toFixed(2);
+      if (!byAmount.has(amountKey)) {
+        byAmount.set(amountKey, {
+          qty: 0,
+          cost: Number(amountKey),
+          date: layer.date,
+          expiry: layer.expiry,
+        });
+      }
+      const agg = byAmount.get(amountKey);
+      agg.qty += layer.qty;
+      if (layer.date && (!agg.date || new Date(layer.date) > new Date(agg.date))) {
+        agg.date = layer.date;
+        agg.expiry = layer.expiry;
+      }
+    }
+    const store = String(m.warehouse_name || "").trim();
+    const branchId = Number(m.branch_id) || 0;
+    if (!store || store === "—" || branchId <= 0) continue;
+
+    for (const agg of byAmount.values()) {
+      items.push({
+        id: m.id,
+        product_name: m.product_name,
+        sku: m.sku,
+        batch_no: m.sku,
+        reference_number: null,
+        unit: m.unit,
+        category: m.category,
+        status: m.status,
+        quantity: Number(agg.qty.toFixed(4)),
+        cost_per_unit: Number(agg.cost.toFixed(2)),
+        total_value: Number((agg.qty * agg.cost).toFixed(2)),
+        selling_price: sell,
+        selling_amount: Number((agg.qty * sell).toFixed(2)),
+        branch_id: m.branch_id,
+        warehouse_name: store,
+        warehouse_location: store,
+        last_update: agg.date,
+        expiry_date: agg.expiry,
+      });
+    }
+  }
+
+  items.sort((a, b) => {
+    const store = String(a.warehouse_name || "").localeCompare(
+      String(b.warehouse_name || ""),
+    );
+    if (store) return store;
+    const prod = String(a.product_name || "").localeCompare(
+      String(b.product_name || ""),
+    );
+    if (prod) return prod;
+    return (a.cost_per_unit || 0) - (b.cost_per_unit || 0);
+  });
+  return items;
+}
+
 // Cost of Goods Manufactured (COGM) Report
 exports.getCOGMReport = async (req, res) => {
   try {
@@ -306,7 +498,7 @@ exports.getInventoryValuationReport = async (req, res) => {
       ORDER BY t.name
     `;
 
-    const rawMaterials = await db.sequelize.query(rawMaterialsQuery, {
+    let rawMaterials = await db.sequelize.query(rawMaterialsQuery, {
       replacements,
       type: db.sequelize.QueryTypes.SELECT,
     });
@@ -383,9 +575,26 @@ exports.getInventoryValuationReport = async (req, res) => {
       ORDER BY t.warehouse_name, t.product_name
     `;
 
-    const finishedGoods = await db.sequelize.query(finishedGoodsQuery, {
+    let finishedGoods = await db.sequelize.query(finishedGoodsQuery, {
       replacements,
       type: db.sequelize.QueryTypes.SELECT,
+    });
+
+    if (isBatchValuationMethod(valuationMethod)) {
+      finishedGoods = await buildReferenceBatchItems({
+        warehouseJoinSql,
+        productWhereSql,
+        categoryWhereSql,
+        replacements,
+      });
+    }
+
+    finishedGoods = finishedGoods.filter((item) => {
+      const store = String(
+        item.warehouse_name || item.warehouse_location || "",
+      ).trim();
+      const branchId = Number(item.branch_id) || 0;
+      return Boolean(store) && store !== "—" && branchId > 0;
     });
 
     // Stores with no quantity as of this date are omitted from the filter.
@@ -477,7 +686,17 @@ exports.getInventoryValuationReport = async (req, res) => {
 
 exports.getInventoryValuationCostLayers = async (req, res) => {
   try {
-    const { facilityId, asOfDate, sku, branchId, warehouseId } = req.body;
+    const {
+      facilityId,
+      asOfDate,
+      sku,
+      branchId,
+      warehouseId,
+      valuationMethod,
+      referenceNumber,
+      unitCost,
+      costPrice,
+    } = req.body;
 
     if (!facilityId || !asOfDate || !sku) {
       return res.status(400).json({
@@ -597,6 +816,180 @@ exports.getInventoryValuationCostLayers = async (req, res) => {
         ? receiptValue / receiptQty
         : parseFloat(item.list_cost || 0);
     const stockQty = parseFloat(item.stock_qty || 0);
+    const wantedRef = String(referenceNumber || "").trim();
+    const wantedCostRaw = unitCost ?? costPrice;
+    const wantedCost =
+      wantedCostRaw !== undefined &&
+      wantedCostRaw !== null &&
+      String(wantedCostRaw).trim() !== "" &&
+      Number.isFinite(Number(wantedCostRaw))
+        ? Number(wantedCostRaw).toFixed(2)
+        : "";
+    const distinctInboundCosts = new Set(
+      (byCost || []).map((row) => Number(row.cost_price || 0).toFixed(2)),
+    );
+    const useBatchLayers =
+      isBatchValuationMethod(valuationMethod) ||
+      !String(valuationMethod || "").trim() ||
+      Boolean(wantedRef) ||
+      Boolean(wantedCost) ||
+      distinctInboundCosts.size > 1;
+
+    if (useBatchLayers) {
+      const movements = await db.sequelize.query(
+        `
+        SELECT
+          se.id,
+          COALESCE(se.receive_date, DATE(se.createdAt)) AS txn_date,
+          se.type,
+          se.reference_number,
+          COALESCE(se.qty_in, 0) AS qty_in,
+          COALESCE(se.qty_out, 0) AS qty_out,
+          ${receiptGrossUnitCostSql} AS unit_cost,
+          se.cost_price,
+          se.branchId AS branch_id,
+          COALESCE(br.branch_name, se.branch_name, '') AS warehouse_name
+        FROM store_entries se
+        LEFT JOIN branches br
+          ON br.id = se.branchId
+          AND ${skuEq("br.facilityId", "se.facilityId")}
+        WHERE ${skuEq("se.product_id", ":sku")}
+          AND se.facilityId = :facilityId
+          AND ${asOfSql}
+          ${warehouseSql}
+        ORDER BY
+          se.branchId ASC,
+          COALESCE(se.receive_date, DATE(se.createdAt)) ASC,
+          se.id ASC
+        `,
+        {
+          replacements,
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+
+      const buckets = new Map();
+      for (const row of movements) {
+        const branchIdKey = Number(row.branch_id) || 0;
+        if (!buckets.has(branchIdKey)) {
+          buckets.set(branchIdKey, {
+            warehouse: row.warehouse_name,
+            layers: [],
+          });
+        }
+        const bucket = buckets.get(branchIdKey);
+        const qtyIn = parseFloat(row.qty_in) || 0;
+        const qtyOut = parseFloat(row.qty_out) || 0;
+        const cost = parseFloat(row.unit_cost || row.cost_price || 0) || 0;
+        if (qtyIn > 0) {
+          bucket.layers.push({
+            ref: batchRefLabel(row.reference_number),
+            type: row.type,
+            qty: qtyIn,
+            cost,
+            date: row.txn_date,
+            warehouse: row.warehouse_name,
+          });
+        }
+        if (qtyOut > 0) {
+          consumeLayerQty(bucket.layers, qtyOut);
+        }
+      }
+
+      const remainingByAmount = new Map();
+      for (const bucket of buckets.values()) {
+        for (const layer of bucket.layers) {
+          if (layer.qty <= 0.0001) continue;
+          const costKey = Number(layer.cost || 0).toFixed(2);
+          if (wantedCost && costKey !== wantedCost) continue;
+          if (wantedRef && layer.ref !== wantedRef) continue;
+          const warehouse = layer.warehouse || bucket.warehouse || "";
+          const key = `${warehouse}|${costKey}`;
+          if (!remainingByAmount.has(key)) {
+            remainingByAmount.set(key, {
+              type: layer.type,
+              warehouse_name: warehouse,
+              qty: 0,
+              cost_price: Number(costKey),
+              value: 0,
+              txn_date: layer.date,
+            });
+          }
+          const agg = remainingByAmount.get(key);
+          agg.qty += layer.qty;
+          agg.value += layer.qty * (layer.cost || 0);
+          if (layer.date && (!agg.txn_date || new Date(layer.date) > new Date(agg.txn_date))) {
+            agg.txn_date = layer.date;
+            agg.type = layer.type;
+          }
+        }
+      }
+
+      const remainingBatches = [...remainingByAmount.values()].map((row) => ({
+        ...row,
+        qty: Number(row.qty.toFixed(4)),
+        cost_price: Number(row.cost_price.toFixed(2)),
+        value: Number(row.value.toFixed(2)),
+      }));
+
+      const batchQty = remainingBatches.reduce((s, r) => s + r.qty, 0);
+      const batchValue = remainingBatches.reduce((s, r) => s + r.value, 0);
+      const remainingCosts = new Set(
+        remainingBatches.map((row) => Number(row.cost_price || 0).toFixed(2)),
+      );
+      const shownLayers = (layers || []).filter((row) => {
+        const costKey = Number(row.cost_price || 0).toFixed(2);
+        if (wantedCost) return costKey === wantedCost;
+        if (wantedRef) {
+          return String(row.reference_number || "").trim() === wantedRef;
+        }
+        return remainingCosts.has(costKey);
+      });
+      const shownByCost = remainingBatches.map((row) => ({
+        type: row.type,
+        warehouse_name: row.warehouse_name,
+        cost_price: row.cost_price,
+        qty: row.qty,
+        value: row.value,
+      }));
+      const shownUnitCost = wantedCost
+        ? Number(wantedCost)
+        : remainingBatches[0]?.cost_price ||
+          (batchQty > 0 ? batchValue / batchQty : 0);
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          item: {
+            id: item.id,
+            name: item.name,
+            sku: item.sku,
+            unit: item.unit,
+            itemType: item.item_type,
+            stockQty: batchQty,
+            unitCost: shownUnitCost,
+            totalValue: batchValue,
+            unit_cost: shownUnitCost,
+          },
+          layers: shownLayers,
+          byCost: shownByCost,
+          remainingBatches,
+          totals: {
+            receiptQty: batchQty,
+            receiptValue: batchValue,
+            avcoCost: shownUnitCost,
+            stockQty: batchQty,
+            totalValue: batchValue,
+          },
+          formula: {
+            method: "BATCH",
+            expression:
+              "Remaining stock is grouped by purchase amount. The same buy price stays on one line; a different buy price is shown separately.",
+            asOfDate,
+          },
+        },
+      });
+    }
 
     res.status(200).json({
       success: true,

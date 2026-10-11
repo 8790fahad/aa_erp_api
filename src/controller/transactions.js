@@ -1,6 +1,7 @@
 import {
   getCurrentUnitCost,
   getCurrentUnitCostWithMultiplier,
+  mapValuationMethodKey,
 } from "./inventory";
 
 const db = require("../models");
@@ -4451,16 +4452,36 @@ exports.createSale = async (req, res) => {
       assertGoodsCogsInventoryForItem(product, pcode, isProBono);
 
       valuationMethod = business?.inv_ev_m || "Weighted Average Cost";
-      const methodKey =
-        valuationMethod === "Weighted Average Cost" ? "WAC" : valuationMethod;
+      const methodKey = mapValuationMethodKey(valuationMethod);
 
       const allowSalesWithoutStock = business?.allow_sales_without_stock || false;
+
+      const lineBranchIdForCost =
+        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
+        saleBranchId ||
+        0;
+      const saleExpiry = await resolveSaleExpiry({
+        sku,
+        facilityId,
+        branchId: lineBranchIdForCost,
+        expiry: itm.expiry_date ?? itm.expiryDate,
+        transaction: t,
+      });
 
       const valuationResult = await getCurrentUnitCostWithMultiplier(
         sku,
         facilityId,
         methodKey,
-        itm.multiplier_id
+        itm.multiplier_id,
+        methodKey === "BATCH"
+          ? {
+              expiry: saleExpiry || itm.expiry_date || itm.expiryDate,
+              batchId: itm.batch_id || itm.batch_no || itm.batchId,
+              referenceNumber:
+                itm.reference_number || itm.referenceNumber || itm.batch_ref,
+              transaction: t,
+            }
+          : { transaction: t },
       );
 
       let unitCost = Number(valuationResult?.calculatedCostPrice) || 0;
@@ -4613,17 +4634,7 @@ exports.createSale = async (req, res) => {
         markUpValue = calculatedMarkUp > 0 ? calculatedMarkUp : 1;
       }
 
-      const lineBranchId =
-        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
-        saleBranchId ||
-        0;
-      const saleExpiry = await resolveSaleExpiry({
-        sku,
-        facilityId,
-        branchId: lineBranchId,
-        expiry: itm.expiry_date ?? itm.expiryDate,
-        transaction: t,
-      });
+      const lineBranchId = lineBranchIdForCost;
 
       await db.StoreEntry.create(
         {
@@ -7084,6 +7095,8 @@ exports.getSalesLineReport = async (req, res) => {
       productSku = "",
       page,
       pageSize,
+      includeCount,
+      all,
     } = req.query;
 
     if (!facilityId) {
@@ -7099,9 +7112,13 @@ exports.getSalesLineReport = async (req, res) => {
       });
     }
 
+    const wantAll = String(all || "") === "1";
+    const skipCount = String(includeCount || "1") === "0";
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.min(500, Math.max(1, parseInt(pageSize, 10) || 100));
-    const offset = (pageNum - 1) * limitNum;
+    const limitNum = wantAll
+      ? 15000
+      : Math.min(500, Math.max(1, parseInt(pageSize, 10) || 50));
+    const offset = wantAll ? 0 : (pageNum - 1) * limitNum;
 
     const replacements = {
       facilityId,
@@ -7126,13 +7143,13 @@ exports.getSalesLineReport = async (req, res) => {
 
     if (fromDate && String(fromDate).trim()) {
       whereParts.push(
-        "DATE(COALESCE(i.transaction_date, se.createdAt, se.receive_date)) >= :fromDate",
+        "COALESCE(i.transaction_date, se.createdAt, se.receive_date) >= :fromDate",
       );
       replacements.fromDate = String(fromDate).trim();
     }
     if (toDate && String(toDate).trim()) {
       whereParts.push(
-        "DATE(COALESCE(i.transaction_date, se.createdAt, se.receive_date)) <= :toDate",
+        "COALESCE(i.transaction_date, se.createdAt, se.receive_date) < DATE_ADD(:toDate, INTERVAL 1 DAY)",
       );
       replacements.toDate = String(toDate).trim();
     }
@@ -7171,8 +7188,8 @@ exports.getSalesLineReport = async (req, res) => {
     if (searchTerm) {
       whereParts.push(`(
         se.reference_number LIKE :search
-        OR COALESCE(c_inv.fullname, c_ce.fullname, c_gl.fullname, '') LIKE :search
-        OR COALESCE(c_inv.customerNo, ce_sales.customerNo, gl_recv.customer_no, '') LIKE :search
+        OR COALESCE(c_inv.fullname, '') LIKE :search
+        OR COALESCE(c_inv.customerNo, i.ref_number, '') LIKE :search
         OR COALESCE(p.name, se.product_id, '') LIKE :search
         OR COALESCE(p.category, '') LIKE :search
       )`);
@@ -7218,45 +7235,37 @@ exports.getSalesLineReport = async (req, res) => {
 
     const lineAmountSql = `se.qty_out * COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0)`;
 
-    const fromSql = `
-      FROM store_entries se
+    const invoiceJoinSql = `
       LEFT JOIN invoices i
         ON ${sqlEq("i.facility_id", "se.facilityId")}
        AND i.type = 'sales'
        AND ${sqlEq("i.invoice_ref", "se.reference_number")}
-      LEFT JOIN customers c_inv
-        ON ${sqlEq("c_inv.facilityId", "se.facilityId")}
-       AND ${sqlEq("c_inv.customerNo", "i.ref_number")}
-      LEFT JOIN (
-        SELECT ce.receiptNo, ce.facilityId, MIN(ce.customerNo) AS customerNo
-        FROM customer_entries ce
-        WHERE ce.type IN ('sales', 'service', 'pro-bono', 'discount', 'tax')
-          AND ce.customerNo IS NOT NULL
-          AND TRIM(ce.customerNo) != ''
-        GROUP BY ce.receiptNo, ce.facilityId
-      ) ce_sales
-        ON ${sqlEq("ce_sales.receiptNo", "se.reference_number")}
-       AND ${sqlEq("ce_sales.facilityId", "se.facilityId")}
-      LEFT JOIN customers c_ce
-        ON ${sqlEq("c_ce.facilityId", "se.facilityId")}
-       AND ${sqlEq("c_ce.customerNo", "ce_sales.customerNo")}
-      LEFT JOIN (
-        SELECT gl.reference_number,
-               gl.facility_id,
-               MAX(CASE WHEN gl.dr > 0 THEN gl.transaction_ref END) AS customer_no,
-               MAX(CASE WHEN gl.dr > 0 THEN gl.payee END) AS payee
-        FROM general_ledger gl
-        WHERE LOWER(gl.type) IN ('receivable', 'recevable')
-        GROUP BY gl.reference_number, gl.facility_id
-      ) gl_recv
-        ON ${sqlEq("gl_recv.reference_number", "se.reference_number")}
-       AND ${sqlEq("gl_recv.facility_id", "se.facilityId")}
-      LEFT JOIN customers c_gl
-        ON ${sqlEq("c_gl.facilityId", "se.facilityId")}
-       AND ${sqlEq("c_gl.customerNo", "gl_recv.customer_no")}
+    `;
+    const productJoinSql = `
       LEFT JOIN products p
         ON ${sqlEq("p.facility_id", "se.facilityId")}
        AND ${sqlEq("p.sku", "se.product_id")}
+    `;
+    const needsProductJoin = Boolean(categoryTerm || productSkuTerm || searchTerm);
+    const summaryFromSql = `
+      FROM store_entries se
+      ${invoiceJoinSql}
+      ${
+        searchTerm
+          ? `LEFT JOIN customers c_inv
+        ON ${sqlEq("c_inv.facilityId", "se.facilityId")}
+       AND ${sqlEq("c_inv.customerNo", "i.ref_number")}`
+          : ""
+      }
+      ${needsProductJoin ? productJoinSql : ""}
+    `;
+    const fromSql = `
+      FROM store_entries se
+      ${invoiceJoinSql}
+      LEFT JOIN customers c_inv
+        ON ${sqlEq("c_inv.facilityId", "se.facilityId")}
+       AND ${sqlEq("c_inv.customerNo", "i.ref_number")}
+      ${productJoinSql}
       LEFT JOIN branches b
         ON b.id = COALESCE(NULLIF(se.branchId, 0), NULLIF(i.branchId, 0))
       LEFT JOIN users u_sp
@@ -7264,99 +7273,87 @@ exports.getSalesLineReport = async (req, res) => {
           "CAST(u_sp.id AS CHAR)",
           "CAST(COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), '')) AS CHAR)",
         )}
-      LEFT JOIN (
-        SELECT
-          ce.receiptNo,
-          ce.facilityId,
-          COALESCE(SUM(ce.cost), 0) AS vat_amount
-        FROM customer_entries ce
-        WHERE LOWER(TRIM(ce.type)) = 'tax'
-        GROUP BY ce.receiptNo, ce.facilityId
-      ) inv_vat
-        ON ${sqlEq("inv_vat.receiptNo", "se.reference_number")}
-       AND ${sqlEq("inv_vat.facilityId", "se.facilityId")}
-      LEFT JOIN (
-        SELECT
-          ce.receiptNo,
-          ce.facilityId,
-          COALESCE(
-            MAX(CASE
-              WHEN NULLIF(ce.mode_of_payment, '') IS NOT NULL
-                AND LOWER(TRIM(ce.type)) IN (
-                  'sales', 'service', 'pro-bono', 'payment', 'deposit', 'bank'
-                )
-              THEN ce.mode_of_payment
-            END),
-            MAX(NULLIF(ce.mode_of_payment, ''))
-          ) AS mode_of_payment
-        FROM customer_entries ce
-        WHERE ce.receiptNo IS NOT NULL
-          AND TRIM(ce.receiptNo) != ''
-        GROUP BY ce.receiptNo, ce.facilityId
-      ) ce_mode
-        ON ${sqlEq("ce_mode.receiptNo", "se.reference_number")}
-       AND ${sqlEq("ce_mode.facilityId", "se.facilityId")}
-      LEFT JOIN (
-        SELECT
-          gl.reference_number,
-          gl.facility_id,
-          MAX(NULLIF(gl.mode_of_payment, '')) AS mode_of_payment
-        FROM general_ledger gl
-        WHERE gl.reference_number IS NOT NULL
-          AND TRIM(gl.reference_number) != ''
-        GROUP BY gl.reference_number, gl.facility_id
-      ) gl_pay
-        ON ${sqlEq("gl_pay.reference_number", "se.reference_number")}
-       AND ${sqlEq("gl_pay.facility_id", "se.facilityId")}
-      LEFT JOIN (
-        SELECT
-          se2.reference_number,
-          se2.facilityId,
-          COALESCE(SUM(
-            se2.qty_out * COALESCE(NULLIF(se2.selling_price, 0), se2.cost_price, 0)
-          ), 0) AS goods_total
-        FROM store_entries se2
-        WHERE se2.qty_out > 0
-          AND se2.reference_number IS NOT NULL
-          AND TRIM(se2.reference_number) != ''
-        GROUP BY se2.reference_number, se2.facilityId
-      ) inv_goods
-        ON ${sqlEq("inv_goods.reference_number", "se.reference_number")}
-       AND ${sqlEq("inv_goods.facilityId", "se.facilityId")}
     `;
 
-    const countRows = await db.sequelize.query(
-      `SELECT COUNT(*) AS total ${fromSql} WHERE ${whereSql}`,
-      {
-        replacements,
-        type: db.sequelize.QueryTypes.SELECT,
-      },
-    );
-    const totalCount = parseInt(countRows[0]?.total || 0, 10);
+    let totalCount = 0;
+    let periodSummary = {
+      line_count: 0,
+      invoice_count: 0,
+      qty: 0,
+      line_total: 0,
+      vat_total: 0,
+      total_incl_vat: 0,
+    };
+    if (!skipCount) {
+      const [summaryRows, vatRows] = await Promise.all([
+        db.sequelize.query(
+          `SELECT
+             COUNT(*) AS line_count,
+             COUNT(DISTINCT se.reference_number) AS invoice_count,
+             COALESCE(SUM(se.qty_out), 0) AS qty,
+             COALESCE(SUM(${lineAmountSql}), 0) AS line_total
+           ${summaryFromSql}
+           WHERE ${whereSql}`,
+          {
+            replacements,
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        ),
+        db.sequelize.query(
+          searchTerm || categoryTerm || productSkuTerm || branchIdList.length
+            ? `SELECT COALESCE(SUM(ce.cost), 0) AS vat_total
+               FROM customer_entries ce
+               INNER JOIN (
+                 SELECT DISTINCT se.reference_number AS ref
+                 ${fromSql}
+                 WHERE ${whereSql}
+               ) sales ON ${sqlEq("sales.ref", "ce.receiptNo")}
+               WHERE ${sqlCol("ce.facilityId")} = ${sqlCol(":facilityId")}
+                 AND LOWER(TRIM(ce.type)) = 'tax'`
+            : `SELECT COALESCE(SUM(ce.cost), 0) AS vat_total
+               FROM customer_entries ce
+               INNER JOIN invoices i
+                 ON ${sqlEq("i.facility_id", "ce.facilityId")}
+                AND i.type = 'sales'
+                AND ${sqlEq("i.invoice_ref", "ce.receiptNo")}
+               WHERE ${sqlCol("ce.facilityId")} = ${sqlCol(":facilityId")}
+                 AND LOWER(TRIM(ce.type)) = 'tax'
+                 ${
+                   replacements.fromDate
+                     ? "AND i.transaction_date >= :fromDate"
+                     : ""
+                 }
+                 ${
+                   replacements.toDate
+                     ? "AND i.transaction_date < DATE_ADD(:toDate, INTERVAL 1 DAY)"
+                     : ""
+                 }`,
+          {
+            replacements,
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        ),
+      ]);
+      const summary = summaryRows[0] || {};
+      const periodLineTotal = parseFloat(summary.line_total || 0) || 0;
+      const periodVatTotal = parseFloat(vatRows[0]?.vat_total || 0) || 0;
+      totalCount = parseInt(summary.line_count || 0, 10);
+      periodSummary = {
+        line_count: totalCount,
+        invoice_count: parseInt(summary.invoice_count || 0, 10),
+        qty: parseFloat(summary.qty || 0) || 0,
+        line_total: periodLineTotal,
+        vat_total: periodVatTotal,
+        total_incl_vat: periodLineTotal + periodVatTotal,
+      };
+    }
 
     const rows = await db.sequelize.query(
       `SELECT
          se.reference_number AS invoice_no,
          COALESCE(i.transaction_date, se.createdAt, se.receive_date) AS invoice_date,
-         COALESCE(
-           c_inv.fullname,
-           c_ce.fullname,
-           c_gl.fullname,
-           CASE
-             WHEN gl_recv.payee LIKE '%—%'
-               THEN TRIM(SUBSTRING_INDEX(gl_recv.payee, '—', -1))
-             WHEN gl_recv.payee IS NOT NULL AND TRIM(gl_recv.payee) != ''
-               THEN TRIM(gl_recv.payee)
-             ELSE NULL
-           END,
-           '—'
-         ) AS customer_name,
-         COALESCE(
-           c_inv.customerNo,
-           ce_sales.customerNo,
-           gl_recv.customer_no,
-           ''
-         ) AS customer_no,
+         COALESCE(c_inv.fullname, '—') AS customer_name,
+         COALESCE(c_inv.customerNo, i.ref_number, '') AS customer_no,
          COALESCE(p.name, se.product_id, '—') AS product_name,
          COALESCE(p.sku, se.product_id, '') AS product_sku,
          COALESCE(p.category, '') AS product_category,
@@ -7372,11 +7369,7 @@ exports.getSalesLineReport = async (req, res) => {
          se.qty_out AS qty,
          COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0) AS unit_price,
          ${lineAmountSql} AS line_total,
-         CASE
-           WHEN COALESCE(inv_goods.goods_total, 0) > 0.0001
-           THEN COALESCE(inv_vat.vat_amount, 0) * ((${lineAmountSql}) / inv_goods.goods_total)
-           ELSE 0
-         END AS vat_amount,
+         COALESCE(se.vat_amount, 0) AS line_vat_amount,
          COALESCE(NULLIF(se.branchId, 0), i.branchId) AS branch_id,
          COALESCE(b.branch_name, se.branch_name, '') AS branch_name,
          COALESCE(NULLIF(TRIM(se.user_id), ''), NULLIF(TRIM(se.inserted_by), ''), '') AS salesperson_id,
@@ -7386,11 +7379,6 @@ exports.getSalesLineReport = async (req, res) => {
            NULLIF(TRIM(se.inserted_by), ''),
            '—'
          ) AS salesperson_name,
-         COALESCE(
-           NULLIF(ce_mode.mode_of_payment, ''),
-           NULLIF(gl_pay.mode_of_payment, ''),
-           ''
-         ) AS mode_of_payment,
          se.id AS store_entry_id
        ${fromSql}
        WHERE ${whereSql}
@@ -7405,14 +7393,79 @@ exports.getSalesLineReport = async (req, res) => {
       },
     );
 
+    const pageRefs = [
+      ...new Set(
+        rows.map((row) => String(row.invoice_no || "").trim()).filter(Boolean),
+      ),
+    ];
+    const invoiceVat = new Map();
+    const invoiceGoods = new Map();
+    const invoiceExtra = new Map();
+    if (pageRefs.length) {
+      const [ceRows, goodsRows] = await Promise.all([
+        db.sequelize.query(
+          `SELECT
+             ce.receiptNo AS invoice_no,
+             MIN(CASE
+               WHEN ce.customerNo IS NOT NULL AND TRIM(ce.customerNo) != ''
+               THEN ce.customerNo
+             END) AS customer_no,
+             COALESCE(SUM(CASE WHEN LOWER(TRIM(ce.type)) = 'tax' THEN ce.cost ELSE 0 END), 0) AS vat_amount,
+             COALESCE(MAX(NULLIF(ce.mode_of_payment, '')), '') AS mode_of_payment
+           FROM customer_entries ce
+           WHERE ${sqlCol("ce.facilityId")} = ${sqlCol(":facilityId")}
+             AND ce.receiptNo IN (:pageRefs)
+           GROUP BY ce.receiptNo`,
+          {
+            replacements: { facilityId, pageRefs },
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        ),
+        db.sequelize.query(
+          `SELECT
+             se.reference_number AS invoice_no,
+             COALESCE(SUM(${lineAmountSql}), 0) AS goods_total
+           FROM store_entries se
+           WHERE ${sqlCol("se.facilityId")} = ${sqlCol(":facilityId")}
+             AND se.reference_number IN (:pageRefs)
+             AND se.qty_out > 0
+           GROUP BY se.reference_number`,
+          {
+            replacements: { facilityId, pageRefs },
+            type: db.sequelize.QueryTypes.SELECT,
+          },
+        ),
+      ]);
+      ceRows.forEach((row) => {
+        invoiceVat.set(String(row.invoice_no), parseFloat(row.vat_amount || 0) || 0);
+        invoiceExtra.set(String(row.invoice_no), {
+          customer_no: row.customer_no || "",
+          mode_of_payment: row.mode_of_payment || "",
+        });
+      });
+      goodsRows.forEach((row) => {
+        invoiceGoods.set(String(row.invoice_no), parseFloat(row.goods_total || 0) || 0);
+      });
+    }
+
     const results = rows.map((row) => {
+      const ref = String(row.invoice_no || "").trim();
       const lineTotal = parseFloat(row.line_total || 0) || 0;
-      const vatAmount = parseFloat(row.vat_amount || 0) || 0;
+      const extra = invoiceExtra.get(ref) || {};
+      const goodsTotal = invoiceGoods.get(ref) || 0;
+      const invoiceVatAmount = invoiceVat.get(ref) || 0;
+      const lineVat = parseFloat(row.line_vat_amount || 0) || 0;
+      const allocatedVat =
+        lineVat > 0.0001
+          ? lineVat
+          : goodsTotal > 0.0001
+            ? invoiceVatAmount * (lineTotal / goodsTotal)
+            : 0;
       return {
         invoice_no: row.invoice_no,
         invoice_date: row.invoice_date,
         customer_name: row.customer_name || "",
-        customer_no: row.customer_no || "",
+        customer_no: row.customer_no || extra.customer_no || "",
         product_name: row.product_name || "—",
         product_sku: row.product_sku || "",
         product_category: row.product_category || "",
@@ -7423,20 +7476,25 @@ exports.getSalesLineReport = async (req, res) => {
         qty: parseFloat(row.qty || 0) || 0,
         unit_price: parseFloat(row.unit_price || 0) || 0,
         line_total: lineTotal,
-        vat_amount: vatAmount,
-        vat: vatAmount,
-        total_incl_vat: lineTotal + vatAmount,
+        vat_amount: allocatedVat,
+        vat: allocatedVat,
+        total_incl_vat: lineTotal + allocatedVat,
         branch_id: row.branch_id,
         branch_name: row.branch_name || "",
         salesperson_id: row.salesperson_id || "",
         salesperson_name: row.salesperson_name || "—",
-        mode_of_payment: row.mode_of_payment || "",
+        mode_of_payment: extra.mode_of_payment || "",
         store_entry_id: row.store_entry_id,
       };
     });
 
     const lineTotalSum = results.reduce((s, r) => s + r.line_total, 0);
     const vatTotalSum = results.reduce((s, r) => s + r.vat_amount, 0);
+    if (skipCount) {
+      totalCount = wantAll || results.length < limitNum
+        ? offset + results.length
+        : offset + results.length + 1;
+    }
 
     return res.json({
       success: true,
@@ -7451,6 +7509,7 @@ exports.getSalesLineReport = async (req, res) => {
         vat_total: vatTotalSum,
         total_incl_vat: lineTotalSum + vatTotalSum,
       },
+      periodSummary,
       userId: String(userId),
       source: "store_entries",
     });
@@ -7704,6 +7763,8 @@ exports.getInputVatReport = async (req, res) => {
       search = "",
       page,
       pageSize,
+      includeCount,
+      all,
     } = req.query;
 
     if (!facilityId) {
@@ -7719,9 +7780,13 @@ exports.getInputVatReport = async (req, res) => {
       });
     }
 
+    const wantAll = String(all || "") === "1";
+    const skipCount = String(includeCount || "1") === "0";
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.min(500, Math.max(1, parseInt(pageSize, 10) || 100));
-    const offset = (pageNum - 1) * limitNum;
+    const limitNum = wantAll
+      ? 15000
+      : Math.min(500, Math.max(1, parseInt(pageSize, 10) || 100));
+    const offset = wantAll ? 0 : (pageNum - 1) * limitNum;
 
     const replacements = {
       facilityId,
@@ -7744,13 +7809,13 @@ exports.getInputVatReport = async (req, res) => {
 
     if (fromDate && String(fromDate).trim()) {
       whereParts.push(
-        "DATE(COALESCE(i.transaction_date, se.transaction_date, se.created_at)) >= :fromDate",
+        "COALESCE(i.transaction_date, se.transaction_date, se.created_at) >= :fromDate",
       );
       replacements.fromDate = String(fromDate).trim();
     }
     if (toDate && String(toDate).trim()) {
       whereParts.push(
-        "DATE(COALESCE(i.transaction_date, se.transaction_date, se.created_at)) <= :toDate",
+        "COALESCE(i.transaction_date, se.transaction_date, se.created_at) < DATE_ADD(:toDate, INTERVAL 1 DAY)",
       );
       replacements.toDate = String(toDate).trim();
     }
@@ -7769,59 +7834,78 @@ exports.getInputVatReport = async (req, res) => {
 
     const whereSql = whereParts.join(" AND ");
 
-    const fromSql = `
-      FROM supplier_entries se
+    const invoiceJoinSql = `
       LEFT JOIN invoices i
         ON ${sqlEq("i.facility_id", "se.facilityId")}
        AND ${sqlEq("i.invoice_ref", "se.receiptNo")}
        AND LOWER(TRIM(COALESCE(i.type, ''))) IN ('purchase', 'expenses')
+    `;
+    const supplierJoinSql = `
       LEFT JOIN suppliersinfo s
         ON ${sqlEq("s.facilityId", "se.facilityId")}
        AND ${sqlEq("s.supplier_number", "se.supplier_number")}
+    `;
+    const fromSql = `
+      FROM supplier_entries se
+      ${invoiceJoinSql}
+      ${supplierJoinSql}
       LEFT JOIN (
         SELECT
           receiptNo,
           facilityId,
-          COALESCE(SUM(cost), 0) AS tax_total
+          COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(type, ''))) = 'tax' THEN cost ELSE 0 END), 0) AS tax_total,
+          COALESCE(SUM(CASE
+            WHEN LOWER(TRIM(COALESCE(type, ''))) IN ('purchase', 'service') THEN
+              CASE
+                WHEN COALESCE(qty_in, 0) > 0 THEN qty_in * COALESCE(cost, 0)
+                ELSE COALESCE(cost, 0)
+              END
+            ELSE 0
+          END), 0) AS goods_total
         FROM supplier_entries
-        WHERE LOWER(TRIM(COALESCE(type, ''))) = 'tax'
+        WHERE ${sqlCol("facilityId")} = ${sqlCol(":facilityId")}
+          AND receiptNo IS NOT NULL
+          AND TRIM(receiptNo) != ''
+          ${
+            replacements.fromDate
+              ? "AND COALESCE(transaction_date, created_at) >= :fromDate"
+              : ""
+          }
+          ${
+            replacements.toDate
+              ? "AND COALESCE(transaction_date, created_at) < DATE_ADD(:toDate, INTERVAL 1 DAY)"
+              : ""
+          }
         GROUP BY receiptNo, facilityId
-      ) inv_tax
-        ON ${sqlEq("inv_tax.receiptNo", "se.receiptNo")}
-       AND ${sqlEq("inv_tax.facilityId", "se.facilityId")}
-      LEFT JOIN (
-        SELECT
-          receiptNo,
-          facilityId,
-          COALESCE(SUM(
-            CASE
-              WHEN COALESCE(qty_in, 0) > 0 THEN qty_in * COALESCE(cost, 0)
-              ELSE COALESCE(cost, 0)
-            END
-          ), 0) AS goods_total
-        FROM supplier_entries
-        WHERE LOWER(TRIM(COALESCE(type, ''))) IN ('purchase', 'service')
-        GROUP BY receiptNo, facilityId
-      ) inv_goods
-        ON ${sqlEq("inv_goods.receiptNo", "se.receiptNo")}
-       AND ${sqlEq("inv_goods.facilityId", "se.facilityId")}
+      ) inv_agg
+        ON ${sqlEq("inv_agg.receiptNo", "se.receiptNo")}
+       AND ${sqlEq("inv_agg.facilityId", "se.facilityId")}
     `;
 
     const vatSql = `CASE
       WHEN COALESCE(se.vat_amount, 0) > 0.0001 THEN COALESCE(se.vat_amount, 0)
-      WHEN COALESCE(inv_goods.goods_total, 0) > 0.0001
-        THEN COALESCE(inv_tax.tax_total, 0) * ((${lineTotalSql}) / inv_goods.goods_total)
+      WHEN COALESCE(inv_agg.goods_total, 0) > 0.0001
+        THEN COALESCE(inv_agg.tax_total, 0) * ((${lineTotalSql}) / inv_agg.goods_total)
       ELSE 0
     END`;
 
-    const countRows = await db.sequelize.query(
-      `SELECT COUNT(*) AS total ${fromSql} WHERE ${whereSql}`,
-      {
-        replacements,
-        type: db.sequelize.QueryTypes.SELECT,
-      },
-    );
-    const totalCount = parseInt(countRows[0]?.total || 0, 10);
+    const countFromSql = `
+      FROM supplier_entries se
+      ${invoiceJoinSql}
+      ${searchTerm ? supplierJoinSql : ""}
+    `;
+
+    let totalCount = 0;
+    if (!skipCount) {
+      const countRows = await db.sequelize.query(
+        `SELECT COUNT(*) AS total ${countFromSql} WHERE ${whereSql}`,
+        {
+          replacements,
+          type: db.sequelize.QueryTypes.SELECT,
+        },
+      );
+      totalCount = parseInt(countRows[0]?.total || 0, 10);
+    }
 
     const rows = await db.sequelize.query(
       `SELECT
@@ -7877,6 +7961,12 @@ exports.getInputVatReport = async (req, res) => {
 
     const lineTotalSum = results.reduce((s, r) => s + r.line_total, 0);
     const vatSum = results.reduce((s, r) => s + r.vat_amount, 0);
+    if (skipCount) {
+      totalCount =
+        wantAll || results.length < limitNum
+          ? offset + results.length
+          : offset + results.length + 1;
+    }
 
     return res.json({
       success: true,
