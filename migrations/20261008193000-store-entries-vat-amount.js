@@ -1,5 +1,9 @@
 "use strict";
 
+/** Mixed dump collations break JOIN '=' on the VPS. */
+const eq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 /** Store the VAT on each stock receipt line, next to cost_price. */
 module.exports = {
   async up(queryInterface, Sequelize) {
@@ -17,10 +21,10 @@ module.exports = {
     await queryInterface.sequelize.query(`
       UPDATE store_entries se
       INNER JOIN supplier_entries p
-        ON p.receiptNo = se.reference_number
-       AND p.facilityId = se.facilityId
-       AND p.type = 'purchase'
-       AND p.link_id = se.product_id
+        ON ${eq("p.receiptNo", "se.reference_number")}
+       AND ${eq("p.facilityId", "se.facilityId")}
+       AND ${eq("p.type", "'purchase'")}
+       AND ${eq("p.link_id", "se.product_id")}
       SET se.vat_amount = p.vat_amount
       WHERE p.vat_amount > 0
         AND (se.vat_amount IS NULL OR se.vat_amount = 0)

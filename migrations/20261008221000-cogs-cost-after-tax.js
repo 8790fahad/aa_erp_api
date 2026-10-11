@@ -1,5 +1,8 @@
 "use strict";
 
+const eq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 /**
  * Move the 7.5% VAT out of cost of sales for Taxable products.
  * Each cost-of-sales debit is reduced to the cost after tax, and the
@@ -14,7 +17,7 @@ module.exports = {
       SELECT gl.transaction_id
       FROM general_ledger gl
       INNER JOIN products p
-        ON p.facility_id = gl.facility_id
+        ON ${eq("p.facility_id", "gl.facility_id")}
        AND p.taxable = 'Taxable'
        AND gl.transaction_description LIKE CONCAT('COGS [', p.sku, '] %')
       WHERE gl.dr > 0
@@ -32,7 +35,7 @@ module.exports = {
       SELECT gl.facility_id
       FROM general_ledger gl
       INNER JOIN products p
-        ON p.facility_id = gl.facility_id
+        ON ${eq("p.facility_id", "gl.facility_id")}
        AND p.taxable = 'Taxable'
        AND gl.transaction_description LIKE CONCAT('COGS [', p.sku, '] %')
       WHERE gl.dr > 0
@@ -40,9 +43,9 @@ module.exports = {
           SELECT 1
           FROM taxes t
           INNER JOIN account_category ac
-            ON ac.facility_id = t.facilityId
-           AND ac.code = t.account_sub_head
-          WHERE t.facilityId = gl.facility_id
+            ON ${eq("ac.facility_id", "t.facilityId")}
+           AND ${eq("ac.code", "t.account_sub_head")}
+          WHERE ${eq("t.facilityId", "gl.facility_id")}
             AND t.tax_category = 'Purchase'
             AND t.inclusive_type = 'inclusive'
             AND t.description LIKE 'Input VAT%'
@@ -50,7 +53,7 @@ module.exports = {
         AND NOT EXISTS (
           SELECT 1
           FROM general_ledger done
-          WHERE done.facility_id = gl.facility_id
+          WHERE ${eq("done.facility_id", "gl.facility_id")}
             AND done.transaction_ref = CONCAT('COGS-VAT-', gl.transaction_id)
         )
       LIMIT 1
@@ -112,7 +115,7 @@ module.exports = {
           gl.user_id
         FROM general_ledger gl
         INNER JOIN products p
-          ON p.facility_id = gl.facility_id
+          ON ${eq("p.facility_id", "gl.facility_id")}
          AND p.taxable = 'Taxable'
          AND gl.transaction_description LIKE CONCAT('COGS [', p.sku, '] %')
         INNER JOIN (
@@ -123,19 +126,19 @@ module.exports = {
             MIN(ac.description) AS description
           FROM taxes t
           INNER JOIN account_category ac
-            ON ac.facility_id = t.facilityId
-           AND ac.code = t.account_sub_head
+            ON ${eq("ac.facility_id", "t.facilityId")}
+           AND ${eq("ac.code", "t.account_sub_head")}
           WHERE t.tax_category = 'Purchase'
             AND t.inclusive_type = 'inclusive'
             AND t.description LIKE 'Input VAT%'
           GROUP BY t.facilityId
-        ) vat ON vat.facilityId = gl.facility_id
+        ) vat ON ${eq("vat.facilityId", "gl.facility_id")}
         WHERE gl.dr > 0
           AND ROUND(gl.dr - (gl.dr / 1.075), 2) > 0
           AND NOT EXISTS (
             SELECT 1
             FROM general_ledger done
-            WHERE done.facility_id = gl.facility_id
+            WHERE ${eq("done.facility_id", "gl.facility_id")}
               AND done.transaction_ref = CONCAT('COGS-VAT-', gl.transaction_id)
           )
         `,
@@ -146,11 +149,11 @@ module.exports = {
         `
         UPDATE general_ledger gl
         INNER JOIN products p
-          ON p.facility_id = gl.facility_id
+          ON ${eq("p.facility_id", "gl.facility_id")}
          AND p.taxable = 'Taxable'
          AND gl.transaction_description LIKE CONCAT('COGS [', p.sku, '] %')
         INNER JOIN general_ledger done
-          ON done.facility_id = gl.facility_id
+          ON ${eq("done.facility_id", "gl.facility_id")}
          AND done.transaction_ref = CONCAT('COGS-VAT-', gl.transaction_id)
          AND done.transaction_description = CONCAT('Input VAT removed from ', gl.transaction_description)
         SET gl.dr = ROUND(gl.dr - done.dr, 2)
@@ -175,7 +178,7 @@ module.exports = {
         `
         UPDATE general_ledger gl
         INNER JOIN general_ledger done
-          ON done.facility_id = gl.facility_id
+          ON ${eq("done.facility_id", "gl.facility_id")}
          AND done.transaction_ref = CONCAT('COGS-VAT-', gl.transaction_id)
          AND done.transaction_description = CONCAT('Input VAT removed from ', gl.transaction_description)
         SET gl.dr = ROUND(gl.dr + done.dr, 2)

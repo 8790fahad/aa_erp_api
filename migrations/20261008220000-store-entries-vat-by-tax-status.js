@@ -1,5 +1,9 @@
 "use strict";
 
+/** Mixed dump collations break JOIN '=' on the VPS. */
+const eq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 /**
  * Fill store_entries.vat_amount from the product VAT status.
  * Taxable lines treat cost_price as including 7.5% VAT.
@@ -22,8 +26,8 @@ module.exports = {
     await queryInterface.sequelize.query(`
       UPDATE store_entries se
       INNER JOIN products p
-        ON p.sku = se.product_id
-       AND p.facility_id = se.facilityId
+        ON ${eq("p.sku", "se.product_id")}
+       AND ${eq("p.facility_id", "se.facilityId")}
       SET se.vat_amount = ROUND(
         (CASE WHEN se.qty_in > 0 THEN se.qty_in ELSE se.qty_out END)
         * se.cost_price * 7.5 / 107.5
@@ -41,8 +45,8 @@ module.exports = {
     await queryInterface.sequelize.query(`
       UPDATE store_entries se
       INNER JOIN products p
-        ON p.sku = se.product_id
-       AND p.facility_id = se.facilityId
+        ON ${eq("p.sku", "se.product_id")}
+       AND ${eq("p.facility_id", "se.facilityId")}
       SET se.vat_amount = 0
       WHERE p.taxable = 'Taxable'
         AND se.vat_amount = ROUND(
