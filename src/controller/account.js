@@ -584,7 +584,6 @@ exports.completeProduction = async (req, res) => {
          WHERE se.product_id = :sku
            AND se.facilityId = :facilityId
            AND se.branch_name = 'Work in Progress'
-           AND (se.expiry_date IS NULL OR se.expiry_date >= CURDATE())
            AND COALESCE(p.status, 'Active') = 'Active'`,
         {
           replacements: { sku, facilityId: facility_id },

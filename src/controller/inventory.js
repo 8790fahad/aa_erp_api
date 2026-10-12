@@ -2540,7 +2540,6 @@ exports.getWipInventory = async (req, res) => {
         AND p.facility_id = se.facilityId
       WHERE se.facilityId = :facilityId
         AND se.branch_name = 'Work in Progress'
-        AND (se.expiry_date IS NULL OR se.expiry_date >= CURDATE())
         AND COALESCE(p.status, 'Active') = 'Active'
       GROUP BY
         se.facilityId,
