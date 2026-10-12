@@ -30,6 +30,10 @@ module.exports = (app) => {
     saleWorkflow.markFulfillmentPrinted,
   );
   app.post(
+    "/api/v1/sale-workflows/record-print",
+    saleWorkflow.recordDocumentPrint,
+  );
+  app.post(
     "/api/v1/sale-workflows/complete-separation",
     saleWorkflow.completeSeparation,
   );

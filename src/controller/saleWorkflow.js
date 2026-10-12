@@ -5252,6 +5252,73 @@ async function userCanReprintGoodsIssue(facilityId, userId) {
   }
 }
 
+exports.recordDocumentPrint = async (req, res) => {
+  try {
+    const { facilityId, saleCode, document, updated_by } = req.body || {};
+    const code = String(saleCode || "").trim();
+    const doc =
+      String(document || "invoice").trim().toLowerCase() === "goods_issue"
+        ? "goods_issue"
+        : "invoice";
+    if (!facilityId || !code) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and saleCode are required",
+      });
+    }
+    if (!db.SaleWorkflow) {
+      return res.status(500).json({
+        success: false,
+        message: "SaleWorkflow model not loaded",
+      });
+    }
+    const row = await db.SaleWorkflow.findOne({
+      where: { facility_id: facilityId, sale_code: code },
+    });
+    if (!row) {
+      return res.status(404).json({
+        success: false,
+        message: "Workflow not found",
+      });
+    }
+    const prior = normalizeHistory(row.history).filter(
+      (entry) => entry?.print_document === doc,
+    ).length;
+    const nextCount = prior + 1;
+    row.history = pushHistory(
+      row.history,
+      row.status,
+      updated_by || req.user?.id,
+      doc === "goods_issue"
+        ? `Goods issue note printed (${nextCount})`
+        : `Sales invoice printed (${nextCount})`,
+      { print_document: doc, print_count: nextCount },
+    );
+    row.updated_by = updated_by || row.updated_by;
+    await row.save();
+    const saved = normalizeHistory(row.history);
+    const invoicePrintCount = saved.filter(
+      (entry) => entry?.print_document === "invoice",
+    ).length;
+    const goodsIssuePrintCount = saved.filter(
+      (entry) => entry?.print_document === "goods_issue",
+    ).length;
+    return res.json({
+      success: true,
+      invoice_printed: invoicePrintCount > 0,
+      goods_issue_printed: goodsIssuePrintCount > 0,
+      invoice_print_count: invoicePrintCount,
+      goods_issue_print_count: goodsIssuePrintCount,
+    });
+  } catch (err) {
+    console.error("recordDocumentPrint:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to record print",
+    });
+  }
+};
+
 exports.markFulfillmentPrinted = async (req, res) => {
   try {
     const { facilityId, packCode, id, updated_by } = req.body || {};

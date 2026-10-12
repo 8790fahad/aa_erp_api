@@ -23,25 +23,8 @@ const sqlEq = (a, b) =>
 const sqlCol = (expr) =>
   `CONVERT(${expr} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 
-/**
- * Ready-for-sales stock is grouped by expiry. Outs must hit a lot that still
- * has positive balance (FEFO), otherwise Goods Balance and Create Invoice Avail diverge.
- */
-async function resolveSaleExpiry({
-  sku,
-  facilityId,
-  branchId,
-  expiry,
-  transaction,
-}) {
-  return resolveStockOutExpiry({
-    db,
-    sku,
-    facilityId,
-    branchId,
-    preferredExpiry: expiry,
-    transaction,
-  });
+async function resolveSaleExpiry() {
+  return resolveStockOutExpiry();
 }
 
 /**
@@ -2223,6 +2206,23 @@ exports.getSaleByCode = async (req, res) => {
       created_by: baseEntry?.created_by,
     };
 
+    let invoicePrintCount = workflowHistory.filter(
+      (entry) => entry?.print_document === "invoice",
+    ).length;
+    let goodsIssuePrintCount = workflowHistory.filter(
+      (entry) => entry?.print_document === "goods_issue",
+    ).length;
+    if (goodsIssuePrintCount === 0 && db.SaleFulfillment) {
+      const printedPacks = await db.SaleFulfillment.count({
+        where: {
+          facility_id: facilityId,
+          sale_code: saleCode,
+          printed_at: { [Op.ne]: null },
+        },
+      });
+      if (printedPacks > 0) goodsIssuePrintCount = printedPacks;
+    }
+
     return res.json({
       success: true,
       data: {
@@ -2248,6 +2248,10 @@ exports.getSaleByCode = async (req, res) => {
         mode_of_payment: modeOfPayment,
         payment_modes: selectedModes,
         workflow_status: workflowStatus,
+        invoice_print_count: invoicePrintCount,
+        goods_issue_print_count: goodsIssuePrintCount,
+        invoice_printed: invoicePrintCount > 0,
+        goods_issue_printed: goodsIssuePrintCount > 0,
         amount_paid: amountPaid,
         cash_paid: cashPaid,
         transfer_paid: transferPaid,
