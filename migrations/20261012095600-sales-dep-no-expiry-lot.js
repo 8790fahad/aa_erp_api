@@ -10,6 +10,11 @@ module.exports = {
     const dialect = queryInterface.sequelize.getDialect();
     if (dialect !== "mysql" && dialect !== "mariadb") return;
 
+    const eq = (a, b) =>
+      `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+    const col = (expr) =>
+      `CONVERT(${expr} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
     await queryInterface.sequelize.query(`
       CREATE OR REPLACE VIEW \`sales_dep\` AS
       WITH latest_prices AS (
@@ -33,8 +38,8 @@ module.exports = {
         CONCAT(p.category, ' (', p.unit_of_measure, ')') AS uom_category,
         p.unit_of_measure AS uom,
         p.taxable AS taxable,
-        COALESCE(se.product_id, p.sku) AS product_id,
-        COALESCE(se.facilityId, p.facility_id) AS facilityId,
+        COALESCE(${col("se.product_id")}, ${col("p.sku")}) AS product_id,
+        COALESCE(${col("se.facilityId")}, ${col("p.facility_id")}) AS facilityId,
         COALESCE(p.selling_price, lp.selling_price, 0) AS selling_price,
         CAST(NULL AS DATE) AS expiry_date,
         COALESCE(pm.multiplier_type) AS multiplier_type,
@@ -45,21 +50,21 @@ module.exports = {
         se.branchId AS branchId
       FROM products p
       LEFT JOIN store_entries se
-        ON se.product_id = p.sku
-        AND se.facilityId = p.facility_id
+        ON ${eq("se.product_id", "p.sku")}
+        AND ${eq("se.facilityId", "p.facility_id")}
         AND LOWER(TRIM(se.branch_name)) IN (
           'for sales', 'for sale', 'resalable', 'finished good'
         )
       LEFT JOIN product_multipliers pm ON se.multiplier_id = pm.id
       LEFT JOIN latest_prices lp
-        ON lp.product_id = p.sku
-        AND lp.facilityId = p.facility_id
+        ON ${eq("lp.product_id", "p.sku")}
+        AND ${eq("lp.facilityId", "p.facility_id")}
         AND lp.branchId <=> se.branchId
         AND lp.rn = 1
       WHERE p.status = 'Active'
       GROUP BY
         p.sku,
-        se.product_id,
+        ${col("se.product_id")},
         se.multiplier_id,
         p.name,
         p.category,
@@ -67,7 +72,7 @@ module.exports = {
         p.taxable,
         p.facility_id,
         p.selling_price,
-        se.facilityId,
+        ${col("se.facilityId")},
         se.branchId,
         lp.selling_price,
         pm.multiplier_type
