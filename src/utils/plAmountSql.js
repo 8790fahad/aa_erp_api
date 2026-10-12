@@ -49,18 +49,25 @@ function cogsLineSql(isCogsAccountSql, gl = "gl") {
   END`;
 }
 
-/** Drop stock and misposted cost-of-sales journals from an account's own P&L balance. */
-function plAccountAmountSql(gl = "gl", ac = "ac") {
-  const keep = `NOT (
+/** Journals that belong on an account's own P&L balance. */
+function plAccountKeepSql(gl = "gl", ac = "ac") {
+  return `NOT (
     ${stockMovementSql(gl)}
     OR (
       ${cogsJournalSql(gl)}
       AND UPPER(IFNULL(${ac}.account_nature, '')) = 'REVENUE'
     )
   )`;
+}
+
+/** Drop stock and misposted cost-of-sales journals from an account's own P&L balance. */
+function plAccountAmountSql(gl = "gl", ac = "ac") {
+  const keep = plAccountKeepSql(gl, ac);
   return {
     crNet: `COALESCE(SUM(CASE WHEN ${keep} THEN ${gl}.cr - ${gl}.dr ELSE 0 END), 0)`,
     drNet: `COALESCE(SUM(CASE WHEN ${keep} THEN ${gl}.dr - ${gl}.cr ELSE 0 END), 0)`,
+    totalDr: `COALESCE(SUM(CASE WHEN ${keep} THEN ${gl}.dr ELSE 0 END), 0)`,
+    totalCr: `COALESCE(SUM(CASE WHEN ${keep} THEN ${gl}.cr ELSE 0 END), 0)`,
   };
 }
 
@@ -84,6 +91,7 @@ module.exports = {
   revenueLineSql,
   expenseLineSql,
   cogsLineSql,
+  plAccountKeepSql,
   plAccountAmountSql,
   misplacedPlSql,
 };

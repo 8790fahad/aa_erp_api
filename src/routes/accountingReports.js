@@ -6,6 +6,10 @@ module.exports = (app) => {
   // Financial Statements - IFRS Compliant
   app.post("/accounting/trial-balance", accountingReports.getTrialBalance);
   app.post(
+    "/accounting/trial-balance-note",
+    accountingReports.getTrialBalanceNote
+  );
+  app.post(
     "/accounting/income-statement",
     accountingReports.getIncomeStatement
   );

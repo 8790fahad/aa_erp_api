@@ -9,6 +9,7 @@ const {
   revenueLineSql,
   expenseLineSql,
   plAccountAmountSql,
+  plAccountKeepSql,
   misplacedPlSql,
 } = require("../utils/plAmountSql");
 
@@ -1153,6 +1154,145 @@ exports.getTrialBalance = async (req, res) => {
   }
 };
 
+exports.getTrialBalanceNote = async (req, res) => {
+  try {
+    const { facilityId, asOfDate, accountCode } = req.body;
+    const code = String(accountCode || "").trim();
+
+    if (!facilityId) {
+      return res.status(400).json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+    if (!asOfDate) {
+      return res.status(400).json({
+        success: false,
+        message: "asOfDate is required",
+      });
+    }
+    if (!code) {
+      return res.status(400).json({
+        success: false,
+        message: "accountCode is required",
+      });
+    }
+
+    const chartRows = await db.sequelize.query(
+      `SELECT code, parent_code, description, account_nature
+       FROM account_category
+       WHERE facility_id = :facilityId
+         AND is_active = 1`,
+      { replacements: { facilityId }, type: QueryTypes.SELECT },
+    );
+
+    const byCode = new Map();
+    const childrenByParent = new Map();
+    for (const row of chartRows) {
+      const rowCode = String(row.code || "").trim();
+      if (!rowCode) continue;
+      byCode.set(rowCode, row);
+      const parent = String(row.parent_code || "").trim();
+      if (!parent || parent === "0" || parent === rowCode) continue;
+      if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+      childrenByParent.get(parent).push(rowCode);
+    }
+
+    const accountCodes = new Set([code]);
+    const queue = [code];
+    while (queue.length) {
+      const current = queue.shift();
+      for (const child of childrenByParent.get(current) || []) {
+        if (accountCodes.has(child)) continue;
+        accountCodes.add(child);
+        queue.push(child);
+      }
+    }
+    const accountCodesList = Array.from(accountCodes);
+    const selected = byCode.get(code);
+    const accountName = selected?.description || `Account ${code}`;
+
+    const entries = await db.sequelize.query(
+      `SELECT
+         DATE(gl.transaction_date) AS transaction_date,
+         gl.account_code,
+         COALESCE(ac.description, gl.account_description, gl.account_code) AS account_name,
+         COALESCE(
+           NULLIF(TRIM(gl.transaction_ref), ''),
+           NULLIF(TRIM(gl.reference_number), ''),
+           '—'
+         ) AS ref,
+         COALESCE(
+           NULLIF(TRIM(gl.transaction_description), ''),
+           NULLIF(TRIM(gl.purpose_of_payment), ''),
+           '—'
+         ) AS description,
+         COALESCE(gl.dr, 0) AS dr,
+         COALESCE(gl.cr, 0) AS cr,
+         gl.type,
+         gl.status
+       FROM general_ledger gl
+       LEFT JOIN account_category ac
+         ON ac.code = gl.account_code
+        AND ac.facility_id = gl.facility_id
+       WHERE gl.facility_id = :facilityId
+         AND gl.account_code IN (:accountCodes)
+         AND gl.transaction_date <= :asOfDate
+       ORDER BY gl.transaction_date ASC, gl.account_code ASC, gl.transaction_id ASC`,
+      {
+        replacements: { facilityId, asOfDate, accountCodes: accountCodesList },
+        type: QueryTypes.SELECT,
+      },
+    );
+
+    const mapped = entries.map((row) => {
+      const debit = parseFloat(row.dr) || 0;
+      const credit = parseFloat(row.cr) || 0;
+      return {
+        date: row.transaction_date,
+        accountCode: row.account_code,
+        accountName: row.account_name,
+        ref: row.ref,
+        description: row.description,
+        type: row.type || null,
+        status: row.status || null,
+        debit: Number(debit.toFixed(2)),
+        credit: Number(credit.toFixed(2)),
+      };
+    });
+
+    const totalDebit = mapped.reduce((s, e) => s + e.debit, 0);
+    const totalCredit = mapped.reduce((s, e) => s + e.credit, 0);
+    const net = totalDebit - totalCredit;
+    const fromDate = mapped.length > 0 ? mapped[0].date : asOfDate;
+
+    return res.json({
+      success: true,
+      data: {
+        accountCode: code,
+        accountName,
+        isHeader: accountCodesList.length > 1,
+        accountCodes: accountCodesList,
+        asOfDate,
+        period: { from: fromDate, to: asOfDate },
+        entries: mapped,
+        totals: {
+          totalDebit: Number(totalDebit.toFixed(2)),
+          totalCredit: Number(totalCredit.toFixed(2)),
+          net: Number(net.toFixed(2)),
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Trial Balance Note Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error loading trial balance note",
+      error: error.message,
+    });
+  }
+};
+
 // Income Statement (Profit and Loss Account)
 /**
  * INCOME STATEMENT CONTROLLER
@@ -1766,7 +1906,9 @@ exports.getIncomeStatement = async (req, res) => {
          ac.account_nature,
          ac.pl_line,
          ${plAmount.crNet}                   AS cr_net,
-         ${plAmount.drNet}                   AS dr_net
+         ${plAmount.drNet}                   AS dr_net,
+         ${plAmount.totalDr}                 AS total_dr,
+         ${plAmount.totalCr}                 AS total_cr
        FROM account_category ac
        LEFT JOIN general_ledger gl
          ON  gl.account_code     = ac.code
@@ -1842,7 +1984,13 @@ exports.getIncomeStatement = async (req, res) => {
 
       if (amount === 0) continue;
 
-      grp.items.push({ accountCode: item.account_code, name: item.account_name, amount });
+      grp.items.push({
+        accountCode: item.account_code,
+        name: item.account_name,
+        amount,
+        debit: r(parseFloat(item.total_dr)),
+        credit: r(parseFloat(item.total_cr)),
+      });
       grp.total += amount;
     }
 
@@ -1987,6 +2135,29 @@ exports.getIncomeStatement = async (req, res) => {
     } = epsPackage;
 
     // ── 10. Build and return response ────────────────────────────────────────
+    const notes = buildNotes(IS_ORDER);
+    const noteAccountCodes = [
+      ...new Set(
+        notes.flatMap((n) =>
+          n.items.map((i) => i.accountCode).filter((code) => code),
+        ),
+      ),
+    ];
+    const glEntries = await fetchIncomeStatementGlEntries(
+      facilityId,
+      startDate,
+      endDate,
+      noteAccountCodes,
+    );
+    for (const note of notes) {
+      const codes = new Set(
+        note.items.map((i) => i.accountCode).filter((code) => code),
+      );
+      note.entries = glEntries.filter((e) => codes.has(e.accountCode));
+      note.totalDebit = r(note.entries.reduce((s, e) => s + e.debit, 0));
+      note.totalCredit = r(note.entries.reduce((s, e) => s + e.credit, 0));
+    }
+
     return res.json({
       success: true,
       data: {
@@ -2088,7 +2259,7 @@ exports.getIncomeStatement = async (req, res) => {
         // ── Notes to the Accounts ─────────────────────────────────────────
         // One entry per note group with activity.
         // Frontend renders these as expandable panels keyed by noteRef.
-        notes: buildNotes(IS_ORDER),
+        notes,
 
       },
     });
@@ -2106,6 +2277,59 @@ exports.getIncomeStatement = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** GL journal lines for income-statement note accounts, dated, with Dr/Cr. */
+async function fetchIncomeStatementGlEntries(
+  facilityId,
+  startDate,
+  endDate,
+  accountCodes,
+) {
+  if (!accountCodes?.length) return [];
+
+  const keep = plAccountKeepSql("gl", "ac");
+  const rows = await db.sequelize.query(
+    `SELECT
+       DATE(gl.transaction_date) AS transaction_date,
+       gl.account_code,
+       ac.description AS account_name,
+       COALESCE(
+         NULLIF(TRIM(gl.transaction_ref), ''),
+         NULLIF(TRIM(gl.reference_number), ''),
+         '—'
+       ) AS ref,
+       COALESCE(NULLIF(TRIM(gl.transaction_description), ''), '—') AS description,
+       COALESCE(gl.dr, 0) AS dr,
+       COALESCE(gl.cr, 0) AS cr
+     FROM general_ledger gl
+     INNER JOIN account_category ac
+       ON ac.code = gl.account_code AND ac.facility_id = gl.facility_id
+     WHERE gl.facility_id = :facilityId
+       AND gl.account_code IN (:accountCodes)
+       AND gl.transaction_date BETWEEN :startDate AND :endDate
+       AND IFNULL(gl.type, '') != 'opening_balance'
+       AND ${keep}
+     ORDER BY gl.transaction_date ASC, gl.account_code ASC, gl.transaction_id ASC`,
+    {
+      replacements: { facilityId, startDate, endDate, accountCodes },
+      type: QueryTypes.SELECT,
+    },
+  );
+
+  return rows.map((row) => {
+    const dr = parseFloat(row.dr) || 0;
+    const cr = parseFloat(row.cr) || 0;
+    return {
+      date: row.transaction_date,
+      accountCode: row.account_code,
+      accountName: row.account_name,
+      ref: row.ref,
+      description: row.description,
+      debit: r(dr),
+      credit: r(cr),
+    };
+  });
+}
 
 /** Share capital balance for EPS (equity share_capital subcategory or description match). */
 async function fetchShareCapitalForEps(facilityId, endDate) {
@@ -2206,8 +2430,13 @@ function buildNotes(isOrder) {
         accountCode : i.accountCode,
         name        : i.name,
         amount      : r(i.amount),
+        debit       : r(i.debit ?? 0),
+        credit      : r(i.credit ?? 0),
       })),
-      total: r(grp.total),
+      total       : r(grp.total),
+      entries     : [],
+      totalDebit  : 0,
+      totalCredit : 0,
     }));
 }
 
