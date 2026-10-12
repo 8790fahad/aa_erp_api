@@ -1892,6 +1892,11 @@ exports.listSaleWorkflows = async (req, res) => {
       };
     }
 
+    if (String(req.query.countOnly || "") === "1") {
+      const count = await db.SaleWorkflow.count({ where });
+      return res.json({ success: true, count, results: [] });
+    }
+
     const limit = Math.min(
       500,
       Math.max(1, parseInt(req.query.limit, 10) || 200),
@@ -1917,6 +1922,7 @@ exports.listSaleWorkflows = async (req, res) => {
       return {
         ...plain,
         history,
+        pending_payment_mode: getPendingPaymentMode(history),
         payment_modes: paymentModesFromHistory(history),
         split_progress,
         remaining,
@@ -1948,12 +1954,19 @@ exports.getSaleWorkflow = async (req, res) => {
       });
     }
     const code = normalizeSaleCode(saleCode);
-    const row = await db.SaleWorkflow.findOne({
+    const candidates = [code];
+    if (/^\d+$/.test(code)) candidates.push(`INV-${code}`);
+    const matches = await db.SaleWorkflow.findAll({
       where: {
         facility_id: facilityId,
-        sale_code: code,
+        sale_code: { [Op.in]: candidates },
       },
+      limit: 5,
     });
+    const row =
+      matches.find((item) => saleCodesMatch(item.sale_code, code)) ||
+      matches[0] ||
+      null;
     if (!row) {
       return res.status(404).json({
         success: false,
@@ -1977,6 +1990,7 @@ exports.getSaleWorkflow = async (req, res) => {
       results: {
         ...plain,
         history,
+        pending_payment_mode: getPendingPaymentMode(history),
         status_label: meta?.label || plain.status,
         status_color: meta?.color || "slate",
         next_status: next,
@@ -5546,6 +5560,129 @@ exports.listWarehouseRequests = async (req, res) => {
       return res.json({ success: true, results: [], count: 0 });
     }
 
+    const fulBase = { facility_id: facilityId };
+    if (scopedBranchIds.length === 1) {
+      fulBase.branch_id = scopedBranchIds[0];
+    } else if (scopedBranchIds.length > 1) {
+      fulBase.branch_id = { [Op.in]: scopedBranchIds };
+    }
+
+    if (String(req.query.countOnly || "") === "1") {
+      const eq = (a, b) =>
+        `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+      const replacements = { facilityId: String(facilityId) };
+      let branchSql = "";
+      if (scopedBranchIds.length === 1) {
+        branchSql = "AND sf.branch_id = :branchId";
+        replacements.branchId = scopedBranchIds[0];
+      } else if (scopedBranchIds.length > 1) {
+        const names = scopedBranchIds.map((id, index) => {
+          const key = `branch${index}`;
+          replacements[key] = id;
+          return `:${key}`;
+        });
+        branchSql = `AND sf.branch_id IN (${names.join(", ")})`;
+      }
+      const [row] = await db.sequelize.query(
+        `SELECT COUNT(*) AS n
+         FROM sale_fulfillments sf
+         INNER JOIN sale_workflows sw
+           ON ${eq("sw.facility_id", "sf.facility_id")}
+          AND ${eq("sw.sale_code", "sf.sale_code")}
+         WHERE ${eq("sf.facility_id", ":facilityId")}
+           AND sf.status <> 'collected'
+           AND sw.status IN ('warehouse_picking', 'dual_signature')
+           ${branchSql}`,
+        { replacements, type: db.sequelize.QueryTypes.SELECT },
+      );
+      return res.json({
+        success: true,
+        count: Number(row?.n) || 0,
+        results: [],
+      });
+    }
+
+    const lookupCode = normalizeSaleCode(req.query.saleCode);
+    if (lookupCode) {
+      const saleCandidates = [lookupCode];
+      if (/^\d+$/.test(lookupCode)) saleCandidates.push(`INV-${lookupCode}`);
+
+      let packs = await db.SaleFulfillment.findAll({
+        where: {
+          ...fulBase,
+          [Op.or]: [
+            { sale_code: { [Op.in]: saleCandidates } },
+            { pack_code: lookupCode },
+          ],
+        },
+        include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+        order: [["branch_id", "ASC"]],
+      });
+
+      let workflow = null;
+      const knownSaleCode = packs[0]?.sale_code;
+      if (knownSaleCode && db.SaleWorkflow) {
+        workflow = await db.SaleWorkflow.findOne({
+          where: { facility_id: facilityId, sale_code: knownSaleCode },
+        });
+      } else if (db.SaleWorkflow) {
+        const matches = await db.SaleWorkflow.findAll({
+          where: {
+            facility_id: facilityId,
+            sale_code: { [Op.in]: saleCandidates },
+          },
+          limit: 5,
+        });
+        workflow =
+          matches.find((item) => saleCodesMatch(item.sale_code, lookupCode)) ||
+          matches.find((item) =>
+            saleCodesMatch(item.sale_code, `INV-${lookupCode}`),
+          ) ||
+          null;
+        if (workflow && String(workflow.status) === "warehouse_picking") {
+          await ensureSaleFulfillments({
+            facilityId,
+            saleCode: workflow.sale_code,
+          });
+          packs = await db.SaleFulfillment.findAll({
+            where: { ...fulBase, sale_code: workflow.sale_code },
+            include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+            order: [["branch_id", "ASC"]],
+          });
+        }
+      }
+
+      if (!packs.length) {
+        const statusLabel = workflow
+          ? stageMeta(workflow.status)?.label || workflow.status
+          : null;
+        return res.status(404).json({
+          success: false,
+          message: statusLabel
+            ? `Invoice is not ready for warehouse collection (${statusLabel}).`
+            : "No warehouse invoice found for that number.",
+        });
+      }
+
+      const enriched = await enrichFulfillments(packs);
+      const plain = workflow?.toJSON ? workflow.toJSON() : workflow;
+      const workflowView = plain
+        ? {
+            ...plain,
+            status_label: stageMeta(plain.status)?.label || plain.status,
+            status_color: stageMeta(plain.status)?.color || "slate",
+          }
+        : null;
+      return res.json({
+        success: true,
+        results: enriched.map((pack) => ({
+          ...pack,
+          workflow: workflowView,
+        })),
+        count: enriched.length,
+      });
+    }
+
     const workflowWhere = {
       facility_id: facilityId,
       status: {
@@ -5577,13 +5714,6 @@ exports.listWarehouseRequests = async (req, res) => {
     const pendingSaleCodes = workflows
       .filter((w) => WAREHOUSE_COLLECT_STATUSES.includes(String(w.status)))
       .map((w) => w.sale_code);
-
-    const fulBase = { facility_id: facilityId };
-    if (scopedBranchIds.length === 1) {
-      fulBase.branch_id = scopedBranchIds[0];
-    } else if (scopedBranchIds.length > 1) {
-      fulBase.branch_id = { [Op.in]: scopedBranchIds };
-    }
 
     const pendingPacks = pendingSaleCodes.length
       ? await db.SaleFulfillment.findAll({
