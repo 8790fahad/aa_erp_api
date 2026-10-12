@@ -1078,7 +1078,7 @@ exports.createProductWithStoreEntry = async (req, res) => {
             truckNo: "",
             waybillNo: "",
             otherInfo: "Initial stock entry",
-            expiry_date: expiry_date || null,
+            expiry_date: null,
           },
           { transaction }
         );
@@ -1461,7 +1461,7 @@ exports.bulkCreateProductsFinishedGoodAndResalable = async (req, res) => {
             truckNo: "",
             waybillNo: "",
             otherInfo: "Bulk initial stock entry",
-            expiry_date: expiry_date || null,
+            expiry_date: null,
           },
           { transaction }
         );
@@ -1764,7 +1764,7 @@ exports.updateProduct = async (req, res) => {
           truckNo: "",
           waybillNo: "",
           otherInfo: "Stock added on product update",
-          expiry_date: expiry_date || null,
+          expiry_date: null,
         },
         { transaction },
       );
@@ -2198,10 +2198,10 @@ exports.setProductOpeningBalance = async (req, res) => {
       : `OB-${await getAndUpdateNumber("OB", facilityId, transaction)}`;
     const narration = `Opening Balance - ${product.name} - Qty: ${qtyIn} @ ${unitCost}`;
     const zone = storeZoneForItemType(product.item_type);
-    const expiry =
-      expiryDate && String(expiryDate).trim()
-        ? String(expiryDate).slice(0, 10)
-        : null;
+    // Opening stock must not carry an expiry lot. Goods groups by expiry and
+    // then hides qty <= 0, so a dated opening against a no-expiry transfer
+    // shows phantom stock (P014 OB-230 vs GT-TRF-2026-8513).
+    const expiry = null;
 
     if (existing) {
       await db.GeneralLedger.destroy({
