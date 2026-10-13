@@ -20,6 +20,15 @@ const LOG = "bak_split_merged_invoice";
 const fac = (column) =>
   `CONVERT(${column} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(:facilityId USING utf8mb4) COLLATE utf8mb4_general_ci`;
 
+const eq = (left, right) =>
+  `CONVERT(${left} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${right} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
+const ne = (left, right) =>
+  `CONVERT(${left} USING utf8mb4) COLLATE utf8mb4_general_ci <> CONVERT(${right} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
+const like = (column, patternSql) =>
+  `CONVERT(${column} USING utf8mb4) COLLATE utf8mb4_general_ci LIKE CONVERT(${patternSql} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 async function tableExists(sequelize, table, transaction) {
   const rows = await sequelize.query(
     `SELECT 1 AS ok
@@ -88,8 +97,8 @@ async function moveCustomer(sequelize, transaction, move) {
          description = REPLACE(description, :oldRef, :newRef),
          link_id = CASE WHEN link_id = :oldRef THEN :newRef ELSE link_id END
      WHERE ${fac("facilityId")}
-       AND customerNo = :customerNo
-       AND (receiptNo = :oldRef OR link_id = :oldRef)`,
+       AND ${eq("customerNo", ":customerNo")}
+       AND (${eq("receiptNo", ":oldRef")} OR ${eq("link_id", ":oldRef")})`,
     { replacements: move, transaction },
   );
 
@@ -98,8 +107,8 @@ async function moveCustomer(sequelize, transaction, move) {
       `UPDATE invoices
        SET invoice_ref = :newRef
        WHERE ${fac("facility_id")}
-         AND invoice_ref = :oldRef
-         AND (customerNo = :customerNo OR ref_number = :customerNo)`,
+         AND ${eq("invoice_ref", ":oldRef")}
+         AND (${eq("customerNo", ":customerNo")} OR ${eq("ref_number", ":customerNo")})`,
       { replacements: move, transaction },
     );
   }
@@ -110,13 +119,13 @@ async function moveCustomer(sequelize, transaction, move) {
        SET reference_number = :newRef,
            transaction_description = REPLACE(transaction_description, :oldRef, :newRef)
        WHERE ${fac("facility_id")}
-         AND reference_number = :oldRef
+         AND ${eq("reference_number", ":oldRef")}
          AND (
-           payee = :customerNo
-           OR payee LIKE CONCAT(:customerNo, ' %')
-           OR payee LIKE CONCAT(:customerNo, '—%')
-           OR payee LIKE CONCAT(:customerNo, ' —%')
-           OR transaction_ref = :customerNo
+           ${eq("payee", ":customerNo")}
+           OR ${like("payee", "CONCAT(:customerNo, ' %')")}
+           OR ${like("payee", "CONCAT(:customerNo, '—%')")}
+           OR ${like("payee", "CONCAT(:customerNo, ' —%')")}
+           OR ${eq("transaction_ref", ":customerNo")}
          )`,
       { replacements: move, transaction },
     );
@@ -127,16 +136,16 @@ async function moveCustomer(sequelize, transaction, move) {
       `UPDATE store_entries se
        INNER JOIN customer_entries ce
          ON ${fac("ce.facilityId")}
-        AND ce.customerNo = :customerNo
-        AND ce.receiptNo = :newRef
-        AND LOWER(ce.type) = 'sales'
-        AND se.product_id = ce.link_id
+        AND ${eq("ce.customerNo", ":customerNo")}
+        AND ${eq("ce.receiptNo", ":newRef")}
+        AND CONVERT(LOWER(ce.type) USING utf8mb4) COLLATE utf8mb4_general_ci = 'sales'
+        AND ${eq("se.product_id", "ce.link_id")}
         AND ABS(COALESCE(se.qty_out, 0) - COALESCE(ce.qty_out, 0)) < 0.001
-        AND se.inserted_by = ce.created_by
+        AND ${eq("se.inserted_by", "ce.created_by")}
         AND (ce.branch_id IS NULL OR se.branchId IS NULL OR se.branchId = ce.branch_id)
        SET se.reference_number = :newRef
        WHERE ${fac("se.facilityId")}
-         AND se.reference_number = :oldRef`,
+         AND ${eq("se.reference_number", ":oldRef")}`,
       { replacements: move, transaction },
     );
   }
@@ -147,17 +156,17 @@ async function moveCustomer(sequelize, transaction, move) {
        SET sw.sale_code = :newRef,
            sw.history = REPLACE(sw.history, :oldRef, :newRef)
        WHERE ${fac("sw.facility_id")}
-         AND sw.sale_code = :oldRef
-         AND sw.customer_no = :customerNo
+         AND ${eq("sw.sale_code", ":oldRef")}
+         AND ${eq("sw.customer_no", ":customerNo")}
          AND NOT EXISTS (
            SELECT 1 FROM (
              SELECT facility_id, sale_code, customer_no
              FROM sale_workflows
            ) other
-           WHERE other.sale_code = :newRef
+           WHERE ${eq("other.sale_code", ":newRef")}
              AND CONVERT(other.facility_id USING utf8mb4) COLLATE utf8mb4_general_ci
                = CONVERT(sw.facility_id USING utf8mb4) COLLATE utf8mb4_general_ci
-             AND other.customer_no <> :customerNo
+             AND ${ne("other.customer_no", ":customerNo")}
          )`,
       { replacements: move, transaction },
     );
@@ -172,8 +181,8 @@ async function moveCustomer(sequelize, transaction, move) {
        SET sale_code = :newRef,
            pack_code = REPLACE(pack_code, :oldRef, :newRef)
        WHERE ${fac("facility_id")}
-         AND sale_code = :oldRef
-         AND created_by = :createdBy`,
+         AND ${eq("sale_code", ":oldRef")}
+         AND ${eq("created_by", ":createdBy")}`,
       { replacements: move, transaction },
     );
   }
@@ -184,8 +193,8 @@ async function moveCustomer(sequelize, transaction, move) {
        SET entity_id = :newRef,
            title = REPLACE(title, :oldRef, :newRef)
        WHERE ${fac("facility_id")}
-         AND entity_id = :oldRef
-         AND actor_user_id = :createdBy`,
+         AND ${eq("entity_id", ":oldRef")}
+         AND ${eq("actor_user_id", ":createdBy")}`,
       { replacements: move, transaction },
     );
   }
@@ -214,7 +223,7 @@ module.exports = {
         `SELECT facilityId AS facility_id, receiptNo AS receipt_no
          FROM customer_entries
          WHERE receiptNo REGEXP '^INV-[0-9]+$'
-           AND LOWER(type) = 'sales'
+           AND CONVERT(LOWER(type) USING utf8mb4) COLLATE utf8mb4_general_ci = 'sales'
          GROUP BY facilityId, receiptNo
          HAVING COUNT(DISTINCT customerNo) > 1`,
         { type: sequelize.QueryTypes.SELECT, transaction },
@@ -230,8 +239,8 @@ module.exports = {
                   MIN(created_by) AS created_by
            FROM customer_entries
            WHERE ${fac("facilityId")}
-             AND receiptNo = :oldRef
-             AND LOWER(type) = 'sales'
+             AND ${eq("receiptNo", ":oldRef")}
+             AND CONVERT(LOWER(type) USING utf8mb4) COLLATE utf8mb4_general_ci = 'sales'
            GROUP BY customerNo
            ORDER BY first_entry ASC`,
           {
@@ -248,8 +257,8 @@ module.exports = {
           const already = await sequelize.query(
             `SELECT id FROM \`${LOG}\`
              WHERE ${fac("facility_id")}
-               AND old_ref = :oldRef
-               AND customer_no = :customerNo
+               AND ${eq("old_ref", ":oldRef")}
+               AND ${eq("customer_no", ":customerNo")}
              LIMIT 1`,
             {
               replacements: {
