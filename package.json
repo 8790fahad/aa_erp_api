@@ -8,7 +8,7 @@
     "start": "node build/app.js",
     "dev": "nodemon --exec babel-node src/app.js",
     "build-server": "babel src --out-dir build --copy-files --source-maps",
-    "build": "npm run clean && npm run build-server",
+    "build": "rm -rf build-next && babel src --out-dir build-next --copy-files --source-maps && rm -rf build && mv build-next build",
     "install-windows-service": "winser -i",
     "uninstall-windows-service": "winser -r",
     "migrate": "node run-migrations.js",

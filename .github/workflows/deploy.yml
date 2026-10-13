@@ -97,6 +97,8 @@ jobs:
             --exclude "logs/" \
             --exclude "uploads/" \
             --exclude "public/uploads/" \
+            --exclude "build/" \
+            --exclude "build-next/" \
             -e "sshpass -e ssh -p ${port} \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=30 \
