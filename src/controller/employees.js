@@ -525,6 +525,144 @@ exports.createEmployee = async (req, res) => {
   }
 };
 
+async function listInvestors(req, res) {
+  const { page = 1, limit = 15, search = "", facilityId } = req.query;
+  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 15, 1), 100);
+  const pageNumber = Math.max(parseInt(page, 10) || 1, 1);
+  const offset = (pageNumber - 1) * pageSize;
+  const term = String(search || "").trim();
+  const like = `%${term}%`;
+  const eq = (left, right) =>
+    `CONVERT(${left} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${right} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
+  const whereSql = `
+    ${eq("e.facilityId", ":facilityId")}
+    AND e.contractType = 'Business Associate'
+    AND COALESCE(e.investmentOpeningBalance, 0) > 0.009
+    AND (
+      :hasSearch = 0
+      OR e.firstName LIKE :like
+      OR e.lastName LIKE :like
+      OR e.employeeId LIKE :like
+      OR e.investmentReference LIKE :like
+      OR CONCAT(e.firstName, ' ', e.lastName) LIKE :like
+    )`;
+
+  const replacements = {
+    facilityId,
+    like,
+    hasSearch: term ? 1 : 0,
+  };
+
+  const [totals] = await db.sequelize.query(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(COALESCE(e.investmentOpeningBalance, 0)), 0) AS principal
+     FROM employees e
+     WHERE ${whereSql}`,
+    { replacements, type: db.Sequelize.QueryTypes.SELECT },
+  );
+
+  const rows = await db.sequelize.query(
+    `SELECT e.id, e.employeeId, e.firstName, e.lastName, e.contactInfo,
+            e.designation, e.contractType, e.status,
+            e.investmentOpeningBalance, e.investmentOpeningDate,
+            e.investmentAccountHead, e.investmentReference
+     FROM employees e
+     WHERE ${whereSql}
+     ORDER BY e.firstName ASC, e.lastName ASC
+     LIMIT ${pageSize} OFFSET ${offset}`,
+    { replacements, type: db.Sequelize.QueryTypes.SELECT },
+  );
+
+  const refs = rows
+    .map((row) => `${row.employeeId}-INV`)
+    .filter(Boolean);
+  const balanceRows = refs.length
+    ? await db.sequelize.query(
+        `SELECT transaction_ref AS ref,
+                COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
+         FROM general_ledger
+         WHERE ${eq("facility_id", ":facilityId")}
+           AND purpose_of_payment = 'Business associate investment'
+           AND transaction_ref IN (:refs)
+         GROUP BY transaction_ref`,
+        {
+          replacements: { facilityId, refs },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      )
+    : [];
+  const balanceByRef = Object.fromEntries(
+    balanceRows.map((row) => [row.ref, Number(row.balance) || 0]),
+  );
+
+  let ledgerTotal = { currentBalance: null };
+  if (!term) {
+    const [sumRow] = await db.sequelize.query(
+      `SELECT COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS currentBalance
+       FROM general_ledger
+       WHERE ${eq("facility_id", ":facilityId")}
+         AND purpose_of_payment = 'Business associate investment'`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    );
+    ledgerTotal = sumRow || ledgerTotal;
+  } else {
+    const matched = await db.sequelize.query(
+      `SELECT CONCAT(e.employeeId, '-INV') AS ref
+       FROM employees e
+       WHERE ${whereSql}`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    );
+    const matchedRefs = matched.map((row) => row.ref).filter(Boolean);
+    if (matchedRefs.length) {
+      const [sumRow] = await db.sequelize.query(
+        `SELECT COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS currentBalance
+         FROM general_ledger
+         WHERE ${eq("facility_id", ":facilityId")}
+           AND purpose_of_payment = 'Business associate investment'
+           AND transaction_ref IN (:matchedRefs)`,
+        {
+          replacements: { facilityId, matchedRefs },
+          type: db.Sequelize.QueryTypes.SELECT,
+        },
+      );
+      ledgerTotal = sumRow || ledgerTotal;
+    } else {
+      ledgerTotal = { currentBalance: 0 };
+    }
+  }
+
+  const total = Number(totals?.total) || 0;
+  return res.json({
+    success: true,
+    data: {
+      employees: rows.map((row) => {
+        const ledgerBalance = balanceByRef[`${row.employeeId}-INV`];
+        const opening = Number(row.investmentOpeningBalance) || 0;
+        return {
+          ...row,
+          investmentOpeningBalance: opening,
+          investmentCurrentBalance:
+            ledgerBalance === undefined ? opening : ledgerBalance,
+        };
+      }),
+      totals: {
+        principal: Number(totals?.principal) || 0,
+        currentBalance:
+          ledgerTotal?.currentBalance == null
+            ? Number(totals?.principal) || 0
+            : Number(ledgerTotal.currentBalance) || 0,
+      },
+      pagination: {
+        total,
+        page: pageNumber,
+        limit: pageSize,
+        pages: Math.max(Math.ceil(total / pageSize), 1),
+      },
+    },
+  });
+}
+
 // Get all employees
 exports.getAllEmployees = async (req, res) => {
   try {
@@ -547,11 +685,13 @@ exports.getAllEmployees = async (req, res) => {
       });
     }
 
+    if (String(req.query.investors) === "1") {
+      return listInvestors(req, res);
+    }
+
     const isLite = lite === "1" || lite === "true";
     const wantInvestment =
-      includeInvestment === "1" ||
-      includeInvestment === "true" ||
-      (!isLite && includeInvestment !== "0" && includeInvestment !== "false");
+      includeInvestment === "1" || includeInvestment === "true";
     const pageSize = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 2000);
     const offset = (page - 1) * pageSize;
 
@@ -636,19 +776,24 @@ exports.getAllEmployees = async (req, res) => {
     );
 
     if (wantInvestment) {
-      const investmentBalances = await db.sequelize.query(
+      const refs = employeesWithInvestment
+        .map((plain) => `${plain.employeeId}-INV`)
+        .filter(Boolean);
+      const investmentBalances = refs.length
+        ? await db.sequelize.query(
         `SELECT transaction_ref AS ref,
                 COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
          FROM general_ledger
          WHERE facility_id = :facilityId
            AND purpose_of_payment = 'Business associate investment'
-           AND transaction_ref LIKE '%-INV'
+           AND transaction_ref IN (:refs)
          GROUP BY transaction_ref`,
         {
-          replacements: { facilityId },
+          replacements: { facilityId, refs },
           type: db.Sequelize.QueryTypes.SELECT,
         },
-      );
+      )
+        : [];
       const balanceByRef = Object.fromEntries(
         (investmentBalances || []).map((row) => [
           row.ref,
