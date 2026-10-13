@@ -576,6 +576,11 @@ const SEPARATION_QUEUE_STATUSES = [
 ];
 
 const WAREHOUSE_COLLECT_STATUSES = ["warehouse_picking", "dual_signature"];
+const WAREHOUSE_VISIBLE_STATUSES = new Set([
+  ...WAREHOUSE_COLLECT_STATUSES,
+  "goods_released",
+  "completed",
+]);
 
 function isSeparationQueueStatus(status) {
   return SEPARATION_QUEUE_STATUSES.includes(String(status || ""));
@@ -2068,7 +2073,7 @@ exports.getSaleWorkflow = async (req, res) => {
       },
       limit: 5,
     });
-    const row =
+    let row =
       matches.find((item) => saleCodesMatch(item.sale_code, code)) ||
       matches[0] ||
       null;
@@ -2078,6 +2083,10 @@ exports.getSaleWorkflow = async (req, res) => {
         message: "Workflow not found",
       });
     }
+    row = await releaseWarehouseIfGoodsIssuePrinted(
+      row,
+      req.query.userId || req.user?.id,
+    );
     const plain = row.toJSON();
     const history = normalizeHistory(plain.history);
     const next = nextStageFor(plain.status, plain.payment_type);
@@ -5154,6 +5163,186 @@ exports.getSaleFulfillment = async (req, res) => {
   }
 };
 
+function goodsIssueAlreadyPrinted(history) {
+  return normalizeHistory(history).some(
+    (entry) => entry?.print_document === "goods_issue",
+  );
+}
+
+/**
+ * Print all branch packs and send the sale to warehouse.
+ * The row must already be loaded inside `transaction`.
+ */
+async function releaseSaleToWarehouse(row, { updated_by, note, transaction }) {
+  const facilityId = row.facility_id;
+  const saleCode = row.sale_code;
+  const pendingMode = getPendingPaymentMode(row.history);
+  const parkedOnModeSwitch =
+    row.status === "awaiting_payment_mode_approval" &&
+    isSeparationQueueStatus(pendingMode?.previous_status);
+  if (
+    !SEPARATION_QUEUE_STATUSES.includes(row.status) &&
+    !parkedOnModeSwitch
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      message: `Sale must be in separation (current: ${row.status})`,
+    };
+  }
+
+  if (
+    String(row.payment_type || "")
+      .toLowerCase()
+      .trim() === "credit" &&
+    row.status !== "credit_approved" &&
+    row.status !== "invoice_separation" &&
+    row.status !== "final_invoice" &&
+    !normalizeHistory(row.history).some(
+      (h) => String(h?.status || "") === "credit_approved",
+    )
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      message:
+        "Credit approval is required at Verification Points before Invoice Separation",
+    };
+  }
+
+  let fulfillments = await ensureSaleFulfillments(
+    {
+      facilityId,
+      saleCode,
+      createdBy: updated_by,
+    },
+    transaction,
+  );
+
+  if (!fulfillments.length && db.SaleFulfillment) {
+    fulfillments = await db.SaleFulfillment.findAll({
+      where: { facility_id: facilityId, sale_code: saleCode },
+      include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+      transaction,
+    });
+  }
+
+  if (!fulfillments.length) {
+    return {
+      ok: false,
+      status: 400,
+      message:
+        "No branch lines found for this invoice. Cannot create branch copies.",
+    };
+  }
+
+  if (
+    row.status === "payment_confirmed" ||
+    row.status === "credit_approved" ||
+    parkedOnModeSwitch
+  ) {
+    row.status = "invoice_separation";
+    row.history = pushHistory(
+      row.history,
+      "invoice_separation",
+      updated_by,
+      parkedOnModeSwitch
+        ? "Ready for invoice separation by branch (payment already collected)"
+        : "Ready for invoice separation by branch",
+    );
+  }
+
+  const now = new Date();
+  for (const pack of fulfillments) {
+    if (pack.status === "pending") {
+      pack.status = "printed";
+    }
+    pack.printed_at = pack.printed_at || now;
+    pack.updated_by = updated_by || pack.updated_by;
+    await pack.save({ transaction });
+  }
+
+  const branchCount = fulfillments.length;
+  row.history = pushHistory(
+    row.history,
+    "final_invoice",
+    updated_by,
+    note ||
+      `Invoice separated into ${branchCount} branch cop${
+        branchCount === 1 ? "y" : "ies"
+      }`,
+  );
+  row.status = "warehouse_picking";
+  row.history = pushHistory(
+    row.history,
+    "warehouse_picking",
+    updated_by,
+    "Branch invoice copies ready for warehouse collection",
+  );
+  row.updated_by = updated_by || row.updated_by;
+  await persistLockedWorkflow(row, transaction);
+
+  const afterCollect = await maybeAdvanceAfterAllCollected({
+    facilityId,
+    saleCode,
+    updatedBy: updated_by,
+    transaction,
+  });
+
+  return {
+    ok: true,
+    row: afterCollect || row,
+    fulfillments,
+    branchCount,
+  };
+}
+
+/**
+ * A goods issue note was recorded, but the sale was left on Invoice Separation
+ * and its branch copy stayed visible on Warehouse Requests.
+ */
+async function releaseWarehouseIfGoodsIssuePrinted(row, updatedBy) {
+  if (!row || !goodsIssueAlreadyPrinted(row.history)) return row;
+  const pendingMode = getPendingPaymentMode(row.history);
+  const parkedOnModeSwitch =
+    row.status === "awaiting_payment_mode_approval" &&
+    isSeparationQueueStatus(pendingMode?.previous_status);
+  if (
+    !SEPARATION_QUEUE_STATUSES.includes(row.status) &&
+    !parkedOnModeSwitch
+  ) {
+    return row;
+  }
+
+  const transaction = await db.sequelize.transaction();
+  try {
+    const locked = await db.SaleWorkflow.findOne({
+      where: { facility_id: row.facility_id, sale_code: row.sale_code },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    if (!locked || !goodsIssueAlreadyPrinted(locked.history)) {
+      await transaction.rollback();
+      return row;
+    }
+    const released = await releaseSaleToWarehouse(locked, {
+      updated_by: updatedBy,
+      note: "Goods issue note already printed — sent to warehouse",
+      transaction,
+    });
+    if (!released.ok) {
+      await transaction.rollback();
+      return row;
+    }
+    await transaction.commit();
+    return released.row;
+  } catch (err) {
+    await transaction.rollback();
+    console.error("releaseWarehouseIfGoodsIssuePrinted:", err);
+    return row;
+  }
+}
+
 /**
  * Mark invoice separated: print all branch packs and send sale to warehouse.
  * Creates one fulfillment pack (invoice copy) per branch from stock lines.
@@ -5173,6 +5362,7 @@ exports.completeSeparation = async (req, res) => {
     const row = await db.SaleWorkflow.findOne({
       where: { facility_id: facilityId, sale_code: saleCode },
       transaction,
+      lock: transaction.LOCK.UPDATE,
     });
     if (!row) {
       await transaction.rollback();
@@ -5182,133 +5372,37 @@ exports.completeSeparation = async (req, res) => {
       });
     }
 
-    const allowed = [...SEPARATION_QUEUE_STATUSES];
-    const pendingMode = getPendingPaymentMode(row.history);
-    const parkedOnModeSwitch =
-      row.status === "awaiting_payment_mode_approval" &&
-      isSeparationQueueStatus(pendingMode?.previous_status);
-    if (!allowed.includes(row.status) && !parkedOnModeSwitch) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message: `Sale must be in separation (current: ${row.status})`,
-      });
-    }
-
-    if (
-      String(row.payment_type || "")
-        .toLowerCase()
-        .trim() === "credit" &&
-      row.status !== "credit_approved" &&
-      row.status !== "invoice_separation" &&
-      row.status !== "final_invoice" &&
-      !normalizeHistory(row.history).some(
-        (h) => String(h?.status || "") === "credit_approved",
-      )
-    ) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message:
-          "Credit approval is required at Verification Points before Invoice Separation",
-      });
-    }
-
-    if (
-      row.status === "payment_confirmed" ||
-      row.status === "credit_approved" ||
-      parkedOnModeSwitch
-    ) {
-      row.status = "invoice_separation";
-      row.history = pushHistory(
-        row.history,
-        "invoice_separation",
-        updated_by,
-        parkedOnModeSwitch
-          ? "Ready for invoice separation by branch (payment already collected)"
-          : "Ready for invoice separation by branch",
-      );
-    }
-
-    let fulfillments = await ensureSaleFulfillments(
-      {
-        facilityId,
-        saleCode,
-        createdBy: updated_by,
-      },
-      transaction,
-    );
-
-    if (!fulfillments.length && db.SaleFulfillment) {
-      fulfillments = await db.SaleFulfillment.findAll({
-        where: { facility_id: facilityId, sale_code: saleCode },
-        include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
-        transaction,
-      });
-    }
-
-    if (!fulfillments.length) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message:
-          "No branch lines found for this invoice. Cannot create branch copies.",
-      });
-    }
-
-    const now = new Date();
-    for (const pack of fulfillments) {
-      if (pack.status === "pending") {
-        pack.status = "printed";
-      }
-      pack.printed_at = pack.printed_at || now;
-      pack.updated_by = updated_by || pack.updated_by;
-      await pack.save({ transaction });
-    }
-
-    const branchCount = fulfillments.length;
-    row.history = pushHistory(
-      row.history,
-      "final_invoice",
+    const released = await releaseSaleToWarehouse(row, {
       updated_by,
-      note ||
-        `Invoice separated into ${branchCount} branch cop${
-          branchCount === 1 ? "y" : "ies"
-        }`,
-    );
-    row.status = "warehouse_picking";
-    row.history = pushHistory(
-      row.history,
-      "warehouse_picking",
-      updated_by,
-      "Branch invoice copies ready for warehouse collection",
-    );
-    row.updated_by = updated_by || row.updated_by;
-    await persistLockedWorkflow(row, transaction);
-
-    // If warehouse already collected packs (legacy leak), finish the sale.
-    const afterCollect = await maybeAdvanceAfterAllCollected({
-      facilityId,
-      saleCode,
-      updatedBy: updated_by,
+      note,
       transaction,
     });
-    const resultRow = afterCollect || row;
+    if (!released.ok) {
+      await transaction.rollback();
+      return res.status(released.status || 400).json({
+        success: false,
+        message: released.message,
+      });
+    }
 
     await transaction.commit();
 
-    fireSaleWorkflowMail(resultRow, updated_by);
+    fireSaleWorkflowMail(released.row, updated_by);
 
-    const enriched = await enrichFulfillments(fulfillments);
+    const enriched = await enrichFulfillments(released.fulfillments);
+    const branchCount = released.branchCount;
     return res.json({
       success: true,
       message: `Separated into ${branchCount} branch invoice cop${
         branchCount === 1 ? "y" : "ies"
       } — sent to warehouse`,
       results: {
-        ...resultRow.toJSON(),
-        status_color: stageMeta(resultRow.status)?.color || "slate",
-        next_status: nextStageFor(resultRow.status, resultRow.payment_type),
+        ...released.row.toJSON(),
+        status_color: stageMeta(released.row.status)?.color || "slate",
+        next_status: nextStageFor(
+          released.row.status,
+          released.row.payment_type,
+        ),
         fulfillments: enriched,
       },
     });
@@ -5372,6 +5466,7 @@ async function userCanReprintGoodsIssue(facilityId, userId) {
 }
 
 exports.recordDocumentPrint = async (req, res) => {
+  let transaction;
   try {
     const { facilityId, saleCode, document, updated_by } = req.body || {};
     const code = String(saleCode || "").trim();
@@ -5391,15 +5486,20 @@ exports.recordDocumentPrint = async (req, res) => {
         message: "SaleWorkflow model not loaded",
       });
     }
+    transaction = await db.sequelize.transaction();
     const row = await db.SaleWorkflow.findOne({
       where: { facility_id: facilityId, sale_code: code },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
     });
     if (!row) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: "Workflow not found",
       });
     }
+    const actor = updated_by || req.user?.id;
     const prior = normalizeHistory(row.history).filter(
       (entry) => entry?.print_document === doc,
     ).length;
@@ -5407,15 +5507,34 @@ exports.recordDocumentPrint = async (req, res) => {
     row.history = pushHistory(
       row.history,
       row.status,
-      updated_by || req.user?.id,
+      actor,
       doc === "goods_issue"
         ? `Goods issue note printed (${nextCount})`
         : `Sales invoice printed (${nextCount})`,
       { print_document: doc, print_count: nextCount },
     );
-    row.updated_by = updated_by || row.updated_by;
-    await row.save();
-    const saved = normalizeHistory(row.history);
+    row.updated_by = actor || row.updated_by;
+    let released = null;
+    if (doc === "goods_issue") {
+      released = await releaseSaleToWarehouse(row, {
+        updated_by: actor,
+        note: `Goods issue note printed (${nextCount}) — sent to warehouse`,
+        transaction,
+      });
+      if (!released.ok && released.status !== 400) {
+        await transaction.rollback();
+        return res.status(released.status || 400).json({
+          success: false,
+          message: released.message,
+        });
+      }
+    }
+    if (!released?.ok) {
+      await persistLockedWorkflow(row, transaction);
+    }
+    await transaction.commit();
+    if (released?.ok) fireSaleWorkflowMail(released.row, actor);
+    const saved = normalizeHistory((released?.row || row).history);
     const invoicePrintCount = saved.filter(
       (entry) => entry?.print_document === "invoice",
     ).length;
@@ -5430,6 +5549,7 @@ exports.recordDocumentPrint = async (req, res) => {
       goods_issue_print_count: goodsIssuePrintCount,
     });
   } catch (err) {
+    if (transaction) await transaction.rollback();
     console.error("recordDocumentPrint:", err);
     return res.status(500).json({
       success: false,
@@ -5812,14 +5932,37 @@ exports.listWarehouseRequests = async (req, res) => {
         }
       }
 
-      if (!packs.length) {
+      const statusBeforeRelease = String(workflow?.status || "");
+      if (workflow) {
+        workflow = await releaseWarehouseIfGoodsIssuePrinted(
+          workflow,
+          req.query.userId || req.user?.id,
+        );
+      }
+      if (
+        workflow?.sale_code &&
+        String(workflow.status || "") !== statusBeforeRelease &&
+        WAREHOUSE_VISIBLE_STATUSES.has(String(workflow.status || ""))
+      ) {
+        packs = await db.SaleFulfillment.findAll({
+          where: { ...fulBase, sale_code: workflow.sale_code },
+          include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+          order: [["branch_id", "ASC"]],
+        });
+      }
+
+      const visibleStatus = String(workflow?.status || "");
+      if (!packs.length || !WAREHOUSE_VISIBLE_STATUSES.has(visibleStatus)) {
         const statusLabel = workflow
           ? stageMeta(workflow.status)?.label || workflow.status
           : null;
+        const code = workflow?.sale_code || lookupCode;
         return res.status(404).json({
           success: false,
           message: statusLabel
-            ? `${workflow.sale_code} is not ready for warehouse collection (${statusLabel}).`
+            ? isSeparationQueueStatus(visibleStatus)
+              ? `${code} is still at ${statusLabel}. It shows on Warehouse Requests after Invoice Separation.`
+              : `${code} is not ready for warehouse collection (${statusLabel}).`
             : "No warehouse invoice found for that number.",
         });
       }

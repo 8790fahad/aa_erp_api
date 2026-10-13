@@ -143,26 +143,25 @@ exports.getCustomerDetails = async (req, res) => {
   c.credit_limit,
   c.receivable_code,
   c.customer_type,
-  GREATEST(COALESCE(SUM(CASE
-    WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
-    THEN gl.dr - gl.cr ELSE 0 END), 0), 0) AS receivables,
-  GREATEST(COALESCE(SUM(CASE
-    WHEN LOWER(COALESCE(gl.type, '')) = 'deposit'
-    THEN gl.cr - gl.dr ELSE 0 END), 0), 0) AS deposit,
-  GREATEST(COALESCE(SUM(CASE
-    WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
-    THEN gl.dr - gl.cr ELSE 0 END), 0), 0) AS balance
+  GREATEST(COALESCE(b.receivables, 0), 0) AS receivables,
+  GREATEST(COALESCE(b.deposit, 0), 0) AS deposit,
+  GREATEST(COALESCE(b.receivables, 0), 0) AS balance
 FROM customers c
-LEFT JOIN general_ledger gl
-  ON gl.facility_id = :facilityId
- AND (
-   gl.transaction_ref = c.customerNo
-   OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
- )
+LEFT JOIN (
+  SELECT
+    SUBSTRING_INDEX(transaction_ref, '-', 2) AS customerNo,
+    SUM(CASE
+      WHEN LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')
+      THEN dr - cr ELSE 0 END) AS receivables,
+    SUM(CASE
+      WHEN LOWER(COALESCE(type, '')) = 'deposit'
+      THEN cr - dr ELSE 0 END) AS deposit
+  FROM general_ledger
+  WHERE facility_id = :facilityId
+    AND transaction_ref LIKE 'CUS-%'
+  GROUP BY SUBSTRING_INDEX(transaction_ref, '-', 2)
+) b ON b.customerNo = c.customerNo
 WHERE c.facilityId = :facilityId
-GROUP BY
-  c.customerNo, c.fullname, c.company_name, c.address,
-  c.phone, c.email, c.credit_limit, c.receivable_code, c.customer_type
 ORDER BY c.fullname ASC;
         `;
 

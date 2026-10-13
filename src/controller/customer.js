@@ -4724,23 +4724,18 @@ exports.getCustomersList = async (req, res) => {
     const balanceByCustomer = {};
     if (customerNos.length) {
       const balanceRows = await db.sequelize.query(
-        `SELECT c.customerNo AS customerNo,
+        `SELECT SUBSTRING_INDEX(transaction_ref, '-', 2) AS customerNo,
                 COALESCE(SUM(CASE
-                  WHEN LOWER(COALESCE(gl.type, '')) IN ('receivable', 'recevable')
-                  THEN gl.dr - gl.cr ELSE 0 END), 0) AS receivables,
+                  WHEN LOWER(COALESCE(type, '')) IN ('receivable', 'recevable')
+                  THEN dr - cr ELSE 0 END), 0) AS receivables,
                 COALESCE(SUM(CASE
-                  WHEN LOWER(COALESCE(gl.type, '')) = 'deposit'
-                  THEN gl.cr - gl.dr ELSE 0 END), 0) AS deposit
-           FROM customers c
-           LEFT JOIN general_ledger gl
-             ON gl.facility_id = :facilityId
-            AND (
-              gl.transaction_ref = c.customerNo
-              OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
-            )
-          WHERE c.facilityId = :facilityId
-            AND c.customerNo IN (:customerNos)
-          GROUP BY c.customerNo`,
+                  WHEN LOWER(COALESCE(type, '')) = 'deposit'
+                  THEN cr - dr ELSE 0 END), 0) AS deposit
+           FROM general_ledger
+          WHERE facility_id = :facilityId
+            AND transaction_ref LIKE 'CUS-%'
+            AND SUBSTRING_INDEX(transaction_ref, '-', 2) IN (:customerNos)
+          GROUP BY SUBSTRING_INDEX(transaction_ref, '-', 2)`,
         {
           replacements: { facilityId, customerNos },
           type: db.Sequelize.QueryTypes.SELECT,

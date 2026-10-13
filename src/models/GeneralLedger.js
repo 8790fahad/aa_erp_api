@@ -31,7 +31,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
       account_subhead: {
-        type: DataTypes.STRING(300),
+        type: DataTypes.STRING(255),
         allowNull: false,
       },
       dr: {

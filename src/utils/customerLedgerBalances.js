@@ -49,13 +49,34 @@ function roundMoney(n) {
 async function getCustomerLedgerBalances(facilityId, customerNo) {
   const db = require("../models");
   const cust = String(customerNo || "").trim();
+  // Indexed lookups. One OR against the invoice subquery makes MariaDB
+  // read the whole ledger for a single customer.
   const rows = await db.sequelize.query(
     `SELECT
        COALESCE(SUM(CASE WHEN ${AR_TYPE_SQL} THEN dr - cr ELSE 0 END), 0) AS receivables,
        COALESCE(SUM(CASE WHEN ${DEPOSIT_TYPE_SQL} THEN cr - dr ELSE 0 END), 0) AS deposit
-     FROM general_ledger
-     WHERE facility_id = :facilityId
-       AND ${customerOwnedGlSql()}`,
+     FROM (
+       SELECT type, dr, cr
+       FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND transaction_ref = :customerNo
+       UNION ALL
+       SELECT type, dr, cr
+       FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND transaction_ref LIKE CONCAT(:customerNo, '-%')
+       UNION ALL
+       SELECT gl.type, gl.dr, gl.cr
+       FROM invoices i
+       INNER JOIN general_ledger gl
+         ON gl.facility_id = i.facility_id
+        AND gl.reference_number = i.invoice_ref
+       WHERE i.facility_id = :facilityId
+         AND i.type = 'sales'
+         AND i.ref_number = :customerNo
+         AND gl.transaction_ref <> :customerNo
+         AND gl.transaction_ref NOT LIKE CONCAT(:customerNo, '-%')
+     ) owned`,
     {
       replacements: { facilityId, customerNo: cust },
       type: db.Sequelize.QueryTypes.SELECT,
