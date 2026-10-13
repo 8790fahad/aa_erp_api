@@ -1809,7 +1809,8 @@ exports.bulkCreateEmployees = async (req, res) => {
 /**
  * POST /api/hr/employees/:id/investment-opening-balance
  * Business associate investment that already existed.
- * Dr the investment account · Cr Opening Balance Equity.
+ * Dr the investment account · Cr the selected source
+ * (opening balance equity, bank, cash, or another chart head).
  */
 exports.setInvestmentOpeningBalance = async (req, res) => {
   const transaction = await db.sequelize.transaction();
@@ -1819,6 +1820,9 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
       amount,
       asOfDate,
       investmentHead,
+      creditHead,
+      paymentMode,
+      chequeNumber,
       userId,
     } = req.body || {};
     const value = parseFloat(amount);
@@ -1870,13 +1874,25 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
       attributes: ["opening_balance_equity"],
       transaction,
     });
+    const mode = String(paymentMode || "equity").trim().toLowerCase();
+    const requestedCredit = String(creditHead || "").trim();
     const equityCode = String(business?.opening_balance_equity || "").trim();
-    if (!equityCode) {
+    const creditCode = requestedCredit || equityCode;
+    if (!creditCode) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
         message:
-          "Set Opening Balance Equity under Default accounts before posting this balance",
+          mode === "equity"
+            ? "Set Opening Balance Equity under Default accounts before posting this balance"
+            : "Select the account to credit",
+      });
+    }
+    if (mode === "cheque" && !String(chequeNumber || "").trim()) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Cheque number is required",
       });
     }
 
@@ -1886,7 +1902,7 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
         transaction,
       }),
       db.AccountCategory.findOne({
-        where: { code: equityCode, facility_id: facilityId },
+        where: { code: creditCode, facility_id: facilityId },
         transaction,
       }),
     ]);
@@ -1901,7 +1917,10 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
       await transaction.rollback();
       return res.status(404).json({
         success: false,
-        message: `Opening Balance Equity account not found: ${equityCode}`,
+        message:
+          mode === "equity"
+            ? `Opening Balance Equity account not found: ${creditCode}`
+            : `Account not found: ${creditCode}`,
       });
     }
 
@@ -1973,7 +1992,21 @@ exports.setInvestmentOpeningBalance = async (req, res) => {
 
     const reference = previousRef || `OB-${await getAndUpdateNumber("OB", facilityId)}`;
     const name = `${employee.firstName || ""} ${employee.lastName || ""}`.trim();
-    const desc = `Opening balance — business associate investment — ${name}`;
+    const cheque = String(chequeNumber || "").trim();
+    const sourceLabel =
+      mode === "cash"
+        ? "cash"
+        : mode === "bank"
+          ? "bank"
+          : mode === "cheque"
+            ? `cheque ${cheque}`
+            : mode === "others"
+              ? equityAccount.description || creditCode
+              : "opening balance";
+    const desc =
+      mode === "equity"
+        ? `Opening balance — business associate investment — ${name}`
+        : `Business associate investment — ${name} — ${sourceLabel}`;
     const parentOf = (account) =>
       account.parentCode ?? account.parent_code ?? account.code ?? "0";
 

@@ -55,6 +55,21 @@ const JWT_SECRET =
   process.env.JWT_SECRET_KEY || process.env.JWT_SECRET || "secret";
 /** Workday-length session; refresh via /auth/verify-token keeps active users signed in */
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "12h";
+/** A signature that expired inside this window can still be renewed on verify. */
+const JWT_RENEW_GRACE_SECONDS = 12 * 60 * 60;
+
+function readSessionToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    if (err.name !== "TokenExpiredError") throw err;
+    const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
+    const expiredAt = Number(decoded?.exp) || 0;
+    const age = Date.now() / 1000 - expiredAt;
+    if (!expiredAt || age > JWT_RENEW_GRACE_SECONDS) throw err;
+    return decoded;
+  }
+}
 
 // load input validation
 const validateRegisterForm = require("../validation/register");
@@ -3075,26 +3090,29 @@ exports.verifyUserToken = (req, res) => {
     });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      const expired = err.name === "TokenExpiredError";
-      if (expired) {
-        console.warn("[verifyUserToken] JWT expired");
-      } else {
-        console.warn(
-          "[verifyUserToken]",
-          err.name || "JsonWebTokenError",
-          err.message,
-        );
-      }
-      return res.status(401).json({
-        success: false,
-        msg: expired
-          ? "Session expired. Please sign in again."
-          : "Failed to authenticate token.",
-        code: err.name,
-      });
+  let decoded;
+  try {
+    decoded = readSessionToken(token);
+  } catch (err) {
+    const expired = err.name === "TokenExpiredError";
+    if (expired) {
+      console.warn("[verifyUserToken] JWT expired");
+    } else {
+      console.warn(
+        "[verifyUserToken]",
+        err.name || "JsonWebTokenError",
+        err.message,
+      );
     }
+    return res.status(401).json({
+      success: false,
+      msg: expired
+        ? "Session expired. Please sign in again."
+        : "Failed to authenticate token.",
+      code: err.name,
+    });
+  }
+  {
     const { id, email, facilityId, username } = decoded;
     return db.sequelize
       .query(
@@ -3220,7 +3238,7 @@ exports.verifyUserToken = (req, res) => {
         res.status(500).json({ success: false, msg: err });
         console.log(err);
       });
-  });
+  }
 };
 
 exports.profile = (req, res) => {
