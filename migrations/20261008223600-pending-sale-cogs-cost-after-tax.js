@@ -26,6 +26,9 @@
 
 const { costIncludesInputVat } = require("../src/constants/taxableStatus");
 
+const eq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 const BACKUP_TABLE = "bak_pending_cogs_vat_sale_workflows";
 
 function round2(n) {
@@ -139,8 +142,8 @@ module.exports = {
              MIN(ac.description) AS description
       FROM taxes t
       INNER JOIN account_category ac
-        ON ac.facility_id = t.facilityId
-       AND ac.code = t.account_sub_head
+        ON ${eq("ac.facility_id", "t.facilityId")}
+       AND ${eq("ac.code", "t.account_sub_head")}
       WHERE t.tax_category = 'Purchase'
         AND t.inclusive_type = 'inclusive'
         AND t.description LIKE 'Input VAT%'

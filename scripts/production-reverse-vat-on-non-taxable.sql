@@ -37,7 +37,8 @@ SELECT
   ROUND(SUM(se.vat_amount), 2) AS vat_to_clear
 FROM store_entries se
 INNER JOIN products p
-  ON p.sku = se.product_id AND p.facility_id = se.facilityId
+  ON CONVERT(p.sku USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.product_id USING utf8mb4) COLLATE utf8mb4_general_ci
+ AND CONVERT(p.facility_id USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.facilityId USING utf8mb4) COLLATE utf8mb4_general_ci
 WHERE (p.taxable IS NULL OR p.taxable <> 'Taxable')
   AND COALESCE(se.vat_amount, 0) <> 0
 GROUP BY p.taxable;
@@ -75,7 +76,8 @@ INSERT IGNORE INTO bak_vat_reversal_store_entries
 SELECT se.*
 FROM store_entries se
 INNER JOIN products p
-  ON p.sku = se.product_id AND p.facility_id = se.facilityId
+  ON CONVERT(p.sku USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.product_id USING utf8mb4) COLLATE utf8mb4_general_ci
+ AND CONVERT(p.facility_id USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.facilityId USING utf8mb4) COLLATE utf8mb4_general_ci
 WHERE (p.taxable IS NULL OR p.taxable <> 'Taxable')
   AND COALESCE(se.vat_amount, 0) <> 0;
 
@@ -110,7 +112,8 @@ WHERE gl.transaction_description LIKE 'COGS [%'
 -- 3. No VAT on stock lines of products that are not Taxable
 UPDATE store_entries se
 INNER JOIN products p
-  ON p.sku = se.product_id AND p.facility_id = se.facilityId
+  ON CONVERT(p.sku USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.product_id USING utf8mb4) COLLATE utf8mb4_general_ci
+ AND CONVERT(p.facility_id USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(se.facilityId USING utf8mb4) COLLATE utf8mb4_general_ci
 SET se.vat_amount = 0
 WHERE (p.taxable IS NULL OR p.taxable <> 'Taxable')
   AND COALESCE(se.vat_amount, 0) <> 0;

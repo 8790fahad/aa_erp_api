@@ -22,6 +22,9 @@
 
 const NOT_TAXABLE = `(p.taxable IS NULL OR p.taxable <> 'Taxable')`;
 
+const eq = (a, b) =>
+  `CONVERT(${a} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${b} USING utf8mb4) COLLATE utf8mb4_general_ci`;
+
 const COGS_WITH_VAT_ROW = `
   FROM general_ledger gl
   INNER JOIN products p
@@ -62,7 +65,7 @@ module.exports = {
         `INSERT IGNORE INTO bak_vat_reversal_store_entries
          SELECT se.* FROM store_entries se
          INNER JOIN products p
-           ON p.sku = se.product_id AND p.facility_id = se.facilityId
+           ON ${eq("p.sku", "se.product_id")} AND ${eq("p.facility_id", "se.facilityId")}
          WHERE ${NOT_TAXABLE} AND COALESCE(se.vat_amount, 0) <> 0`,
       );
     }
@@ -106,7 +109,7 @@ module.exports = {
         await sequelize.query(
           `UPDATE store_entries se
            INNER JOIN products p
-             ON p.sku = se.product_id AND p.facility_id = se.facilityId
+             ON ${eq("p.sku", "se.product_id")} AND ${eq("p.facility_id", "se.facilityId")}
            SET se.vat_amount = 0
            WHERE ${NOT_TAXABLE} AND COALESCE(se.vat_amount, 0) <> 0`,
           { transaction },
