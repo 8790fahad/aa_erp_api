@@ -532,11 +532,9 @@ async function listInvestors(req, res) {
   const offset = (pageNumber - 1) * pageSize;
   const term = String(search || "").trim();
   const like = `%${term}%`;
-  const eq = (left, right) =>
-    `CONVERT(${left} USING utf8mb4) COLLATE utf8mb4_general_ci = CONVERT(${right} USING utf8mb4) COLLATE utf8mb4_general_ci`;
 
   const whereSql = `
-    ${eq("e.facilityId", ":facilityId")}
+    e.facilityId = :facilityId
     AND e.contractType = 'Business Associate'
     AND COALESCE(e.investmentOpeningBalance, 0) > 0.009
     AND (
@@ -554,104 +552,69 @@ async function listInvestors(req, res) {
     hasSearch: term ? 1 : 0,
   };
 
-  const [totals] = await db.sequelize.query(
-    `SELECT COUNT(*) AS total,
-            COALESCE(SUM(COALESCE(e.investmentOpeningBalance, 0)), 0) AS principal
-     FROM employees e
-     WHERE ${whereSql}`,
-    { replacements, type: db.Sequelize.QueryTypes.SELECT },
-  );
+  // Outstanding balance lives on the *-INV lines only. The matching *-OBE
+  // credit is the equity contra entry and must not be netted into the total.
+  const balanceExpr = `
+    CASE
+      WHEN COUNT(gl.transaction_ref) = 0 THEN COALESCE(e.investmentOpeningBalance, 0)
+      ELSE COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
+    END`;
+  const ledgerJoin = `
+    LEFT JOIN general_ledger gl
+      ON gl.facility_id = e.facilityId
+     AND gl.transaction_ref = CONCAT(e.employeeId, '-INV')
+     AND gl.purpose_of_payment = 'Business associate investment'`;
 
-  const rows = await db.sequelize.query(
-    `SELECT e.id, e.employeeId, e.firstName, e.lastName, e.contactInfo,
-            e.designation, e.contractType, e.status,
-            e.investmentOpeningBalance, e.investmentOpeningDate,
-            e.investmentAccountHead, e.investmentReference
-     FROM employees e
-     WHERE ${whereSql}
-     ORDER BY e.firstName ASC, e.lastName ASC
-     LIMIT ${pageSize} OFFSET ${offset}`,
-    { replacements, type: db.Sequelize.QueryTypes.SELECT },
-  );
-
-  const refs = rows
-    .map((row) => `${row.employeeId}-INV`)
-    .filter(Boolean);
-  const balanceRows = refs.length
-    ? await db.sequelize.query(
-        `SELECT transaction_ref AS ref,
-                COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS balance
-         FROM general_ledger
-         WHERE ${eq("facility_id", ":facilityId")}
-           AND purpose_of_payment = 'Business associate investment'
-           AND transaction_ref IN (:refs)
-         GROUP BY transaction_ref`,
-        {
-          replacements: { facilityId, refs },
-          type: db.Sequelize.QueryTypes.SELECT,
-        },
-      )
-    : [];
-  const balanceByRef = Object.fromEntries(
-    balanceRows.map((row) => [row.ref, Number(row.balance) || 0]),
-  );
-
-  let ledgerTotal = { currentBalance: null };
-  if (!term) {
-    const [sumRow] = await db.sequelize.query(
-      `SELECT COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS currentBalance
-       FROM general_ledger
-       WHERE ${eq("facility_id", ":facilityId")}
-         AND purpose_of_payment = 'Business associate investment'`,
+  const [[totals], rows] = await Promise.all([
+    db.sequelize.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(opening), 0) AS principal,
+              COALESCE(SUM(currentBalance), 0) AS currentBalance
+       FROM (
+         SELECT e.investmentOpeningBalance AS opening,
+                ${balanceExpr} AS currentBalance
+         FROM employees e
+         ${ledgerJoin}
+         WHERE ${whereSql}
+         GROUP BY e.id, e.investmentOpeningBalance
+       ) investor_totals`,
       { replacements, type: db.Sequelize.QueryTypes.SELECT },
-    );
-    ledgerTotal = sumRow || ledgerTotal;
-  } else {
-    const matched = await db.sequelize.query(
-      `SELECT CONCAT(e.employeeId, '-INV') AS ref
+    ),
+    db.sequelize.query(
+      `SELECT e.id, e.employeeId, e.firstName, e.lastName, e.contactInfo,
+              e.designation, e.contractType, e.status,
+              e.investmentOpeningBalance, e.investmentOpeningDate,
+              e.investmentAccountHead, e.investmentReference,
+              ${balanceExpr} AS investmentCurrentBalance
        FROM employees e
-       WHERE ${whereSql}`,
+       ${ledgerJoin}
+       WHERE ${whereSql}
+       GROUP BY e.id, e.employeeId, e.firstName, e.lastName, e.contactInfo,
+                e.designation, e.contractType, e.status,
+                e.investmentOpeningBalance, e.investmentOpeningDate,
+                e.investmentAccountHead, e.investmentReference
+       ORDER BY e.firstName ASC, e.lastName ASC
+       LIMIT ${pageSize} OFFSET ${offset}`,
       { replacements, type: db.Sequelize.QueryTypes.SELECT },
-    );
-    const matchedRefs = matched.map((row) => row.ref).filter(Boolean);
-    if (matchedRefs.length) {
-      const [sumRow] = await db.sequelize.query(
-        `SELECT COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0) AS currentBalance
-         FROM general_ledger
-         WHERE ${eq("facility_id", ":facilityId")}
-           AND purpose_of_payment = 'Business associate investment'
-           AND transaction_ref IN (:matchedRefs)`,
-        {
-          replacements: { facilityId, matchedRefs },
-          type: db.Sequelize.QueryTypes.SELECT,
-        },
-      );
-      ledgerTotal = sumRow || ledgerTotal;
-    } else {
-      ledgerTotal = { currentBalance: 0 };
-    }
-  }
+    ),
+  ]);
 
   const total = Number(totals?.total) || 0;
   return res.json({
     success: true,
     data: {
       employees: rows.map((row) => {
-        const ledgerBalance = balanceByRef[`${row.employeeId}-INV`];
         const opening = Number(row.investmentOpeningBalance) || 0;
+        const current = Number(row.investmentCurrentBalance);
         return {
           ...row,
           investmentOpeningBalance: opening,
-          investmentCurrentBalance:
-            ledgerBalance === undefined ? opening : ledgerBalance,
+          investmentCurrentBalance: Number.isFinite(current) ? current : opening,
         };
       }),
       totals: {
         principal: Number(totals?.principal) || 0,
-        currentBalance:
-          ledgerTotal?.currentBalance == null
-            ? Number(totals?.principal) || 0
-            : Number(ledgerTotal.currentBalance) || 0,
+        currentBalance: Number(totals?.currentBalance) || 0,
       },
       pagination: {
         total,
