@@ -493,11 +493,35 @@ class JournalEntryService {
           throw new Error("Journal entry has no lines");
         }
 
+        const accountCodes = [
+          ...new Set(
+            draftLines
+              .map((line) => String(line.account_code || "").trim())
+              .filter(Boolean),
+          ),
+        ];
+        const parentByCode = new Map();
+        if (accountCodes.length && db.AccountCategory) {
+          const categories = await db.AccountCategory.findAll({
+            where: {
+              code: { [Op.in]: accountCodes },
+              facilityId: String(facilityId),
+            },
+            attributes: ["code", "parentCode"],
+            transaction,
+          });
+          for (const category of categories) {
+            const parent = String(category.parentCode || "").trim();
+            parentByCode.set(String(category.code), parent || "0");
+          }
+        }
+
         const notes = draft.notes || draft.description || "Journal Entry";
         const ledgerEntries = draftLines.map((line) => ({
           transaction_date: line.line_date || draft.entry_date,
           account_code: line.account_code,
-          account_subhead: line.account_name || "",
+          account_subhead:
+            parentByCode.get(String(line.account_code || "").trim()) || "0",
           dr: line.debit || 0,
           cr: line.credit || 0,
           transaction_description:
@@ -842,7 +866,7 @@ class JournalEntryService {
         id: line.transaction_id,
         line_number: index + 1,
         account_code: line.account_code,
-        account_name: line.account_subhead,
+        account_name: line.account_description || line.account_subhead,
         line_date: line.transaction_date,
         line_description: line.transaction_description,
         description: line.transaction_description,

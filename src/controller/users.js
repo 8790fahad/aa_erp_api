@@ -2822,7 +2822,6 @@ exports.login = (req, res) => {
         .then(async (isMatch) => {
           if (isMatch) {
             // user matched
-            console.log("matched!");
             const hoursCheck = await assertUserCanLoginNow(
               db,
               user[0].dataValues,
@@ -2915,7 +2914,6 @@ exports.login = (req, res) => {
                     businessCount: businessesList.length,
                     branch_id: currentBusiness?.branch_id || null,
                   };
-                  console.log(result);
                   res.json(result);
                 };
 

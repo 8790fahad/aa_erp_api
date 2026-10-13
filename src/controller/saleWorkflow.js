@@ -989,6 +989,13 @@ function saleCodesMatch(a, b) {
   return normalizeSaleCode(a).toUpperCase() === normalizeSaleCode(b).toUpperCase();
 }
 
+function invoiceNumberPrefix(value) {
+  const code = normalizeSaleCode(value).toUpperCase();
+  const withPrefix = /^\d{3,}$/.test(code) ? `INV-${code}` : code;
+  if (!/^INV-\d{3,}$/.test(withPrefix)) return "";
+  return withPrefix;
+}
+
 const POST_COLLECTION_STATUSES = new Set([
   "payment_confirmed",
   "credit_approved",
@@ -1155,8 +1162,24 @@ function resolveLineBranchId(...candidates) {
  * Build branch packs from store_entries (and customer_entries fallback).
  * One pack per distinct store/branch involved in the sale.
  */
+function storeEntryMatchesCustomerLine(entry, lines) {
+  const sku = String(entry.product_id || "").trim();
+  const qty = Number(entry.qty_out || 0);
+  const by = String(entry.inserted_by || "").trim();
+  const branch = resolveLineBranchId(entry.branchId, entry.branch_id);
+  return lines.some((line) => {
+    if (String(line.link_id || "").trim() !== sku) return false;
+    if (Math.abs(Number(line.qty_out || 0) - qty) >= 0.001) return false;
+    const lineBy = String(line.created_by || "").trim();
+    if (lineBy && by && lineBy !== by) return false;
+    const lineBranch = resolveLineBranchId(line.branch_id, line.branchId);
+    if (lineBranch > 0 && branch > 0 && lineBranch !== branch) return false;
+    return true;
+  });
+}
+
 async function ensureSaleFulfillments(
-  { facilityId, saleCode, createdBy },
+  { facilityId, saleCode, createdBy, customerNo },
   transaction,
 ) {
   if (!db.SaleFulfillment || !db.SaleFulfillmentLine) {
@@ -1175,8 +1198,33 @@ async function ensureSaleFulfillments(
         })
       : [];
 
+  // A shared invoice number can hold two sales. Separation follows the
+  // customer on this workflow, not every product still tagged with the number.
+  const distinctCustomers = [
+    ...new Set(
+      customerLines
+        .map((line) => String(line.customerNo || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  let ownerNo = String(customerNo || "").trim();
+  if (!ownerNo && distinctCustomers.length > 1 && db.SaleWorkflow) {
+    const workflow = await db.SaleWorkflow.findOne({
+      where: { facility_id: facilityId, sale_code: saleCode },
+      attributes: ["customer_no"],
+      transaction,
+    });
+    ownerNo = String(workflow?.customer_no || "").trim();
+  }
+  const ownedLines =
+    ownerNo && distinctCustomers.length > 1
+      ? customerLines.filter(
+          (line) => String(line.customerNo || "").trim() === ownerNo,
+        )
+      : customerLines;
+
   const customerBranchBySku = new Map();
-  for (const line of customerLines) {
+  for (const line of ownedLines) {
     const sku = String(line.link_id || "").trim();
     if (!sku) continue;
     const bid = resolveLineBranchId(line.branch_id, line.branchId);
@@ -1196,11 +1244,18 @@ async function ensureSaleFulfillments(
       })
     : [];
 
+  const scopedStoreEntries =
+    ownedLines === customerLines
+      ? storeEntries
+      : storeEntries.filter((entry) =>
+          storeEntryMatchesCustomerLine(entry, ownedLines),
+        );
+
   const byBranch = new Map();
 
-  if (storeEntries.length) {
+  if (scopedStoreEntries.length) {
     const productIds = [
-      ...new Set(storeEntries.map((e) => e.product_id).filter(Boolean)),
+      ...new Set(scopedStoreEntries.map((e) => e.product_id).filter(Boolean)),
     ];
     const products = productIds.length
       ? await db.Product.findAll({
@@ -1211,7 +1266,7 @@ async function ensureSaleFulfillments(
       : [];
     const nameBySku = new Map(products.map((p) => [p.sku, p.name]));
 
-    for (const entry of storeEntries) {
+    for (const entry of scopedStoreEntries) {
       const sku = String(entry.product_id || "").trim();
       const bid = resolveLineBranchId(
         entry.branchId,
@@ -1236,10 +1291,10 @@ async function ensureSaleFulfillments(
     (bid) => bid > 0,
   );
 
-  if ((!byBranch.size || storeOnlyZero) && customerLines.length) {
+  if ((!byBranch.size || storeOnlyZero) && ownedLines.length) {
     if (!byBranch.size || customerHasRealBranches) {
       byBranch.clear();
-      for (const line of customerLines) {
+      for (const line of ownedLines) {
         const bid = resolveLineBranchId(line.branch_id, line.branchId);
         if (!byBranch.has(bid)) byBranch.set(bid, []);
         byBranch.get(bid).push({
@@ -1331,27 +1386,45 @@ async function createFulfillmentsFromGroups({
           transaction,
         });
 
-    // Create lines on first insert, or backfill if a pending pack has none
-    if (created || (row.status === "pending" && !existingLines.length)) {
-      if (!created && existingLines.length === 0) {
+    const lineSignature = (list) =>
+      list
+        .map(
+          (l) =>
+            `${String(l.product_id || "")}:${Number(l.qty)}:${String(
+              l.item_name || "",
+            )}`,
+        )
+        .sort()
+        .join("|");
+    const pendingUntouched =
+      String(row.status || "") === "pending" &&
+      existingLines.every((l) => Number(l.qty_collected || 0) === 0);
+    const linesChanged =
+      lineSignature(existingLines) !== lineSignature(lines);
+
+    // Create lines on first insert, or refresh a pending pack that still
+    // contains another customer's products from a shared invoice number.
+    if (
+      created ||
+      (pendingUntouched && (!existingLines.length || linesChanged))
+    ) {
+      if (!created) {
         await db.SaleFulfillmentLine.destroy({
           where: { fulfillment_id: row.id },
           transaction,
         });
       }
-      if (created || !existingLines.length) {
-        await db.SaleFulfillmentLine.bulkCreate(
-          lines.map((l) => ({
-            fulfillment_id: row.id,
-            product_id: l.product_id || null,
-            item_name: l.item_name || null,
-            qty: l.qty,
-            qty_collected: 0,
-            store_entry_id: l.store_entry_id || null,
-          })),
-          { transaction },
-        );
-      }
+      await db.SaleFulfillmentLine.bulkCreate(
+        lines.map((l) => ({
+          fulfillment_id: row.id,
+          product_id: l.product_id || null,
+          item_name: l.item_name || null,
+          qty: l.qty,
+          qty_collected: 0,
+          store_entry_id: l.store_entry_id || null,
+        })),
+        { transaction },
+      );
     }
 
     const withLines = await db.SaleFulfillment.findByPk(row.id, {
@@ -1359,6 +1432,38 @@ async function createFulfillmentsFromGroups({
       transaction,
     });
     results.push(withLines);
+  }
+
+  const keepBranchIds = new Set(
+    [...byBranch.keys()].map((bid) => (Number(bid) > 0 ? Number(bid) : 0)),
+  );
+  const pendingPacks = await db.SaleFulfillment.findAll({
+    where: {
+      facility_id: facilityId,
+      sale_code: saleCode,
+      status: "pending",
+    },
+    transaction,
+  });
+  for (const pack of pendingPacks) {
+    const bid = Number(pack.branch_id) > 0 ? Number(pack.branch_id) : 0;
+    if (keepBranchIds.has(bid)) continue;
+    const packLines = db.SaleFulfillmentLine
+      ? await db.SaleFulfillmentLine.findAll({
+          where: { fulfillment_id: pack.id },
+          transaction,
+        })
+      : [];
+    if (packLines.some((line) => Number(line.qty_collected || 0) > 0)) {
+      continue;
+    }
+    if (db.SaleFulfillmentLine) {
+      await db.SaleFulfillmentLine.destroy({
+        where: { fulfillment_id: pack.id },
+        transaction,
+      });
+    }
+    await pack.destroy({ transaction });
   }
 
   // Return packs sorted by branch for stable Copy N of M display
@@ -5652,6 +5757,61 @@ exports.listWarehouseRequests = async (req, res) => {
         }
       }
 
+      if (!packs.length && !workflow) {
+        const prefix = invoiceNumberPrefix(lookupCode);
+        if (prefix && db.SaleWorkflow) {
+          const matches = await db.SaleWorkflow.findAll({
+            where: {
+              facility_id: facilityId,
+              sale_code: { [Op.like]: `${prefix}%` },
+            },
+            limit: 8,
+          });
+          if (matches.length === 1) {
+            workflow = matches[0];
+          } else if (matches.length > 1) {
+            return res.status(404).json({
+              success: false,
+              message: `Several invoices start with ${prefix}. Scan the full number: ${matches
+                .map((item) => item.sale_code)
+                .join(", ")}.`,
+            });
+          }
+        }
+      }
+
+      if (!packs.length && workflow?.sale_code) {
+        const anywhere = await db.SaleFulfillment.findAll({
+          where: { facility_id: facilityId, sale_code: workflow.sale_code },
+          include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+          order: [["branch_id", "ASC"]],
+        });
+        const allowed = new Set(scopedBranchIds.map((id) => Number(id)));
+        const here = allowed.size
+          ? anywhere.filter((pack) => allowed.has(Number(pack.branch_id)))
+          : anywhere;
+        if (here.length) {
+          packs = here;
+        } else if (anywhere.length && allowed.size) {
+          const named = await enrichFulfillments(anywhere);
+          const stores = [...new Set(named.map((pack) => pack.branch_name))];
+          return res.status(404).json({
+            success: false,
+            message: `${workflow.sale_code} is at ${stores.join(", ")}, not this warehouse.`,
+          });
+        } else if (String(workflow.status) === "warehouse_picking") {
+          await ensureSaleFulfillments({
+            facilityId,
+            saleCode: workflow.sale_code,
+          });
+          packs = await db.SaleFulfillment.findAll({
+            where: { ...fulBase, sale_code: workflow.sale_code },
+            include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+            order: [["branch_id", "ASC"]],
+          });
+        }
+      }
+
       if (!packs.length) {
         const statusLabel = workflow
           ? stageMeta(workflow.status)?.label || workflow.status
@@ -5659,7 +5819,7 @@ exports.listWarehouseRequests = async (req, res) => {
         return res.status(404).json({
           success: false,
           message: statusLabel
-            ? `Invoice is not ready for warehouse collection (${statusLabel}).`
+            ? `${workflow.sale_code} is not ready for warehouse collection (${statusLabel}).`
             : "No warehouse invoice found for that number.",
         });
       }
