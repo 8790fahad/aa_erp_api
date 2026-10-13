@@ -591,6 +591,128 @@ async function assertProductSalesLimits({
   }
 }
 
+/**
+ * One sales-limit pass for a whole invoice.
+ * Loads products, warehouse limits, and sold quantities in a few queries
+ * instead of repeating that work for every line.
+ */
+async function assertCartSalesLimits({
+  lines,
+  facilityId,
+  saleDate,
+  transaction,
+}) {
+  const grouped = new Map();
+  for (const line of lines || []) {
+    const sku = String(line?.sku || "").trim();
+    const qty = Number(line?.qty) || 0;
+    if (!sku || !(qty > 0)) continue;
+    const branchId = parseBranchId(line.branchId) || 0;
+    const key = limitKey(sku, branchId);
+    const prev = grouped.get(key);
+    if (prev) prev.qty += qty;
+    else grouped.set(key, { sku, qty, branchId, product: line.product || null });
+  }
+  const entries = [...grouped.values()];
+  if (!entries.length || !facilityId) return;
+
+  const skus = [...new Set(entries.map((e) => e.sku))];
+  const missing = skus.filter(
+    (sku) => !entries.some((e) => e.sku === sku && e.product),
+  );
+  if (missing.length && db.Product) {
+    const products = await db.Product.findAll({
+      where: { facility_id: facilityId, sku: missing },
+      attributes: [
+        "sku",
+        "name",
+        "daily_sales_limit",
+        "weekly_sales_limit",
+        "monthly_sales_limit",
+        "sales_stopped",
+      ],
+      raw: true,
+      transaction,
+    });
+    const bySku = new Map((products || []).map((p) => [String(p.sku), p]));
+    for (const entry of entries) {
+      if (!entry.product) entry.product = bySku.get(entry.sku) || null;
+    }
+  }
+
+  const [warehouseRows, stopRows] = await Promise.all([
+    loadWarehouseLimitRows({ facilityId, skus, transaction }),
+    loadWarehouseStopRows({ facilityId, skus, transaction }),
+  ]);
+
+  const prepared = [];
+  const uniqueChecks = [];
+  const seenChecks = new Set();
+  for (const entry of entries) {
+    const label = (entry.product?.name || entry.sku || "product").trim();
+    if (
+      isStoppedForWarehouse({
+        product: entry.product,
+        sku: entry.sku,
+        branchId: entry.branchId,
+        stopRows,
+      })
+    ) {
+      throw new Error(
+        `Sales are stopped for ${label} at this warehouse. This product cannot be sold on invoices.`,
+      );
+    }
+    const limitProduct = resolveLimitProduct({
+      product: entry.product || {},
+      sku: entry.sku,
+      branchId: entry.branchId,
+      warehouseRows,
+    });
+    const checks = limitChecksForProduct(limitProduct, saleDate);
+    const countByBranch = warehouseRows.some(
+      (r) => String(r.sku) === String(entry.sku),
+    );
+    prepared.push({ ...entry, checks, countByBranch, label });
+    for (const check of checks) {
+      const key = `${check.name}|${check.from}|${check.to}`;
+      if (seenChecks.has(key)) continue;
+      seenChecks.add(key);
+      uniqueChecks.push(check);
+    }
+  }
+
+  const soldByCheck = new Map();
+  await Promise.all(
+    uniqueChecks.map(async (check) => {
+      const maps = await getSoldQtyInRangeBatch({
+        skus,
+        facilityId,
+        fromDate: check.from,
+        toDate: check.to,
+        transaction,
+      });
+      soldByCheck.set(`${check.name}|${check.from}|${check.to}`, maps);
+    }),
+  );
+
+  for (const row of prepared) {
+    for (const check of row.checks) {
+      const maps = soldByCheck.get(`${check.name}|${check.from}|${check.to}`);
+      const sold = row.countByBranch
+        ? maps?.bySkuBranch.get(limitKey(row.sku, row.branchId)) || 0
+        : maps?.bySku.get(row.sku) || 0;
+      const remaining = check.limit - sold;
+      if (row.qty > remaining) {
+        throw new Error(
+          `Sales ${check.name} limit reached for ${row.label}` +
+            (row.countByBranch ? " at this warehouse" : "") +
+            `. Limit: ${check.limit}, already sold: ${sold}, remaining: ${Math.max(0, remaining)}, requested: ${row.qty}`,
+        );
+      }
+    }
+  }
+}
+
 function omitStoppedUnlessIncluded(rows, includeStopped) {
   if (includeStopped) return rows || [];
   return (rows || []).filter((r) => !isSalesStopped(r.sales_stopped));
@@ -604,6 +726,7 @@ module.exports = {
   getProductSalesLimitSnapshot,
   attachSalesLimitInfo,
   assertProductSalesLimits,
+  assertCartSalesLimits,
   loadWarehouseLimitRows,
   loadWarehouseStopRows,
   omitStoppedUnlessIncluded,

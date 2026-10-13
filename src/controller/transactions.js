@@ -10,8 +10,8 @@ const UUIDV4 = require("uuid").v4;
 const { Op, QueryTypes } = require("sequelize");
 const { sellingApi } = require("./api/transactionsApi");
 const { getAndUpdateNumber } = require("../services/numberGen");
-const { getSellableQtyAtBranch, listSellableBranchesForSku } = require("../services/sellableStock");
-const { assertProductSalesLimits } = require("../services/salesLimits");
+const { listSellableBranchesForSku, getSellableQtyMap } = require("../services/sellableStock");
+const { assertCartSalesLimits } = require("../services/salesLimits");
 const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../constants/storeEntryTypes");
 const {
   resolveStockOutExpiry,
@@ -1364,6 +1364,7 @@ exports.getSaleByCode = async (req, res) => {
         receiptNo: saleCode,
         facilityId,
       },
+      order: [["entry_id", "ASC"]],
     });
 
     let reconstructedEntries = [];
@@ -1390,12 +1391,46 @@ exports.getSaleByCode = async (req, res) => {
       return !found.some((code) => code.toUpperCase() !== saleCodeNorm);
     };
 
-    const entries = (customerEntries.length
+    let entries = (customerEntries.length
       ? customerEntries.map((entry) =>
           entry.get ? entry.get({ plain: true }) : entry,
         )
       : reconstructedEntries
     ).filter(belongsToThisSale);
+
+    // Two sales saved at the same moment can share one invoice number.
+    // Print only the customer this document belongs to.
+    const lineCustomers = [];
+    for (const entry of entries) {
+      const entryType = String(entry.type || "").toLowerCase();
+      const isGoodsLine =
+        entryType.includes("sales") ||
+        entryType.includes("service") ||
+        entryType.includes("pro-bono");
+      if (!isGoodsLine) continue;
+      const customerNo = String(entry.customerNo || "").trim();
+      if (customerNo && !lineCustomers.includes(customerNo)) {
+        lineCustomers.push(customerNo);
+      }
+    }
+    const requestedCustomer = String(
+      req.query.customer_no || req.query.customerNo || "",
+    ).trim();
+    const invoiceCustomer =
+      requestedCustomer ||
+      (lineCustomers.length > 1 ? lineCustomers[0] : "");
+    if (invoiceCustomer && lineCustomers.length > 1) {
+      const owned = entries.filter(
+        (entry) => String(entry.customerNo || "").trim() === invoiceCustomer,
+      );
+      if (!owned.length) {
+        return res.status(404).json({
+          success: false,
+          message: "No sale found for this customer on the provided sale code",
+        });
+      }
+      entries = owned;
+    }
 
     if (!entries.length) {
       return res.status(404).json({
@@ -3377,7 +3412,6 @@ async function clearExistingSaleForEdit(facilityId, saleCode, transaction) {
 exports.createSale = async (req, res) => {
   const t = await db.sequelize.transaction();
   let saleRef, saleDate;
-  console.log(req.body, "=============> req.body");
   try {
     const {
       customer_id,
@@ -3423,8 +3457,6 @@ exports.createSale = async (req, res) => {
       typeof req.body.discount === "string"
         ? Number(String(req.body.discount).replace(/,/g, "")) || 0
         : 0);
-
-    console.log(req.body, "=============> req.body");
 
     /** Drop duplicate tax ids; if inclusive+exclusive Output VAT clones share a rate, keep exclusive. */
     const normalizeSaleTaxes = (taxList) => {
@@ -3870,11 +3902,13 @@ exports.createSale = async (req, res) => {
     }
 
     // ===================================================================
-    // STOP SALES + SALES TARGET (early, before ledger / stock work)
-    // Aggregates qty by SKU + warehouse so multi-line carts cannot bypass limits.
+    // STOP SALES + SALES TARGET (one batched check for the whole cart)
     // ===================================================================
+    const preloadedProducts = new Map();
+    let sellableQtyByKey = new Map();
     {
-      const earlyQtyByKey = new Map();
+      const limitLines = [];
+      const skus = [];
       for (const itm of items) {
         const sku = itm.product_id || itm.sku;
         const qty = Number(itm.quantity || itm.qty || 0);
@@ -3883,18 +3917,23 @@ exports.createSale = async (req, res) => {
           parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
           saleBranchId ||
           0;
-        const key = `${sku}|${bid}`;
-        earlyQtyByKey.set(key, (earlyQtyByKey.get(key) || 0) + qty);
+        limitLines.push({ sku: String(sku), qty, branchId: bid });
+        skus.push(String(sku));
       }
-      for (const [key, qty] of earlyQtyByKey.entries()) {
-        const [sku, branchPart] = key.split("|");
-        const branchId = parseInt(branchPart, 10) || 0;
-        const product = await db.Product.findOne({
-          where: { sku, facility_id: facilityId },
+      const uniqueSkus = [...new Set(skus)];
+      if (uniqueSkus.length) {
+        const products = await db.Product.findAll({
+          where: { sku: uniqueSkus, facility_id: facilityId },
           attributes: [
             "id",
             "sku",
             "name",
+            "item_type",
+            "category",
+            "inventory_account",
+            "cogs_head",
+            "revenue_account",
+            "taxable",
             "daily_sales_limit",
             "weekly_sales_limit",
             "monthly_sales_limit",
@@ -3902,22 +3941,27 @@ exports.createSale = async (req, res) => {
           ],
           transaction: t,
         });
-        if (!product) {
-          await t.rollback();
-          return res.status(400).json({
-            success: false,
-            message: `Product not found: ${sku}`,
-          });
+        for (const product of products || []) {
+          preloadedProducts.set(String(product.sku), product);
+        }
+        for (const sku of uniqueSkus) {
+          if (!preloadedProducts.has(sku)) {
+            await t.rollback();
+            return res.status(400).json({
+              success: false,
+              message: `Product not found: ${sku}`,
+            });
+          }
         }
         try {
-          await assertProductSalesLimits({
-            product,
-            sku,
+          await assertCartSalesLimits({
+            lines: limitLines.map((line) => ({
+              ...line,
+              product: preloadedProducts.get(line.sku),
+            })),
             facilityId,
-            qty,
             saleDate,
             transaction: t,
-            branchId,
           });
         } catch (limitErr) {
           await t.rollback();
@@ -3926,6 +3970,11 @@ exports.createSale = async (req, res) => {
             message: limitErr.message || "Sales limit exceeded",
           });
         }
+        sellableQtyByKey = await getSellableQtyMap({
+          facilityId,
+          skus: uniqueSkus,
+          transaction: t,
+        });
       }
     }
 
@@ -4727,24 +4776,9 @@ exports.createSale = async (req, res) => {
 
     // ===================================================================
     // FIRST PASS: CALCULATE SUBTOTAL AND VALIDATE ITEMS
+    // Sales limits already ran once for the whole cart.
     // ===================================================================
-    // Aggregate qty by SKU + warehouse so multi-line carts cannot bypass limits
-    const qtyBySku = new Map();
-    const qtyBySkuBranch = new Map();
     const remainingSellableByKey = new Map();
-    const assertedLimitKeys = new Set();
-    for (const itm of items) {
-      const sku = itm.product_id;
-      const qty = Number(itm.quantity);
-      if (!sku || !(qty > 0)) continue;
-      qtyBySku.set(sku, (qtyBySku.get(sku) || 0) + qty);
-      const bid =
-        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
-        saleBranchId ||
-        0;
-      const key = `${sku}|${bid}`;
-      qtyBySkuBranch.set(key, (qtyBySkuBranch.get(key) || 0) + qty);
-    }
     const productBySku = new Map();
 
     for (const itm of items) {
@@ -4762,7 +4796,7 @@ exports.createSale = async (req, res) => {
         throw new Error(`Invalid item: ${sku} - price must be greater than 0`);
       }
 
-      let product = productBySku.get(sku);
+      let product = productBySku.get(sku) || preloadedProducts.get(String(sku));
       if (!product) {
         product = await db.Product.findOne({
           where: { sku, facility_id: facilityId },
@@ -4781,28 +4815,12 @@ exports.createSale = async (req, res) => {
             "monthly_sales_limit",
             "sales_stopped",
           ],
+          transaction: t,
         });
         if (!product) throw new Error(`Product not found: ${sku}`);
         productBySku.set(sku, product);
-      }
-
-      const lineLimitBranchId =
-        parseInt(itm.branchId ?? itm.branch_id ?? saleBranchId, 10) ||
-        saleBranchId ||
-        0;
-      const limitKey = `${sku}|${lineLimitBranchId}`;
-      if (!assertedLimitKeys.has(limitKey)) {
-        assertedLimitKeys.add(limitKey);
-        // Sales target / limit / stop — block even when stock remains (aggregated qty)
-        await assertProductSalesLimits({
-          product,
-          sku,
-          facilityId,
-          qty: qtyBySkuBranch.get(limitKey) || qty,
-          saleDate,
-          transaction: t,
-          branchId: lineLimitBranchId,
-        });
+      } else if (!productBySku.has(sku)) {
+        productBySku.set(sku, product);
       }
 
       // Check inventory for goods — branch total from store_entries (same as Goods List)
@@ -4824,12 +4842,14 @@ exports.createSale = async (req, res) => {
         const stockKey = `${sku}|${stockBranchId}`;
 
         if (!remainingSellableByKey.has(stockKey)) {
-          let currentBalance = await getSellableQtyAtBranch({
-            sku,
-            facilityId,
-            branchId: stockBranchId,
-            transaction: t,
-          });
+          let currentBalance =
+            stockBranchId > 0
+              ? sellableQtyByKey.get(`${sku}|${stockBranchId}`) || 0
+              : [...sellableQtyByKey.entries()].reduce(
+                  (sum, [key, bal]) =>
+                    key.startsWith(`${sku}|`) ? sum + bal : sum,
+                  0,
+                );
 
           // Sales are warehouse-bound: never pull stock from another store.
           const mayRetarget = false;

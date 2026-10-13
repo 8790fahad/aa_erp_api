@@ -8946,72 +8946,21 @@ exports.getReadyForSalesItems = async (req, res) => {
 
     const allowSalesWithoutStock = business?.allow_sales_without_stock || false;
 
-    const balanceCondition = allowSalesWithoutStock
-      ? ""
-      : "WHERE sd.`balance` > 0";
-
     // Pickers (New Invoice) opt in so stopped products can be listed as
     // unselectable instead of silently disappearing. Other callers keep the
     // old behaviour of omitting them entirely.
     const includeStopped = ["1", "true", "yes"].includes(
       String(req.query.includeStopped || "").toLowerCase(),
     );
-    const salesStoppedCondition = includeStopped
-      ? ""
-      : "AND (p.`sales_stopped` IS NULL OR p.`sales_stopped` = 0)";
 
-    // All sales-floor stock for the facility — no branch filter.
-    // Same SKU appears once per branchId with its own balance.
-    const query = `
-      SELECT
-        sd.\`sku\`,
-        sd.\`item_name\`,
-        sd.\`uom_category\`,
-        sd.\`uom\`,
-        sd.\`product_id\`,
-        sd.\`facilityId\`,
-        sd.\`branchId\`,
-        sd.\`selling_price\`,
-        sd.\`expiry_date\`,
-        sd.\`multiplier_type\`,
-        sd.\`multiplier_id\`,
-        sd.\`balance\`,
-        sd.\`unit_of_measure\`,
-        sd.\`branch_name\`,
-        sd.\`taxable\`,
-        p.\`daily_sales_limit\`,
-        p.\`weekly_sales_limit\`,
-        p.\`monthly_sales_limit\`,
-        p.\`sales_stopped\`,
-        b.\`branch_name\` AS \`location_name\`,
-        CONCAT(
-          sd.\`product_id\`, '-',
-          COALESCE(sd.\`expiry_date\`, 'NULL'), '-',
-          COALESCE(sd.\`multiplier_id\`, 'NULL'), '-',
-          sd.\`selling_price\`, '-',
-          COALESCE(sd.\`branchId\`, '0')
-        ) AS \`id\`
-      FROM \`sales_dep\` sd
-      LEFT JOIN \`products\` p
-        ON p.\`sku\` = sd.\`product_id\`
-        AND p.\`facility_id\` = sd.\`facilityId\`
-      LEFT JOIN \`branches\` b
-        ON b.\`id\` = sd.\`branchId\`
-        AND (b.\`facilityId\` = sd.\`facilityId\` OR b.\`facilityId\` IS NULL)
-      ${balanceCondition ? balanceCondition + " AND" : "WHERE"} sd.\`facilityId\` = :facilityId
-        AND sd.\`branchId\` IS NOT NULL
-        AND sd.\`branchId\` > 0
-        ${salesStoppedCondition}
-      ORDER BY
-        COALESCE(b.\`branch_name\`, ''),
-        sd.\`item_name\`,
-        sd.\`branchId\`,
-        sd.\`expiry_date\`
-    `;
-
-    const results = await db.sequelize.query(query, {
-      replacements: { facilityId },
-      type: db.Sequelize.QueryTypes.SELECT,
+    // Facility-scoped stock (not the sales_dep view). Optional search/limit
+    // keeps New Invoice from loading every SKU before the user types.
+    const { listReadyForSales } = require("../services/sellableStock");
+    const results = await listReadyForSales({
+      facilityId,
+      allowSalesWithoutStock,
+      search: req.query.search,
+      limit: req.query.limit,
     });
 
     await attachSalesLimitInfo(results, facilityId);
@@ -9147,6 +9096,19 @@ exports.getServiceProducts = async (req, res) => {
       ? ""
       : "AND (p.sales_stopped IS NULL OR p.sales_stopped = 0)";
 
+    const rawQ = String(req.query.search || "")
+      .trim()
+      .replace(/[%_\\]/g, "");
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const rowLimit =
+      Number.isFinite(parsedLimit) && parsedLimit > 0
+        ? Math.min(parsedLimit, 50)
+        : null;
+    const searchSql = rawQ
+      ? "AND (p.name LIKE :like OR p.sku LIKE :like)"
+      : "";
+    const limitSql = rowLimit ? `LIMIT ${rowLimit}` : "";
+
     const results = await db.sequelize.query(
       `SELECT
     p.id,
@@ -9175,9 +9137,14 @@ WHERE p.facility_id = :facilityId
     AND p.item_type = 'Service'
     AND p.status = 'Active'
     ${salesStoppedCondition}
-ORDER BY p.name ASC;`,
+    ${searchSql}
+ORDER BY p.name ASC
+${limitSql}`,
       {
-        replacements: { facilityId },
+        replacements: {
+          facilityId,
+          ...(rawQ ? { like: `%${rawQ}%` } : {}),
+        },
         type: db.Sequelize.QueryTypes.SELECT,
       },
     );
