@@ -600,147 +600,47 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
     const gitCode = gitAcc?.code || null;
     const typeSql = vendorTypeSqlForApplyDeposit(types);
 
-    const gitJoin = gitCode
-      ? `LEFT JOIN (
-           SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
-             FROM general_ledger
-            WHERE facility_id = :facilityId
-              AND account_code = :gitCode
-              AND LOWER(type) IN ('goods_in_transit', 'git', 'inventory', 'prepayment')
-            GROUP BY transaction_ref
-         ) git ON git.transaction_ref = s.supplier_number`
-      : `LEFT JOIN (
-           SELECT transaction_ref, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
-             FROM general_ledger
-            WHERE facility_id = :facilityId
-              AND LOWER(type) IN ('goods_in_transit', 'git')
-            GROUP BY transaction_ref
-         ) git ON git.transaction_ref = s.supplier_number`;
+    const gitTypeSql = gitCode
+      ? `AND account_code = :gitCode
+         AND line_type IN ('goods_in_transit', 'git', 'inventory', 'prepayment')`
+      : `AND line_type IN ('goods_in_transit', 'git')`;
 
-    const havingSql = withBalance
-      ? `HAVING available_deposit > 0.009
+    const balanceFilter = withBalance
+      ? `WHERE available_deposit > 0.009
            OR available_credit_note > 0.009
            OR available_git > 0.009`
       : "";
 
+    // One range read of SUP- ledger lines. Joining every supplier with
+    // LIKE supplier-% makes MariaDB scan the whole ledger.
     const rows = await db.sequelize.query(
-      `SELECT
-         s.supplier_number,
-         MAX(s.supplier_name) AS supplier_name,
-         MAX(s.vendor_type) AS vendor_type,
-         MAX(s.email) AS email,
-         MAX(s.phone) AS phone,
-         GREATEST(COALESCE(MAX(adv.bal), 0) - COALESCE(MAX(cn_adv.bal), 0), 0) + GREATEST(COALESCE(SUM(prepaid.bal), 0), 0) AS available_deposit,
-         GREATEST(COALESCE(MAX(cn.bal), 0), 0) AS available_credit_note,
-         GREATEST(COALESCE(MAX(git.bal), 0), 0) AS available_git
-       FROM (
+      `WITH party AS (
          SELECT
-           supplier_number,
-           MAX(NULLIF(supplier_name, '')) AS supplier_name,
-           MAX(vendor_type) AS vendor_type,
-           MAX(email) AS email,
-           MAX(phone) AS phone
-         FROM suppliersinfo
-         WHERE facilityId = :facilityId
-         GROUP BY supplier_number
-       ) s
-       LEFT JOIN (
-         SELECT supplier_number, COALESCE(SUM(dr) - SUM(cr), 0) AS bal
-           FROM (
-             SELECT
-               s2.supplier_number,
-               gl.dr,
-               gl.cr
-             FROM suppliersinfo s2
-             INNER JOIN general_ledger gl
-               ON gl.facility_id = s2.facilityId
-              AND LOWER(gl.type) IN ('accrued', 'advance')
-              AND (
-                gl.transaction_ref = s2.supplier_number
-                OR gl.transaction_ref LIKE CONCAT(s2.supplier_number, '-%')
-              )
-             WHERE s2.facilityId = :facilityId
-           ) dep
-          GROUP BY supplier_number
-       ) adv ON adv.supplier_number = s.supplier_number
-       LEFT JOIN (
-         SELECT supplier_number, SUM(LEAST(note_net, remaining)) AS bal
-           FROM (
-             SELECT
-               se.supplier_number,
-               GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0) AS remaining,
-               (
-                 SELECT COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)
-                 FROM general_ledger gl
-                 WHERE gl.facility_id = :facilityId
-                   AND CONVERT(gl.reference_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
-                     = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
-                   AND LOWER(gl.type) IN ('accrued', 'advance')
-                   AND (
-                     gl.transaction_ref = se.supplier_number
-                     OR gl.transaction_ref LIKE CONCAT(se.supplier_number, '-%')
-                   )
-               ) AS note_net
-             FROM invoices i
-             INNER JOIN (
-               SELECT ref_no AS cheque_no, MAX(supplier_number) AS supplier_number
-               FROM (
-                 SELECT cheque_no AS ref_no, supplier_number
-                 FROM supplier_entries
-                 WHERE facilityId = :facilityId
-                   AND cheque_no LIKE 'CN-S%'
-                 UNION ALL
-                 SELECT receiptNo AS ref_no, supplier_number
-                 FROM supplier_entries
-                 WHERE facilityId = :facilityId
-                   AND receiptNo LIKE 'CN-S%'
-               ) refs
-               GROUP BY ref_no
-             ) se
-               ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
-                = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
-             LEFT JOIN (
-               SELECT credit_note_number, SUM(amount) AS applied
-               FROM credit_note_applications
-               WHERE facility_id = :facilityId
-                 AND UPPER(invoice_ref) <> 'ADVANCE'
-               GROUP BY credit_note_number
-             ) app
-               ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
-                = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
-             WHERE i.facility_id = :facilityId
-               AND i.type = 'purchase'
-               AND i.invoice_ref LIKE 'CN-S%'
-               AND i.amount < 0
-           ) notes
-          WHERE remaining > 0.009
-            AND note_net > 0.009
-          GROUP BY supplier_number
-       ) cn_adv ON cn_adv.supplier_number = s.supplier_number
-       LEFT JOIN (
-         SELECT party_ref, SUM(ref_net) AS bal
-           FROM (
-             SELECT
-               transaction_ref AS party_ref,
-               GREATEST(0, COALESCE(SUM(dr), 0) - COALESCE(SUM(cr), 0)) AS ref_net
-             FROM general_ledger
-             WHERE facility_id = :facilityId
-               AND LOWER(COALESCE(type, '')) IN ('payable', 'payables', 'payment')
-               AND transaction_ref IS NOT NULL
-               AND transaction_ref <> ''
-             GROUP BY transaction_ref
-           ) pref
-          GROUP BY party_ref
-       ) prepaid
-         ON prepaid.party_ref = s.supplier_number
-         OR prepaid.party_ref LIKE CONCAT(s.supplier_number, '-%')
-       LEFT JOIN (
+           transaction_ref,
+           SUBSTRING_INDEX(transaction_ref, '-', 2) AS supplier_number,
+           reference_number,
+           LOWER(COALESCE(type, '')) AS line_type,
+           account_code,
+           SUM(dr) AS dr_sum,
+           SUM(cr) AS cr_sum
+         FROM general_ledger
+         WHERE facility_id = :facilityId
+           AND transaction_ref LIKE 'SUP-%'
+         GROUP BY
+           transaction_ref,
+           SUBSTRING_INDEX(transaction_ref, '-', 2),
+           reference_number,
+           LOWER(COALESCE(type, '')),
+           account_code
+       ),
+       notes AS (
          SELECT
            se.supplier_number,
-           SUM(GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0)) AS bal
+           GREATEST(ABS(i.amount) - COALESCE(app.applied, 0), 0) AS remaining,
+           COALESCE(gln.note_net, 0) AS note_net
          FROM invoices i
          INNER JOIN (
-           SELECT ref_no AS cheque_no, MAX(supplier_number) AS supplier_number
+           SELECT ref_no, MAX(supplier_number) AS supplier_number
            FROM (
              SELECT cheque_no AS ref_no, supplier_number
              FROM supplier_entries
@@ -753,29 +653,104 @@ exports.listSuppliersForApplyDeposit = async (req, res) => {
                AND receiptNo LIKE 'CN-S%'
            ) refs
            GROUP BY ref_no
-         ) se
-           ON CONVERT(se.cheque_no USING utf8mb4) COLLATE utf8mb4_unicode_ci
-            = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         ) se ON se.ref_no = i.invoice_ref
          LEFT JOIN (
            SELECT credit_note_number, SUM(amount) AS applied
            FROM credit_note_applications
            WHERE facility_id = :facilityId
              AND UPPER(invoice_ref) <> 'ADVANCE'
            GROUP BY credit_note_number
-         ) app
-           ON CONVERT(app.credit_note_number USING utf8mb4) COLLATE utf8mb4_unicode_ci
-            = CONVERT(i.invoice_ref USING utf8mb4) COLLATE utf8mb4_unicode_ci
+         ) app ON app.credit_note_number = i.invoice_ref
+         LEFT JOIN (
+           SELECT
+             supplier_number,
+             reference_number,
+             SUM(dr_sum - cr_sum) AS note_net
+           FROM party
+           WHERE line_type IN ('accrued', 'advance')
+             AND reference_number LIKE 'CN-S%'
+           GROUP BY supplier_number, reference_number
+         ) gln
+           ON gln.reference_number = i.invoice_ref
+          AND gln.supplier_number = se.supplier_number
          WHERE i.facility_id = :facilityId
            AND i.type = 'purchase'
            AND i.invoice_ref LIKE 'CN-S%'
            AND i.amount < 0
-         GROUP BY se.supplier_number
-       ) cn ON cn.supplier_number = s.supplier_number
-       ${gitJoin}
-       WHERE 1 = 1
-         ${typeSql}
-       GROUP BY s.supplier_number
-       ${havingSql}
+       )
+       SELECT
+         supplier_number,
+         supplier_name,
+         vendor_type,
+         email,
+         phone,
+         available_deposit,
+         available_credit_note,
+         available_git
+       FROM (
+         SELECT
+           s.supplier_number,
+           s.supplier_name,
+           s.vendor_type,
+           s.email,
+           s.phone,
+           GREATEST(COALESCE(adv.bal, 0) - COALESCE(cn_adv.bal, 0), 0)
+             + GREATEST(COALESCE(prepaid.bal, 0), 0) AS available_deposit,
+           GREATEST(COALESCE(cn.bal, 0), 0) AS available_credit_note,
+           GREATEST(COALESCE(git.bal, 0), 0) AS available_git
+         FROM (
+           SELECT
+             supplier_number,
+             MAX(NULLIF(supplier_name, '')) AS supplier_name,
+             MAX(vendor_type) AS vendor_type,
+             MAX(email) AS email,
+             MAX(phone) AS phone
+           FROM suppliersinfo
+           WHERE facilityId = :facilityId
+           GROUP BY supplier_number
+         ) s
+         LEFT JOIN (
+           SELECT supplier_number, SUM(dr_sum - cr_sum) AS bal
+           FROM party
+           WHERE line_type IN ('accrued', 'advance')
+           GROUP BY supplier_number
+         ) adv ON adv.supplier_number = s.supplier_number
+         LEFT JOIN (
+           SELECT supplier_number, SUM(ref_net) AS bal
+           FROM (
+             SELECT
+               transaction_ref,
+               MAX(supplier_number) AS supplier_number,
+               GREATEST(0, SUM(dr_sum) - SUM(cr_sum)) AS ref_net
+             FROM party
+             WHERE line_type IN ('payable', 'payables', 'payment')
+             GROUP BY transaction_ref
+           ) pref
+           GROUP BY supplier_number
+         ) prepaid ON prepaid.supplier_number = s.supplier_number
+         LEFT JOIN (
+           SELECT transaction_ref AS supplier_number, SUM(dr_sum - cr_sum) AS bal
+           FROM party
+           WHERE 1 = 1
+             ${gitTypeSql}
+           GROUP BY transaction_ref
+         ) git ON git.supplier_number = s.supplier_number
+         LEFT JOIN (
+           SELECT supplier_number, SUM(remaining) AS bal
+           FROM notes
+           GROUP BY supplier_number
+         ) cn ON cn.supplier_number = s.supplier_number
+         LEFT JOIN (
+           SELECT supplier_number, SUM(LEAST(note_net, remaining)) AS bal
+           FROM notes
+           WHERE remaining > 0.009
+             AND note_net > 0.009
+           GROUP BY supplier_number
+         ) cn_adv ON cn_adv.supplier_number = s.supplier_number
+         WHERE 1 = 1
+           ${typeSql}
+       ) listed
+       ${balanceFilter}
        ORDER BY supplier_name ASC
        LIMIT 2000`,
       {
