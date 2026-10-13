@@ -1441,48 +1441,216 @@ exports.getSaleByCode = async (req, res) => {
 
     const baseEntry = entries[0];
 
-    const customer = baseEntry?.customerNo
-      ? await db.Customer.findOne({
+    const productSkus = [
+      ...new Set(
+        entries
+          .map((entry) => String(entry.link_id || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    const discountIds = [
+      ...new Set(
+        entries
+          .filter(
+            (item) =>
+              typeof item.type === "string" &&
+              item.type.includes("discount") &&
+              item.link_id,
+          )
+          .map((item) => item.link_id),
+      ),
+    ];
+    const taxIds = [
+      ...new Set(
+        entries
+          .filter(
+            (item) =>
+              typeof item.type === "string" &&
+              item.type.includes("tax") &&
+              item.link_id,
+          )
+          .map((item) => item.link_id),
+      ),
+    ];
+    const createdById =
+      entries.find((item) => {
+        const entryType = String(item.type || "").toLowerCase();
+        return (
+          item.created_by &&
+          (entryType.includes("service") ||
+            entryType.includes("sales") ||
+            entryType.includes("pro-bono"))
+        );
+      })?.created_by || baseEntry?.created_by;
+
+    const warnLookup = async (label, promise) => {
+      try {
+        return await promise;
+      } catch (err) {
+        console.warn(label, err.message);
+        return null;
+      }
+    };
+
+    const [
+      customer,
+      businessRow,
+      productRows,
+      discountRecords,
+      taxRecords,
+      storeRows,
+      linkedPaymentEntries,
+      workflowRow,
+      customerCopy,
+      user,
+    ] = await Promise.all([
+      baseEntry?.customerNo
+        ? db.Customer.findOne({
+            where: {
+              customerNo: baseEntry.customerNo,
+              facilityId,
+            },
+            attributes: [
+              "fullname",
+              "customerNo",
+              "address",
+              "phone",
+              "email",
+              "customer_type",
+            ],
+            raw: true,
+          })
+        : null,
+      warnLookup(
+        "getSaleByCode business lookup:",
+        db.business.findOne({
+          where: { id: facilityId },
+          attributes: [
+            "id",
+            "business_name",
+            "business_address",
+            "business_phone",
+            "fax",
+            "business_email",
+            "description",
+            "rc",
+            "vat_policy",
+            "show_vat_on_sales_invoice",
+            "sales_invoice_print_in_color",
+            "default_receipt_type",
+            "print_delivery_order",
+            "delivery_order_format",
+            "delivery_document_type",
+            "document_header_style",
+            "business_logo",
+            "customer_notes",
+            "terms_conditions",
+            "invoice_powered_by",
+          ],
+          raw: true,
+        }),
+      ),
+      productSkus.length
+        ? db.Product.findAll({
+            where: {
+              sku: { [Op.in]: productSkus },
+              facility_id: facilityId,
+            },
+            attributes: [
+              "id",
+              "sku",
+              "name",
+              "taxable",
+              "unit_of_measure",
+              "item_type",
+            ],
+            raw: true,
+          })
+        : [],
+      discountIds.length
+        ? Discount.findAll({
+            where: {
+              discount_id: { [Op.in]: discountIds },
+              facilityId,
+            },
+          })
+        : [],
+      taxIds.length
+        ? Tax.findAll({
+            where: {
+              id: { [Op.in]: taxIds },
+              facilityId,
+            },
+          })
+        : [],
+      warnLookup(
+        "getSaleByCode branch enrich:",
+        db.StoreEntry
+          ? db.StoreEntry.findAll({
+              where: {
+                facilityId,
+                reference_number: saleCode,
+                qty_out: { [Op.gt]: 0 },
+              },
+              attributes: ["id", "product_id", "branchId", "qty_out"],
+              raw: true,
+            })
+          : [],
+      ),
+      warnLookup(
+        "getSaleByCode linked payments:",
+        CustomerEntry.findAll({
           where: {
-            customerNo: baseEntry.customerNo,
             facilityId,
+            link_id: saleCode,
+            receiptNo: { [Op.ne]: saleCode },
           },
           raw: true,
-        })
-      : null;
+        }),
+      ),
+      warnLookup(
+        "getSaleByCode workflow:",
+        db.SaleWorkflow
+          ? db.SaleWorkflow.findOne({
+              where: { facility_id: facilityId, sale_code: saleCode },
+              attributes: ["payment_type", "amount", "status", "history"],
+              raw: true,
+            })
+          : null,
+      ),
+      baseEntry?.customerNo
+        ? db.CustomerCopy.findOne({
+            where: {
+              facilityId,
+              customerNo: baseEntry.customerNo,
+              reference_id: saleCode,
+            },
+          })
+        : null,
+      createdById
+        ? db.users.findOne({
+            where: { id: createdById },
+            attributes: ["id", "firstname", "lastname", "signature"],
+          })
+        : null,
+    ]);
 
-    let business = null;
-    try {
-      business = await db.business.findOne({
-        where: { id: facilityId },
-        attributes: [
-          "id",
-          "business_name",
-          "business_address",
-          "business_phone",
-          "fax",
-          "business_email",
-          "description",
-          "rc",
-          "vat_policy",
-          "show_vat_on_sales_invoice",
-          "sales_invoice_print_in_color",
-          "default_receipt_type",
-          "print_delivery_order",
-          "delivery_order_format",
-          "delivery_document_type",
-          "document_header_style",
-          "business_logo",
-          "customer_notes",
-          "terms_conditions",
-          "invoice_powered_by",
-        ],
-        raw: true,
-      });
-    } catch (bizErr) {
-      console.warn("getSaleByCode business lookup:", bizErr.message);
-    }
-    business = business || { id: facilityId };
+    let business = businessRow || { id: facilityId };
+    const productBySku = new Map(
+      (productRows || []).map((product) => [String(product.sku), product]),
+    );
+    const discountById = new Map(
+      (discountRecords || []).map((record) => [
+        String(record.discount_id),
+        record.get ? record.get({ plain: true }) : record,
+      ]),
+    );
+    const taxById = new Map(
+      (taxRecords || []).map((record) => [
+        String(record.id),
+        record.get ? record.get({ plain: true }) : record,
+      ]),
+    );
 
     const taxEntries = entries.filter(
       (item) => typeof item.type === "string" && item.type.includes("tax")
@@ -1491,53 +1659,29 @@ exports.getSaleByCode = async (req, res) => {
       (item) => typeof item.type === "string" && item.type.includes("discount")
     );
 
-    const discounts = await Promise.all(
-      discountEntries.map(async (item) => {
-        const discountRecord = item.link_id
-          ? await Discount.findOne({
-              where: {
-                discount_id: item.link_id,
-                facilityId,
-              },
-            })
-          : null;
+    const discounts = discountEntries.map((item) => {
+      const discountRecord = item.link_id
+        ? discountById.get(String(item.link_id))
+        : null;
+      return {
+        ...item,
+        amount: Number(item.cost || 0),
+        ...(discountRecord || {}),
+      };
+    });
 
-        return {
-          ...item,
-          amount: Number(item.cost || 0),
-          ...(discountRecord ? discountRecord.get({ plain: true }) : {}),
-        };
-      })
-    );
+    const taxes = taxEntries.map((item) => {
+      const taxRecord = item.link_id ? taxById.get(String(item.link_id)) : null;
+      return {
+        ...item,
+        amount: Number(item.cost || 0),
+        ...(taxRecord || {}),
+      };
+    });
 
-    const taxes = await Promise.all(
-      taxEntries.map(async (item) => {
-        const taxRecord = item.link_id
-          ? await Tax.findOne({
-              where: {
-                id: item.link_id,
-                facilityId,
-              },
-            })
-          : null;
-
-        return {
-          ...item,
-          amount: Number(item.cost || 0),
-          ...(taxRecord ? taxRecord.get({ plain: true }) : {}),
-        };
-      })
-    );
-
-    const mapEntryToSaleItem = async (item) => {
+    const mapEntryToSaleItem = (item) => {
       const product = item.link_id
-        ? await db.Product.findOne({
-            where: {
-              sku: item.link_id,
-              facility_id: facilityId,
-            },
-            raw: true,
-          })
+        ? productBySku.get(String(item.link_id)) || null
         : null;
 
       const parsedDisc = parseLineDiscountMarker(item.description);
@@ -1685,18 +1829,6 @@ exports.getSaleByCode = async (req, res) => {
         )
         .sort((a, b) => a - b)[0] || new Date();
 
-    const user = await db.users.findOne({
-      where: {
-        id: items[0]?.created_by || baseEntry?.created_by,
-      },
-    });
-    const customerCopy = await db.CustomerCopy.findOne({
-      where: {
-        facilityId,
-        customerNo: baseEntry.customerNo,
-        reference_id: saleCode,
-      },
-    });
     const customerCopyRecord = customerCopy
       ? customerCopy.get({ plain: true })
       : null;
@@ -1729,17 +1861,7 @@ exports.getSaleByCode = async (req, res) => {
     // Enrich line branch from store_entries when customer_entries lack branch_id
     let enrichedItems = items;
     try {
-      if (db.StoreEntry) {
-        const storeRows = await db.StoreEntry.findAll({
-          where: {
-            facilityId,
-            reference_number: saleCode,
-            qty_out: { [Op.gt]: 0 },
-          },
-          attributes: ["id", "product_id", "branchId", "qty_out"],
-          raw: true,
-        });
-        if (storeRows.length) {
+      if (Array.isArray(storeRows) && storeRows.length) {
           const bySku = new Map();
           for (const se of storeRows) {
             const key = String(se.product_id || "");
@@ -1754,7 +1876,6 @@ exports.getSaleByCode = async (req, res) => {
             const bid = match.branchId != null ? Number(match.branchId) : null;
             return { ...it, branch_id: bid, branchId: bid };
           });
-        }
       }
     } catch (enrichErr) {
       console.warn("getSaleByCode branch enrich:", enrichErr.message);
@@ -1815,19 +1936,9 @@ exports.getSaleByCode = async (req, res) => {
         desc.includes("advance applied")
       );
     };
-    let extraPaymentEntries = [];
-    try {
-      extraPaymentEntries = await CustomerEntry.findAll({
-        where: {
-          facilityId,
-          link_id: saleCode,
-          receiptNo: { [Op.ne]: saleCode },
-        },
-        raw: true,
-      });
-    } catch (linkErr) {
-      console.warn("getSaleByCode linked payments:", linkErr.message);
-    }
+    const extraPaymentEntries = Array.isArray(linkedPaymentEntries)
+      ? linkedPaymentEntries
+      : [];
     const paymentEntries = [
       ...entries.filter(isPaymentLine),
       ...extraPaymentEntries
@@ -1967,11 +2078,7 @@ exports.getSaleByCode = async (req, res) => {
           getCreditRemainderFromHistory,
           normalizeHistory,
         } = require("./saleWorkflow");
-        const wf = await db.SaleWorkflow.findOne({
-          where: { facility_id: facilityId, sale_code: saleCode },
-          attributes: ["payment_type", "amount", "status", "history"],
-          raw: true,
-        });
+        const wf = workflowRow;
         if (wf) {
           workflowPaymentType = wf.payment_type || null;
           workflowAmount =
