@@ -106,6 +106,14 @@ module.exports = (app) => {
     supplierAdvancePayment.createSupplierAdvancePayment,
   );
   app.get(
+    "/api/v1/get-supplier-payment",
+    supplierAdvancePayment.getSupplierPaymentForEdit,
+  );
+  app.post(
+    "/api/v1/update-supplier-payment",
+    supplierAdvancePayment.updateSupplierPayment,
+  );
+  app.get(
     "/api/v1/get-supplier-advance-history",
     supplierAdvancePayment.getSupplierAdvanceHistory,
   );

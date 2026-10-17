@@ -3423,6 +3423,413 @@ exports.reverseCustomerDeposit = async (req, res) => {
 };
 
 /**
+ * Edit a received customer deposit (AD-). Applied and reversed rows are left alone.
+ * POST /api/v1/update-received-payment
+ */
+exports.updateReceivedPayment = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    receipt_no,
+    customer_no,
+    transaction_date,
+    amount_paid,
+    narration,
+    mode_of_payment,
+    accountHead,
+    bankAccount,
+    payment_splits: paymentSplitsFromBody,
+    cheque_number,
+  } = req.body;
+
+  const receiptNo = String(receipt_no || "").trim();
+  if (!/^AD[-_]/i.test(receiptNo)) {
+    return res.status(400).json({
+      success: false,
+      error: "Only a received deposit (AD-) can be edited.",
+    });
+  }
+  if (!facilityId) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!customer_no) {
+    return res.status(400).json({ success: false, error: "customer_no is required" });
+  }
+
+  const paymentSplits = Array.isArray(paymentSplitsFromBody)
+    ? paymentSplitsFromBody
+        .map((s) => ({
+          mode: String(s?.mode || "").toLowerCase().trim(),
+          amount: parseAmount(s?.amount),
+          accountHead: s?.accountHead || null,
+          bankAccount: s?.bankAccount || null,
+        }))
+        .filter((s) => s.amount != null && s.amount > 0)
+    : [];
+
+  let amountPaidNum =
+    paymentSplits.length > 0
+      ? paymentSplits.reduce((s, x) => s + (x.amount || 0), 0)
+      : parseAmount(amount_paid);
+  if (amountPaidNum == null || amountPaidNum <= 0) {
+    return res.status(400).json({ success: false, error: "Valid amount_paid is required" });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(transaction_date || new Date(), {
+      field: "transaction_date",
+    });
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+
+  try {
+    const entries = await CustomerEntry.findAll({
+      where: { facilityId, receiptNo, type: "deposit" },
+    });
+    if (!entries.length) {
+      return res.status(404).json({ success: false, error: "Payment not found" });
+    }
+    if (
+      entries.some((entry) =>
+        /^INV[-_]/i.test(String(entry.link_id || "").trim()),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "This payment was applied to an invoice and can't be edited.",
+      });
+    }
+
+    const ledgerRows = await GeneralLedger.findAll({
+      where: { facility_id: facilityId, reference_number: receiptNo },
+    });
+    if (
+      ledgerRows.some(
+        (row) => String(row.type || "").toLowerCase() === "receivable",
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "This payment settled invoices and can't be edited.",
+      });
+    }
+
+    const oldAmount = entries.reduce(
+      (sum, entry) => sum + (parseFloat(entry.cost) || 0),
+      0,
+    );
+    const oldCustomerNo = String(entries[0].customerNo || "").trim();
+    const sameCustomer = oldCustomerNo === String(customer_no).trim();
+    const decrease = oldAmount - amountPaidNum;
+
+    const balRows = await db.sequelize.query(
+      `SELECT COALESCE(SUM(cr) - SUM(dr), 0) AS available_deposit
+       FROM general_ledger
+       WHERE LOWER(type) = 'deposit'
+         AND facility_id = :facilityId
+         AND (
+           transaction_ref = :customerNo
+           OR transaction_ref LIKE CONCAT(:customerNo, '-%')
+         )`,
+      {
+        replacements: { facilityId, customerNo: oldCustomerNo },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const availableDeposit = Math.max(
+      0,
+      parseFloat(balRows[0]?.available_deposit) || 0,
+    );
+    if (!sameCustomer && availableDeposit + 0.01 < oldAmount) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Part of this deposit has already been used, so the customer can't be changed.",
+      });
+    }
+    if (sameCustomer && decrease > availableDeposit + 0.01) {
+      return res.status(400).json({
+        success: false,
+        error: `Amount can't drop by more than the available deposit of ₦${availableDeposit.toLocaleString()}.`,
+      });
+    }
+
+    const customer = await Customer.findOne({
+      where: { customerNo: customer_no, facilityId },
+    });
+    if (!customer) {
+      return res.status(404).json({ success: false, error: "Customer not found" });
+    }
+    const customerName = customer.fullname || customer_no;
+    const depositCode = customer.receivable_accural_code;
+    if (!depositCode) {
+      return res.status(400).json({
+        success: false,
+        error: "Deposit account code is not set for this customer",
+      });
+    }
+    const depositAccount = await db.AccountCategory.findOne({
+      where: { code: depositCode, facility_id: facilityId },
+    });
+    if (!depositAccount) {
+      return res.status(404).json({
+        success: false,
+        error: `Deposit account not found: ${depositCode}`,
+      });
+    }
+
+    const resolvedSplits = [];
+    if (paymentSplits.length > 0) {
+      for (const split of paymentSplits) {
+        const isCash = split.mode === "cash";
+        let headCode = null;
+        let bankId = null;
+        let accountDesc = "";
+        if (isCash) {
+          headCode = split.accountHead?.head || accountHead?.head;
+          accountDesc =
+            split.accountHead?.description || accountHead?.description || "";
+          if (!headCode) {
+            return res.status(400).json({
+              success: false,
+              error: "Account head is required for the cash portion",
+            });
+          }
+        } else {
+          const bankIdRaw = split.bankAccount?.id || bankAccount?.id;
+          if (!bankIdRaw) {
+            return res.status(400).json({
+              success: false,
+              error: "Bank account is required for the transfer portion",
+            });
+          }
+          const ba = await db.bank_account.findOne({
+            where: { id: bankIdRaw, facilityId, status: "active" },
+          });
+          if (!ba) {
+            return res.status(404).json({
+              success: false,
+              error: "Bank account not found or inactive",
+            });
+          }
+          headCode = ba.head;
+          bankId = ba.id;
+          accountDesc = ba.account_name || ba.bank_name || "";
+        }
+        const acct = await db.AccountCategory.findOne({
+          where: { code: headCode, facility_id: facilityId },
+        });
+        if (!acct) {
+          return res.status(404).json({
+            success: false,
+            error: `Cash/Bank account not found: ${headCode}`,
+          });
+        }
+        resolvedSplits.push({
+          mode: isCash ? "cash" : "bank transfer",
+          amount: split.amount,
+          account: acct,
+          bankId,
+          accountDesc,
+        });
+      }
+    } else {
+      const mode = String(mode_of_payment || "").toLowerCase().trim();
+      const isCash = mode === "cash" || mode === "c";
+      let headCode = null;
+      let bankId = null;
+      let accountDesc = "";
+      let storedMode = "cash";
+      if (isCash) {
+        headCode = accountHead?.head;
+        accountDesc = accountHead?.description || "";
+        storedMode = "cash";
+        if (!headCode) {
+          return res.status(400).json({
+            success: false,
+            error: "Account head is required for cash",
+          });
+        }
+      } else {
+        if (!bankAccount?.id) {
+          return res.status(400).json({
+            success: false,
+            error: "Bank account is required",
+          });
+        }
+        const ba = await db.bank_account.findOne({
+          where: { id: bankAccount.id, facilityId, status: "active" },
+        });
+        if (!ba) {
+          return res.status(404).json({
+            success: false,
+            error: "Bank account not found or inactive",
+          });
+        }
+        headCode = ba.head;
+        bankId = ba.id;
+        accountDesc = ba.account_name || ba.bank_name || "";
+        storedMode =
+          mode === "card"
+            ? "card"
+            : mode === "cheque"
+              ? "cheque"
+              : "bank transfer";
+      }
+      const acct = await db.AccountCategory.findOne({
+        where: { code: headCode, facility_id: facilityId },
+      });
+      if (!acct) {
+        return res.status(404).json({
+          success: false,
+          error: `Cash/Bank account not found: ${headCode}`,
+        });
+      }
+      resolvedSplits.push({
+        mode: storedMode,
+        amount: amountPaidNum,
+        account: acct,
+        bankId,
+        accountDesc,
+      });
+    }
+
+    const note =
+      String(narration || "").trim() || `Customer deposit ${receiptNo}`;
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const payee = String(customerName).slice(0, 50);
+    const createdBy = entries[0].created_by || userId;
+    const branchId = entries[0].branch_id || null;
+    const combinedMode =
+      resolvedSplits.length > 1
+        ? "cash+transfer"
+        : resolvedSplits[0].mode;
+
+    await db.sequelize.transaction(async (t) => {
+      await CustomerEntry.destroy({
+        where: { facilityId, receiptNo, type: "deposit" },
+        transaction: t,
+      });
+      await GeneralLedger.destroy({
+        where: { facility_id: facilityId, reference_number: receiptNo },
+        transaction: t,
+      });
+
+      for (const split of resolvedSplits) {
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: split.account.code,
+            account_subhead: split.account.parent_code || 0,
+            dr: split.amount,
+            cr: 0,
+            account_description: split.accountDesc || split.account.description,
+            transaction_description: `${note} (${split.mode})`,
+            reference_number: receiptNo,
+            purpose_of_payment: note.slice(0, 150),
+            payee,
+            bank_account_id: split.bankId || null,
+            cheque_no: cheque_number || null,
+            mode_of_payment: String(split.mode).slice(0, 20),
+            created_by: createdBy,
+            facility_id: facilityId,
+            branch_id: branchId,
+            status: "posted",
+            type: "bank",
+            transaction_ref: "",
+          },
+          { transaction: t },
+        );
+        await CustomerEntry.create(
+          {
+            customerNo: customer_no,
+            description: note.slice(0, 255),
+            qty_in: 0,
+            qty_out: 0,
+            cost: split.amount,
+            amount_paid: split.amount,
+            facilityId,
+            branch_id: branchId,
+            link_id: null,
+            mode_of_payment: split.mode,
+            type: "deposit",
+            receiptNo,
+            bank_account_id: split.bankId || split.account.code,
+            created_by: createdBy,
+            created_at: transactionDate,
+          },
+          { transaction: t },
+        );
+      }
+
+      await db.sequelize.query(
+        `UPDATE customer_entries
+         SET created_at = :createdAt
+         WHERE facilityId = :facilityId AND receiptNo = :receiptNo`,
+        {
+          replacements: {
+            createdAt: transactionDate,
+            facilityId,
+            receiptNo,
+          },
+          transaction: t,
+        },
+      );
+
+      await GeneralLedger.create(
+        {
+          transaction_date: transactionDate,
+          account_code: depositCode,
+          account_subhead:
+            depositAccount.subhead ||
+            depositAccount.parent_code ||
+            depositCode.substring(0, 6) ||
+            0,
+          dr: 0,
+          cr: amountPaidNum,
+          account_description: depositAccount.description,
+          transaction_description: `Customer advance deposit - ${customerName}`,
+          reference_number: receiptNo,
+          purpose_of_payment: note.slice(0, 150),
+          payee,
+          bank_account_id: null,
+          cheque_no: cheque_number || null,
+          mode_of_payment: String(combinedMode).slice(0, 20),
+          created_by: createdBy,
+          facility_id: facilityId,
+          branch_id: branchId,
+          status: "posted",
+          type: "deposit",
+          transaction_ref: customer_no,
+        },
+        { transaction: t },
+      );
+    });
+
+    return res.json({
+      success: true,
+      message: `${receiptNo} updated`,
+      data: {
+        reference_number: receiptNo,
+        amount_paid: amountPaidNum,
+        customer_no,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating received payment:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Failed to update payment",
+    });
+  }
+};
+
+/**
  * Per-invoice GL settlement for sales invoice balance.
  * - ar_outstanding: open A/R (receivable dr − cr) on the invoice ref
  * - cash_settled: bank/deposit settlements (cash receipt or advance at credit sale)

@@ -1047,13 +1047,32 @@ function validateLinesAgainstOutstanding(invoiceLines, dueByRef) {
 exports.getOutstandingSupplierPurchaseInvoices = async (req, res) => {
   try {
     const { supplierNo, facilityId } = req.query;
+    const releaseReceipt = String(req.query.releaseReceipt || "").trim();
     if (!supplierNo || !facilityId) {
       return res.status(400).json({
         success: false,
         message: "supplierNo and facilityId are required",
       });
     }
-    const rows = await loadOutstandingPurchaseInvoices(supplierNo, facilityId);
+    let rows = await loadOutstandingPurchaseInvoices(supplierNo, facilityId);
+    if (releaseReceipt && /^SAP[-_]/i.test(releaseReceipt)) {
+      const entry = await SupplierEntry.findOne({
+        where: { facilityId, receiptNo: releaseReceipt },
+        raw: true,
+      });
+      if (
+        entry &&
+        String(entry.supplier_number || "").trim() === String(supplierNo).trim()
+      ) {
+        const assignedRows = await findAssignedBillPayments(
+          facilityId,
+          releaseReceipt,
+          entry.supplier_number,
+          entry.created_at || entry.transaction_date,
+        );
+        rows = releaseAssignedAmounts(rows, assignedRows);
+      }
+    }
     const outstanding = rows.filter((r) => r.amount_due > 0.000001);
     return res.json({
       success: true,
@@ -1667,6 +1686,827 @@ exports.createSupplierAdvancePayment = async (req, res) => {
 };
 
 /** Payment history — all suppliers or filtered by supplierNo. */
+function roundMoney(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+/**
+ * Bill payments are stored on the bill reference, not the SAP receipt.
+ * They belong to this receipt when they were posted with it (same supplier, a few seconds apart).
+ */
+async function findAssignedBillPayments(facilityId, receiptNo, supplierNo, createdAt) {
+  const createdAtSql = createdAt
+    ? new Date(createdAt).toISOString().slice(0, 19).replace("T", " ")
+    : null;
+  if (!facilityId || !receiptNo || !supplierNo || !createdAtSql) return [];
+  return db.sequelize.query(
+    `SELECT transaction_id, reference_number, dr, transaction_description, account_code, created_at
+     FROM general_ledger
+     WHERE facility_id = :facilityId
+       AND LOWER(type) = 'payment'
+       AND transaction_ref = :supplierNo
+       AND reference_number <> :receiptNo
+       AND reference_number IS NOT NULL
+       AND TRIM(reference_number) <> ''
+       AND created_at BETWEEN DATE_SUB(:createdAt, INTERVAL 30 SECOND)
+                          AND DATE_ADD(:createdAt, INTERVAL 30 SECOND)`,
+    {
+      replacements: {
+        facilityId,
+        supplierNo,
+        receiptNo,
+        createdAt: createdAtSql,
+      },
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+}
+
+function groupAssignedBills(rows) {
+  const byRef = new Map();
+  for (const row of rows || []) {
+    const ref = String(row.reference_number || "").trim();
+    if (!ref) continue;
+    const prev = byRef.get(ref) || {
+      bill_ref: ref,
+      amount: 0,
+      description: "",
+      transaction_ids: [],
+    };
+    prev.amount = roundMoney(prev.amount + (parseFloat(row.dr) || 0));
+    if (!prev.description && row.transaction_description) {
+      prev.description = row.transaction_description;
+    }
+    prev.transaction_ids.push(row.transaction_id);
+    byRef.set(ref, prev);
+  }
+  return [...byRef.values()];
+}
+
+function releaseAssignedAmounts(outstandingRows, assignedRows) {
+  const released = new Map();
+  for (const row of assignedRows || []) {
+    const ref = String(row.reference_number || row.bill_ref || "").trim();
+    if (!ref) continue;
+    released.set(
+      ref,
+      roundMoney((released.get(ref) || 0) + (parseFloat(row.dr ?? row.amount) || 0)),
+    );
+  }
+  return (outstandingRows || []).map((row) => {
+    const extra = released.get(row.invoice_ref) || 0;
+    if (extra <= 0) return row;
+    const totalPaid = roundMoney(
+      Math.max(0, (parseFloat(row.total_paid) || 0) - extra),
+    );
+    const amountDue = roundMoney(
+      Math.max(0, (parseFloat(row.amount) || 0) - totalPaid),
+    );
+    let status = "Unpaid";
+    if (totalPaid + 0.000001 >= (parseFloat(row.amount) || 0) && (parseFloat(row.amount) || 0) > 0) {
+      status = "Paid";
+    } else if (totalPaid > 0) {
+      status = "Partially Paid";
+    }
+    return {
+      ...row,
+      total_paid: totalPaid,
+      amount_due: amountDue,
+      status,
+    };
+  });
+}
+
+exports.getSupplierPaymentForEdit = async (req, res) => {
+  try {
+    const facilityId = req.query.facilityId;
+    const receiptNo = String(req.query.receiptNo || "").trim();
+    if (!facilityId || !receiptNo) {
+      return res.status(400).json({
+        success: false,
+        error: "facilityId and receiptNo are required",
+      });
+    }
+    const entries = await SupplierEntry.findAll({
+      where: { facilityId, receiptNo },
+      raw: true,
+    });
+    if (!entries.length) {
+      return res.status(404).json({ success: false, error: "Payment not found" });
+    }
+    const supplier = await SuppliersInfo.findOne({
+      where: {
+        supplier_number: entries[0].supplier_number,
+        facilityId,
+      },
+      raw: true,
+    });
+    const bankLines = await GeneralLedger.findAll({
+      where: {
+        facility_id: facilityId,
+        reference_number: receiptNo,
+        type: "bank",
+      },
+      raw: true,
+    });
+    const amount = entries.reduce(
+      (sum, entry) => sum + (parseFloat(entry.cost) || 0),
+      0,
+    );
+    const assignedRows = await findAssignedBillPayments(
+      facilityId,
+      receiptNo,
+      entries[0].supplier_number,
+      entries[0].created_at || entries[0].transaction_date,
+    );
+    const assignments = groupAssignedBills(assignedRows).map((row) => ({
+      bill_ref: row.bill_ref,
+      amount: row.amount,
+      description: row.description,
+    }));
+    return res.json({
+      success: true,
+      payment: {
+        receipt_no: receiptNo,
+        supplier_number: entries[0].supplier_number,
+        supplier_name: supplier?.supplier_name || entries[0].supplier_number,
+        amount,
+        date: entries[0].transaction_date || entries[0].created_at,
+        description: entries[0].description || "",
+        mode_of_payment: entries[0].mode_of_payment || "",
+        bank_account_id: entries[0].bank_account_id || "",
+        bank_lines: bankLines.map((line) => ({
+          mode: line.mode_of_payment || "",
+          amount: parseFloat(line.cr) || 0,
+          bank_account_id: line.bank_account_id || "",
+          account_code: line.account_code || "",
+        })),
+        assignments,
+      },
+    });
+  } catch (error) {
+    console.error("getSupplierPaymentForEdit:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load payment",
+    });
+  }
+};
+
+/**
+ * Edit a Pay Bills payment (SAP-). Amount, date, mode, and vendor update the
+ * original receipt. If the payment is already applied to bills, the client
+ * can disconnect those bills and apply the same receipt again.
+ * POST /api/v1/update-supplier-payment
+ */
+exports.updateSupplierPayment = async (req, res) => {
+  const {
+    facilityId,
+    userId,
+    receipt_no,
+    supplier_number,
+    supplier_no,
+    transaction_date,
+    amount_paid,
+    narration,
+    mode_of_payment,
+    accountHead,
+    bankAccount,
+    payment_splits: paymentSplitsFromBody,
+    cheque_number,
+    payable_code,
+    payable_accural_code,
+    invoices: invoicesFromBody,
+    disconnect,
+    allocation_order,
+  } = req.body;
+
+  const facility = facilityId;
+  const receiptNo = String(receipt_no || "").trim();
+  const supplierNoResolved = String(supplier_number || supplier_no || "").trim();
+  if (!/^SAP[-_]/i.test(receiptNo)) {
+    return res.status(400).json({
+      success: false,
+      error: "Only a Pay Bills payment (SAP-) can be edited.",
+    });
+  }
+  if (!facility) {
+    return res.status(400).json({ success: false, error: "facilityId is required" });
+  }
+  if (!userId) {
+    return res.status(400).json({ success: false, error: "userId is required" });
+  }
+  if (!supplierNoResolved) {
+    return res.status(400).json({ success: false, error: "supplier_number is required" });
+  }
+
+  const paymentSplits = Array.isArray(paymentSplitsFromBody)
+    ? paymentSplitsFromBody
+        .map((split) => ({
+          mode: String(split?.mode || "").toLowerCase().trim(),
+          amount: parseAmount(split?.amount),
+          accountHead: split?.accountHead || null,
+          bankAccount: split?.bankAccount || null,
+        }))
+        .filter((split) => split.amount != null && split.amount > 0)
+    : [];
+  const amountPaidNum =
+    paymentSplits.length > 0
+      ? roundMoney(paymentSplits.reduce((sum, split) => sum + split.amount, 0))
+      : parseAmount(amount_paid);
+  if (amountPaidNum == null || amountPaidNum <= 0) {
+    return res.status(400).json({ success: false, error: "Valid amount_paid is required" });
+  }
+
+  let normalizedTxDate;
+  try {
+    normalizedTxDate = validatePostingDate(transaction_date || new Date(), {
+      field: "transaction_date",
+    });
+  } catch (dateErr) {
+    return res.status(400).json({ success: false, error: dateErr.message });
+  }
+
+  try {
+    const entries = await SupplierEntry.findAll({
+      where: { facilityId: facility, receiptNo },
+    });
+    if (!entries.length) {
+      return res.status(404).json({ success: false, error: "Payment not found" });
+    }
+    const oldSupplier = String(entries[0].supplier_number || "").trim();
+    const oldAmount = roundMoney(
+      entries.reduce((sum, entry) => sum + (parseFloat(entry.cost) || 0), 0),
+    );
+    if (oldAmount <= 0) {
+      return res.status(400).json({ success: false, error: "Payment amount is empty" });
+    }
+
+    const receiptLines = await GeneralLedger.findAll({
+      where: { facility_id: facility, reference_number: receiptNo },
+    });
+    const bankLines = receiptLines.filter(
+      (line) => String(line.type || "").toLowerCase() === "bank" || Number(line.cr) > 0,
+    );
+    let debitLines = receiptLines.filter((line) => Number(line.dr) > 0.009);
+    const bankTotal = roundMoney(
+      bankLines.reduce((sum, line) => sum + (parseFloat(line.cr) || 0), 0),
+    );
+    let debitTotal = roundMoney(
+      debitLines.reduce((sum, line) => sum + (parseFloat(line.dr) || 0), 0),
+    );
+    const createdAt = entries[0].created_at || entries[0].transaction_date;
+    const createdAtSql = createdAt
+      ? new Date(createdAt).toISOString().slice(0, 19).replace("T", " ")
+      : null;
+    const assignedRows = await findAssignedBillPayments(
+      facility,
+      receiptNo,
+      oldSupplier,
+      createdAt,
+    );
+    const wantsDisconnect =
+      disconnect === true ||
+      disconnect === "true" ||
+      disconnect === 1 ||
+      disconnect === "1";
+
+    if (Math.abs(debitTotal - oldAmount) > 0.05 && assignedRows.length) {
+      const extra = await GeneralLedger.findAll({
+        where: { transaction_id: assignedRows.map((row) => row.transaction_id) },
+      });
+      debitLines = debitLines.concat(extra);
+      debitTotal = roundMoney(
+        debitLines.reduce((sum, line) => sum + (parseFloat(line.dr) || 0), 0),
+      );
+    }
+
+    if (Math.abs(bankTotal - oldAmount) > 0.05 || Math.abs(debitTotal - oldAmount) > 0.05) {
+      return res.status(400).json({
+        success: false,
+        error: "This payment was applied to bills in a way that can't be edited.",
+      });
+    }
+
+    const sameSupplier = oldSupplier === supplierNoResolved;
+    const siblingBillLines = debitLines.filter(
+      (line) => String(line.reference_number || "") !== receiptNo,
+    );
+    if (!wantsDisconnect && !sameSupplier && siblingBillLines.length) {
+      return res.status(400).json({
+        success: false,
+        error: "Disconnect this payment from its bills before changing the vendor.",
+      });
+    }
+
+    const oldAccrued = roundMoney(
+      debitLines
+        .filter((line) => String(line.type || "").toLowerCase() === "accrued")
+        .reduce((sum, line) => sum + (parseFloat(line.dr) || 0), 0),
+    );
+    const ratio = amountPaidNum / oldAmount;
+    const newAccrued = roundMoney(oldAccrued * ratio);
+    if (
+      !(wantsDisconnect && assignedRows.length) &&
+      (newAccrued + 0.01 < oldAccrued || (!sameSupplier && oldAccrued > 0.01))
+    ) {
+      const available = await getAvailableSupplierAdvance(facility, oldSupplier);
+      const needed = !sameSupplier ? oldAccrued : oldAccrued - newAccrued;
+      if (available + 0.01 < needed) {
+        return res.status(400).json({
+          success: false,
+          error: `Vendor advance already used. Only ₦${Number(available).toLocaleString()} can be changed.`,
+        });
+      }
+    }
+
+    const supplier = await SuppliersInfo.findOne({
+      where: { supplier_number: supplierNoResolved, facilityId: facility },
+    });
+    if (!supplier) {
+      return res.status(404).json({ success: false, error: "Supplier not found" });
+    }
+    const supplierName = supplier.supplier_name || supplierNoResolved;
+
+    const resolvedSplits = [];
+    if (paymentSplits.length > 0) {
+      for (const split of paymentSplits) {
+        const isCash = split.mode === "cash";
+        let headCode = null;
+        let bankId = null;
+        let accountDesc = "";
+        if (isCash) {
+          headCode = split.accountHead?.head || accountHead?.head;
+          accountDesc = split.accountHead?.description || accountHead?.description || "";
+          if (!headCode) {
+            return res.status(400).json({
+              success: false,
+              error: "Cash account is required for the cash portion",
+            });
+          }
+          bankId = headCode;
+        } else {
+          const bankIdRaw = split.bankAccount?.id || bankAccount?.id;
+          if (!bankIdRaw) {
+            return res.status(400).json({
+              success: false,
+              error: "Bank account is required for the transfer portion",
+            });
+          }
+          const ba = await db.bank_account.findOne({
+            where: { id: bankIdRaw, facilityId: facility, status: "active" },
+          });
+          if (!ba) {
+            return res.status(404).json({
+              success: false,
+              error: "Bank account not found or inactive",
+            });
+          }
+          headCode = ba.head;
+          bankId = ba.id;
+          accountDesc = ba.account_name || ba.bank_name || "";
+        }
+        const acct = await resolvePostingAccountHead(facility, headCode);
+        if (!acct) {
+          return res.status(404).json({
+            success: false,
+            error: `Cash/Bank account not found: ${headCode}`,
+          });
+        }
+        resolvedSplits.push({
+          mode: isCash ? "cash" : "bank",
+          amount: split.amount,
+          account: acct,
+          bankId,
+          accountDesc,
+          headCode,
+        });
+      }
+    } else {
+      const mode = String(mode_of_payment || "cash").toLowerCase().trim();
+      const isCash = mode === "cash" || mode === "c";
+      let headCode = null;
+      let bankId = null;
+      let accountDesc = "";
+      let storedMode = "cash";
+      if (isCash) {
+        headCode = accountHead?.head;
+        accountDesc = accountHead?.description || "";
+        bankId = headCode;
+        if (!headCode) {
+          return res.status(400).json({
+            success: false,
+            error: "Cash account is required",
+          });
+        }
+      } else {
+        if (!bankAccount?.id) {
+          return res.status(400).json({
+            success: false,
+            error: "Bank account is required",
+          });
+        }
+        const ba = await db.bank_account.findOne({
+          where: { id: bankAccount.id, facilityId: facility, status: "active" },
+        });
+        if (!ba) {
+          return res.status(404).json({
+            success: false,
+            error: "Bank account not found or inactive",
+          });
+        }
+        headCode = ba.head;
+        bankId = ba.id;
+        accountDesc = ba.account_name || ba.bank_name || "";
+        storedMode = mode === "card" ? "card" : mode === "cheque" ? "cheque" : "bank";
+      }
+      const acct = await resolvePostingAccountHead(facility, headCode);
+      if (!acct) {
+        return res.status(404).json({
+          success: false,
+          error: `Cash/Bank account not found: ${headCode}`,
+        });
+      }
+      resolvedSplits.push({
+        mode: storedMode,
+        amount: amountPaidNum,
+        account: acct,
+        bankId,
+        accountDesc,
+        headCode,
+      });
+    }
+
+    const note =
+      String(narration || "").trim() ||
+      String(entries[0].description || "").trim() ||
+      `Supplier payment ${receiptNo}`;
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const payee = String(supplierName).slice(0, 50);
+    const combinedMode =
+      resolvedSplits.length > 1 ? "cash+transfer" : resolvedSplits[0].mode;
+    const primaryBankId = resolvedSplits[0]?.bankId || null;
+
+    if (wantsDisconnect && assignedRows.length) {
+      const payableCodeUse = payable_code || supplier.payable_code;
+      const accrualCodeUse =
+        payable_accural_code ||
+        supplier.payable_accural_code ||
+        supplier.payable_accrual_code;
+      if (!payableCodeUse || !accrualCodeUse) {
+        return res.status(400).json({
+          success: false,
+          error: "Payable code and payable accrual code are required",
+        });
+      }
+      const payableAccount = await resolvePostingAccountHead(facility, payableCodeUse);
+      const accruedAccount = await resolvePostingAccountHead(facility, accrualCodeUse);
+      if (!payableAccount) {
+        return res.status(404).json({
+          success: false,
+          error: `Payable account not found: ${payableCodeUse}`,
+        });
+      }
+      if (!accruedAccount) {
+        return res.status(404).json({
+          success: false,
+          error: `Payable accrual / advance account not found: ${accrualCodeUse}`,
+        });
+      }
+
+      const outstandingRows = releaseAssignedAmounts(
+        await loadOutstandingPurchaseInvoices(supplierNoResolved, facility),
+        assignedRows,
+      );
+      const openBills = outstandingRows.filter((row) => row.amount_due > 0.000001);
+      const dueByRef = new Map(openBills.map((row) => [row.invoice_ref, row.amount_due]));
+      let invoices = Array.isArray(invoicesFromBody)
+        ? invoicesFromBody
+            .map((row) => ({
+              invoice_ref: String(row?.invoice_ref || row?.reference_number || "").trim(),
+              amount_paid: parseAmount(row?.amount_paid),
+            }))
+            .filter((row) => row.invoice_ref && row.amount_paid > 0)
+        : [];
+      if (invoices.length === 0) {
+        const fifo = buildFifoPurchaseAllocations(
+          openBills,
+          amountPaidNum,
+          allocation_order,
+        );
+        invoices = fifo.invoices;
+      } else {
+        const check = validateLinesAgainstOutstanding(invoices, dueByRef);
+        if (check.error) {
+          return res.status(400).json({ success: false, error: check.error });
+        }
+      }
+      const sumAlloc = roundMoney(
+        invoices.reduce((sum, row) => sum + (parseFloat(row.amount_paid) || 0), 0),
+      );
+      if (sumAlloc > amountPaidNum + 0.02) {
+        return res.status(400).json({
+          success: false,
+          error: "Sum of bill allocations cannot exceed total amount paid",
+        });
+      }
+      const totalOutstanding = roundMoney(
+        openBills.reduce((sum, row) => sum + (parseFloat(row.amount_due) || 0), 0),
+      );
+      if (totalOutstanding > 0.02 && invoices.length > 0) {
+        const requiredOnBills = Math.min(amountPaidNum, totalOutstanding);
+        if (sumAlloc + 0.02 < requiredOnBills) {
+          return res.status(400).json({
+            success: false,
+            error: `Apply the full payment to outstanding bills. At least ${requiredOnBills.toFixed(2)} is required on bill lines.`,
+          });
+        }
+      }
+      const remainderToAdvance = roundMoney(Math.max(0, amountPaidNum - sumAlloc));
+      if (remainderToAdvance + 0.01 < oldAccrued || (!sameSupplier && oldAccrued > 0.01)) {
+        const available = await getAvailableSupplierAdvance(facility, oldSupplier);
+        const needed = !sameSupplier ? oldAccrued : oldAccrued - remainderToAdvance;
+        if (available + 0.01 < needed) {
+          return res.status(400).json({
+            success: false,
+            error: `Vendor advance already used. Only ₦${Number(available).toLocaleString()} can be changed.`,
+          });
+        }
+      }
+
+      const assignedIds = assignedRows.map((row) => row.transaction_id);
+      await db.sequelize.transaction(async (t) => {
+        if (assignedIds.length) {
+          await GeneralLedger.destroy({
+            where: { transaction_id: assignedIds },
+            transaction: t,
+          });
+        }
+        await GeneralLedger.destroy({
+          where: {
+            facility_id: facility,
+            reference_number: receiptNo,
+            type: ["accrued", "payment"],
+          },
+          transaction: t,
+        });
+
+        const stampedIds = [];
+        let remainingAmount = amountPaidNum;
+        for (const inv of invoices) {
+          const applicationAmount = Math.min(
+            parseFloat(inv.amount_paid) || 0,
+            remainingAmount,
+          );
+          if (applicationAmount <= 0) continue;
+          const created = await GeneralLedger.create(
+            {
+              transaction_date: transactionDate,
+              account_code: payableCodeUse,
+              account_subhead:
+                payableAccount.subhead || String(payableCodeUse).substring(0, 6),
+              dr: applicationAmount,
+              cr: 0,
+              account_description: payableAccount.description || "Accounts Payable",
+              transaction_description: `${note || "Payment"} ${inv.invoice_ref} — ${supplierName}`.slice(0, 255),
+              reference_number: inv.invoice_ref,
+              purpose_of_payment: note.slice(0, 150),
+              payee,
+              bank_account_id: primaryBankId,
+              cheque_no: cheque_number || null,
+              mode_of_payment: String(combinedMode).slice(0, 20),
+              created_by: entries[0].created_by || userId,
+              facility_id: facility,
+              status: "paid",
+              type: "payment",
+              transaction_ref: supplierNoResolved,
+            },
+            { transaction: t },
+          );
+          stampedIds.push(created.transaction_id);
+          remainingAmount = roundMoney(remainingAmount - applicationAmount);
+          if (remainingAmount <= 0) break;
+        }
+        if (remainingAmount > 0.009) {
+          const created = await GeneralLedger.create(
+            {
+              transaction_date: transactionDate,
+              account_code: accrualCodeUse,
+              account_subhead:
+                accruedAccount.subhead || String(accrualCodeUse).substring(0, 6),
+              dr: remainingAmount,
+              cr: 0,
+              account_description:
+                accruedAccount.description || "Supplier advance / prepaid",
+              transaction_description: `Supplier advance — ${supplierName}`.slice(0, 255),
+              reference_number: receiptNo,
+              purpose_of_payment: note.slice(0, 150),
+              payee,
+              bank_account_id: primaryBankId,
+              cheque_no: cheque_number || null,
+              mode_of_payment: String(combinedMode).slice(0, 20),
+              created_by: entries[0].created_by || userId,
+              facility_id: facility,
+              status: "paid",
+              type: "accrued",
+              transaction_ref: supplierNoResolved,
+            },
+            { transaction: t },
+          );
+          stampedIds.push(created.transaction_id);
+        }
+        if (stampedIds.length && createdAtSql) {
+          await db.sequelize.query(
+            `UPDATE general_ledger
+             SET created_at = :createdAt
+             WHERE transaction_id IN (:ids)`,
+            {
+              replacements: { createdAt: createdAtSql, ids: stampedIds },
+              transaction: t,
+            },
+          );
+        }
+
+        await GeneralLedger.destroy({
+          where: {
+            facility_id: facility,
+            reference_number: receiptNo,
+            type: "bank",
+          },
+          transaction: t,
+        });
+        for (const split of resolvedSplits) {
+          const headCode = split.headCode || split.account.head || split.account.code;
+          await GeneralLedger.create(
+            {
+              transaction_date: transactionDate,
+              account_code: headCode,
+              account_subhead:
+                split.account.subhead ||
+                split.account.parent_code ||
+                String(headCode).substring(0, 6),
+              dr: 0,
+              cr: split.amount,
+              account_description:
+                split.accountDesc || split.account.description || "Bank/Cash",
+              transaction_description: `${note} (${split.mode}) — ${supplierName}`,
+              reference_number: receiptNo,
+              purpose_of_payment: note.slice(0, 150),
+              payee,
+              bank_account_id: split.bankId || null,
+              cheque_no: cheque_number || null,
+              mode_of_payment: String(split.mode).slice(0, 20),
+              created_by: entries[0].created_by || userId,
+              facility_id: facility,
+              status: "paid",
+              type: "bank",
+              transaction_ref: "",
+            },
+            { transaction: t },
+          );
+        }
+
+        const first = entries[0];
+        await first.update(
+          {
+            supplier_number: supplierNoResolved,
+            description: note.slice(0, 255),
+            cost: amountPaidNum,
+            mode_of_payment: combinedMode,
+            bank_account_id: primaryBankId,
+            transaction_date: transactionDate,
+          },
+          { transaction: t },
+        );
+        if (entries.length > 1) {
+          await SupplierEntry.destroy({
+            where: {
+              entry_id: entries.slice(1).map((entry) => entry.entry_id),
+            },
+            transaction: t,
+          });
+        }
+      });
+
+      return res.json({
+        success: true,
+        message: `${receiptNo} disconnected and applied again`,
+        data: {
+          reference_number: receiptNo,
+          amount_paid: amountPaidNum,
+          supplier_number: supplierNoResolved,
+          disconnected: true,
+          applied_to: invoices.map((row) => ({
+            bill_ref: row.invoice_ref,
+            amount: row.amount_paid,
+          })),
+          advance_amount: remainderToAdvance,
+        },
+      });
+    }
+
+    await db.sequelize.transaction(async (t) => {
+      let allocated = 0;
+      for (let index = 0; index < debitLines.length; index += 1) {
+        const line = debitLines[index];
+        const isLast = index === debitLines.length - 1;
+        const nextDr = isLast
+          ? roundMoney(amountPaidNum - allocated)
+          : roundMoney((parseFloat(line.dr) || 0) * ratio);
+        allocated = roundMoney(allocated + nextDr);
+        await line.update(
+          {
+            dr: nextDr,
+            transaction_date: transactionDate,
+            payee,
+            purpose_of_payment: note.slice(0, 150),
+            transaction_ref: supplierNoResolved,
+            mode_of_payment: String(combinedMode).slice(0, 20),
+          },
+          { transaction: t },
+        );
+      }
+
+      await GeneralLedger.destroy({
+        where: {
+          facility_id: facility,
+          reference_number: receiptNo,
+          type: "bank",
+        },
+        transaction: t,
+      });
+
+      for (const split of resolvedSplits) {
+        const headCode = split.headCode || split.account.head || split.account.code;
+        await GeneralLedger.create(
+          {
+            transaction_date: transactionDate,
+            account_code: headCode,
+            account_subhead:
+              split.account.subhead ||
+              split.account.parent_code ||
+              String(headCode).substring(0, 6),
+            dr: 0,
+            cr: split.amount,
+            account_description:
+              split.accountDesc || split.account.description || "Bank/Cash",
+            transaction_description: `${note} (${split.mode}) — ${supplierName}`,
+            reference_number: receiptNo,
+            purpose_of_payment: note.slice(0, 150),
+            payee,
+            bank_account_id: split.bankId || null,
+            cheque_no: cheque_number || null,
+            mode_of_payment: String(split.mode).slice(0, 20),
+            created_by: entries[0].created_by || userId,
+            facility_id: facility,
+            status: "paid",
+            type: "bank",
+            transaction_ref: "",
+          },
+          { transaction: t },
+        );
+      }
+
+      const first = entries[0];
+      await first.update(
+        {
+          supplier_number: supplierNoResolved,
+          description: note.slice(0, 255),
+          cost: amountPaidNum,
+          mode_of_payment: combinedMode,
+          bank_account_id: primaryBankId,
+          transaction_date: transactionDate,
+        },
+        { transaction: t },
+      );
+      if (entries.length > 1) {
+        await SupplierEntry.destroy({
+          where: {
+            entry_id: entries.slice(1).map((entry) => entry.entry_id),
+          },
+          transaction: t,
+        });
+      }
+    });
+
+    return res.json({
+      success: true,
+      message: `${receiptNo} updated`,
+      data: {
+        reference_number: receiptNo,
+        amount_paid: amountPaidNum,
+        supplier_number: supplierNoResolved,
+      },
+    });
+  } catch (error) {
+    console.error("updateSupplierPayment:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Failed to update payment",
+    });
+  }
+};
+
 exports.getSupplierAdvanceHistory = async (req, res) => {
   try {
     const {

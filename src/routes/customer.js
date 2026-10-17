@@ -68,6 +68,10 @@ module.exports = (app) => {
     customer.createCustomerAdvancePayment,
   );
   app.post(
+    "/api/v1/update-received-payment",
+    customer.updateReceivedPayment,
+  );
+  app.post(
     "/api/v1/customer-advance-payment-allocate",
     customer.customerAdvancePaymentAllocate,
   );
