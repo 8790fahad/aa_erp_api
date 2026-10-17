@@ -4644,10 +4644,19 @@ exports.createSale = async (req, res) => {
           : { transaction: t },
       );
 
-      let unitCost = Number(valuationResult?.calculatedCostPrice) || 0;
-      let vatPerUnit = costIncludesInputVat(product?.taxable)
-        ? Number(valuationResult?.vatPerUnit) || 0
-        : 0;
+      const valuedNet = Number(valuationResult?.calculatedCostPrice) || 0;
+      const valuedVat = Number(valuationResult?.vatPerUnit) || 0;
+      const vatable = costIncludesInputVat(product?.taxable);
+      // Vatable: cost of sales is after tax, and the VAT stays on the stock line.
+      // Not vatable: keep the full cost. The average may already have had VAT
+      // taken out, so put that VAT back and do not post it as input VAT.
+      let unitCost = valuedNet;
+      let vatPerUnit = 0;
+      if (vatable) {
+        vatPerUnit = valuedVat;
+      } else if (valuedVat > 0) {
+        unitCost = Number((valuedNet + valuedVat).toFixed(2));
+      }
 
       // If no cost price calculated and allow_sales_without_stock is enabled, use fallback
       if (unitCost <= 0) {

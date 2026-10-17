@@ -3,6 +3,8 @@
 const { Op } = require("sequelize");
 const db = require("../models");
 const { recordActivity } = require("./activityAuditService");
+const { costIncludesInputVat } = require("../constants/taxableStatus");
+const inventoryCtrl = require("../controller/inventory");
 
 const VERIFICATION_STATUSES = [
   "awaiting_payment",
@@ -26,6 +28,82 @@ const NON_CREDIT_PAYMENT_TYPES = [
 ];
 
 const CREDIT_PAYMENT_TYPES = ["credit", "credit_split"];
+
+/**
+ * Cost to put back when a sale is reversed.
+ * Vatable goods come back at the VAT-inclusive cost, with that VAT kept on the line.
+ * Anything else comes back at the full cost, so VAT already removed from the
+ * average is not left out of the stock.
+ */
+async function reversedStockPrice({
+  facilityId,
+  productId,
+  costPrice,
+  vatAmount,
+  qty,
+  transaction,
+  valued,
+}) {
+  const unit = Number(costPrice) || 0;
+  const q = Number(qty) || 0;
+  const lineVat = Number(vatAmount) || 0;
+  if (q <= 0 || unit <= 0) {
+    return { cost_price: unit, vat_amount: lineVat };
+  }
+
+  const product = await db.Product.findOne({
+    where: { sku: productId, facility_id: facilityId },
+    attributes: ["taxable"],
+    transaction,
+  });
+  const vatable = costIncludesInputVat(product?.taxable);
+  const vatPer = lineVat / q;
+  const vatInsideUnit = unit - unit / 1.075;
+  const vatAlreadyInside = vatPer > 0 && Math.abs(vatPer - vatInsideUnit) < 1;
+
+  if (vatable) {
+    let gross = vatAlreadyInside || vatPer <= 0 ? unit : unit + vatPer;
+    if (vatPer <= 0) {
+      const quote =
+        valued ||
+        (await inventoryCtrl.getCurrentUnitCost(productId, facilityId, "WAC", {
+          transaction,
+        }));
+      const net = Number(quote?.calculatedCostPrice) || 0;
+      const vat = Number(quote?.vatPerUnit) || 0;
+      const whole = net > 0 && vat > 0.004 ? Number((net + vat).toFixed(2)) : 0;
+      if (whole > gross + 0.004) gross = whole;
+    }
+    // Keep the VAT inside the cost. A separate vat_amount is taken off again
+    // when this return is valued, which is what made reversed stock cheaper.
+    return {
+      cost_price: Number(gross.toFixed(2)),
+      vat_amount: 0,
+    };
+  }
+
+  if (vatPer > 0 && !vatAlreadyInside) {
+    return {
+      cost_price: Number((unit + vatPer).toFixed(2)),
+      vat_amount: 0,
+    };
+  }
+
+  const quote =
+    valued ||
+    (await inventoryCtrl.getCurrentUnitCost(productId, facilityId, "WAC", {
+      transaction,
+    }));
+  const net = Number(quote?.calculatedCostPrice) || 0;
+  const vat = Number(quote?.vatPerUnit) || 0;
+  if (net > 0 && vat > 0.004) {
+    const whole = Number((net + vat).toFixed(2));
+    if (whole > unit + 0.004) {
+      return { cost_price: whole, vat_amount: 0 };
+    }
+  }
+  return { cost_price: unit, vat_amount: 0 };
+}
 
 function normalizeHistory(history) {
   if (Array.isArray(history)) return history;
@@ -213,6 +291,7 @@ async function voidUnpaidNonCreditSale({
       transaction,
     });
     let reversedStoreEntries = 0;
+    const valuedBySku = new Map();
     for (const row of storeRows) {
       const plain = row.get ? row.get({ plain: true }) : row;
       if (String(plain.status || "").toLowerCase() === "voided") continue;
@@ -233,6 +312,28 @@ async function voidUnpaidNonCreditSale({
       clone.status = "voided";
       clone.destination = "void";
       clone.reference_number = normalizedRef;
+      if (qtyOut > 0 && plain.product_id) {
+        const sku = String(plain.product_id);
+        if (!valuedBySku.has(sku)) {
+          valuedBySku.set(
+            sku,
+            await inventoryCtrl.getCurrentUnitCost(sku, facilityId, "WAC", {
+              transaction,
+            }),
+          );
+        }
+        const priced = await reversedStockPrice({
+          facilityId,
+          productId: sku,
+          costPrice: plain.cost_price,
+          vatAmount: plain.vat_amount,
+          qty: qtyOut,
+          transaction,
+          valued: valuedBySku.get(sku),
+        });
+        clone.cost_price = priced.cost_price;
+        clone.vat_amount = priced.vat_amount;
+      }
       await db.StoreEntry.create(clone, { transaction });
       reversedStoreEntries += 1;
     }
