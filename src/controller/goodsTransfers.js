@@ -169,21 +169,33 @@ function valuationMethodKey(invEvM) {
       : invEvM;
 }
 
-/** Unit cost from perpetual inventory valuation (WAC / FIFO / LIFO / batch). */
+/**
+ * Full unit cost for a transfer. Valuation returns the cost after VAT,
+ * and the stock report shows whatever is saved, so the VAT is put back
+ * into the cost and is not stored separately (that would take it off again).
+ */
 async function resolveUnitCostForTransfer({
   sku,
   facilityId,
   methodKey,
   expiry = null,
   batchId = null,
+  transaction = null,
 }) {
-  const { calculatedCostPrice } = await inventoryCtrl.getCurrentUnitCost(
+  const quote = await inventoryCtrl.getCurrentUnitCost(
     sku,
     facilityId,
     methodKey,
-    methodKey === "BATCH" ? { expiry, batchId } : {},
+    methodKey === "BATCH"
+      ? { expiry, batchId, transaction }
+      : { transaction },
   );
-  return parseFloat(calculatedCostPrice) || 0;
+  const valuedNet = Number(quote?.calculatedCostPrice) || 0;
+  const valuedVat = Number(quote?.vatPerUnit) || 0;
+  if (valuedVat > 0) {
+    return Number((valuedNet + valuedVat).toFixed(2));
+  }
+  return valuedNet;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +737,7 @@ exports.approveGoodsTransfer = async (req, res) => {
         methodKey,
         expiry: expiryDate || line.expiry_date,
         batchId: line.batch_id || line.batch_no,
+        transaction: t,
       });
       if (cost <= 0) {
         await t.rollback();
@@ -758,6 +771,7 @@ exports.approveGoodsTransfer = async (req, res) => {
           qty_in: 0,
           qty_out: qty,
           cost_price: cost,
+          vat_amount: 0,
           selling_price: sell,
           expiry_date: expiryDate,
           branch_name: ZONE,
@@ -781,6 +795,7 @@ exports.approveGoodsTransfer = async (req, res) => {
           qty_in: qty,
           qty_out: 0,
           cost_price: cost,
+          vat_amount: 0,
           selling_price: sell,
           expiry_date: expiryDate,
           branch_name: ZONE,
