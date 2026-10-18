@@ -1542,7 +1542,11 @@ exports.getSaleByCode = async (req, res) => {
             "delivery_order_format",
             "delivery_document_type",
             "document_header_style",
-            "business_logo",
+            // The goods issue slip does not print the logo. Leaving it out
+            // drops most of this response. Invoice print still asks for it.
+            ...(String(req.query.omit_logo || "") === "1"
+              ? []
+              : ["business_logo"]),
             "customer_notes",
             "terms_conditions",
             "invoice_powered_by",
