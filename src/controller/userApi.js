@@ -2,23 +2,121 @@ const db = require("../models");
 const moment = require("moment");
 const { sqlEq } = require("../utils/sqlCollate");
 
+const BUSINESS_MEDIA_ATTRIBUTES = ["business_logo", "seal"];
+
+const BUSINESS_PROFILE_ATTRIBUTES = [
+  "id",
+  "business_name",
+  "business_type",
+  "business_address",
+  "wip",
+  "opening_balance_equity",
+  "sale_revenue_code",
+  "document_header_style",
+  "primary_color",
+  "secondary_color",
+  "business_phone",
+  "business_email",
+  "rc",
+  "fax",
+  "description",
+  "abnormal_loss_account",
+  "scrap_inventory_account",
+  "prefix",
+  "payable_code",
+  "finished_goods_code",
+  "other_payable_code",
+  "receivable_code",
+  "cost_of_sale",
+  "payable_accural_code",
+  "other_receivable_code",
+  "receivable_accural_code",
+  "costing_method",
+  "depreciation_method",
+  "auto_depreciation_enabled",
+  "invoice_closing_enabled",
+  "invoice_closing_time",
+  "invoice_closing_timezone",
+  "invoice_closing_last_run",
+  "financial_year_start_month",
+  "session_lock_enabled",
+  "session_lock_idle_minutes",
+  "workflow_mail_enabled",
+  "workflow_mail_processes",
+  "login_hours_enabled",
+  "login_opening_time",
+  "login_closing_time",
+  "login_hours_timezone",
+  "auto_depreciation_frequency",
+  "auto_depreciation_day",
+  "auto_depreciation_last_run",
+  "vat_policy",
+  "show_vat_on_sales_invoice",
+  "sales_invoice_print_in_color",
+  "vat_account_code",
+  "recon_cash_account_code",
+  "recon_safe_account_code",
+  "recon_shortage_account_code",
+  "inv_ev_m",
+  "default_valuation_source",
+  "allow_sales_without_stock",
+  "allow_invoice_selling_price",
+  "filter_products_by_default_supplier",
+  "paye_auto_calculation",
+  "pro_bono_code",
+  "valuation_date",
+  "default_receipt_type",
+  "print_delivery_order",
+  "delivery_order_format",
+  "delivery_document_type",
+  "customer_notes",
+  "terms_conditions",
+  "invoice_powered_by",
+  "enable_online_ordering",
+  "enable_production_correction",
+  "enable_material_requisition",
+  "link_user",
+  "marketplace_tiny_link",
+  "enable_marketplace_social_media",
+  "marketplace_social_media",
+];
+
+async function _getMembershipByEmail(email) {
+  return db.sequelize.query(
+    `SELECT \`business_id\`, \`access_to\`, \`functionalities\`, \`branch_id\`
+     FROM \`membership\`
+     WHERE ${sqlEq("`email`", ":email")}`,
+    {
+      replacements: { email },
+      type: db.Sequelize.QueryTypes.SELECT,
+    },
+  );
+}
+
+const _getBusinessMedia = async (email) => {
+  const membership = await _getMembershipByEmail(email);
+  if (!membership.length) return [];
+  const businessIds = membership.map((m) => m.business_id).filter(Boolean);
+  if (!businessIds.length) return [];
+  const rows = await db.business.findAll({
+    where: { id: { [db.Sequelize.Op.in]: businessIds } },
+    attributes: ["id", ...BUSINESS_MEDIA_ATTRIBUTES],
+  });
+  return rows.map((row) => row.toJSON());
+};
+
 const _getBusinessProfile = async (
   callback = (f) => f,
   error = (f) => f,
   email,
+  options = {},
 ) => {
+  const includeMedia = options.includeMedia !== false;
+  const skipDefaultCodes = options.skipDefaultCodes === true;
+
   try {
-    console.log();
     // Find membership to get business_id from user_id
-    const membership = await db.sequelize.query(
-      `SELECT \`business_id\`, \`access_to\`, \`functionalities\`, \`branch_id\`
-       FROM \`membership\`
-       WHERE ${sqlEq("`email`", ":email")}`,
-      {
-        replacements: { email },
-        type: db.Sequelize.QueryTypes.SELECT,
-      },
-    );
+    const membership = await _getMembershipByEmail(email);
 
     if (!membership.length) {
       return error(new Error("Membership not found"));
@@ -32,85 +130,9 @@ const _getBusinessProfile = async (
     const businessIds = membership.map((m) => m.business_id).filter(Boolean);
     const businesses = await db.business.findAll({
       where: { id: { [db.Sequelize.Op.in]: businessIds } },
-      attributes: [
-        "id",
-        "business_name",
-        "business_type",
-        "business_address",
-        "wip",
-        "opening_balance_equity",
-        "sale_revenue_code",
-        "business_logo",
-        "document_header_style",
-        "primary_color",
-        "secondary_color",
-        "business_phone",
-        "business_email",
-        "rc",
-        "fax",
-        "description",
-        "abnormal_loss_account",
-        "scrap_inventory_account",
-        "prefix",
-        "payable_code",
-        "finished_goods_code",
-        "other_payable_code",
-        "receivable_code",
-        "cost_of_sale",
-        "payable_accural_code",
-        "other_receivable_code",
-        "receivable_accural_code",
-        "costing_method",
-        "depreciation_method",
-        "auto_depreciation_enabled",
-        "invoice_closing_enabled",
-        "invoice_closing_time",
-        "invoice_closing_timezone",
-        "invoice_closing_last_run",
-        "financial_year_start_month",
-        "session_lock_enabled",
-        "session_lock_idle_minutes",
-        "workflow_mail_enabled",
-        "workflow_mail_processes",
-        "login_hours_enabled",
-        "login_opening_time",
-        "login_closing_time",
-        "login_hours_timezone",
-        "auto_depreciation_frequency",
-        "auto_depreciation_day",
-        "auto_depreciation_last_run",
-        "vat_policy",
-        "show_vat_on_sales_invoice",
-        "sales_invoice_print_in_color",
-        "vat_account_code",
-        "recon_cash_account_code",
-        "recon_safe_account_code",
-        "recon_shortage_account_code",
-        "seal",
-        "inv_ev_m",
-        "default_valuation_source",
-        "allow_sales_without_stock",
-        "allow_invoice_selling_price",
-        "filter_products_by_default_supplier",
-        "paye_auto_calculation",
-        "pro_bono_code",
-        "valuation_date",
-        "default_receipt_type",
-        "print_delivery_order",
-        "delivery_order_format",
-        "delivery_document_type",
-        "customer_notes",
-        "terms_conditions",
-        "invoice_powered_by",
-        "enable_online_ordering",
-        "enable_production_correction",
-        "enable_material_requisition",
-        "link_user",
-        "marketplace_tiny_link",
-        "enable_marketplace_social_media",
-        "marketplace_social_media",
-        "business_logo"
-      ],
+      attributes: includeMedia
+        ? [...BUSINESS_PROFILE_ATTRIBUTES, ...BUSINESS_MEDIA_ATTRIBUTES]
+        : BUSINESS_PROFILE_ATTRIBUTES,
     });
 
     if (!businesses.length) {
@@ -122,6 +144,26 @@ const _getBusinessProfile = async (
     // If accounting codes are not set, get defaults from Chart of Accounts
     const facilityId = business.id;
     let defaultCodes = {};
+
+    // Login/verify only need the stored profile. Extra CoA lookups can wait.
+    if (skipDefaultCodes) {
+      const businessData = {
+        ...business.toJSON(),
+        access_to: membership[0].access_to,
+        functionalities: membership[0].functionalities,
+        branch_id: membership[0].branch_id,
+      };
+      const businessesList = businesses.map((b) => {
+        const mem = membership.find((m) => m.business_id === b.id);
+        return {
+          ...b.toJSON(),
+          access_to: mem?.access_to ?? null,
+          functionalities: mem?.functionalities ?? null,
+          branch_id: mem?.branch_id ?? null,
+        };
+      });
+      return callback([[businessData]], businessesList);
+    }
 
     // Get default codes from account_category if not already set
     if (!business.receivable_code) {
@@ -566,3 +608,4 @@ const _createBusiness = async (obj, callback = (f) => f, error = (f) => f) => {
 
 exports.createBusiness = _createBusiness;
 exports.getBusinessProfile = _getBusinessProfile;
+exports.getBusinessMedia = _getBusinessMedia;

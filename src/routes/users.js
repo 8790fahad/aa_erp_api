@@ -54,6 +54,7 @@ module.exports = (app) => {
     users.businessProfile
   );
   app.get("/api/v1/business-profile", users.getBusinessProfile);
+  app.get("/api/v1/business-media", users.getBusinessMedia);
 
   //retrieve all users
   app.get(

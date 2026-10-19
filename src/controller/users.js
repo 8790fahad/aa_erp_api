@@ -2946,6 +2946,7 @@ exports.login = (req, res) => {
                     });
                   },
                   user[0].dataValues.email,
+                  { includeMedia: false, skipDefaultCodes: true },
                 );
               },
             );
@@ -3231,6 +3232,7 @@ exports.verifyUserToken = (req, res) => {
             });
           },
           user[0].dataValues.email,
+          { includeMedia: false, skipDefaultCodes: true },
         );
       })
       .catch((err) => {
@@ -4837,4 +4839,22 @@ exports.getBusinessProfile = (req, res) => {
     },
     email,
   );
+};
+
+exports.getBusinessMedia = async (req, res) => {
+  const email = req.query.email || req.user?.email;
+  if (!email) {
+    return res.status(400).json({
+      success: false,
+      message: "email is required",
+    });
+  }
+
+  try {
+    const results = await userApi.getBusinessMedia(email);
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error("Error loading business media:", err);
+    return res.status(500).json({ success: false, err });
+  }
 };
