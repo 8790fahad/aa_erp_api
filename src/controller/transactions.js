@@ -16,6 +16,7 @@ const { STORE_ENTRY_TYPE, saleStoreEntryType, salesTypesSqlList } = require("../
 const {
   resolveStockOutExpiry,
 } = require("../utils/storeLotExpiry");
+const { balanceLedgerEntries } = require("../utils/ledgerBalance");
 
 /** Mixed dump collations (utf8mb4_unicode_ci vs utf8mb4_general_ci) break JOIN '='. */
 const sqlEq = (a, b) =>
@@ -5980,30 +5981,34 @@ exports.createSale = async (req, res) => {
 
     // ===================================================================
     // VALIDATE LEDGER BALANCE
+    // Multi-line VAT / unit prices often leave a few kobo of float/round
+    // drift (e.g. DR 322567.70 vs CR 322567.68). Round to kobo, auto-fix
+    // gaps up to ₦2 on a tax/revenue/AR plug line, and only reject larger.
     // ===================================================================
-    const totalDebits = ledgerEntries.reduce((sum, entry) => sum + entry.dr, 0);
-    const totalCredits = ledgerEntries.reduce(
-      (sum, entry) => sum + entry.cr,
-      0
-    );
-    console.log(ledgerEntries)
-    const difference = Math.abs(totalDebits - totalCredits);
+    const {
+      totalDebits,
+      totalCredits,
+      difference,
+      balanced,
+      adjustmentNote,
+    } = balanceLedgerEntries(ledgerEntries, { tolerance: 2 });
 
     console.log("\n=== LEDGER VALIDATION ===");
     console.log("Total Debits:", totalDebits.toFixed(2));
     console.log("Total Credits:", totalCredits.toFixed(2));
     console.log("Difference:", difference.toFixed(2));
+    if (adjustmentNote) console.log(adjustmentNote);
 
     console.log("\n=== LEDGER ENTRIES ===");
     ledgerEntries.forEach((entry, idx) => {
       console.log(
-        `${idx + 1}. ${entry.transaction_description} | DR: ${entry.dr.toFixed(
-          2
-        )} | CR: ${entry.cr.toFixed(2)}`
+        `${idx + 1}. ${entry.transaction_description} | DR: ${Number(
+          entry.dr || 0,
+        ).toFixed(2)} | CR: ${Number(entry.cr || 0).toFixed(2)}`,
       );
     });
 
-    if (difference > 0.02) {
+    if (!balanced) {
       console.error("\n=== LEDGER IMBALANCE DETECTED ===");
       throw new Error(
         `Ledger entries do not balance! Debits: ${totalDebits.toFixed(
@@ -6257,7 +6262,7 @@ exports.createSale = async (req, res) => {
       ledger_balance_check: {
         debits: totalDebits.toFixed(2),
         credits: totalCredits.toFixed(2),
-        balanced: Math.abs(totalDebits - totalCredits) < 0.02,
+        balanced: Math.abs(totalDebits - totalCredits) <= 2,
       },
       items_summary: {
         total_items: items.length,
