@@ -9,6 +9,8 @@ const {
     bulkCreateBankAccounts,
     getBankAccounts,
     updateBankAccount,
+    disableBankAccount,
+    enableBankAccount,
     deleteBankAccount,
     getBankReconciliationList,
     uploadBankStatement,
@@ -57,6 +59,8 @@ module.exports = (app) => {
     app.post("/api/bulk/bank-accounts", bulkCreateBankAccounts);
     app.get("/api/get/bank-accounts", getBankAccounts);
     app.put("/api/update/bank-account/by-id/:id", updateBankAccount);
+    app.post("/api/bank-account/:id/disable", disableBankAccount);
+    app.post("/api/bank-account/:id/enable", enableBankAccount);
     app.delete("/api/bank-account/:id", deleteBankAccount);
 
     // Matching Rules CRUD routes

@@ -488,7 +488,6 @@ exports.getAccountCategories = async (req, res) => {
         is_active
       FROM account_category
       WHERE facility_id = :facilityId
-        AND (is_active = 1 OR is_active IS NULL)
       ORDER BY
         FIELD(UPPER(COALESCE(account_nature, '')), 'ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'),
         code ASC`,
@@ -1416,7 +1415,9 @@ exports.updateAccountCategory = async (req, res) => {
 };
 
 /**
- * Disable (soft delete) an account category - sets isActive to false
+ * Disable (soft delete) a leaf account category — sets isActive to false.
+ * Parent / head accounts with children cannot be disabled (they stay available
+ * for hierarchy; only children are hidden from select fetches).
  */
 exports.disableAccountCategory = async (req, res) => {
   const transaction = await db.sequelize.transaction();
@@ -1431,12 +1432,11 @@ exports.disableAccountCategory = async (req, res) => {
       });
     }
 
-    // Check if category has active children
+    // Any child (active or not) means this is a head — disable is leaf-only.
     const children = await db.AccountCategory.count({
       where: {
         parentCode: code,
         facilityId,
-        isActive: true,
       },
       transaction,
     });
@@ -1445,7 +1445,8 @@ exports.disableAccountCategory = async (req, res) => {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
-        message: "Cannot disable category with child categories",
+        message:
+          "Only child accounts can be disabled. Disable the sub-accounts under this head first.",
       });
     }
 
@@ -1487,6 +1488,67 @@ exports.disableAccountCategory = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error disabling account category",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Re-enable a previously disabled leaf account category.
+ */
+exports.enableAccountCategory = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const { code, facilityId } = { ...req.body, ...req.query };
+
+    if (!code || !facilityId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "code and facilityId are required",
+      });
+    }
+
+    const existing = await db.AccountCategory.findOne({
+      where: { code, facilityId },
+      transaction,
+    });
+    if (!existing) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Account category not found",
+      });
+    }
+
+    const parentCode = existing.parentCode;
+    if (parentCode && String(parentCode).trim() && String(parentCode) !== "0") {
+      const parent = await db.AccountCategory.findOne({
+        where: { code: parentCode, facilityId },
+        transaction,
+      });
+      if (parent && parent.isActive === false) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Enable the parent account (${parentCode}) first.`,
+        });
+      }
+    }
+
+    await existing.update({ isActive: true }, { transaction });
+    await transaction.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: "Account category enabled successfully",
+    });
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    console.error("Error enabling account category:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error enabling account category",
       error: error.message,
     });
   }

@@ -1085,13 +1085,22 @@ exports.bulkCreateBankAccounts = async (req, res) => {
 
 exports.getBankAccounts = async (req, res) => {
   try {
-    const { facilityId } = req.query;
+    const { facilityId, includeInactive } = req.query;
     if (!facilityId) {
       return res.json({
         success: false,
         message: "facilityId is required",
       });
     }
+
+    // Selects / pickers: active only. Bank Setup may pass includeInactive=1.
+    const showInactive =
+      includeInactive === "1" ||
+      includeInactive === "true" ||
+      includeInactive === "yes";
+    const statusClause = showInactive
+      ? "bld.facility_id = :facilityId"
+      : "bld.facility_id = :facilityId AND bld.status = 'active'";
 
     const bankAccounts = await db.sequelize.query(
       `SELECT
@@ -1132,7 +1141,8 @@ exports.getBankAccounts = async (req, res) => {
           AND gl.facility_id = :facilityId
         GROUP BY gl.account_code
       ) obc ON obc.account_code = ba.head
-      WHERE bld.facility_id = :facilityId AND bld.status = 'active'`,
+      WHERE ${statusClause}
+      ORDER BY bld.account_name ASC`,
       {
         replacements: {
           facilityId,
@@ -1140,7 +1150,6 @@ exports.getBankAccounts = async (req, res) => {
         type: db.Sequelize.QueryTypes.SELECT,
       }
     );
-    console.log(bankAccounts, "==========");
     res.json({
       success: true,
       results: bankAccounts,
@@ -1315,10 +1324,112 @@ exports.updateBankAccount = async (req, res) => {
   }
 };
 
+/**
+ * Soft-disable a bank account. Hidden from select pickers (active-only fetches).
+ */
+exports.disableBankAccount = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { facilityId } = { ...req.body, ...req.query };
+
+    if (!id) {
+      return res.json({
+        success: false,
+        message: "Bank account ID is required",
+      });
+    }
+    if (!facilityId) {
+      return res.json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const bankAccount = await db.bank_account.findOne({
+      where: { id, facilityId },
+    });
+    if (!bankAccount) {
+      return res.json({
+        success: false,
+        message: "Bank account not found",
+      });
+    }
+    if (bankAccount.status === "inactive") {
+      return res.json({
+        success: true,
+        message: "Bank account is already disabled",
+      });
+    }
+
+    await bankAccount.update({ status: "inactive" });
+    return res.json({
+      success: true,
+      message: "Bank account disabled — it will no longer appear in bank selects",
+    });
+  } catch (error) {
+    console.error("Error disabling bank account:", error);
+    return res.json({
+      success: false,
+      message: "Error disabling bank account",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Re-enable a disabled bank account (shows again in selects).
+ */
+exports.enableBankAccount = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { facilityId } = { ...req.body, ...req.query };
+
+    if (!id) {
+      return res.json({
+        success: false,
+        message: "Bank account ID is required",
+      });
+    }
+    if (!facilityId) {
+      return res.json({
+        success: false,
+        message: "facilityId is required",
+      });
+    }
+
+    const bankAccount = await db.bank_account.findOne({
+      where: { id, facilityId },
+    });
+    if (!bankAccount) {
+      return res.json({
+        success: false,
+        message: "Bank account not found",
+      });
+    }
+
+    await bankAccount.update({ status: "active" });
+    return res.json({
+      success: true,
+      message: "Bank account enabled successfully",
+    });
+  } catch (error) {
+    console.error("Error enabling bank account:", error);
+    return res.json({
+      success: false,
+      message: "Error enabling bank account",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Permanent delete. Blocked when the account has ledger or statement history —
+ * use Disable instead in that case.
+ */
 exports.deleteBankAccount = async (req, res) => {
   try {
     const { id } = req.params;
-    const { facilityId } = req.body;
+    const { facilityId } = { ...req.body, ...req.query };
 
     if (!id) {
       return res.json({
@@ -1334,13 +1445,8 @@ exports.deleteBankAccount = async (req, res) => {
       });
     }
 
-    // Find the bank account
     const bankAccount = await db.bank_account.findOne({
-      where: {
-        id,
-        facilityId,
-        status: "active",
-      },
+      where: { id, facilityId },
     });
 
     if (!bankAccount) {
@@ -1350,18 +1456,50 @@ exports.deleteBankAccount = async (req, res) => {
       });
     }
 
-    // Update status to inactive instead of deleting
-    await bankAccount.update({
-      status: "inactive",
-    });
+    const idStr = String(id);
+    const [glRows] = await db.sequelize.query(
+      `SELECT COUNT(*) AS c FROM general_ledger
+       WHERE facility_id = :facilityId
+         AND CAST(bank_account_id AS CHAR) = :id`,
+      {
+        replacements: {
+          facilityId,
+          id: idStr,
+        },
+      },
+    );
+    const glCount = Number(glRows?.[0]?.c || 0);
 
-    res.json({
+    let stmtCount = 0;
+    try {
+      const [stmtRows] = await db.sequelize.query(
+        `SELECT COUNT(*) AS c FROM bank_statements
+         WHERE facility_id = :facilityId
+           AND CAST(bank_account_id AS CHAR) = :id`,
+        { replacements: { facilityId, id: idStr } },
+      );
+      stmtCount = Number(stmtRows?.[0]?.c || 0);
+    } catch {
+      /* bank_statements may not exist in every env */
+    }
+
+    if (glCount > 0 || stmtCount > 0) {
+      return res.json({
+        success: false,
+        message:
+          "This bank account has transactions and cannot be permanently deleted. Disable it instead so it is hidden from bank selects.",
+      });
+    }
+
+    await bankAccount.destroy();
+
+    return res.json({
       success: true,
-      message: "Bank account deactivated successfully",
+      message: "Bank account permanently deleted",
     });
   } catch (error) {
     console.error("Error deleting bank account:", error);
-    res.json({
+    return res.json({
       success: false,
       message: "Error deleting bank account",
       error: error.message,

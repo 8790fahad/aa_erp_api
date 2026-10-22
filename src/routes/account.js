@@ -763,6 +763,10 @@ module.exports = (app) => {
     "/account/account-category/disable",
     accountCategory.disableAccountCategory,
   );
+  app.post(
+    "/account/account-category/enable",
+    accountCategory.enableAccountCategory,
+  );
   app.delete(
     "/account/account-category",
     accountCategory.deleteAccountCategory,
