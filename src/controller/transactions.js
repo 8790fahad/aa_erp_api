@@ -3551,6 +3551,8 @@ exports.createSale = async (req, res) => {
       taxes: taxesRaw = [],
       transaction_date,
       saleDate: saleDateFromClient,
+      due_date: dueDateFromClient = null,
+      invoice_terms: invoiceTermsFromClient = null,
       sale_branch_id = 0,
       apply_prepayment = false,
       amountPaid: amountPaidFromClient = 0,
@@ -6075,10 +6077,38 @@ exports.createSale = async (req, res) => {
       // amount = receivable: what the customer is to pay
       // - VAT inclusive: subtotal - discount (tax already in prices, leave as-is)
       // - VAT exclusive: subtotal - discount + tax (sum together)
-      // Cash sales: due on sale date (already settled). Credit: +30 days.
-      const invoiceDueDate = isCashSale
+      // Cash: due on sale date. Credit: client due_date / Net N terms, else +30 days.
+      const parseClientDueDate = (raw) => {
+        if (raw == null || raw === "") return null;
+        const s = String(raw).trim();
+        const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (m) {
+          const d = new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00`);
+          return Number.isNaN(d.getTime()) ? null : d;
+        }
+        const d = new Date(s);
+        return Number.isNaN(d.getTime()) ? null : d;
+      };
+      const termDaysFromLabel = (terms) => {
+        const raw = String(terms || "").trim();
+        if (!raw || /^due on receipt$/i.test(raw)) return 0;
+        const match = raw.match(/^net\s+(\d+)$/i);
+        if (!match) return null;
+        const days = parseInt(match[1], 10);
+        return Number.isFinite(days) ? Math.max(0, days) : null;
+      };
+      let invoiceDueDate = isCashSale
         ? new Date(`${saleDate}T12:00:00`)
-        : new Date(new Date(saleDate).getTime() + 30 * 24 * 60 * 60 * 1000);
+        : parseClientDueDate(dueDateFromClient);
+      if (!invoiceDueDate && !isCashSale) {
+        const termDays = termDaysFromLabel(invoiceTermsFromClient);
+        const days =
+          termDays != null ? termDays : 30;
+        const base = new Date(`${saleDate}T12:00:00`);
+        invoiceDueDate = new Date(
+          base.getTime() + days * 24 * 60 * 60 * 1000,
+        );
+      }
 
       await db.Invoice.create(
         {
