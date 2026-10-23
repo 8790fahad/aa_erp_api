@@ -232,6 +232,9 @@ async function loadHandedToSafe({
 /**
  * Cash moved out of the till to bank (or another account) via cash_transfers.
  * Counts against cash-to-retire for the cashier.
+ * Collection Reconciliation hand-ins (cash_to_safe / cash_shortage) are excluded:
+ * those are already cleared on the cashier who was confirmed, and created_by is
+ * the person who clicked confirm, not that cashier.
  */
 async function loadTillCashTransfersOut({
   facilityId,
@@ -289,6 +292,8 @@ async function loadTillCashTransfersOut({
       "DATE(`date`) BETWEEN :fromDate AND :toDate",
       "amount > 0",
       "(status IS NULL OR LOWER(status) IN ('completed', 'posted', 'paid', ''))",
+      "LOWER(IFNULL(transaction_type, '')) NOT IN ('cash_to_safe', 'cash_shortage')",
+      "LOWER(IFNULL(remarks, '')) NOT LIKE 'collection reconciliation%'",
     ];
     const replacements = {
       facilityId: String(facilityId),
