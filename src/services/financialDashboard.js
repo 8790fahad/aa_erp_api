@@ -513,7 +513,7 @@ function resolveSalesInvoiceStatus(
   hasReceivableActivity,
 ) {
   let amountDue;
-  if (arOutstanding > 0.001) {
+  if (arOutstanding >= 0.05) {
     amountDue = Math.min(arOutstanding, amount);
   } else if (hasReceivableActivity) {
     amountDue = 0;
@@ -521,8 +521,8 @@ function resolveSalesInvoiceStatus(
     amountDue = Math.max(amount - Math.min(cashSettled, amount), 0);
   }
   const totalPaid = Math.max(amount - amountDue, 0);
-  if (amountDue <= 0.001) return "paid";
-  if (totalPaid > 0.001) return "partially_paid";
+  if (amountDue < 0.05) return "paid";
+  if (totalPaid >= 0.05) return "partially_paid";
   return "unpaid";
 }
 
@@ -555,7 +555,10 @@ async function fetchRecentActivity(sequelize, facilityId, limit = 5) {
         SELECT
           reference_number AS invoice_ref,
           facility_id,
-          GREATEST(SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END), 0) AS ar_outstanding,
+          CASE
+            WHEN ABS(SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END)) < 0.05 THEN 0
+            ELSE GREATEST(SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END), 0)
+          END AS ar_outstanding,
           GREATEST(SUM(CASE WHEN LOWER(type) IN ('bank', 'deposit') THEN dr - cr ELSE 0 END), 0) AS cash_settled,
           CASE WHEN SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS has_receivable_activity
         FROM general_ledger
@@ -1026,7 +1029,7 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
         c.fullname,
         c.store_name,
         c.company_name
-      HAVING GREATEST(COALESCE(SUM(gl.cr) - SUM(gl.dr), 0), 0) > 0.005
+      HAVING GREATEST(COALESCE(SUM(gl.cr) - SUM(gl.dr), 0), 0) >= 0.05
       ORDER BY balance DESC
       LIMIT :rowLimit
     `,
@@ -1049,7 +1052,7 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
           AND transaction_ref IS NOT NULL
           AND TRIM(transaction_ref) != ''
         GROUP BY transaction_ref
-        HAVING GREATEST(COALESCE(SUM(cr) - SUM(dr), 0), 0) > 0.005
+        HAVING GREATEST(COALESCE(SUM(cr) - SUM(dr), 0), 0) >= 0.05
       ) t
     `,
     {
@@ -1080,7 +1083,7 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
         gl.transaction_ref,
         si.supplier_name,
         si.company_name
-      HAVING GREATEST(COALESCE(SUM(gl.dr) - SUM(gl.cr), 0), 0) > 0.005
+      HAVING GREATEST(COALESCE(SUM(gl.dr) - SUM(gl.cr), 0), 0) >= 0.05
       ORDER BY balance DESC
       LIMIT :rowLimit
     `,
@@ -1103,7 +1106,7 @@ async function fetchAdvanceDepositBalances(sequelize, facilityId, limit = 8) {
           AND transaction_ref IS NOT NULL
           AND TRIM(transaction_ref) != ''
         GROUP BY transaction_ref
-        HAVING GREATEST(COALESCE(SUM(dr) - SUM(cr), 0), 0) > 0.005
+        HAVING GREATEST(COALESCE(SUM(dr) - SUM(cr), 0), 0) >= 0.05
       ) t
     `,
     {
@@ -1287,7 +1290,7 @@ async function fetchOutstandingBills(sequelize, facilityId) {
       dueDate: r.due_date,
       kind: "purchase",
     }))
-    .filter((r) => r.amountDue > 0.005)
+    .filter((r) => r.amountDue >= 0.05)
     .slice(0, 20);
   const expenseItems = expenses.map((r) => ({
     ref: r.ref,

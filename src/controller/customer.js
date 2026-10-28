@@ -3839,24 +3839,48 @@ const SALES_INVOICE_GL_SETTLEMENT_SUBQUERY = `
         SELECT
           reference_number AS invoice_ref,
           facility_id,
-          GREATEST(
-            SUM(
+          CASE
+            WHEN ABS(SUM(
               CASE
                 WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
                 ELSE 0
               END
-            ),
-            0
-          ) AS ar_outstanding,
-          GREATEST(
-            SUM(
+            )) < 0.05 THEN 0
+            ELSE GREATEST(
+              SUM(
+                CASE
+                  WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
+                  ELSE 0
+                END
+              ),
+              0
+            )
+          END AS ar_outstanding,
+          CASE
+            WHEN ABS(SUM(
               CASE
-                WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr
+                WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
                 ELSE 0
               END
-            ),
-            0
-          ) AS ar_invoiced,
+            )) < 0.05 THEN GREATEST(
+              SUM(
+                CASE
+                  WHEN LOWER(type) IN ('receivable', 'recevable') THEN cr
+                  ELSE 0
+                END
+              ),
+              0
+            )
+            ELSE GREATEST(
+              SUM(
+                CASE
+                  WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr
+                  ELSE 0
+                END
+              ),
+              0
+            )
+          END AS ar_invoiced,
           GREATEST(
             SUM(
               CASE
@@ -3893,8 +3917,8 @@ const SALES_INVOICE_TOTAL_PAID_SQL = `
 
 const SALES_INVOICE_STATUS_SQL = `
         CASE
-          WHEN (${SALES_INVOICE_AMOUNT_DUE_SQL}) <= 0.001 THEN 'paid'
-          WHEN (${SALES_INVOICE_TOTAL_PAID_SQL}) > 0.001 THEN 'partially_paid'
+          WHEN (${SALES_INVOICE_AMOUNT_DUE_SQL}) < 0.05 THEN 'paid'
+          WHEN (${SALES_INVOICE_TOTAL_PAID_SQL}) >= 0.05 THEN 'partially_paid'
           ELSE 'unpaid'
         END`;
 

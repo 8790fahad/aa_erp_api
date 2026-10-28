@@ -93,7 +93,7 @@ const OUTSTANDING_SUBQUERY = `
     i.facility_id,
     COALESCE(SUM(
       CASE
-        WHEN COALESCE(se_tot.ar_outstanding, 0) > 0.001
+        WHEN COALESCE(se_tot.ar_outstanding, 0) >= 0.05
           THEN LEAST(COALESCE(se_tot.ar_outstanding, 0), i.amount)
         WHEN COALESCE(se_tot.has_receivable_activity, 0) = 1
           THEN 0
@@ -109,7 +109,7 @@ const OUTSTANDING_SUBQUERY = `
           AND i.due_date < CURDATE()
           AND (
             CASE
-              WHEN COALESCE(se_tot.ar_outstanding, 0) > 0.001
+              WHEN COALESCE(se_tot.ar_outstanding, 0) >= 0.05
                 THEN LEAST(COALESCE(se_tot.ar_outstanding, 0), i.amount)
               WHEN COALESCE(se_tot.has_receivable_activity, 0) = 1
                 THEN 0
@@ -118,10 +118,10 @@ const OUTSTANDING_SUBQUERY = `
                 0
               )
             END
-          ) > 0.001
+          ) >= 0.05
         THEN (
           CASE
-            WHEN COALESCE(se_tot.ar_outstanding, 0) > 0.001
+            WHEN COALESCE(se_tot.ar_outstanding, 0) >= 0.05
               THEN LEAST(COALESCE(se_tot.ar_outstanding, 0), i.amount)
             WHEN COALESCE(se_tot.has_receivable_activity, 0) = 1
               THEN 0
@@ -139,10 +139,10 @@ const OUTSTANDING_SUBQUERY = `
     SELECT
       reference_number AS invoice_ref,
       facility_id,
-      GREATEST(
-        SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END),
-        0
-      ) AS ar_outstanding,
+      CASE
+        WHEN ABS(SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END)) < 0.05 THEN 0
+        ELSE GREATEST(SUM(CASE WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr ELSE 0 END), 0)
+      END AS ar_outstanding,
       GREATEST(
         SUM(CASE WHEN LOWER(type) IN ('bank', 'deposit') THEN dr - cr ELSE 0 END),
         0

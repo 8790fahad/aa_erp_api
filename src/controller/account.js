@@ -37,6 +37,11 @@ const {
   omitUnassignedBranches,
 } = require("../services/branchResolver");
 const { getCustomerLedgerBalances } = require("../utils/customerLedgerBalances");
+const {
+  clearReferenceKoboDust,
+  roundMoney,
+  snapReportBalance,
+} = require("../utils/ledgerBalance");
 const { notifyMemoWorkflow, notifyWorkflowPosting, WORKFLOW_NEXT } = require("../services/workflowMail");
 const {
   fetchEnrichedSalesInvoices,
@@ -19824,6 +19829,8 @@ exports.getPayableLedger = async (req, res) => {
         gl.transaction_date,
         gl.reference_number,
         gl.transaction_ref,
+        gl.type,
+        gl.facility_id,
         gl.dr,
         gl.cr,
         gl.transaction_description,
@@ -19844,7 +19851,7 @@ exports.getPayableLedger = async (req, res) => {
 
     const openingBalanceTxns = await db.sequelize.query(
       `
-      SELECT gl.dr, gl.cr
+      SELECT gl.dr, gl.cr, gl.reference_number, gl.type, gl.facility_id
       FROM general_ledger gl
       WHERE gl.facility_id = :facilityId
         AND gl.transaction_date < :fromDate
@@ -19857,10 +19864,18 @@ exports.getPayableLedger = async (req, res) => {
       },
     );
 
+    clearReferenceKoboDust([...openingBalanceTxns, ...transactions], [
+      "payable",
+      "payables",
+    ]);
+
     let openingBalance = 0;
     openingBalanceTxns.forEach((t) => {
-      openingBalance += parseFloat(t.dr || 0) - parseFloat(t.cr || 0);
+      openingBalance = roundMoney(
+        openingBalance + parseFloat(t.dr || 0) - parseFloat(t.cr || 0),
+      );
     });
+    openingBalance = snapReportBalance(openingBalance);
 
     // Calculate balance forward date (day before fromDate)
     const balanceForwardDate = moment(fromDate)
@@ -19872,7 +19887,9 @@ exports.getPayableLedger = async (req, res) => {
     const processedTransactions = transactions.map((t) => {
       const debit = parseFloat(t.dr || 0);
       const credit = parseFloat(t.cr || 0);
-      runningBalance += debit - credit;
+      runningBalance = snapReportBalance(
+        roundMoney(runningBalance + debit - credit),
+      );
 
       return {
         date: moment(t.transaction_date).format("YYYY-MM-DD"),
@@ -19995,10 +20012,15 @@ exports.getReceivableLedger = async (req, res) => {
       raw: true,
     });
 
+    clearReferenceKoboDust([...openingBalanceTxns, ...transactions]);
+
     let openingBalance = 0;
     openingBalanceTxns.forEach((t) => {
-      openingBalance += parseFloat(t.dr || 0) - parseFloat(t.cr || 0);
+      openingBalance = roundMoney(
+        openingBalance + parseFloat(t.dr || 0) - parseFloat(t.cr || 0),
+      );
     });
+    openingBalance = snapReportBalance(openingBalance);
 
     // Calculate balance forward date (day before fromDate)
     const balanceForwardDate = moment(fromDate)
@@ -20010,7 +20032,9 @@ exports.getReceivableLedger = async (req, res) => {
     const processedTransactions = transactions.map((t) => {
       const debit = parseFloat(t.dr || 0);
       const credit = parseFloat(t.cr || 0);
-      runningBalance += debit - credit;
+      runningBalance = snapReportBalance(
+        roundMoney(runningBalance + debit - credit),
+      );
       const txRef = String(t.transaction_ref || "").trim();
       const parsedCustomerId = customerId
         || (txRef.match(/^CUS-\d+/i) || [txRef])[0];
@@ -20112,6 +20136,23 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
               gl.transaction_ref = c.customerNo
               OR gl.transaction_ref LIKE CONCAT(c.customerNo, '-%')
             )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM general_ledger g2
+              WHERE g2.facility_id = gl.facility_id
+                AND g2.reference_number = gl.reference_number
+                AND g2.reference_number IS NOT NULL
+                AND TRIM(g2.reference_number) <> ''
+                AND (:asAtDate IS NULL OR g2.transaction_date <= :asAtDate)
+                AND LOWER(COALESCE(g2.type, '')) IN ('receivable', 'recevable')
+                AND (
+                  g2.transaction_ref = c.customerNo
+                  OR g2.transaction_ref LIKE CONCAT(c.customerNo, '-%')
+                )
+              GROUP BY g2.reference_number
+              HAVING ABS(SUM(g2.dr) - SUM(g2.cr)) > 0
+                 AND ABS(SUM(g2.dr) - SUM(g2.cr)) < 0.05
+            )
         ), 0) AS balance
       FROM customers c
       WHERE c.facilityId = :facilityId
@@ -20141,6 +20182,7 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
           AND gl.transaction_ref IS NOT NULL
           AND gl.transaction_ref != ''
         GROUP BY gl.transaction_ref, gl.reference_number
+        HAVING ABS(COALESCE(SUM(gl.dr), 0) - COALESCE(SUM(gl.cr), 0)) >= 0.05
       ) open_ap
         ON open_ap.party_ref = s.supplier_number
         OR open_ap.party_ref LIKE CONCAT(s.supplier_number, '-%')
@@ -20152,7 +20194,7 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
         s.phone,
         s.email
     ) parties
-    WHERE ABS(COALESCE(balance, 0)) > 0.0001
+    WHERE ABS(COALESCE(balance, 0)) >= 0.05
     ORDER BY party_name ASC
     `,
     {
@@ -20171,11 +20213,11 @@ async function fetchPartyBalancesByDrCr(facilityId, asAtDate = null) {
     address: row.address,
     phone: row.phone,
     email: row.email,
-    balance: parseFloat(row.balance || 0) || 0,
+    balance: snapReportBalance(parseFloat(row.balance || 0) || 0),
   });
 
   const mapCreditorRow = (row) => {
-    const balance = parseFloat(row.balance || 0) || 0;
+    const balance = snapReportBalance(parseFloat(row.balance || 0) || 0);
     return {
       party_type: row.party_type,
       party_id: row.party_id,
@@ -20337,7 +20379,7 @@ async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
       ), 0) AS balance
     FROM customers c
     WHERE c.facilityId = :facilityId
-    HAVING balance > 0.0001
+    HAVING balance >= 0.05
     ORDER BY party_name ASC
     `,
     {
@@ -20398,7 +20440,7 @@ async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
       s.address,
       s.phone,
       s.email
-    HAVING balance > 0.0001
+    HAVING balance >= 0.05
     ORDER BY party_name ASC
     `,
     {
@@ -20414,7 +20456,7 @@ async function fetchDepositAdvanceBalances(facilityId, asAtDate = null) {
     address: row.address,
     phone: row.phone,
     email: row.email,
-    balance: parseFloat(row.balance || 0) || 0,
+    balance: snapReportBalance(parseFloat(row.balance || 0) || 0),
   });
 
   return {
@@ -20499,15 +20541,23 @@ exports.getCustomerCreditsReport = async (req, res) => {
         SELECT
           reference_number AS invoice_ref,
           facility_id,
-          GREATEST(
-            SUM(
+          CASE
+            WHEN ABS(SUM(
               CASE
                 WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
                 ELSE 0
               END
-            ),
-            0
-          ) AS ar_outstanding
+            )) < 0.05 THEN 0
+            ELSE GREATEST(
+              SUM(
+                CASE
+                  WHEN LOWER(type) IN ('receivable', 'recevable') THEN dr - cr
+                  ELSE 0
+                END
+              ),
+              0
+            )
+          END AS ar_outstanding
         FROM general_ledger
         WHERE facility_id = :facilityId
           AND reference_number IS NOT NULL
@@ -20520,7 +20570,7 @@ exports.getCustomerCreditsReport = async (req, res) => {
       WHERE i.type = 'sales'
         AND i.facility_id = :facilityId
         AND (:asAtDate IS NULL OR i.transaction_date <= :asAtDate)
-      HAVING balance > 0.0001
+      HAVING balance >= 0.05
       ORDER BY i.invoice_ref ASC
       `,
       {
@@ -20555,7 +20605,7 @@ exports.getCustomerCreditsReport = async (req, res) => {
     for (const row of invoiceRows) {
       if (pendingApproval.has(String(row.invoice_ref))) continue;
       const bal = parseFloat(row.balance || 0) || 0;
-      if (bal <= 0.0001) continue;
+      if (bal < 0.05) continue;
       const key = row.party_id;
       const cur = byCustomer.get(key) || {
         party_type: "customer",

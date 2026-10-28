@@ -194,7 +194,7 @@ exports.listCustomers = async (req, res) => {
       replacements.assigned_user_id = assigned_user_id;
     }
     if (has_outstanding === "1" || has_outstanding === "true") {
-      where.push(`COALESCE(o.outstanding, 0) > 0.001`);
+      where.push(`COALESCE(o.outstanding, 0) >= 0.05`);
     }
 
     const baseFrom = `

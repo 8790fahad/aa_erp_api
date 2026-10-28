@@ -67,7 +67,7 @@ test("gap above 2.00 is rejected", () => {
   assert.equal(result.difference, 2.01);
 });
 
-test("credits higher by kobo are fixed onto AR debit", () => {
+test("credits higher by kobo come off sales, not accounts receivable", () => {
   const entries = [
     { type: "receivable", transaction_description: "AR", dr: 99.99, cr: 0 },
     { type: "revenue", transaction_description: "Sales", dr: 0, cr: 100 },
@@ -75,7 +75,40 @@ test("credits higher by kobo are fixed onto AR debit", () => {
   const result = balanceLedgerEntries(entries, { tolerance: 2 });
   assert.equal(result.balanced, true);
   assert.equal(result.adjusted, true);
-  assert.equal(entries[0].dr, 100);
+  assert.equal(entries[0].dr, 99.99);
+  assert.equal(entries[1].cr, 99.99);
+});
+
+test("cash sale kobo stays off the customer balance", () => {
+  const entries = [
+    { type: "receivable", transaction_description: "Cash sale", dr: 76800, cr: 0 },
+    { type: "revenue", transaction_description: "Sales revenue", dr: 0, cr: 75488.38 },
+    {
+      type: "tax",
+      transaction_description: "Output VAT @7.5% (Inclusive)",
+      dr: 0,
+      cr: 1311.63,
+    },
+    { type: "bank", transaction_description: "Sale payment", dr: 76800, cr: 0 },
+    {
+      type: "receivable",
+      transaction_description: "Sale settlement",
+      dr: 0,
+      cr: 76800,
+    },
+  ];
+  const result = balanceLedgerEntries(entries, { tolerance: 2 });
+  assert.equal(result.balanced, true);
+  assert.equal(entries[0].dr, 76800);
+  assert.equal(entries[3].dr, 76800);
+  assert.equal(entries[4].cr, 76800);
+  assert.equal(entries[2].cr, 1311.62);
+  const arNet = roundMoney(
+    entries
+      .filter((e) => e.type === "receivable")
+      .reduce((sum, e) => sum + e.dr - e.cr, 0),
+  );
+  assert.equal(arNet, 0);
 });
 
 test("already balanced entries stay untouched", () => {
