@@ -32,6 +32,56 @@ const {
   parseCreditLimitValue,
 } = require("../utils/customerKind");
 
+const CUSTOMER_SUPERUSER_KEYS = ["Administrator", "Super Administrator", "Admin"];
+
+function parseMembershipFunctionalities(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function userHasCustomerPrivilege(facilityId, userId, privilege) {
+  const uid = String(userId || "").trim();
+  if (!facilityId || !uid || !privilege) return false;
+  try {
+    const bizRows = await db.sequelize.query(
+      `SELECT business_admin FROM business WHERE id = :facilityId LIMIT 1`,
+      {
+        replacements: { facilityId },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    if (String(bizRows[0]?.business_admin || "") === uid) return true;
+
+    const memRows = await db.sequelize.query(
+      `SELECT functionalities, role
+       FROM membership
+       WHERE business_id = :facilityId
+         AND CAST(user_id AS CHAR) = CAST(:userId AS CHAR)
+       LIMIT 1`,
+      {
+        replacements: { facilityId, userId: uid },
+        type: db.sequelize.QueryTypes.SELECT,
+      },
+    );
+    const funcs = parseMembershipFunctionalities(memRows[0]?.functionalities);
+    const role = String(memRows[0]?.role || "");
+    if (
+      CUSTOMER_SUPERUSER_KEYS.some((key) => funcs.includes(key) || role === key)
+    ) {
+      return true;
+    }
+    return funcs.includes(privilege);
+  } catch (err) {
+    console.warn("userHasCustomerPrivilege:", err.message);
+    return false;
+  }
+}
+
 function resolveVendorType(value) {
   const resolved = String(value || "")
     .trim()
@@ -755,6 +805,20 @@ exports.CreateCustomer = async (req, res) => {
     );
     console.log(req.body, "====");
     const userId = created_by || req.user?.id;
+    if (query_type === "update" && customerNo) {
+      const allowed = await userHasCustomerPrivilege(
+        facilityId,
+        userId,
+        "Edit Customer",
+      );
+      if (!allowed) {
+        await transaction.rollback();
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to edit customers.",
+        });
+      }
+    }
     const displayName = (fullname || name || company_name || "").trim();
     const billing = billing_address || null;
     const shipping = shipping_address || null;
@@ -1345,6 +1409,29 @@ exports.setCustomerOpeningBalance = async (req, res) => {
       });
     }
 
+    const requestedKind = String(kind || "").trim().toLowerCase();
+    const entryKindForPermission =
+      requestedKind === "deposit" || OB < 0 ? "deposit" : "receivable";
+    const openingPrivilege =
+      entryKindForPermission === "deposit"
+        ? "Deposit opening balance"
+        : "Opening balance";
+    const allowed = await userHasCustomerPrivilege(
+      facilityId,
+      created_by,
+      openingPrivilege,
+    );
+    if (!allowed) {
+      await transaction.rollback();
+      return res.status(403).json({
+        success: false,
+        message:
+          entryKindForPermission === "deposit"
+            ? "You do not have permission to record a deposit opening balance."
+            : "You do not have permission to record an opening balance.",
+      });
+    }
+
     const customer = await db.Customer.findOne({
       where: { customerNo, facilityId },
       transaction,
@@ -1421,9 +1508,7 @@ exports.setCustomerOpeningBalance = async (req, res) => {
       });
     }
 
-    const requestedKind = String(kind || "").trim().toLowerCase();
-    const entryKind =
-      requestedKind === "deposit" || OB < 0 ? "deposit" : "receivable";
+    const entryKind = entryKindForPermission;
     const existing = await db.CustomerEntry.findOne({
       where:
         entryKind === "deposit"
