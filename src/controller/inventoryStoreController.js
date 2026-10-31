@@ -118,11 +118,11 @@ exports.getInventoryItemDetails = async (req, res) => {
     const from = String(fromDate || "").trim();
     const to = String(toDate || "").trim();
     if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
-      dateCondition += " AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) >= :fromDate";
+      dateCondition += " AND DATE(se.createdAt) >= :fromDate";
       replacements.fromDate = from;
     }
     if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-      dateCondition += " AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) <= :toDate";
+      dateCondition += " AND DATE(se.createdAt) <= :toDate";
       replacements.toDate = to;
     }
 
@@ -207,7 +207,7 @@ exports.getInventoryItemDetails = async (req, res) => {
         FROM store_entries se
         WHERE ${sqlEq("se.product_id", ":productId")}
           AND ${sqlEq("se.facilityId", ":facilityId")}
-          AND DATE(COALESCE(se.createdAt, se.inserted_time, se.receive_date)) ${cmp} :asOfDate
+          AND DATE(se.createdAt) ${cmp} :asOfDate
           ${branchSql}
         `,
         { replacements: repl, type: db.sequelize.QueryTypes.SELECT },
