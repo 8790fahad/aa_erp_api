@@ -7546,6 +7546,8 @@ exports.getSalesLineReport = async (req, res) => {
            ELSE 'sales'
          END AS line_type,
          se.qty_out AS qty,
+         COALESCE(se.cost_price, 0) AS unit_cost,
+         se.qty_out * COALESCE(se.cost_price, 0) AS line_cost,
          COALESCE(NULLIF(se.selling_price, 0), se.cost_price, 0) AS unit_price,
          ${lineAmountSql} AS line_total,
          COALESCE(se.vat_amount, 0) AS line_vat_amount,
@@ -7653,6 +7655,8 @@ exports.getSalesLineReport = async (req, res) => {
         line_type: row.line_type || "sales",
         basis: "sales",
         qty: parseFloat(row.qty || 0) || 0,
+        unit_cost: parseFloat(row.unit_cost || 0) || 0,
+        line_cost: parseFloat(row.line_cost || 0) || 0,
         unit_price: parseFloat(row.unit_price || 0) || 0,
         line_total: lineTotal,
         vat_amount: allocatedVat,
