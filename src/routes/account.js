@@ -368,6 +368,10 @@ module.exports = (app) => {
     account.updateInvoiceClosingSettings,
   );
   app.post(
+    "/account/update-recon-auto-save/:facilityId/:user_id",
+    account.updateReconAutoSaveSettings,
+  );
+  app.post(
     "/account/update-financial-year/:facilityId/:user_id",
     account.updateFinancialYear,
   );

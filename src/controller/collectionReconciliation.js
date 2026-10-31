@@ -555,13 +555,25 @@ function buildLedgerRow({
   const typeFallback = Number(debit) > 0 && Number(credit) === 0
     ? "expenses"
     : "payment";
+  const code = String(account?.code || "").trim();
+  const accountDescription = String(account?.description || "").trim();
+  const parent = String(account?.parentCode || account?.parent_code || "").trim();
+  if (!code || !accountDescription) {
+    throw new Error(
+      `Account ${code || "selected"} is missing its chart head`,
+    );
+  }
+  if (account?.isActive === false || account?.is_active === false) {
+    throw new Error(`Account ${code} is inactive`);
+  }
+  const subhead = parent && parent !== "0" ? parent : code;
   return {
     transaction_date: reconDate,
-    account_code: account.code,
-    account_subhead: String(account.parentCode || account.parent_code || 0),
+    account_code: code,
+    account_subhead: subhead,
     dr: money(debit),
     cr: money(credit),
-    account_description: clip(accountLabel(account, account.code), 300),
+    account_description: clip(accountDescription, 300),
     transaction_description: clip(description, 500),
     reference_number: transferId,
     purpose_of_payment: clip(purpose, 150) || "Cash to Safe",
@@ -715,6 +727,98 @@ async function postCashToSafeJournal({
   for (const row of rows) {
     await GeneralLedger.create(row, { transaction });
   }
+}
+
+const PENDING_COLLECT_STATUSES = [
+  "awaiting_payment",
+  "awaiting_cashier_confirm",
+  "awaiting_payment_method",
+  "awaiting_payment_mode_approval",
+];
+
+const PENDING_COLLECT_TYPES = [
+  "cash",
+  "transfer",
+  "bank",
+  "card",
+  "split",
+  "credit_split",
+  "deposit",
+  "apply_deposit",
+];
+
+function mapPendingCollectRow(row) {
+  return {
+    sale_code: row.sale_code,
+    customer_name: row.customer_name || "",
+    amount: money(row.amount),
+    payment_type: row.payment_type || "",
+    status: row.status || "",
+    created_at: row.created_at || null,
+  };
+}
+
+/** Invoices still at Verification Points, and goods still at Warehouse Collection. */
+async function loadPendingToCollect(facilityId) {
+  const empty = {
+    count: 0,
+    total: 0,
+    rows: [],
+    goods_count: 0,
+    goods_total: 0,
+    goods_rows: [],
+  };
+  if (!facilityId || !db.SaleWorkflow) return empty;
+  const replacements = {
+    facilityId: String(facilityId),
+    statuses: PENDING_COLLECT_STATUSES,
+    types: PENDING_COLLECT_TYPES,
+    goodsStatuses: ["warehouse_picking", "dual_signature"],
+  };
+  const [totals, rows, goodsTotals, goodsRows] = await Promise.all([
+    db.sequelize.query(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+         FROM sale_workflows
+        WHERE facility_id = :facilityId
+          AND status IN (:statuses)
+          AND LOWER(IFNULL(payment_type, '')) IN (:types)`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    ),
+    db.sequelize.query(
+      `SELECT sale_code, customer_name, amount, payment_type, status, created_at
+         FROM sale_workflows
+        WHERE facility_id = :facilityId
+          AND status IN (:statuses)
+          AND LOWER(IFNULL(payment_type, '')) IN (:types)
+        ORDER BY created_at DESC
+        LIMIT 100`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    ),
+    db.sequelize.query(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+         FROM sale_workflows
+        WHERE facility_id = :facilityId
+          AND status IN (:goodsStatuses)`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    ),
+    db.sequelize.query(
+      `SELECT sale_code, customer_name, amount, payment_type, status, created_at
+         FROM sale_workflows
+        WHERE facility_id = :facilityId
+          AND status IN (:goodsStatuses)
+        ORDER BY created_at DESC
+        LIMIT 100`,
+      { replacements, type: db.Sequelize.QueryTypes.SELECT },
+    ),
+  ]);
+  return {
+    count: Number(totals?.[0]?.cnt) || 0,
+    total: money(totals?.[0]?.total),
+    rows: (rows || []).map(mapPendingCollectRow),
+    goods_count: Number(goodsTotals?.[0]?.cnt) || 0,
+    goods_total: money(goodsTotals?.[0]?.total),
+    goods_rows: (goodsRows || []).map(mapPendingCollectRow),
+  };
 }
 
 /**
@@ -956,6 +1060,8 @@ exports.getSummary = async (req, res) => {
       }
     });
 
+    const pendingToCollect = await loadPendingToCollect(facilityId);
+
     return res.json({
       success: true,
       date: reconDate,
@@ -963,6 +1069,7 @@ exports.getSummary = async (req, res) => {
       cashiers,
       cashier_options,
       summary: totals,
+      pending_to_collect: pendingToCollect,
     });
   } catch (error) {
     console.error("collectionReconciliation.getSummary:", error);
@@ -1432,25 +1539,11 @@ exports.confirmHandIn = async (req, res) => {
     }
 
     if (needsCashProcess) {
-      if (expectedCash > 0.05 && !cashFromCode) {
-        return res.status(400).json({
-          success: false,
-          message: "Select the cash (till) account to move from",
-        });
-      }
-      if (toSafeAmt > 0.05 && !safeCode) {
-        return res.status(400).json({
-          success: false,
-          message: "Select the Safe account to move cash into",
-        });
-      }
-      if (Math.abs(shortageAmt) > 0.05 && !shortageCode) {
+      if (!cashFromCode || !safeCode || !shortageCode) {
         return res.status(400).json({
           success: false,
           message:
-            shortageAmt > 0
-              ? "Select an account for the cash shortage"
-              : "Select an account for the cash overage",
+            "Cash, Safe, and Shortage heads must all be set before moving cash to Safe",
         });
       }
       if (

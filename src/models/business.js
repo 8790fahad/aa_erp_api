@@ -175,6 +175,28 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         comment: "Default shortage head for Collection Reconciliation",
       },
+      recon_auto_save_enabled: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        comment: "When true, open hand-ins save automatically after the set time",
+      },
+      recon_auto_save_time: {
+        type: DataTypes.STRING(5),
+        allowNull: true,
+        defaultValue: "18:00",
+        comment: "Local HH:mm when automatic hand-in save runs",
+      },
+      recon_auto_save_timezone: {
+        type: DataTypes.STRING(64),
+        allowNull: true,
+        defaultValue: "Africa/Lagos",
+      },
+      recon_auto_save_last_run: {
+        type: DataTypes.STRING(10),
+        allowNull: true,
+        comment: "YYYY-MM-DD of the last automatic hand-in save",
+      },
       vat_payment_reminder_last_sent: {
         type: DataTypes.STRING(7),
         allowNull: true,
@@ -555,6 +577,24 @@ module.exports = (sequelize, DataTypes) => {
       }
       if (!have.has("recon_shortage_account_code")) {
         adds.push("ADD COLUMN recon_shortage_account_code VARCHAR(50) NULL");
+      }
+      if (!have.has("recon_auto_save_enabled")) {
+        adds.push(
+          "ADD COLUMN recon_auto_save_enabled TINYINT(1) NOT NULL DEFAULT 0",
+        );
+      }
+      if (!have.has("recon_auto_save_time")) {
+        adds.push(
+          "ADD COLUMN recon_auto_save_time VARCHAR(5) NULL DEFAULT '18:00'",
+        );
+      }
+      if (!have.has("recon_auto_save_timezone")) {
+        adds.push(
+          "ADD COLUMN recon_auto_save_timezone VARCHAR(64) NULL DEFAULT 'Africa/Lagos'",
+        );
+      }
+      if (!have.has("recon_auto_save_last_run")) {
+        adds.push("ADD COLUMN recon_auto_save_last_run VARCHAR(10) NULL");
       }
       if (adds.length) {
         await sequelize.query(`ALTER TABLE business ${adds.join(", ")}`);

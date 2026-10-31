@@ -578,6 +578,17 @@ const startServer = () => {
           err.message,
         );
       }
+      try {
+        const {
+          startCollectionReconAutoSaveCron,
+        } = require("./jobs/collectionReconAutoSaveCron");
+        startCollectionReconAutoSaveCron();
+      } catch (err) {
+        console.error(
+          `[Worker ${process.pid}] Failed to start collection reconciliation auto-save cron:`,
+          err.message,
+        );
+      }
     }
     try {
       const {

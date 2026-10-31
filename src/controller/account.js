@@ -10544,6 +10544,95 @@ exports.updateInvoiceClosingSettings = async (req, res) => {
 };
 
 /**
+ * POST /account/update-recon-auto-save/:facilityId/:user_id
+ * body: { recon_auto_save_enabled, recon_auto_save_time, recon_auto_save_timezone? }
+ */
+exports.updateReconAutoSaveSettings = async (req, res) => {
+  try {
+    const { facilityId } = req.params;
+    const body = req.body || {};
+    if (db.business?.ensureReconDefaultColumns) {
+      await db.business.ensureReconDefaultColumns();
+    }
+
+    const updatePayload = {};
+    if (body.recon_auto_save_enabled !== undefined) {
+      updatePayload.recon_auto_save_enabled =
+        body.recon_auto_save_enabled === true ||
+        body.recon_auto_save_enabled === "true" ||
+        body.recon_auto_save_enabled === 1 ||
+        body.recon_auto_save_enabled === "1";
+    }
+    if (body.recon_auto_save_time !== undefined) {
+      const time = String(body.recon_auto_save_time || "").trim();
+      if (!/^\d{1,2}:\d{2}$/.test(time)) {
+        return res.status(400).json({
+          success: false,
+          message: "Time must be HH:mm (e.g. 18:00)",
+        });
+      }
+      const [hRaw, mRaw] = time.split(":");
+      const h = Math.min(23, Math.max(0, parseInt(hRaw, 10)));
+      const m = Math.min(59, Math.max(0, parseInt(mRaw, 10)));
+      updatePayload.recon_auto_save_time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    }
+    if (body.recon_auto_save_timezone !== undefined) {
+      const tz = String(body.recon_auto_save_timezone || "").trim();
+      if (tz.length < 3 || tz.length > 64) {
+        return res.status(400).json({
+          success: false,
+          message: "Timezone is invalid",
+        });
+      }
+      updatePayload.recon_auto_save_timezone = tz;
+    }
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No automatic save settings provided",
+      });
+    }
+
+    if (updatePayload.recon_auto_save_enabled) {
+      const current = await db.business.findOne({ where: { id: facilityId } });
+      const cash = String(current?.recon_cash_account_code || "").trim();
+      const safe = String(current?.recon_safe_account_code || "").trim();
+      const shortage = String(current?.recon_shortage_account_code || "").trim();
+      if (!cash || !safe || !shortage) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Set Cash, Safe, and Shortage heads before automatic save. Every cash move needs all three heads.",
+        });
+      }
+    }
+
+    const [updatedRowsCount] = await db.business.update(updatePayload, {
+      where: { id: facilityId },
+    });
+    if (updatedRowsCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Business not found",
+      });
+    }
+
+    const updated = await db.business.findOne({ where: { id: facilityId } });
+    return res.json({
+      success: true,
+      results: updated,
+      message: "Automatic hand-in save updated",
+    });
+  } catch (err) {
+    console.error("Error updating recon auto save:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Internal server error",
+    });
+  }
+};
+
+/**
  * Update financial year start month (1–12).
  * POST /account/update-financial-year/:facilityId/:user_id
  * Body: { startMonth: number }

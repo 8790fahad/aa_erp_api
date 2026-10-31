@@ -319,6 +319,75 @@ exports.getInventoryItemDetails = async (req, res) => {
       },
     };
 
+    let pendingCollections = [];
+    try {
+      const pendingBranchSql = hasBranchFilter
+        ? " AND se.branchId = :branchId"
+        : "";
+      const collectedBranchSql = hasBranchFilter
+        ? " AND f.branch_id = :branchId"
+        : "";
+      pendingCollections = await db.sequelize.query(
+        `
+        SELECT
+          se.reference_number AS sale_code,
+          MAX(sw.customer_name) AS customer_name,
+          SUM(se.qty_out) AS qty_sold,
+          IFNULL(MAX(col.qty_collected), 0) AS qty_collected,
+          GREATEST(SUM(se.qty_out) - IFNULL(MAX(col.qty_collected), 0), 0) AS qty_pending
+        FROM store_entries se
+        LEFT JOIN sale_workflows sw
+          ON ${sqlEq("sw.facility_id", "se.facilityId")}
+          AND ${sqlEq("sw.sale_code", "se.reference_number")}
+        LEFT JOIN (
+          SELECT
+            f.sale_code,
+            SUM(IFNULL(l.qty_collected, 0)) AS qty_collected
+          FROM sale_fulfillments f
+          INNER JOIN sale_fulfillment_lines l
+            ON l.fulfillment_id = f.id
+          WHERE ${sqlEq("f.facility_id", ":facilityId")}
+            AND ${sqlEq("l.product_id", ":productId")}
+            ${collectedBranchSql}
+          GROUP BY f.sale_code
+        ) col
+          ON ${sqlEq("col.sale_code", "se.reference_number")}
+        WHERE ${sqlEq("se.facilityId", ":facilityId")}
+          AND ${sqlEq("se.product_id", ":productId")}
+          AND se.qty_out > 0
+          AND LOWER(TRIM(IFNULL(se.branch_name, ''))) IN ('for sales', 'for sale')
+          AND (
+            LOWER(TRIM(IFNULL(se.destination, ''))) = 'sold'
+            OR LOWER(IFNULL(se.type, '')) IN (${salesTypesSqlList()})
+            OR se.reference_number LIKE 'INV-%'
+          )
+          AND LOWER(IFNULL(se.type, '')) NOT IN (
+            'service', 'transfer', 'adjustment', 'write-off',
+            'sales_return', 'purchase_return'
+          )
+          AND (
+            sw.id IS NULL
+            OR LOWER(IFNULL(sw.status, '')) NOT IN ('reversed', 'cancelled')
+          )
+          ${pendingBranchSql}
+        GROUP BY se.reference_number
+        HAVING GREATEST(SUM(se.qty_out) - IFNULL(MAX(col.qty_collected), 0), 0) > 0.0001
+        ORDER BY se.reference_number
+        `,
+        { replacements, type: db.sequelize.QueryTypes.SELECT },
+      );
+    } catch (pendingErr) {
+      console.warn(
+        "Pending-to-collect lines skipped:",
+        pendingErr?.message || pendingErr,
+      );
+      pendingCollections = [];
+    }
+    const pendingToCollect = pendingCollections.reduce(
+      (sum, row) => sum + (parseFloat(row.qty_pending) || 0),
+      0,
+    );
+
     res.status(200).json({
       success: true,
       data: {
@@ -331,6 +400,8 @@ exports.getInventoryItemDetails = async (req, res) => {
         balanceBroughtForwardDate: /^\d{4}-\d{2}-\d{2}$/.test(from)
           ? from
           : null,
+        pendingToCollect,
+        pendingCollections,
       },
     });
   } catch (error) {
