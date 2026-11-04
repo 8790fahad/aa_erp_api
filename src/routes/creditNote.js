@@ -11,6 +11,14 @@ module.exports = (app) => {
   app.post("/api/credit-notes/apply", creditNoteController.applyCreditNote);
   app.get("/api/credit-notes/search-invoices", creditNoteController.searchInvoices);
   app.get("/api/credit-notes/invoices/:entityId", creditNoteController.getInvoicesForEntity);
+  app.put(
+    "/api/credit-notes/:creditNoteNumber",
+    creditNoteController.updateCreditNote,
+  );
+  app.delete(
+    "/api/credit-notes/:creditNoteNumber",
+    creditNoteController.deleteCreditNote,
+  );
   app.get("/api/credit-notes/:creditNoteNumber", creditNoteController.getCreditNoteDetails);
 };
 

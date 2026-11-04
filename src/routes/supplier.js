@@ -129,4 +129,16 @@ module.exports = (app) => {
     "/api/v1/write-off-supplier-git",
     supplierAdvancePayment.writeOffSupplierGoodsInTransit,
   );
+  app.post(
+    "/api/v1/reverse-supplier-git-move",
+    supplierAdvancePayment.reverseSupplierGitMove,
+  );
+  app.post(
+    "/api/v1/reverse-supplier-advance-application",
+    supplierAdvancePayment.reverseSupplierAdvanceApplication,
+  );
+  app.post(
+    "/api/v1/reverse-supplier-git-write-off",
+    supplierAdvancePayment.reverseSupplierGitWriteOff,
+  );
 };

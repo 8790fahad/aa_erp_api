@@ -2678,26 +2678,45 @@ exports.getSupplierAdvanceHistory = async (req, res) => {
       rememberPayer(id, name);
     }
 
+    const mappedRows = rows.map((r) => {
+      const receipt = String(r.receipt_no || "").trim();
+      const mode = String(r.mode_of_payment || "").trim().toUpperCase();
+      let operation = "payment";
+      if (/^GIT[-_]/i.test(receipt)) operation = "git_move";
+      else if (/^SAD[-_]/i.test(receipt)) operation = "advance_apply";
+      else if (/^GWO[-_]/i.test(receipt)) operation = "git_write_off";
+      else if (/^R(GIT|SAD|GWO)[-_]/i.test(receipt) || mode === "REVERSE")
+        operation = "reverse";
+      else if (/^SAP[-_]/i.test(receipt)) operation = "supplier_payment";
+      return {
+        entry_id:        r.entry_id,
+        supplier_no:     r.supplier_number || "",
+        supplier_name:   r.supplier_name || r.supplier_number || "",
+        date:            r.date || r.created_at,
+        receipt_no:      receipt,
+        description:     r.description || "",
+        amount:          parseFloat(r.amount) || 0,
+        mode_of_payment: r.mode_of_payment || "",
+        type:            r.type || "",
+        link_id:         r.link_id || "",
+        operation,
+        created_by:      r.created_by || "",
+        created_by_name: labelFor(r.created_by, r),
+      };
+    });
+    const resultsWithFlags = await exports.markSupplierHistoryReversible(
+      facilityId,
+      mappedRows,
+    );
+
     return res.json({
       success: true,
       see_all: allowedAll,
       payers: [...payerByName.values()].sort((a, b) =>
         String(a.name).localeCompare(String(b.name)),
       ),
-      results: rows.map((r) => ({
-        entry_id:        r.entry_id,
-        supplier_no:     r.supplier_number || "",
-        supplier_name:   r.supplier_name || r.supplier_number || "",
-        date:            r.date || r.created_at,
-        receipt_no:      r.receipt_no || "",
-        description:     r.description || "",
-        amount:          parseFloat(r.amount) || 0,
-        mode_of_payment: r.mode_of_payment || "",
-        type:            r.type || "",
-        created_by:      r.created_by || "",
-        created_by_name: labelFor(r.created_by, r),
-      })),
-      count:             rows.length,
+      results: resultsWithFlags,
+      count:             resultsWithFlags.length,
       available_advance: availableAdvance,
       available_deposit: availableAdvance,
       available_credit_note: availableCreditNote,
@@ -3787,3 +3806,584 @@ function formatAmount(n) {
     maximumFractionDigits: 2,
   });
 }
+
+async function hasSupplierReverseEntry(facilityId, originalRef, transaction) {
+  const rows = await db.sequelize.query(
+    `SELECT entry_id FROM supplier_entries
+     WHERE facilityId = :facilityId
+       AND link_id = :originalRef
+       AND UPPER(IFNULL(mode_of_payment, '')) = 'REVERSE'
+     LIMIT 1`,
+    {
+      replacements: { facilityId, originalRef: String(originalRef || "").trim() },
+      type: db.sequelize.QueryTypes.SELECT,
+      ...(transaction ? { transaction } : {}),
+    },
+  );
+  return Boolean(rows?.[0]);
+}
+
+async function loadGlByReference(facilityId, referenceNumber, transaction) {
+  return GeneralLedger.findAll({
+    where: {
+      facility_id: facilityId,
+      reference_number: String(referenceNumber || "").trim(),
+    },
+    order: [["transaction_id", "ASC"]],
+    ...(transaction ? { transaction } : {}),
+  });
+}
+
+async function postCompensatingGlRows({
+  rows,
+  transaction,
+  newReference,
+  actor,
+  narration,
+  transactionDate,
+}) {
+  let count = 0;
+  for (const row of rows || []) {
+    const plain = row.get ? row.get({ plain: true }) : row;
+    const desc = String(plain.transaction_description || "");
+    if (/^VOID:/i.test(desc)) continue;
+    if (String(plain.status || "").toLowerCase() === "reversed") continue;
+    const dr = parseFloat(plain.dr || 0);
+    const cr = parseFloat(plain.cr || 0);
+    if (Math.abs(dr) < 0.009 && Math.abs(cr) < 0.009) continue;
+    const clone = { ...plain };
+    delete clone.transaction_id;
+    delete clone.id;
+    delete clone.createdAt;
+    delete clone.updatedAt;
+    delete clone.created_at;
+    delete clone.updated_at;
+    clone.dr = cr;
+    clone.cr = dr;
+    clone.status = "reversed";
+    clone.reference_number = newReference;
+    clone.created_by = actor;
+    clone.transaction_date = transactionDate || plain.transaction_date;
+    clone.transaction_description = `VOID: ${plain.transaction_description || newReference}`.slice(
+      0,
+      500,
+    );
+    clone.purpose_of_payment = String(
+      narration || plain.purpose_of_payment || `Reverse ${plain.reference_number}`,
+    ).slice(0, 150);
+    await GeneralLedger.create(clone, { transaction });
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * POST /api/v1/reverse-supplier-git-move
+ * body: { facilityId, userId, reference_number, narration? }
+ */
+exports.reverseSupplierGitMove = async (req, res) => {
+  const facilityId = req.body?.facilityId;
+  const actor = req.body?.userId || pickActor(req);
+  const referenceNumber = String(req.body?.reference_number || "").trim();
+  const narration = String(req.body?.narration || "").trim();
+
+  if (!facilityId || !actor || !/^GIT[-_]/i.test(referenceNumber)) {
+    return res.status(400).json({
+      success: false,
+      error: "facilityId, userId, and a GIT- reference_number are required",
+    });
+  }
+
+  try {
+    if (await hasSupplierReverseEntry(facilityId, referenceNumber)) {
+      return res.status(400).json({
+        success: false,
+        error: "This GIT move has already been reversed",
+      });
+    }
+
+    const entry = await SupplierEntry.findOne({
+      where: {
+        facilityId,
+        receiptNo: referenceNumber,
+      },
+    });
+    if (!entry) {
+      return res.status(404).json({
+        success: false,
+        error: "GIT move not found",
+      });
+    }
+
+    const supplierNumber = entry.supplier_number;
+    const originalAmt = parseFloat(entry.cost) || 0;
+    const gitAccount = await resolveGoodsInTransitAccount(facilityId);
+    const availableGit = await getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+      null,
+      gitAccount?.code,
+    );
+    const reverseAmt = Math.min(originalAmt, availableGit);
+    if (reverseAmt <= 0.009) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "No goods in transit left to reverse. Reverse any GIT applications or write-offs first.",
+        available_goods_in_transit: availableGit,
+      });
+    }
+
+    const glRows = await loadGlByReference(facilityId, referenceNumber);
+    if (!glRows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "No ledger lines found for this GIT move",
+      });
+    }
+
+    let normalizedTxDate;
+    try {
+      normalizedTxDate = validatePostingDate(new Date(), {
+        field: "transaction_date",
+      });
+    } catch (dateErr) {
+      return res.status(400).json({ success: false, error: dateErr.message });
+    }
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const reverseRef = `RGIT-${await getAndUpdateNumber("RGIT", facilityId)}`;
+    const desc =
+      narration ||
+      `Reverse GIT move ${referenceNumber} — ${supplierNumber}`;
+
+    await db.sequelize.transaction(async (t) => {
+      await postCompensatingGlRows({
+        rows: glRows,
+        transaction: t,
+        newReference: reverseRef,
+        actor,
+        narration: desc,
+        transactionDate,
+      });
+
+      const cnRefs = [
+        ...new Set(
+          glRows
+            .map((r) => String(r.transaction_ref || ""))
+            .filter((ref) => /^CN-S-/i.test(ref))
+            .map((ref) => ref.replace(/-AP$/i, "")),
+        ),
+      ];
+      let left = reverseAmt;
+      for (const cn of cnRefs) {
+        if (left <= 0.009) break;
+        const apps = await db.CreditNoteApplication.findAll({
+          where: {
+            facility_id: facilityId,
+            credit_note_number: cn,
+            invoice_ref: "GIT",
+          },
+          order: [["created_at", "DESC"]],
+          transaction: t,
+        });
+        for (const app of apps) {
+          if (left <= 0.009) break;
+          const amt = parseFloat(app.amount) || 0;
+          if (amt <= left + 0.009) {
+            left -= amt;
+            await app.destroy({ transaction: t });
+          }
+        }
+      }
+
+      await SupplierEntry.create(
+        {
+          supplier_number: supplierNumber,
+          description: desc.slice(0, 255),
+          qty_in: 0,
+          qty_out: 0,
+          cost: reverseAmt,
+          facilityId,
+          mode_of_payment: "REVERSE",
+          receiptNo: reverseRef,
+          type: "payment",
+          link_id: referenceNumber,
+          created_by: actor,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+    });
+
+    const gitAfter = await getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+      null,
+      gitAccount?.code,
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "reverse",
+      entityType: "supplier_advance",
+      entityId: reverseRef,
+      entityLabel: supplierNumber,
+      after: {
+        original_reference: referenceNumber,
+        reverse_reference: reverseRef,
+        amount: reverseAmt,
+        available_goods_in_transit: gitAfter,
+      },
+      remark: desc,
+    });
+
+    return res.json({
+      success: true,
+      message: `Reversed GIT move ${referenceNumber}`,
+      data: {
+        reference_number: reverseRef,
+        original_reference: referenceNumber,
+        amount: reverseAmt,
+        available_goods_in_transit: gitAfter,
+      },
+    });
+  } catch (error) {
+    console.error("reverseSupplierGitMove:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Failed to reverse GIT move",
+    });
+  }
+};
+
+/**
+ * POST /api/v1/reverse-supplier-advance-application
+ * body: { facilityId, userId, reference_number (SAD-*), invoice_refs?[] }
+ */
+exports.reverseSupplierAdvanceApplication = async (req, res) => {
+  const facilityId = req.body?.facilityId;
+  const actor = req.body?.userId || pickActor(req);
+  const referenceNumber = String(req.body?.reference_number || "").trim();
+  const invoiceFilter = Array.isArray(req.body?.invoice_refs)
+    ? req.body.invoice_refs.map((x) => String(x || "").trim()).filter(Boolean)
+    : null;
+  const narration = String(req.body?.narration || "").trim();
+
+  if (!facilityId || !actor || !/^SAD[-_]/i.test(referenceNumber)) {
+    return res.status(400).json({
+      success: false,
+      error: "facilityId, userId, and a SAD- reference_number are required",
+    });
+  }
+
+  try {
+    if (await hasSupplierReverseEntry(facilityId, referenceNumber)) {
+      return res.status(400).json({
+        success: false,
+        error: "This application has already been reversed",
+      });
+    }
+
+    const entries = await SupplierEntry.findAll({
+      where: { facilityId, receiptNo: referenceNumber },
+    });
+    if (!entries.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Application batch not found",
+      });
+    }
+
+    const supplierNumber = entries[0].supplier_number;
+    const selected = invoiceFilter?.length
+      ? entries.filter((e) => invoiceFilter.includes(String(e.link_id || e.cheque_no || "")))
+      : entries;
+    if (!selected.length) {
+      return res.status(400).json({
+        success: false,
+        error: "No matching bill applications to reverse",
+      });
+    }
+
+    let normalizedTxDate;
+    try {
+      normalizedTxDate = validatePostingDate(new Date(), {
+        field: "transaction_date",
+      });
+    } catch (dateErr) {
+      return res.status(400).json({ success: false, error: dateErr.message });
+    }
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const reverseRef = `RSAD-${await getAndUpdateNumber("RSAD", facilityId)}`;
+    const desc =
+      narration || `Reverse apply ${referenceNumber} — ${supplierNumber}`;
+
+    let reversedTotal = 0;
+    await db.sequelize.transaction(async (t) => {
+      for (const entry of selected) {
+        const billRef = String(entry.link_id || entry.cheque_no || "").trim();
+        const amt = parseFloat(entry.cost) || 0;
+        if (!billRef || amt <= 0.009) continue;
+        const glRows = await loadGlByReference(facilityId, billRef, t);
+        const related = glRows.filter((row) => {
+          const plain = row.get ? row.get({ plain: true }) : row;
+          const d = String(plain.transaction_description || "");
+          return (
+            d.includes(referenceNumber) ||
+            d.includes(billRef) ||
+            String(plain.purpose_of_payment || "").includes(billRef)
+          );
+        });
+        const toFlip =
+          related.length > 0
+            ? related.filter((row) => {
+                const plain = row.get ? row.get({ plain: true }) : row;
+                const lineAmt =
+                  parseFloat(plain.dr || 0) || parseFloat(plain.cr || 0);
+                return Math.abs(lineAmt - amt) < 0.05;
+              })
+            : [];
+        const rowsForBill =
+          toFlip.length >= 2
+            ? toFlip
+            : glRows.filter((row) => {
+                const plain = row.get ? row.get({ plain: true }) : row;
+                const lineAmt =
+                  parseFloat(plain.dr || 0) || parseFloat(plain.cr || 0);
+                const type = String(plain.type || "").toLowerCase();
+                return (
+                  Math.abs(lineAmt - amt) < 0.05 &&
+                  (type === "payment" ||
+                    type === "goods_in_transit" ||
+                    type === "git" ||
+                    type === "accrued")
+                );
+              });
+        if (rowsForBill.length) {
+          await postCompensatingGlRows({
+            rows: rowsForBill,
+            transaction: t,
+            newReference: reverseRef,
+            actor,
+            narration: `${desc} — ${billRef}`,
+            transactionDate,
+          });
+        }
+        reversedTotal += amt;
+      }
+
+      await SupplierEntry.create(
+        {
+          supplier_number: supplierNumber,
+          description: desc.slice(0, 255),
+          qty_in: 0,
+          qty_out: 0,
+          cost: reversedTotal,
+          facilityId,
+          mode_of_payment: "REVERSE",
+          receiptNo: reverseRef,
+          type: "payment",
+          link_id: referenceNumber,
+          created_by: actor,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+    });
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "reverse",
+      entityType: "supplier_advance",
+      entityId: reverseRef,
+      entityLabel: supplierNumber,
+      after: {
+        original_reference: referenceNumber,
+        reverse_reference: reverseRef,
+        amount: reversedTotal,
+      },
+      remark: desc,
+    });
+
+    return res.json({
+      success: true,
+      message: `Reversed application ${referenceNumber}`,
+      data: {
+        reference_number: reverseRef,
+        original_reference: referenceNumber,
+        amount: reversedTotal,
+      },
+    });
+  } catch (error) {
+    console.error("reverseSupplierAdvanceApplication:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Failed to reverse application",
+    });
+  }
+};
+
+/**
+ * POST /api/v1/reverse-supplier-git-write-off
+ * body: { facilityId, userId, reference_number (GWO-*), narration? }
+ */
+exports.reverseSupplierGitWriteOff = async (req, res) => {
+  const facilityId = req.body?.facilityId;
+  const actor = req.body?.userId || pickActor(req);
+  const referenceNumber = String(req.body?.reference_number || "").trim();
+  const narration = String(req.body?.narration || "").trim();
+
+  if (!facilityId || !actor || !/^GWO[-_]/i.test(referenceNumber)) {
+    return res.status(400).json({
+      success: false,
+      error: "facilityId, userId, and a GWO- reference_number are required",
+    });
+  }
+
+  try {
+    if (await hasSupplierReverseEntry(facilityId, referenceNumber)) {
+      return res.status(400).json({
+        success: false,
+        error: "This write-off has already been reversed",
+      });
+    }
+
+    const entry = await SupplierEntry.findOne({
+      where: { facilityId, receiptNo: referenceNumber },
+    });
+    if (!entry) {
+      return res.status(404).json({
+        success: false,
+        error: "GIT write-off not found",
+      });
+    }
+
+    const glRows = await loadGlByReference(facilityId, referenceNumber);
+    if (!glRows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "No ledger lines found for this write-off",
+      });
+    }
+
+    let normalizedTxDate;
+    try {
+      normalizedTxDate = validatePostingDate(new Date(), {
+        field: "transaction_date",
+      });
+    } catch (dateErr) {
+      return res.status(400).json({ success: false, error: dateErr.message });
+    }
+    const transactionDate = new Date(`${normalizedTxDate}T12:00:00`);
+    const reverseRef = `RGWO-${await getAndUpdateNumber("RGWO", facilityId)}`;
+    const supplierNumber = entry.supplier_number;
+    const amt = parseFloat(entry.cost) || 0;
+    const desc =
+      narration ||
+      `Reverse GIT write-off ${referenceNumber} — ${supplierNumber}`;
+
+    await db.sequelize.transaction(async (t) => {
+      await postCompensatingGlRows({
+        rows: glRows,
+        transaction: t,
+        newReference: reverseRef,
+        actor,
+        narration: desc,
+        transactionDate,
+      });
+      await SupplierEntry.create(
+        {
+          supplier_number: supplierNumber,
+          description: desc.slice(0, 255),
+          qty_in: 0,
+          qty_out: 0,
+          cost: amt,
+          facilityId,
+          mode_of_payment: "REVERSE",
+          receiptNo: reverseRef,
+          type: "payment",
+          link_id: referenceNumber,
+          created_by: actor,
+          created_at: new Date(),
+        },
+        { transaction: t },
+      );
+    });
+
+    const gitAfter = await getAvailableSupplierGoodsInTransit(
+      facilityId,
+      supplierNumber,
+    );
+
+    await recordActivity({
+      facilityId,
+      userId: actor,
+      action: "reverse",
+      entityType: "supplier_advance",
+      entityId: reverseRef,
+      entityLabel: supplierNumber,
+      after: {
+        original_reference: referenceNumber,
+        reverse_reference: reverseRef,
+        amount: amt,
+        available_goods_in_transit: gitAfter,
+      },
+      remark: desc,
+    });
+
+    return res.json({
+      success: true,
+      message: `Reversed write-off ${referenceNumber}`,
+      data: {
+        reference_number: reverseRef,
+        original_reference: referenceNumber,
+        amount: amt,
+        available_goods_in_transit: gitAfter,
+      },
+    });
+  } catch (error) {
+    console.error("reverseSupplierGitWriteOff:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Failed to reverse write-off",
+    });
+  }
+};
+
+/**
+ * Enrich history with reversible flags (second pass).
+ * GET same payload as history; call after mapping or from UI via this helper endpoint.
+ */
+exports.markSupplierHistoryReversible = async (facilityId, results) => {
+  const refs = (results || [])
+    .map((r) => String(r.receipt_no || "").trim())
+    .filter((r) => /^GIT[-_]/i.test(r) || /^SAD[-_]/i.test(r) || /^GWO[-_]/i.test(r));
+  if (!refs.length) {
+    return (results || []).map((r) => ({ ...r, reversible: false }));
+  }
+  const reversed = await db.sequelize.query(
+    `SELECT link_id FROM supplier_entries
+     WHERE facilityId = :facilityId
+       AND UPPER(IFNULL(mode_of_payment, '')) = 'REVERSE'
+       AND link_id IN (:refs)`,
+    {
+      replacements: { facilityId, refs },
+      type: db.sequelize.QueryTypes.SELECT,
+    },
+  );
+  const reversedSet = new Set(
+    (reversed || []).map((r) => String(r.link_id || "").trim()),
+  );
+  return (results || []).map((r) => {
+    const receipt = String(r.receipt_no || "").trim();
+    const op = r.operation;
+    const canType =
+      op === "git_move" || op === "advance_apply" || op === "git_write_off";
+    return {
+      ...r,
+      reversible: Boolean(canType && receipt && !reversedSet.has(receipt)),
+    };
+  });
+};

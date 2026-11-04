@@ -15,17 +15,18 @@ const {
 const {
   applyCreditNoteInventoryMovement,
 } = require("../services/creditNoteInventoryService");
+const {
+  applicationUsesCredit,
+  reverseCreditNoteDocument,
+  mutabilityFlags,
+  loadCreditNoteMutableContext,
+} = require("../services/creditNoteMutationService");
 
 const PAYMENT_ADJUSTMENT_LABELS = {
   offset_outstanding: "Posted to customer deposit",
   refund_bank: "Refund via bank transfer",
   account_adjustment: "Account adjustment",
 };
-
-/** Parking a money-only supplier credit on the advance does not use it up. */
-function applicationUsesCredit(row) {
-  return String(row?.invoice_ref || "").trim().toUpperCase() !== "ADVANCE";
-}
 
 function formatPaymentAdjustmentNote(method) {
   if (method == null || method === "") return "";
@@ -165,7 +166,9 @@ const getAccountByCode = async (facilityId, accountCode) => {
  * POST /api/credit-notes
  */
 exports.createCreditNote = async (req, res) => {
-  const transaction = await db.sequelize.transaction();
+  const transaction =
+    req._sharedTransaction || (await db.sequelize.transaction());
+  const isUpdate = Boolean(req._creditNoteUpdate);
 
   try {
     const {
@@ -1217,11 +1220,12 @@ exports.createCreditNote = async (req, res) => {
     }
 
     await transaction.commit();
+    delete req._sharedTransaction;
 
     await recordActivity({
       facilityId,
       userId: pickActor(req) || userId,
-      action: "create",
+      action: isUpdate ? "update" : "create",
       entityType: type === "supplier" ? "vendor_credit" : "credit_note",
       entityId: creditNoteNumber,
       entityLabel: entityName || entityId,
@@ -1235,7 +1239,7 @@ exports.createCreditNote = async (req, res) => {
         inventoryStoreRows: inventoryMovement.storeRows,
         cogsReversed: inventoryMovement.cogsReversed,
       },
-      remark: reason || "Credit note created",
+      remark: reason || (isUpdate ? "Credit note updated" : "Credit note created"),
     });
 
     try {
@@ -1245,7 +1249,7 @@ exports.createCreditNote = async (req, res) => {
         actorUserId: userId,
         documentId: creditNoteNumber,
         documentType: type === "supplier" ? "Vendor credit" : "Credit note",
-        eventLabel: "created",
+        eventLabel: isUpdate ? "updated" : "created",
         nextStep: WORKFLOW_NEXT.creditNote,
         details: [
           ["Reference", creditNoteNumber],
@@ -1262,10 +1266,11 @@ exports.createCreditNote = async (req, res) => {
       console.warn("Credit note mail skipped:", notifErr?.message || notifErr);
     }
 
-    res.status(201).json({
+    res.status(isUpdate ? 200 : 201).json({
       success: true,
-      message:
-        paymentAdjustmentMethod === "refund_bank"
+      message: isUpdate
+        ? "Credit note updated successfully"
+        : paymentAdjustmentMethod === "refund_bank"
           ? "Credit note created and refunded successfully"
           : type === "customer"
             ? "Credit note posted to customer deposit. Apply it on Create Invoice with Apply Deposit or Apply Credit."
@@ -1315,12 +1320,170 @@ exports.createCreditNote = async (req, res) => {
       },
     });
   } catch (error) {
-    await transaction.rollback();
+    try {
+      await transaction.rollback();
+    } catch (_) {
+      /* already finished */
+    }
+    delete req._sharedTransaction;
     console.error("Error creating credit note:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to create credit note",
+      message: isUpdate
+        ? "Failed to update credit note"
+        : "Failed to create credit note",
       error: error.message,
+    });
+  }
+};
+
+/**
+ * DELETE /api/credit-notes/:creditNoteNumber
+ * body/query: facilityId, userId
+ */
+exports.deleteCreditNote = async (req, res) => {
+  const transaction = await db.sequelize.transaction();
+  try {
+    const creditNoteNumber = String(
+      req.params.creditNoteNumber || "",
+    ).trim();
+    const facilityId =
+      req.body?.facilityId || req.query?.facilityId || null;
+    const userId = req.body?.userId || req.query?.userId || pickActor(req);
+
+    if (!facilityId || !creditNoteNumber) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "facilityId and creditNoteNumber are required",
+      });
+    }
+
+    const result = await reverseCreditNoteDocument(
+      facilityId,
+      creditNoteNumber,
+      transaction,
+      { mode: "delete" },
+    );
+    await transaction.commit();
+
+    await recordActivity({
+      facilityId,
+      userId: userId || pickActor(req),
+      action: "delete",
+      entityType:
+        result.type === "supplier" ? "vendor_credit" : "credit_note",
+      entityId: creditNoteNumber,
+      after: { deleted: true, ...result },
+      remark: "Credit note deleted",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Credit note deleted",
+      data: { creditNoteNumber, ...result },
+    });
+  } catch (error) {
+    try {
+      await transaction.rollback();
+    } catch (_) {
+      /* already finished */
+    }
+    console.error("Error deleting credit note:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || "Failed to delete credit note",
+    });
+  }
+};
+
+/**
+ * PUT /api/credit-notes/:creditNoteNumber
+ * Same body as create; number and party stay locked to the existing note.
+ */
+exports.updateCreditNote = async (req, res) => {
+  const creditNoteNumber = String(req.params.creditNoteNumber || "").trim();
+  const facilityId = req.body?.facilityId;
+  if (!facilityId || !creditNoteNumber) {
+    return res.status(400).json({
+      success: false,
+      message: "facilityId and creditNoteNumber are required",
+    });
+  }
+
+  const transaction = await db.sequelize.transaction();
+  try {
+    const context = await loadCreditNoteMutableContext(
+      facilityId,
+      creditNoteNumber,
+      transaction,
+    );
+    const existingType =
+      context.invoice.type === "sales" ? "customer" : "supplier";
+    if (req.body.type && req.body.type !== existingType) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Cannot change credit note party type",
+      });
+    }
+
+    let entityId = "";
+    if (existingType === "customer") {
+      const ce = await db.CustomerEntry.findOne({
+        where: { facilityId, receiptNo: creditNoteNumber },
+        order: [["created_at", "DESC"]],
+        transaction,
+      });
+      entityId = ce?.customerNo || req.body.customerId || "";
+    } else {
+      const se = await db.SupplierEntry.findOne({
+        where: { facilityId, cheque_no: creditNoteNumber },
+        order: [["created_at", "DESC"]],
+        transaction,
+      });
+      entityId =
+        se?.supplier_number ||
+        context.invoice.ref_number ||
+        req.body.supplierId ||
+        "";
+    }
+    if (!entityId) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Could not resolve the original customer or supplier",
+      });
+    }
+
+    await reverseCreditNoteDocument(
+      facilityId,
+      creditNoteNumber,
+      transaction,
+      { mode: "replace" },
+    );
+
+    req.body = {
+      ...(req.body || {}),
+      type: existingType,
+      creditNoteNumber,
+      customerId: existingType === "customer" ? entityId : undefined,
+      supplierId: existingType === "supplier" ? entityId : undefined,
+    };
+
+    req._sharedTransaction = transaction;
+    req._creditNoteUpdate = true;
+    return exports.createCreditNote(req, res);
+  } catch (error) {
+    try {
+      await transaction.rollback();
+    } catch (_) {
+      /* already finished */
+    }
+    console.error("Error updating credit note:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || "Failed to update credit note",
     });
   }
 };
@@ -1408,18 +1571,22 @@ exports.getCreditNotes = async (req, res) => {
           });
 
     const appliedMap = {};
+    const allAppsByCn = {};
     for (const a of apps) {
-      if (!applicationUsesCredit(a)) continue;
       const k = a.credit_note_number;
+      if (!allAppsByCn[k]) allAppsByCn[k] = [];
+      allAppsByCn[k].push(a);
+      if (!applicationUsesCredit(a)) continue;
       appliedMap[k] = (appliedMap[k] || 0) + (parseFloat(a.amount) || 0);
     }
 
     const mapped = [];
     for (const inv of invoices) {
       const totalAmount = Math.abs(parseFloat(inv.amount) || 0);
-      const creditsApplied = appliedMap[inv.invoice_ref] || 0;
-      const creditsRemaining = Math.max(0, totalAmount - creditsApplied);
-      const docStatus = creditsRemaining <= 0.009 ? "closed" : "open";
+      const flags = mutabilityFlags(allAppsByCn[inv.invoice_ref] || [], totalAmount);
+      const creditsApplied = flags.creditsApplied;
+      const creditsRemaining = flags.creditsRemaining;
+      const docStatus = flags.status;
       const isCustomer = inv.type === "sales";
 
       let entityId = "";
@@ -1460,6 +1627,8 @@ exports.getCreditNotes = async (req, res) => {
         creditsApplied,
         creditsRemaining,
         status: docStatus,
+        canEdit: flags.canEdit,
+        canDelete: flags.canDelete,
         entityId,
         entityName: entityName || entityId || "—",
         vatAmount: parseFloat(inv.tax_amount) || 0,
@@ -1726,13 +1895,9 @@ exports.getCreditNoteDetails = async (req, res) => {
       order: [["created_at", "DESC"]],
     });
 
-    const creditsApplied = applications.reduce(
-      (s, a) =>
-        applicationUsesCredit(a) ? s + (parseFloat(a.amount) || 0) : s,
-      0,
-    );
     const totalAmount = Math.abs(parseFloat(invoice.amount) || 0);
-    const creditsRemaining = Math.max(0, totalAmount - creditsApplied);
+    const flags = mutabilityFlags(applications, totalAmount);
+    const { creditsApplied, creditsRemaining } = flags;
 
     const glEntries = await db.GeneralLedger.findAll({
       where: {
@@ -1874,7 +2039,9 @@ exports.getCreditNoteDetails = async (req, res) => {
         totalAmount,
         creditsApplied,
         creditsRemaining,
-        status: creditsRemaining <= 0.009 ? "closed" : "open",
+        status: flags.status,
+        canEdit: flags.canEdit,
+        canDelete: flags.canDelete,
         lineItems,
         applications: applications.map((a) => ({
           id: a.id,

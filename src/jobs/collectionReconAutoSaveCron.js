@@ -4,6 +4,8 @@ const db = require("../models");
 const collectionReconciliation = require("../controller/collectionReconciliation");
 const { getNowPartsInTimezone } = require("../services/invoiceClosingService");
 
+const MAX_CATCH_UP_DAYS = 14;
+
 function parseTime(value) {
   const match = String(value || "18:00").trim().match(/^(\d{1,2}):(\d{2})$/);
   if (!match) return { hour: 18, minute: 0 };
@@ -21,6 +23,57 @@ function isPastSaveTime(business, now = new Date()) {
     now,
   );
   return parts.hour * 60 + parts.minute >= hour * 60 + minute;
+}
+
+/** Add calendar days to a YYYY-MM-DD string. */
+function addDaysYmd(ymd, days) {
+  const [y, m, d] = String(ymd)
+    .slice(0, 10)
+    .split("-")
+    .map((n) => parseInt(n, 10));
+  if (![y, m, d].every((n) => Number.isFinite(n))) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+/**
+ * Dates still owed since last_run.
+ * Past missed days are always included. Today only after the save time.
+ */
+function datesDueForBusiness(business, now = new Date()) {
+  if (!business?.recon_auto_save_enabled) return [];
+  const parts = getNowPartsInTimezone(
+    business.recon_auto_save_timezone || "Africa/Lagos",
+    now,
+  );
+  const today = parts.date;
+  const lastRun = business.recon_auto_save_last_run
+    ? String(business.recon_auto_save_last_run).slice(0, 10)
+    : null;
+
+  if (!lastRun || !/^\d{4}-\d{2}-\d{2}$/.test(lastRun)) {
+    return isPastSaveTime(business, now) ? [today] : [];
+  }
+  if (lastRun >= today) {
+    return [];
+  }
+
+  const due = [];
+  let cursor = addDaysYmd(lastRun, 1);
+  let guard = 0;
+  while (cursor && cursor <= today && guard < MAX_CATCH_UP_DAYS + 2) {
+    guard += 1;
+    if (cursor < today) {
+      due.push(cursor);
+    } else if (cursor === today && isPastSaveTime(business, now)) {
+      due.push(cursor);
+    }
+    cursor = addDaysYmd(cursor, 1);
+  }
+  return due.slice(0, MAX_CATCH_UP_DAYS);
 }
 
 function callJson(handler, req) {
@@ -100,27 +153,53 @@ async function saveOpenHandIns(business, reconDate) {
     }
   }
 
-  return { saved, skipped, blocked, open: open.length };
+  return { saved, skipped, blocked, open: open.length, date: reconDate };
 }
 
 async function processFacility(business, now = new Date()) {
-  const parts = getNowPartsInTimezone(
-    business.recon_auto_save_timezone || "Africa/Lagos",
-    now,
-  );
-  const summary = await saveOpenHandIns(business, parts.date);
-  if (!summary.blocked) {
+  const dates = datesDueForBusiness(business, now);
+  if (!dates.length) {
+    return { saved: 0, skipped: 0, blocked: false, open: 0, dates: [] };
+  }
+
+  let saved = 0;
+  let skipped = 0;
+  let open = 0;
+  let blocked = false;
+  let lastOk = null;
+
+  for (const reconDate of dates) {
+    const summary = await saveOpenHandIns(business, reconDate);
+    saved += summary.saved;
+    skipped += summary.skipped;
+    open += summary.open;
+    if (summary.blocked) {
+      blocked = true;
+      console.error(
+        `[recon-auto-save] ${business.id}: stopped catch-up at ${reconDate} (ledger heads missing)`,
+      );
+      break;
+    }
+    lastOk = reconDate;
+    if (summary.open > 0) {
+      console.log(
+        `[recon-auto-save] ${business.id} ${reconDate}: open=${summary.open} saved=${summary.saved} skipped=${summary.skipped}`,
+      );
+    } else {
+      console.log(
+        `[recon-auto-save] ${business.id} ${reconDate}: nothing open to save`,
+      );
+    }
+  }
+
+  if (lastOk) {
     await db.business.update(
-      { recon_auto_save_last_run: parts.date },
+      { recon_auto_save_last_run: lastOk },
       { where: { id: business.id } },
     );
   }
-  if (summary.open > 0) {
-    console.log(
-      `[recon-auto-save] ${business.id}: open=${summary.open} saved=${summary.saved} skipped=${summary.skipped}`,
-    );
-  }
-  return summary;
+
+  return { saved, skipped, blocked, open, dates, lastOk };
 }
 
 async function runScheduledReconAutoSave(now = new Date(), { verbose = false } = {}) {
@@ -135,15 +214,8 @@ async function runScheduledReconAutoSave(now = new Date(), { verbose = false } =
   let dueCount = 0;
   for (const business of businesses) {
     try {
-      if (!isPastSaveTime(business, now)) continue;
-      const parts = getNowPartsInTimezone(
-        business.recon_auto_save_timezone || "Africa/Lagos",
-        now,
-      );
-      const lastRun = business.recon_auto_save_last_run
-        ? String(business.recon_auto_save_last_run).slice(0, 10)
-        : null;
-      if (lastRun === parts.date) continue;
+      const dates = datesDueForBusiness(business, now);
+      if (!dates.length) continue;
       dueCount += 1;
       const summary = await processFacility(business, now);
       results.push({ facilityId: business.id, success: true, ...summary });
@@ -161,6 +233,47 @@ async function runScheduledReconAutoSave(now = new Date(), { verbose = false } =
     console.log(
       `[recon-auto-save] ${businesses.length} enabled, ${dueCount} due`,
     );
+  }
+  return results;
+}
+
+/**
+ * One-off / migration helper: save open hand-ins for a specific calendar date
+ * for every business that has automatic save enabled (and heads when cash).
+ */
+async function backfillReconAutoSaveForDate(reconDate, { facilityId = null } = {}) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(reconDate || ""))) {
+    throw new Error("reconDate must be YYYY-MM-DD");
+  }
+  if (db.business?.ensureReconDefaultColumns) {
+    await db.business.ensureReconDefaultColumns();
+  }
+  const where = { recon_auto_save_enabled: true };
+  if (facilityId) where.id = facilityId;
+  const businesses = await db.business.findAll({ where });
+  const results = [];
+  for (const business of businesses) {
+    try {
+      const summary = await saveOpenHandIns(business, reconDate);
+      results.push({
+        facilityId: business.id,
+        success: true,
+        ...summary,
+      });
+      console.log(
+        `[recon-auto-save] backfill ${business.id} ${reconDate}: open=${summary.open} saved=${summary.saved} skipped=${summary.skipped}`,
+      );
+    } catch (err) {
+      console.error(
+        `[recon-auto-save] backfill failed ${business.id} ${reconDate}:`,
+        err.message,
+      );
+      results.push({
+        facilityId: business.id,
+        success: false,
+        error: err.message,
+      });
+    }
   }
   return results;
 }
@@ -190,4 +303,7 @@ function startCollectionReconAutoSaveCron() {
 module.exports = {
   startCollectionReconAutoSaveCron,
   runScheduledReconAutoSave,
+  saveOpenHandIns,
+  backfillReconAutoSaveForDate,
+  datesDueForBusiness,
 };
