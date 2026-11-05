@@ -10594,17 +10594,10 @@ exports.updateReconAutoSaveSettings = async (req, res) => {
     }
 
     if (updatePayload.recon_auto_save_enabled) {
-      const current = await db.business.findOne({ where: { id: facilityId } });
-      const cash = String(current?.recon_cash_account_code || "").trim();
-      const safe = String(current?.recon_safe_account_code || "").trim();
-      const shortage = String(current?.recon_shortage_account_code || "").trim();
-      if (!cash || !safe || !shortage) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Set Cash, Safe, and Shortage heads before automatic save. Every cash move needs all three heads.",
-        });
-      }
+      return res.status(400).json({
+        success: false,
+        message: "Automatic save is turned off. Confirm hand-ins from Collection Reconciliation.",
+      });
     }
 
     const [updatedRowsCount] = await db.business.update(updatePayload, {

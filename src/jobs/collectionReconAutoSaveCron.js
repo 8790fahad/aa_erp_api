@@ -156,85 +156,9 @@ async function saveOpenHandIns(business, reconDate) {
   return { saved, skipped, blocked, open: open.length, date: reconDate };
 }
 
-async function processFacility(business, now = new Date()) {
-  const dates = datesDueForBusiness(business, now);
-  if (!dates.length) {
-    return { saved: 0, skipped: 0, blocked: false, open: 0, dates: [] };
-  }
-
-  let saved = 0;
-  let skipped = 0;
-  let open = 0;
-  let blocked = false;
-  let lastOk = null;
-
-  for (const reconDate of dates) {
-    const summary = await saveOpenHandIns(business, reconDate);
-    saved += summary.saved;
-    skipped += summary.skipped;
-    open += summary.open;
-    if (summary.blocked) {
-      blocked = true;
-      console.error(
-        `[recon-auto-save] ${business.id}: stopped catch-up at ${reconDate} (ledger heads missing)`,
-      );
-      break;
-    }
-    lastOk = reconDate;
-    if (summary.open > 0) {
-      console.log(
-        `[recon-auto-save] ${business.id} ${reconDate}: open=${summary.open} saved=${summary.saved} skipped=${summary.skipped}`,
-      );
-    } else {
-      console.log(
-        `[recon-auto-save] ${business.id} ${reconDate}: nothing open to save`,
-      );
-    }
-  }
-
-  if (lastOk) {
-    await db.business.update(
-      { recon_auto_save_last_run: lastOk },
-      { where: { id: business.id } },
-    );
-  }
-
-  return { saved, skipped, blocked, open, dates, lastOk };
-}
-
-async function runScheduledReconAutoSave(now = new Date(), { verbose = false } = {}) {
-  if (db.business?.ensureReconDefaultColumns) {
-    await db.business.ensureReconDefaultColumns();
-  }
-  const businesses = await db.business.findAll({
-    where: { recon_auto_save_enabled: true },
-  });
-
-  const results = [];
-  let dueCount = 0;
-  for (const business of businesses) {
-    try {
-      const dates = datesDueForBusiness(business, now);
-      if (!dates.length) continue;
-      dueCount += 1;
-      const summary = await processFacility(business, now);
-      results.push({ facilityId: business.id, success: true, ...summary });
-    } catch (err) {
-      console.error(`[recon-auto-save] Failed for ${business.id}:`, err.message);
-      results.push({
-        facilityId: business.id,
-        success: false,
-        error: err.message,
-      });
-    }
-  }
-
-  if (verbose || dueCount > 0) {
-    console.log(
-      `[recon-auto-save] ${businesses.length} enabled, ${dueCount} due`,
-    );
-  }
-  return results;
+async function runScheduledReconAutoSave() {
+  // Scheduled automatic save no longer confirms hand-ins.
+  return [];
 }
 
 /**
@@ -279,25 +203,9 @@ async function backfillReconAutoSaveForDate(reconDate, { facilityId = null } = {
 }
 
 function startCollectionReconAutoSaveCron() {
-  if (process.env.ENABLE_RECON_AUTO_SAVE_CRON === "false") {
-    console.log("[recon-auto-save] Disabled via ENABLE_RECON_AUTO_SAVE_CRON=false");
-    return null;
-  }
-  const intervalMs = Math.max(
-    15000,
-    parseInt(process.env.RECON_AUTO_SAVE_POLL_MS, 10) || 60 * 1000,
-  );
-  const tick = (verbose = false) => {
-    runScheduledReconAutoSave(new Date(), { verbose }).catch((err) =>
-      console.error("[recon-auto-save] Unhandled error:", err),
-    );
-  };
-  tick(true);
-  const timer = setInterval(() => tick(false), intervalMs);
-  console.log(
-    `[recon-auto-save] Polling every ${Math.round(intervalMs / 1000)}s`,
-  );
-  return timer;
+  // Automatic hand-in save is turned off. Past days stay on History via migration.
+  console.log("[recon-auto-save] Automatic save is off");
+  return null;
 }
 
 module.exports = {
