@@ -5827,6 +5827,43 @@ exports.listWarehouseRequests = async (req, res) => {
       });
     }
 
+    if (String(req.query.historyOnly || "") === "1") {
+      const dateParam = String(req.query.historyDate || req.query.date || "").trim();
+      const historyDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
+        ? dateParam
+        : moment().format("YYYY-MM-DD");
+      const historyStart = new Date(`${historyDate}T00:00:00.000`);
+      const historyEnd = new Date(`${historyDate}T23:59:59.999`);
+      const collectedPacks = await db.SaleFulfillment.findAll({
+        where: {
+          ...fulBase,
+          status: "collected",
+          [Op.or]: [
+            { collected_at: { [Op.between]: [historyStart, historyEnd] } },
+            {
+              collected_at: null,
+              updated_at: { [Op.between]: [historyStart, historyEnd] },
+            },
+          ],
+        },
+        include: [{ model: db.SaleFulfillmentLine, as: "lines" }],
+        order: [
+          ["collected_at", "DESC"],
+          ["updated_at", "DESC"],
+        ],
+        limit: 500,
+      });
+      const enriched = collectedPacks.length
+        ? await enrichFulfillments(collectedPacks)
+        : [];
+      return res.json({
+        success: true,
+        results: enriched,
+        count: enriched.length,
+        history_date: historyDate,
+      });
+    }
+
     const lookupCode = normalizeSaleCode(req.query.saleCode);
     if (lookupCode) {
       const saleCandidates = [lookupCode];
